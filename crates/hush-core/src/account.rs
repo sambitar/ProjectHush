@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::crypto::{decrypt, encrypt, random_bytes};
 use crate::error::Error;
 use crate::invite::InvitePayload;
-use crate::message::ReceivedMessage;
+use crate::message::{InboxResult, ReceivedMessage};
 use crate::payload::{MessagePayload, MAX_INLINE_FILE_BYTES};
 use crate::relay_client::RelayClient;
 use crate::signal::{
@@ -24,6 +24,9 @@ pub struct Contact {
     pub protocol_name: String,
     pub queue_id: String,
     pub queue_token: String,
+    /// True after we successfully received at least one message from them (they added our invite).
+    #[serde(default)]
+    pub inbound_ready: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -33,6 +36,9 @@ struct AccountState {
     receive_queue_id: String,
     receive_queue_token: String,
     contacts: Vec<Contact>,
+    /// Stable invite string so "Copy my invite" does not rotate keys every click.
+    #[serde(default)]
+    invite_cache: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,6 +73,7 @@ impl Account {
             receive_queue_id,
             receive_queue_token,
             contacts: Vec::new(),
+            invite_cache: None,
         };
         let account = Self {
             vault,
@@ -116,6 +123,9 @@ impl Account {
     }
 
     pub async fn invite(&mut self) -> Result<String, Error> {
+        if let Some(cached) = &self.state.invite_cache {
+            return Ok(cached.clone());
+        }
         let bundle = mint_prekey_bundle(&mut self.store).await?;
         let payload = invite_from_bundle(
             &self.state.relay,
@@ -124,12 +134,17 @@ impl Account {
             &self.state.receive_queue_token,
             &bundle,
         )?;
+        let encoded = payload.encode()?;
+        self.state.invite_cache = Some(encoded.clone());
         self.save().await?;
-        payload.encode()
+        Ok(encoded)
     }
 
     pub async fn add_contact(&mut self, nickname: &str, invite_str: &str) -> Result<(), Error> {
         let payload = InvitePayload::decode(invite_str)?;
+        if normalize_relay(&payload.relay) != normalize_relay(&self.state.relay) {
+            return Err(Error::RelayMismatch(payload.relay.clone(), self.state.relay.clone()));
+        }
         if self
             .state
             .contacts
@@ -151,6 +166,7 @@ impl Account {
             protocol_name: payload.protocol_name.clone(),
             queue_id: payload.queue_id,
             queue_token: payload.queue_token,
+            inbound_ready: false,
         });
         self.save().await?;
         Ok(())
@@ -168,18 +184,30 @@ impl Account {
 
     pub async fn send_file(&mut self, nickname: &str, path: &Path) -> Result<(), Error> {
         let data = fs::read(path)?;
-        if data.len() > MAX_INLINE_FILE_BYTES {
-            return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
-        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        self.vault.put_blob(&data)?;
+        self.send_file_bytes(nickname, &name, &data).await
+    }
+
+    pub async fn send_file_bytes(
+        &mut self,
+        nickname: &str,
+        name: &str,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        if data.len() > MAX_INLINE_FILE_BYTES {
+            return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
+        }
+        self.vault.put_blob(data)?;
         self.send_payload(
             nickname,
-            MessagePayload::File { name, data },
+            MessagePayload::File {
+                name: name.to_string(),
+                data: data.to_vec(),
+            },
         )
         .await
     }
@@ -210,12 +238,14 @@ impl Account {
         Ok(())
     }
 
-    pub async fn recv(&mut self) -> Result<Vec<ReceivedMessage>, Error> {
+    pub async fn recv(&mut self) -> Result<InboxResult, Error> {
         let relay = RelayClient::new(&self.state.relay);
         let ids = relay
             .list(&self.state.receive_queue_id, &self.state.receive_queue_token)
             .await?;
         let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        let mut dirty = false;
         for blob_id in ids {
             let body = relay
                 .get(
@@ -225,16 +255,35 @@ impl Account {
                 )
                 .await?;
             let wire: WireEnvelope = serde_json::from_slice(&body).map_err(|_| Error::Corrupt)?;
-            let plain = decrypt_message(
+            let plain = match decrypt_message(
                 &mut self.store,
                 &self.state.protocol_name,
                 &wire.from,
                 &wire.ct,
             )
-            .await?;
+            .await
+            {
+                Ok(p) => p,
+                Err(Error::Session) => {
+                    warnings.push(format!(
+                        "Could not read a message from {} — they may not have added your invite yet (use Copy my invite on your side, they paste it under Add contact).",
+                        short_name(&wire.from)
+                    ));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let payload = decode_legacy_payload(&plain)?;
             if let MessagePayload::File { data, .. } = &payload {
                 self.vault.put_blob(data)?;
+            }
+            if let Some(c) = self
+                .state
+                .contacts
+                .iter_mut()
+                .find(|c| c.protocol_name == wire.from)
+            {
+                c.inbound_ready = true;
             }
             let nick = self
                 .state
@@ -242,7 +291,7 @@ impl Account {
                 .iter()
                 .find(|c| c.protocol_name == wire.from)
                 .map(|c| c.nickname.clone())
-                .unwrap_or_else(|| wire.from.clone());
+                .unwrap_or_else(|| short_name(&wire.from));
             out.push(ReceivedMessage {
                 from_nick: nick,
                 payload,
@@ -254,11 +303,15 @@ impl Account {
                     &blob_id,
                 )
                 .await?;
+            dirty = true;
         }
-        if !out.is_empty() {
+        if dirty {
             self.save().await?;
         }
-        Ok(out)
+        Ok(InboxResult {
+            messages: out,
+            warnings,
+        })
     }
 
     fn find_contact(&self, nickname: &str) -> Option<&Contact> {
@@ -290,6 +343,18 @@ fn decode_legacy_payload(plain: &[u8]) -> Result<MessagePayload, Error> {
     }
     let text = String::from_utf8(plain.to_vec()).map_err(|_| Error::Corrupt)?;
     Ok(MessagePayload::Text { body: text })
+}
+
+fn normalize_relay(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+fn short_name(protocol_name: &str) -> String {
+    if protocol_name.len() > 12 {
+        format!("{}…", &protocol_name[..12])
+    } else {
+        protocol_name.to_string()
+    }
 }
 
 fn dir_size(path: &Path) -> u64 {

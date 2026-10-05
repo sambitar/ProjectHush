@@ -2113,6 +2113,7 @@ name = "hush-daemon"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "clap",
  "hush-core",
  "serde",
@@ -2143,6 +2144,7 @@ dependencies = [
 name = "hush-tauri"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "tauri",
  "tauri-build",
 ]

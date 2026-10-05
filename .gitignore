@@ -7,3 +7,6 @@ relay.db
 *-vault/
 alice-vault/
 bob-vault/
+instances/
+apps/hush-tauri/node_modules/
+.cursor/

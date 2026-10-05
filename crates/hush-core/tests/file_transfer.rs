@@ -39,9 +39,9 @@ async fn send_file_roundtrip_and_not_on_relay_disk() {
 
     bob.send_file("alice", fixture.path()).await.unwrap();
 
-    let msgs = alice.recv().await.unwrap();
-    assert_eq!(msgs.len(), 1);
-    match &msgs[0].payload {
+    let inbox = alice.recv().await.unwrap();
+    assert_eq!(inbox.messages.len(), 1);
+    match &inbox.messages[0].payload {
         MessagePayload::File { name, data } => {
             assert!(!name.is_empty());
             assert_eq!(data.as_slice(), marker);

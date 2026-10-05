@@ -38,11 +38,11 @@ async fn two_accounts_exchange_encrypted_text() {
 
     bob.send_text("alice", "hello from bob").await.unwrap();
 
-    let messages = alice.recv().await.unwrap();
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].from_nick, "bob");
+    let inbox = alice.recv().await.unwrap();
+    assert_eq!(inbox.messages.len(), 1);
+    assert_eq!(inbox.messages[0].from_nick, "bob");
     assert_eq!(
-        messages[0].payload,
+        inbox.messages[0].payload,
         hush_core::MessagePayload::Text {
             body: "hello from bob".into()
         }
@@ -52,10 +52,10 @@ async fn two_accounts_exchange_encrypted_text() {
         .send_text("bob", "hello back from alice")
         .await
         .unwrap();
-    let bob_messages = bob.recv().await.unwrap();
-    assert_eq!(bob_messages.len(), 1);
+    let bob_inbox = bob.recv().await.unwrap();
+    assert_eq!(bob_inbox.messages.len(), 1);
     assert_eq!(
-        bob_messages[0].payload,
+        bob_inbox.messages[0].payload,
         hush_core::MessagePayload::Text {
             body: "hello back from alice".into()
         }

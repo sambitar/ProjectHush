@@ -32,6 +32,8 @@ pub enum Error {
     PassphraseRequired,
     #[error("file too large (max {0} bytes)")]
     FileTooLarge(usize),
+    #[error("invite relay {0} does not match this vault relay {1}")]
+    RelayMismatch(String, String),
 }
 
 impl From<argon2::Error> for Error {

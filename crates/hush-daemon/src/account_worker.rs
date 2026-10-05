@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::thread;
 
-use hush_core::{Account, Contact, ReceivedMessage};
+use hush_core::{Account, Contact, InboxResult};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct AccountWorker {
@@ -38,6 +38,12 @@ enum Work {
         path: PathBuf,
         reply: oneshot::Sender<WorkResult>,
     },
+    SendFileBytes {
+        to: String,
+        name: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
     Recv {
         reply: oneshot::Sender<WorkResult>,
     },
@@ -50,7 +56,7 @@ pub enum WorkResult {
     Ok,
     Invite(String),
     Contacts(Vec<Contact>),
-    Messages(Vec<ReceivedMessage>),
+    Inbox(InboxResult),
     Meta {
         protocol_name: String,
         vault_bytes: u64,
@@ -136,11 +142,26 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::SendFileBytes {
+                            to,
+                            name,
+                            data,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.send_file_bytes(&to, &name, &data).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::Recv { reply } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => match a.recv().await {
-                                    Ok(msgs) => WorkResult::Messages(msgs),
+                                    Ok(inbox) => WorkResult::Inbox(inbox),
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
@@ -221,6 +242,16 @@ impl AccountWorker {
         self.call(|reply| Work::SendFile {
             to: to.to_string(),
             path: path.clone(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn send_file_bytes(&self, to: &str, name: &str, data: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::SendFileBytes {
+            to: to.to_string(),
+            name: name.to_string(),
+            data,
             reply,
         })
         .await

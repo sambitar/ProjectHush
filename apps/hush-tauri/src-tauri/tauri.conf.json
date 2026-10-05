@@ -4,19 +4,22 @@
   "version": "0.1.0",
   "identifier": "com.hush.capsule",
   "build": {
-    "frontendDist": "../ui"
+    "frontendDist": "../ui/dist",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [
       {
         "title": "Hush",
-        "width": 920,
-        "height": 720,
+        "width": 1100,
+        "height": 760,
+        "minWidth": 960,
+        "minHeight": 720,
         "resizable": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:9876; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:9876 http://127.0.0.1:9877; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
     }
   },
   "bundle": {

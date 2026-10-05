@@ -12,6 +12,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use hush_core::{Contact, MessagePayload, ReceivedMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -76,6 +77,20 @@ struct InviteResponse {
 struct ContactDto {
     nickname: String,
     protocol_name: String,
+    /// They have added your invite (we received from them at least once).
+    inbound_ready: bool,
+}
+
+#[derive(Serialize)]
+struct ApiError {
+    error: String,
+}
+
+#[derive(Deserialize)]
+struct SendFileDataRequest {
+    to: String,
+    name: String,
+    data_base64: String,
 }
 
 #[derive(Serialize)]
@@ -110,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/contacts/add", post(add_contact))
         .route("/api/send", post(send_text))
         .route("/api/send-file", post(send_file))
+        .route("/api/send-file-data", post(send_file_data))
         .route("/api/recv", post(recv))
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
@@ -143,10 +159,12 @@ async fn touch(state: &App) {
     *state.unlocked_at.lock().await = Some(Instant::now());
 }
 
-fn map_err(result: WorkResult) -> Result<WorkResult, StatusCode> {
+fn map_err(result: WorkResult) -> Result<WorkResult, (StatusCode, Json<ApiError>)> {
     match result {
-        WorkResult::Err(msg) if msg == "locked" => Err(StatusCode::UNAUTHORIZED),
-        WorkResult::Err(_) => Err(StatusCode::BAD_REQUEST),
+        WorkResult::Err(msg) if msg == "locked" => {
+            Err((StatusCode::UNAUTHORIZED, Json(ApiError { error: msg })))
+        }
+        WorkResult::Err(msg) => Err((StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))),
         other => Ok(other),
     }
 }
@@ -195,16 +213,25 @@ async fn lock(State(state): State<Arc<App>>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn invite(State(state): State<Arc<App>>) -> Result<Json<InviteResponse>, StatusCode> {
+async fn invite(
+    State(state): State<Arc<App>>,
+) -> Result<Json<InviteResponse>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let result = map_err(state.worker.invite().await)?;
     match result {
         WorkResult::Invite(invite) => Ok(Json(InviteResponse { invite })),
-        _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
     }
 }
 
-async fn contacts(State(state): State<Arc<App>>) -> Result<Json<Vec<ContactDto>>, StatusCode> {
+async fn contacts(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<ContactDto>>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let result = map_err(state.worker.contacts().await)?;
     match result {
@@ -213,17 +240,23 @@ async fn contacts(State(state): State<Arc<App>>) -> Result<Json<Vec<ContactDto>>
                 .map(|c: &Contact| ContactDto {
                     nickname: c.nickname.clone(),
                     protocol_name: c.protocol_name.clone(),
+                    inbound_ready: c.inbound_ready,
                 })
                 .collect(),
         )),
-        _ => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
     }
 }
 
 async fn add_contact(
     State(state): State<Arc<App>>,
     Json(body): Json<AddContactRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(state.worker.add_contact(&body.nickname, &body.invite).await)?;
     Ok(StatusCode::NO_CONTENT)
@@ -232,7 +265,7 @@ async fn add_contact(
 async fn send_text(
     State(state): State<Arc<App>>,
     Json(body): Json<SendTextRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(state.worker.send_text(&body.to, &body.text).await)?;
     Ok(StatusCode::NO_CONTENT)
@@ -241,7 +274,7 @@ async fn send_text(
 async fn send_file(
     State(state): State<Arc<App>>,
     Json(body): Json<SendFileRequest>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(
         state
@@ -252,16 +285,62 @@ async fn send_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn recv(State(state): State<Arc<App>>) -> Result<Json<Vec<ReceivedDto>>, StatusCode> {
+async fn send_file_data(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SendFileDataRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let data = STANDARD
+        .decode(body.data_base64.trim())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "invalid base64 file data".into(),
+                }),
+            )
+        })?;
+    map_err(
+        state
+            .worker
+            .send_file_bytes(&body.to, &body.name, data)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct RecvResponse {
+    messages: Vec<ReceivedDto>,
+    warnings: Vec<String>,
+}
+
+async fn recv(
+    State(state): State<Arc<App>>,
+) -> Result<Json<RecvResponse>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let result = map_err(state.worker.recv().await)?;
-    let messages = match result {
-        WorkResult::Messages(msgs) => msgs,
-        _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    let inbox = match result {
+        WorkResult::Inbox(inbox) => inbox,
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "unexpected worker response".into(),
+                }),
+            ))
+        }
     };
-    let inbox = state.dir.join("inbox");
-    let _ = std::fs::create_dir_all(&inbox);
-    Ok(Json(messages.into_iter().map(|m| to_dto(m, &inbox)).collect()))
+    let inbox_dir = state.dir.join("inbox");
+    let _ = std::fs::create_dir_all(&inbox_dir);
+    Ok(Json(RecvResponse {
+        messages: inbox
+            .messages
+            .into_iter()
+            .map(|m| to_dto(m, &inbox_dir))
+            .collect(),
+        warnings: inbox.warnings,
+    }))
 }
 
 fn to_dto(msg: ReceivedMessage, inbox: &std::path::Path) -> ReceivedDto {

@@ -80,7 +80,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Recv { save_dir } => {
             let mut account = open(&dir, &passphrase).await?;
-            for msg in account.recv().await? {
+            let inbox = account.recv().await?;
+            for w in &inbox.warnings {
+                eprintln!("warning: {}", w);
+            }
+            for msg in inbox.messages {
                 match msg.payload {
                     MessagePayload::Text { body } => {
                         println!("{}: {}", msg.from_nick, body);

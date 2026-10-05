@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 clap = { version = "4", features = ["derive", "env"] }
+base64 = "0.22"
 hush-core = { path = "../hush-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
