@@ -117,6 +117,10 @@ impl Vault {
         self.identity_public
     }
 
+    pub(crate) fn master_key(&self) -> &[u8; MASTER_KEY_LEN] {
+        &self.master
+    }
+
     pub fn put_blob(&self, plaintext: &[u8]) -> Result<BlobId, Error> {
         let id = BlobId(sha256(plaintext));
         let packed = encrypt(&self.master, plaintext)?;

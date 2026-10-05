@@ -3,7 +3,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     Key, XChaCha20Poly1305, XNonce,
 };
-use rand::RngCore;
+use rand::{RngCore, TryRngCore};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -15,7 +15,7 @@ pub const SALT_LEN: usize = 16;
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rngs::OsRng.unwrap_err().fill_bytes(&mut buf);
     buf
 }
 

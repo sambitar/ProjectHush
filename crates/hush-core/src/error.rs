@@ -18,6 +18,18 @@ pub enum Error {
     BlobNotFound,
     #[error("corrupt vault metadata")]
     Corrupt,
+    #[error("relay error: {0}")]
+    Relay(String),
+    #[error("signal session error")]
+    Session,
+    #[error("contact not found")]
+    ContactNotFound,
+    #[error("contact already exists")]
+    ContactExists,
+    #[error("unsupported invite version")]
+    UnsupportedInvite,
+    #[error("passphrase required: use --passphrase or set HUSH_PASSPHRASE")]
+    PassphraseRequired,
 }
 
 impl From<argon2::Error> for Error {
