@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/hush-core"]
+resolver = "2"
