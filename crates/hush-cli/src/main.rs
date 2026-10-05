@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use hush_core::Account;
+use std::path::PathBuf as StdPathBuf;
+
+use hush_core::{Account, MessagePayload};
 
 const DEFAULT_RELAY: &str = "http://127.0.0.1:8787";
 
@@ -35,7 +37,15 @@ enum Commands {
         #[arg(long)]
         text: String,
     },
-    Recv,
+    SendFile {
+        to: String,
+        #[arg(long)]
+        path: StdPathBuf,
+    },
+    Recv {
+        #[arg(long)]
+        save_dir: Option<StdPathBuf>,
+    },
     Contacts,
 }
 
@@ -63,10 +73,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             account.send_text(&to, &text).await?;
             println!("sent");
         }
-        Commands::Recv => {
+        Commands::SendFile { to, path } => {
             let mut account = open(&dir, &passphrase).await?;
-            for (from, text) in account.recv().await? {
-                println!("{}: {}", from, text);
+            account.send_file(&to, &path).await?;
+            println!("sent file");
+        }
+        Commands::Recv { save_dir } => {
+            let mut account = open(&dir, &passphrase).await?;
+            for msg in account.recv().await? {
+                match msg.payload {
+                    MessagePayload::Text { body } => {
+                        println!("{}: {}", msg.from_nick, body);
+                    }
+                    MessagePayload::File { name, data } => {
+                        let out = if let Some(d) = &save_dir {
+                            std::fs::create_dir_all(d)?;
+                            d.join(&name)
+                        } else {
+                            StdPathBuf::from(format!("received-{}-{}", msg.from_nick, name))
+                        };
+                        std::fs::write(&out, &data)?;
+                        println!("{}: file -> {}", msg.from_nick, out.display());
+                    }
+                }
             }
         }
         Commands::Contacts => {

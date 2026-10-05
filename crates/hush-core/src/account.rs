@@ -8,6 +8,8 @@ use uuid::Uuid;
 use crate::crypto::{decrypt, encrypt, random_bytes};
 use crate::error::Error;
 use crate::invite::InvitePayload;
+use crate::message::ReceivedMessage;
+use crate::payload::{MessagePayload, MAX_INLINE_FILE_BYTES};
 use crate::relay_client::RelayClient;
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
@@ -93,6 +95,10 @@ impl Account {
         })
     }
 
+    pub fn vault_dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn relay(&self) -> &str {
         &self.state.relay
     }
@@ -103,6 +109,10 @@ impl Account {
 
     pub fn contacts(&self) -> &[Contact] {
         &self.state.contacts
+    }
+
+    pub fn vault_bytes_on_disk(&self) -> u64 {
+        dir_size(&self.dir)
     }
 
     pub async fn invite(&mut self) -> Result<String, Error> {
@@ -147,15 +157,44 @@ impl Account {
     }
 
     pub async fn send_text(&mut self, nickname: &str, text: &str) -> Result<(), Error> {
+        self.send_payload(
+            nickname,
+            MessagePayload::Text {
+                body: text.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn send_file(&mut self, nickname: &str, path: &Path) -> Result<(), Error> {
+        let data = fs::read(path)?;
+        if data.len() > MAX_INLINE_FILE_BYTES {
+            return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        self.vault.put_blob(&data)?;
+        self.send_payload(
+            nickname,
+            MessagePayload::File { name, data },
+        )
+        .await
+    }
+
+    async fn send_payload(&mut self, nickname: &str, payload: MessagePayload) -> Result<(), Error> {
         let contact = self
             .find_contact(nickname)
             .ok_or(Error::ContactNotFound)?
             .clone();
+        let plain = payload.encode()?;
         let ct = encrypt_message(
             &mut self.store,
             &self.state.protocol_name,
             &contact.protocol_name,
-            text,
+            plain.as_slice(),
         )
         .await?;
         let wire = WireEnvelope {
@@ -171,7 +210,7 @@ impl Account {
         Ok(())
     }
 
-    pub async fn recv(&mut self) -> Result<Vec<(String, String)>, Error> {
+    pub async fn recv(&mut self) -> Result<Vec<ReceivedMessage>, Error> {
         let relay = RelayClient::new(&self.state.relay);
         let ids = relay
             .list(&self.state.receive_queue_id, &self.state.receive_queue_token)
@@ -193,7 +232,10 @@ impl Account {
                 &wire.ct,
             )
             .await?;
-            let text = String::from_utf8(plain).map_err(|_| Error::Corrupt)?;
+            let payload = decode_legacy_payload(&plain)?;
+            if let MessagePayload::File { data, .. } = &payload {
+                self.vault.put_blob(data)?;
+            }
             let nick = self
                 .state
                 .contacts
@@ -201,7 +243,10 @@ impl Account {
                 .find(|c| c.protocol_name == wire.from)
                 .map(|c| c.nickname.clone())
                 .unwrap_or_else(|| wire.from.clone());
-            out.push((nick, text));
+            out.push(ReceivedMessage {
+                from_nick: nick,
+                payload,
+            });
             relay
                 .delete(
                     &self.state.receive_queue_id,
@@ -237,4 +282,27 @@ impl Account {
         fs::write(self.dir.join("signal.enc"), signal_enc)?;
         Ok(())
     }
+}
+
+fn decode_legacy_payload(plain: &[u8]) -> Result<MessagePayload, Error> {
+    if let Ok(p) = MessagePayload::decode(plain) {
+        return Ok(p);
+    }
+    let text = String::from_utf8(plain.to_vec()).map_err(|_| Error::Corrupt)?;
+    Ok(MessagePayload::Text { body: text })
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            } else if p.is_dir() {
+                total += dir_size(&p);
+            }
+        }
+    }
+    total
 }

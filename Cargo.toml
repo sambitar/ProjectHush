@@ -1,3 +1,9 @@
 [workspace]
-members = ["crates/hush-core", "crates/hush-relay", "crates/hush-cli"]
+members = [
+  "crates/hush-core",
+  "crates/hush-relay",
+  "crates/hush-cli",
+  "crates/hush-daemon",
+  "apps/hush-tauri/src-tauri",
+]
 resolver = "2"

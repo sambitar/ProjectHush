@@ -1,0 +1,18 @@
+[package]
+name = "hush-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "hush-daemon"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+clap = { version = "4", features = ["derive", "env"] }
+hush-core = { path = "../hush-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tower-http = { version = "0.6", features = ["cors"] }

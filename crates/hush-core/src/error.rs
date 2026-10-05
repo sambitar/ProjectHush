@@ -30,6 +30,8 @@ pub enum Error {
     UnsupportedInvite,
     #[error("passphrase required: use --passphrase or set HUSH_PASSPHRASE")]
     PassphraseRequired,
+    #[error("file too large (max {0} bytes)")]
+    FileTooLarge(usize),
 }
 
 impl From<argon2::Error> for Error {

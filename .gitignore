@@ -2,3 +2,8 @@
 .tools/
 **/*.rs.bk
 .DS_Store
+relay.db
+.tmp-*/
+*-vault/
+alice-vault/
+bob-vault/

@@ -199,7 +199,7 @@ pub async fn encrypt_message(
     store: &mut InMemSignalProtocolStore,
     local_name: &str,
     remote_name: &str,
-    text: &str,
+    plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     use libsignal_protocol::message_encrypt;
 
@@ -207,7 +207,7 @@ pub async fn encrypt_message(
     let remote = protocol_address(remote_name);
     let mut csprng = OsRng.unwrap_err();
     let msg = message_encrypt(
-        text.as_bytes(),
+        plaintext,
         &remote,
         &local,
         &mut store.session_store,
