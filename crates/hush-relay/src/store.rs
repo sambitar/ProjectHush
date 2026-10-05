@@ -1,0 +1,234 @@
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
+
+use crate::auth::{hash_token, tokens_match};
+use crate::config::RelayConfig;
+use crate::error::RelayError;
+
+pub struct Store {
+    conn: Mutex<Connection>,
+    config: RelayConfig,
+    /// queue_id -> (window_start_secs, count)
+    rate: Mutex<std::collections::HashMap<String, (u64, u32)>>,
+}
+
+impl Store {
+    pub fn open(path: &str, config: RelayConfig) -> Result<Self, RelayError> {
+        let conn = Connection::open(path).map_err(|_| RelayError::Internal)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS queues (
+                id TEXT PRIMARY KEY,
+                token_hash BLOB NOT NULL,
+                burned INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS blobs (
+                id TEXT PRIMARY KEY,
+                queue_id TEXT NOT NULL,
+                body BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (queue_id) REFERENCES queues(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_blobs_queue ON blobs(queue_id);
+            ",
+        )
+        .map_err(|_| RelayError::Internal)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            config,
+            rate: Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
+    }
+
+    fn check_rate(&self, queue_id: &str) -> Result<(), RelayError> {
+        let now = Self::now_secs();
+        let window = self.config.rate_limit_window.as_secs().max(1);
+        let max = self.config.rate_limit_max;
+        let mut rate = self.rate.lock().map_err(|_| RelayError::Internal)?;
+        let entry = rate.entry(queue_id.to_string()).or_insert((now, 0));
+        if now - entry.0 >= window {
+            *entry = (now, 0);
+        }
+        if entry.1 >= max {
+            return Err(RelayError::RateLimited);
+        }
+        entry.1 += 1;
+        Ok(())
+    }
+
+    fn load_queue(&self, queue_id: &str) -> Result<Option<QueueRow>, RelayError> {
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let mut stmt = conn
+            .prepare("SELECT token_hash, burned FROM queues WHERE id = ?1")
+            .map_err(|_| RelayError::Internal)?;
+        let mut rows = stmt
+            .query(params![queue_id])
+            .map_err(|_| RelayError::Internal)?;
+        if let Some(row) = rows.next().map_err(|_| RelayError::Internal)? {
+            let hash: Vec<u8> = row.get(0).map_err(|_| RelayError::Internal)?;
+            let burned: i64 = row.get(1).map_err(|_| RelayError::Internal)?;
+            return Ok(Some(QueueRow {
+                token_hash: hash,
+                burned: burned != 0,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn authorize(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {
+        match self.load_queue(queue_id)? {
+            Some(q) if q.burned => Err(RelayError::Burned),
+            Some(q) if tokens_match(&q.token_hash, token) => Ok(()),
+            Some(_) => Err(RelayError::Unauthorized),
+            None => {
+                let hash = hash_token(token);
+                let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+                conn.execute(
+                    "INSERT INTO queues (id, token_hash, burned) VALUES (?1, ?2, 0)",
+                    params![queue_id, hash.as_slice()],
+                )
+                .map_err(|_| RelayError::Internal)?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn put_blob(
+        &self,
+        queue_id: &str,
+        token: &str,
+        body: &[u8],
+    ) -> Result<String, RelayError> {
+        if body.len() > self.config.max_blob_bytes {
+            return Err(RelayError::TooLarge);
+        }
+        self.authorize(queue_id, token)?;
+        self.check_rate(queue_id)?;
+
+        let blob_id = hex::encode(Sha256::digest(body));
+        let created = Self::now_secs() as i64;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        conn.execute(
+            "INSERT INTO blobs (id, queue_id, body, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![blob_id, queue_id, body, created],
+        )
+        .map_err(|_| RelayError::Internal)?;
+        Ok(blob_id)
+    }
+
+    pub fn list_blobs(&self, queue_id: &str, token: &str) -> Result<Vec<BlobMeta>, RelayError> {
+        self.authorize_existing(queue_id, token)?;
+        self.purge_expired()?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let mut stmt = conn
+            .prepare("SELECT id, created_at FROM blobs WHERE queue_id = ?1 ORDER BY created_at")
+            .map_err(|_| RelayError::Internal)?;
+        let rows = stmt
+            .query_map(params![queue_id], |row| {
+                Ok(BlobMeta {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                })
+            })
+            .map_err(|_| RelayError::Internal)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|_| RelayError::Internal)?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_blob(
+        &self,
+        queue_id: &str,
+        token: &str,
+        blob_id: &str,
+    ) -> Result<Vec<u8>, RelayError> {
+        self.authorize_existing(queue_id, token)?;
+        self.purge_expired()?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let mut stmt = conn
+            .prepare("SELECT body FROM blobs WHERE queue_id = ?1 AND id = ?2")
+            .map_err(|_| RelayError::Internal)?;
+        let mut rows = stmt
+            .query(params![queue_id, blob_id])
+            .map_err(|_| RelayError::Internal)?;
+        if let Some(row) = rows.next().map_err(|_| RelayError::Internal)? {
+            let body: Vec<u8> = row.get(0).map_err(|_| RelayError::Internal)?;
+            return Ok(body);
+        }
+        Err(RelayError::NotFound)
+    }
+
+    pub fn delete_blob(
+        &self,
+        queue_id: &str,
+        token: &str,
+        blob_id: &str,
+    ) -> Result<(), RelayError> {
+        self.authorize_existing(queue_id, token)?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let n = conn
+            .execute(
+                "DELETE FROM blobs WHERE queue_id = ?1 AND id = ?2",
+                params![queue_id, blob_id],
+            )
+            .map_err(|_| RelayError::Internal)?;
+        if n == 0 {
+            return Err(RelayError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn report_queue(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {
+        self.authorize_existing(queue_id, token)?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        conn.execute(
+            "UPDATE queues SET burned = 1 WHERE id = ?1",
+            params![queue_id],
+        )
+        .map_err(|_| RelayError::Internal)?;
+        conn.execute("DELETE FROM blobs WHERE queue_id = ?1", params![queue_id])
+            .map_err(|_| RelayError::Internal)?;
+        Ok(())
+    }
+
+    fn authorize_existing(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {
+        match self.load_queue(queue_id)? {
+            Some(q) if q.burned => Err(RelayError::Burned),
+            Some(q) if tokens_match(&q.token_hash, token) => Ok(()),
+            Some(_) => Err(RelayError::Unauthorized),
+            None => Err(RelayError::NotFound),
+        }
+    }
+
+    fn purge_expired(&self) -> Result<(), RelayError> {
+        let ttl = self.config.blob_ttl.as_secs() as i64;
+        let cutoff = Self::now_secs() as i64 - ttl;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        conn.execute("DELETE FROM blobs WHERE created_at < ?1", params![cutoff])
+            .map_err(|_| RelayError::Internal)?;
+        Ok(())
+    }
+}
+
+struct QueueRow {
+    token_hash: Vec<u8>,
+    burned: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BlobMeta {
+    pub id: String,
+    pub created_at: i64,
+}
