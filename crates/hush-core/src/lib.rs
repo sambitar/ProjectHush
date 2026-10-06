@@ -1,4 +1,5 @@
 mod account;
+mod paths;
 mod backup;
 mod chat_log;
 mod crypto;
@@ -15,6 +16,7 @@ mod vault;
 mod wire;
 
 pub use account::{Account, Contact};
+pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
 pub use chat_log::{ChatRecord, ChatRecordPayload};

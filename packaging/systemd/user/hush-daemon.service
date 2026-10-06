@@ -1,0 +1,28 @@
+# User unit for local dogfood / distro packaging. Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/user/hush-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hush-daemon
+#
+# Tauri UI talks to the daemon over loopback HTTP until the shell uses a Unix socket client.
+
+[Unit]
+Description=Hush vault daemon (local API)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/hush-daemon
+Environment=HUSH_DATA_DIR=%h/.local/share/hush
+Environment=HUSH_DAEMON_ADDR=127.0.0.1:9876
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

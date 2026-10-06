@@ -1,4 +1,6 @@
 mod account_worker;
+mod paths;
+mod security;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,7 +9,7 @@ use std::time::{Duration, Instant};
 use account_worker::{AccountWorker, ContactDto, WorkResult};
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -16,7 +18,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use hush_core::{ChatRecord, MessagePayload, ReceivedMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 const AUTO_LOCK: Duration = Duration::from_secs(15 * 60);
 
@@ -102,12 +104,48 @@ struct BlobResponse {
     data_base64: String,
 }
 
+fn local_ui_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            origin.to_str().is_ok_and(|s| {
+                s.starts_with("http://127.0.0.1:")
+                    || s.starts_with("http://localhost:")
+                    || s == "https://tauri.localhost"
+                    || s == "http://tauri.localhost"
+                    || s == "tauri://localhost"
+            })
+        }))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE])
+}
+
+async fn vault_mount_watch(state: Arc<App>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if !*state.unlocked.lock().await {
+            continue;
+        }
+        let dir = state.dir.clone();
+        let ok = tokio::task::spawn_blocking(move || dir.is_dir() && std::fs::metadata(&dir).is_ok())
+            .await
+            .unwrap_or(false);
+        if !ok {
+            state.worker.lock().await;
+            *state.unlocked.lock().await = false;
+            *state.unlocked_at.lock().await = None;
+            eprintln!("hush-daemon: vault path unavailable — auto-locked");
+        }
+    }
+}
+
 /// libsignal protocol futures are not `Send`; account ops run on a dedicated worker thread.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    security::harden_process();
     let args = Args::parse();
+    let vault_dir = paths::vault_dir_from_args(args.dir);
     let app = App {
-        dir: args.dir,
+        dir: vault_dir,
         worker: AccountWorker::spawn(),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
@@ -115,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(app);
 
     tokio::spawn(auto_lock_loop(state.clone()));
+    tokio::spawn(vault_mount_watch(state.clone()));
 
     let router = Router::new()
         .route("/api/status", get(status))
@@ -134,12 +173,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/backup/import", post(backup_import))
         .route("/api/recovery/pending", get(recovery_pending))
         .route("/api/recovery/acknowledge", post(recovery_acknowledge))
-        .layer(CorsLayer::permissive())
+        .layer(local_ui_cors())
         .with_state(state.clone());
 
     let vault_dir = state.dir.display().to_string();
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
-    eprintln!("hush-daemon on http://{} vault={}", args.addr, vault_dir);
+    eprintln!(
+        "hush-daemon on http://{} vault={} (set HUSH_DATA_DIR for default data root)",
+        args.addr,
+        vault_dir
+    );
     axum::serve(listener, router).await?;
     Ok(())
 }

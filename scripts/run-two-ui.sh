@@ -39,7 +39,7 @@ if ! curl -s -o /dev/null --connect-timeout 1 "$RELAY_URL/" 2>/dev/null; then
     exit 1
   fi
   echo "Starting relay at $RELAY_URL …"
-  HUSH_RELAY_ADDR="${RELAY_URL#http://}" "$RELAY_BIN" &
+  HUSH_RELAY_DB="${ROOT}/instances/relay/relay.db" HUSH_RELAY_ADDR="${RELAY_URL#http://}" "$RELAY_BIN" &
   RELAY_PID=$!
   sleep 0.5
 else

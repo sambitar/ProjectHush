@@ -4,14 +4,14 @@
 
 | ID | Violation | Location / notes | Suggested owner task |
 |----|-----------|------------------|----------------------|
-| DR-01 | No unified **`HUSH_DATA_DIR`**; vault via `--dir` only; relay DB often `relay.db` in cwd | `hush-daemon`, `hush-cli`, `hush-relay`, scripts | Task 1 + 5 |
-| DR-02 | Daemon listens on **TCP** `127.0.0.1:9876` by default, not Unix socket in runtime dir | `crates/hush-daemon/src/main.rs` | Task 5 |
-| DR-03 | **`CorsLayer::permissive()`** on daemon HTTP API | `hush-daemon/src/main.rs` | Task 5 |
+| DR-01 | No unified **`HUSH_DATA_DIR`**; vault via `--dir` only; relay DB often `relay.db` in cwd | `hush-core::paths`, daemon/cli/relay | Task 5 — **done** (`resolve_data_dir`, relay under data root) |
+| DR-02 | Daemon listens on **TCP** `127.0.0.1:9876` by default, not Unix socket in runtime dir | `crates/hush-daemon/src/main.rs` | Task 5 — **open** (Tauri fetch needs loopback HTTP for now) |
+| DR-03 | **`CorsLayer::permissive()`** on daemon HTTP API | `hush-daemon/src/main.rs` | Task 5 — **done** (loopback + Tauri origins only) |
 | DR-04 | **Plaintext `inbox/*`** after file recv | `hush-daemon` `to_dto` | Task 5c.2 — **done** |
 | DR-05 | UI state in **`localStorage`** (theme, avatar photos) outside data root | `apps/hush-tauri/src/lib/theme.ts`, `Avatar.ts` | Task 5 |
-| DR-06 | No **systemd** unit or hardening directives in repo | — | Task 5 |
-| DR-07 | No **core dump disable** / `mlock` for daemon secrets | — | Task 5 + 5c |
-| DR-08 | No handling for **vault mount loss** (USB unplug) | — | Task 5 |
+| DR-06 | No **systemd** unit or hardening directives in repo | `packaging/systemd/user/` | Task 5 — **partial** (user unit shipped; full hardening TBD) |
+| DR-07 | No **core dump disable** / `mlock` for daemon secrets | `hush-daemon/security.rs` | Task 5 — **partial** (core dumps off on Linux; mlock TBD) |
+| DR-08 | No handling for **vault mount loss** (USB unplug) | vault path watch | Task 5 — **done** (auto-lock when path missing) |
 | DR-09 | No **auto-lock on suspend** / lid close | daemon auto-lock is idle-time only | Task 5 |
 | DR-10 | No **`rust-toolchain.toml`**; no **`cargo-deny` / `cargo-audit`** in CI | repo root | Task 7 |
 | DR-11 | Signing (Task 7) not yet a **standalone library + CLI** | planned Tauri-only | Task 7 |

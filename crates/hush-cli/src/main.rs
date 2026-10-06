@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf as StdPathBuf;
 
-use hush_core::{Account, MessagePayload};
+use hush_core::{Account, MessagePayload, resolve_data_dir};
 
 const DEFAULT_RELAY: &str = "http://127.0.0.1:8787";
 
@@ -52,7 +52,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let dir = cli.dir.clone();
+    let dir = resolve_data_dir(&cli.dir);
     let passphrase = cli.passphrase.clone();
     match cli.command {
         Commands::Init { passphrase, relay } => {

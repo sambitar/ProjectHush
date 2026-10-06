@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+hush-core = { path = "../hush-core" }
 axum = { version = "0.8", features = ["macros"] }
 hex = "0.4"
 http-body-util = "0.1"
