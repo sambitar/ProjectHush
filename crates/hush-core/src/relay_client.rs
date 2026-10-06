@@ -18,14 +18,44 @@ struct BlobMeta {
     id: String,
 }
 
+/// Whether plain HTTP may be used for a relay that is not on loopback.
+///
+/// This is an explicit parameter rather than an inline `cfg!(debug_assertions)`
+/// so that both branches are reachable from tests. The release rule is the one
+/// that protects shipped clients, and a debug test run can never exercise it
+/// otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpPolicy {
+    /// Debug builds: HTTP anywhere, for local dogfood and tests.
+    Allow,
+    /// Release builds: HTTPS required unless the relay is on loopback.
+    LoopbackOnly,
+}
+
+impl HttpPolicy {
+    /// The policy for the build this code was compiled into.
+    pub fn current() -> Self {
+        if cfg!(debug_assertions) {
+            Self::Allow
+        } else {
+            Self::LoopbackOnly
+        }
+    }
+}
+
 /// Task 5c.4: HTTPS for non-loopback relays; plain HTTP allowed for localhost (and any HTTP in debug builds).
 pub fn normalize_relay_base(base: &str) -> Result<String, Error> {
+    normalize_relay_base_with(base, HttpPolicy::current())
+}
+
+/// [`normalize_relay_base`] with the HTTP policy supplied explicitly.
+pub fn normalize_relay_base_with(base: &str, policy: HttpPolicy) -> Result<String, Error> {
     let base = base.trim().trim_end_matches('/').to_string();
     if base.starts_with("https://") {
         return Ok(base);
     }
     if base.starts_with("http://") {
-        if relay_http_allowed(&base) {
+        if http_url_allowed(&base, policy) {
             return Ok(base);
         }
         return Err(Error::Relay(
@@ -37,14 +67,33 @@ pub fn normalize_relay_base(base: &str) -> Result<String, Error> {
     ))
 }
 
-fn relay_http_allowed(url: &str) -> bool {
-    if cfg!(debug_assertions) {
+fn http_url_allowed(url: &str, policy: HttpPolicy) -> bool {
+    match policy {
+        HttpPolicy::Allow => true,
+        HttpPolicy::LoopbackOnly => reqwest::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_owned))
+            .is_some_and(|host| host_is_loopback(&host)),
+    }
+}
+
+/// Whether a parsed URL host is loopback.
+///
+/// `Url::host_str` returns IPv6 literals still bracketed (`[::1]`), so brackets
+/// come off before the address is parsed. A host that is neither `localhost` nor
+/// a parseable loopback address is refused, which fails closed for names like
+/// `127.0.0.1.example.com`.
+fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    let rest = url.strip_prefix("http://").unwrap_or("");
-    let host = rest.split('/').next().unwrap_or("");
-    let host = host.split(':').next().unwrap_or(host);
-    host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1"
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 impl RelayClient {
@@ -177,7 +226,7 @@ impl RelayClient {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_relay_base;
+    use super::{normalize_relay_base, normalize_relay_base_with, HttpPolicy};
 
     #[test]
     fn https_relay_ok() {
@@ -188,5 +237,91 @@ mod tests {
     fn loopback_http_ok() {
         assert!(normalize_relay_base("http://127.0.0.1:8080").is_ok());
         assert!(normalize_relay_base("http://localhost:9999").is_ok());
+    }
+
+    #[test]
+    fn release_refuses_remote_http() {
+        for url in [
+            "http://relay.example.com",
+            "http://203.0.113.1:8787",
+            "http://10.0.0.5:8787",
+            "http://192.168.1.10:8787",
+            "http://0.0.0.0:8787",
+            // Names that merely start with a loopback literal must not pass.
+            "http://127.0.0.1.example.com",
+            "http://localhost.example.com",
+            // Userinfo must not be mistaken for the host.
+            "http://127.0.0.1@relay.example.com",
+        ] {
+            assert!(
+                normalize_relay_base_with(url, HttpPolicy::LoopbackOnly).is_err(),
+                "{url} should be refused in a release build"
+            );
+        }
+    }
+
+    #[test]
+    fn release_allows_loopback_http() {
+        for url in [
+            "http://127.0.0.1:8787",
+            "http://127.0.0.1",
+            "http://127.0.0.2:8787",
+            "http://localhost:8787",
+            "http://LOCALHOST:8787",
+            "http://[::1]:8787",
+            "http://[::1]",
+        ] {
+            assert!(
+                normalize_relay_base_with(url, HttpPolicy::LoopbackOnly).is_ok(),
+                "{url} is loopback and should be allowed in a release build"
+            );
+        }
+    }
+
+    #[test]
+    fn release_allows_https_anywhere() {
+        assert!(
+            normalize_relay_base_with("https://relay.example.com", HttpPolicy::LoopbackOnly)
+                .is_ok()
+        );
+        assert!(
+            normalize_relay_base_with("https://203.0.113.1:8787", HttpPolicy::LoopbackOnly).is_ok()
+        );
+    }
+
+    #[test]
+    fn debug_policy_allows_remote_http() {
+        assert!(
+            normalize_relay_base_with("http://10.0.0.5:8787", HttpPolicy::Allow).is_ok(),
+            "debug builds keep plain HTTP for dogfood"
+        );
+    }
+
+    #[test]
+    fn non_http_scheme_refused_under_both_policies() {
+        for policy in [HttpPolicy::Allow, HttpPolicy::LoopbackOnly] {
+            assert!(normalize_relay_base_with("ftp://relay.example", policy).is_err());
+            assert!(normalize_relay_base_with("relay.example", policy).is_err());
+        }
+    }
+
+    /// The production entry point must follow the build it was compiled into.
+    /// Run under `--release` for this to prove the shipped behaviour.
+    #[test]
+    fn production_entry_point_follows_build_mode() {
+        let remote = "http://10.0.0.5:8787";
+        if cfg!(debug_assertions) {
+            assert!(
+                normalize_relay_base(remote).is_ok(),
+                "debug builds keep plain HTTP for dogfood"
+            );
+        } else {
+            assert!(
+                normalize_relay_base(remote).is_err(),
+                "release builds must refuse non-loopback HTTP"
+            );
+        }
+        assert!(normalize_relay_base("https://relay.example.com").is_ok());
+        assert!(normalize_relay_base("http://127.0.0.1:8787").is_ok());
     }
 }

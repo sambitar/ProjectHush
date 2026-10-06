@@ -1,0 +1,69 @@
+# System unit for a VPS relay. Install:
+#   cargo build --release --locked -p hush-relay
+#   install -Dm755 target/release/hush-relay /usr/local/bin/hush-relay
+#   useradd --system --no-create-home --shell /usr/sbin/nologin hush-relay
+#   install -Dm644 packaging/systemd/system/hush-relay.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hush-relay
+#
+# The relay is a dumb store-and-forward: it holds queue IDs and ciphertext, never
+# keys or plaintext. It therefore gets no mlock and no secret handling, and it
+# binds loopback on purpose — terminate TLS in front of it and expose only 443.
+# See docs/ops/relay-https-checklist.md.
+
+[Unit]
+Description=Hush relay (store-and-forward)
+Documentation=https://github.com/your-org/hush
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hush-relay
+Group=hush-relay
+ExecStart=/usr/local/bin/hush-relay
+# Loopback only. Put Caddy or nginx in front for TLS; never bind a public
+# interface here, or clients will happily send plaintext HTTP to it.
+Environment=HUSH_RELAY_ADDR=127.0.0.1:8787
+# Relay DB lands at /var/lib/hush-relay/relay/relay.db.
+Environment=HUSH_DATA_DIR=/var/lib/hush-relay
+# Creates the state dir owned by the service user, mode 0700, and makes it
+# writable under ProtectSystem=strict.
+StateDirectory=hush-relay
+StateDirectoryMode=0700
+Restart=always
+RestartSec=2
+UMask=0077
+
+# --- sandbox ----------------------------------------------------------------
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# --- resource bounds --------------------------------------------------------
+# Publicly reachable, so bound it: blobs are capped at 1 MiB by RelayConfig and
+# the queue count is small, so this is generous.
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target
