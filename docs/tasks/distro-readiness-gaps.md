@@ -8,7 +8,7 @@
 | DR-02 | Daemon listens on **TCP** `127.0.0.1:9876` by default, not Unix socket in runtime dir | `crates/hush-daemon/src/main.rs` | Task 5 — **open** (Tauri fetch needs loopback HTTP for now) |
 | DR-03 | **`CorsLayer::permissive()`** on daemon HTTP API | `hush-daemon/src/main.rs` | Task 5 — **done** (loopback + Tauri origins only) |
 | DR-04 | **Plaintext `inbox/*`** after file recv | `hush-daemon` `to_dto` | Task 5c.2 — **done** |
-| DR-05 | UI state in **`localStorage`** (theme, avatar photos) outside data root | `apps/hush-tauri/src/lib/theme.ts`, `Avatar.ts` | Task 5 |
+| DR-05 | UI state in **`localStorage`** (theme, avatar photos) outside data root | `ui-prefs.json` + `/api/ui-prefs` | Task 5 — **done** |
 | DR-06 | No **systemd** unit or hardening directives in repo | `packaging/systemd/user/` | Task 5 — **partial** (user unit shipped; full hardening TBD) |
 | DR-07 | No **core dump disable** / `mlock` for daemon secrets | `hush-daemon/security.rs` | Task 5 — **partial** (core dumps off on Linux; mlock TBD) |
 | DR-08 | No handling for **vault mount loss** (USB unplug) | vault path watch | Task 5 — **done** (auto-lock when path missing) |

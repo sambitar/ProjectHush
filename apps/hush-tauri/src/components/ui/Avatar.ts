@@ -1,13 +1,18 @@
+import { patchUiPrefs, uiPrefsSnapshot } from "../../lib/api/uiPrefs";
 import { hueFromKey } from "../../lib/hash";
 
-const photoKey = (protocol: string) => `hush_avatar_${protocol}`;
-
 export function getLocalPhoto(protocol: string): string | null {
-  return localStorage.getItem(photoKey(protocol));
+  return uiPrefsSnapshot().avatars[protocol] ?? null;
 }
 
-export function setLocalPhoto(protocol: string, dataUrl: string): void {
-  localStorage.setItem(photoKey(protocol), dataUrl);
+export async function setLocalPhoto(
+  protocol: string,
+  dataUrl: string,
+): Promise<void> {
+  const p = uiPrefsSnapshot();
+  await patchUiPrefs({
+    avatars: { ...p.avatars, [protocol]: dataUrl },
+  });
 }
 
 export function createAvatarEl(

@@ -95,4 +95,10 @@ export const api = {
     request<{ code: string }>("/api/recovery/pending"),
   recoveryAcknowledge: () =>
     request<null>("/api/recovery/acknowledge", { method: "POST" }),
+  uiPrefsGet: () => request<import("./uiPrefs").UiPrefsDto>("/api/ui-prefs"),
+  uiPrefsPut: (prefs: import("./uiPrefs").UiPrefsDto) =>
+    request<null>("/api/ui-prefs", {
+      method: "PUT",
+      body: JSON.stringify(prefs),
+    }),
 };

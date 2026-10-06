@@ -1,15 +1,18 @@
+import { loadUiPrefs, patchUiPrefs, uiPrefsSnapshot } from "./api/uiPrefs";
+
 export type ThemeMode = "light" | "dark" | "system";
 
-const KEY = "hush_theme";
-
-export function getThemeMode(): ThemeMode {
-  const v = localStorage.getItem(KEY);
-  if (v === "light" || v === "dark" || v === "system") return v;
-  return "system";
+export async function initThemeFromDaemon(): Promise<void> {
+  await loadUiPrefs();
+  applyTheme(getThemeMode());
 }
 
-export function setThemeMode(mode: ThemeMode): void {
-  localStorage.setItem(KEY, mode);
+export function getThemeMode(): ThemeMode {
+  return uiPrefsSnapshot().theme;
+}
+
+export async function setThemeMode(mode: ThemeMode): Promise<void> {
+  await patchUiPrefs({ theme: mode });
   applyTheme(mode);
 }
 
@@ -22,10 +25,10 @@ export function applyTheme(mode: ThemeMode): void {
   document.documentElement.dataset.themeMode = mode;
 }
 
-export function cycleTheme(): ThemeMode {
+export async function cycleTheme(): Promise<ThemeMode> {
   const order: ThemeMode[] = ["system", "light", "dark"];
   const i = order.indexOf(getThemeMode());
   const next = order[(i + 1) % order.length];
-  setThemeMode(next);
+  await setThemeMode(next);
   return next;
 }

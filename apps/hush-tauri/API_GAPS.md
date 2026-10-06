@@ -9,8 +9,8 @@ These features use local mocks in `src/lib/api/mock.ts` and `src/lib/chatStore.t
 - Message history: loaded from **`GET /api/messages`** after unlock (Task **5c.3**); new messages still arrive via **`POST /api/recv`**
 - Live presence: **`POST /api/presence/heartbeat`** + **`online`** on contacts; chat send blocked when contact offline (async mail = Task **5d**)
 - Reactions
-- Mute, block, report, remove contact (local flags only)
-- Nickname edit (local display override)
+- Mute, block, nickname override (persisted in **`ui-prefs.json`** under data root via **`GET/PUT /api/ui-prefs`**)
+- Remove contact from vault (block is local-only flag today)
 - Auto-lock timeout configuration
 - Recovery code cannot be re-shown after acknowledge (by design — save offline)
 - Change passphrase

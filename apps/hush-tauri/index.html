@@ -6,14 +6,9 @@
     <title>Hush</title>
     <script>
       (function () {
-        var k = "hush_theme";
-        var v = localStorage.getItem(k) || "system";
-        var dark =
-          v === "dark" ||
-          (v === "system" &&
-            window.matchMedia("(prefers-color-scheme: dark)").matches);
+        var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
         document.documentElement.dataset.theme = dark ? "dark" : "light";
-        document.documentElement.dataset.themeMode = v;
+        document.documentElement.dataset.themeMode = "system";
       })();
     </script>
   </head>

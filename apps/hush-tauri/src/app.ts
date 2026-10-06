@@ -21,7 +21,7 @@ import {
   toggleReaction,
 } from "./lib/chatStore";
 import { MAX_FILE_BYTES, RECV_POLL_MS, AUTO_LOCK_MS } from "./lib/constants";
-import { displayNick, getMockSettings, setBlocked, setMuted, setNickOverride, clearMockLocal, isMuted } from "./lib/api/mock";
+import { displayNick, getMockSettings, setBlocked, setMuted, setNickOverride, clearMockLocal, isMuted, refreshContactPrefs } from "./lib/api/mock";
 import { fileToBase64, formatBytes, formatRelative } from "./lib/format";
 import {
   attachFileActions,
@@ -283,6 +283,7 @@ export class App {
         ring.classList.add("bloom");
         await sleep(400);
         await this.refreshStatus();
+        await refreshContactPrefs();
         const history = await api.messages();
         if (history) loadHistory(history);
         await this.maybeShowRecoveryCode();
@@ -958,8 +959,7 @@ export class App {
         b.className = getThemeMode() === mode ? "active" : "";
         b.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
         b.onclick = () => {
-          setThemeMode(mode);
-          this.render();
+          void setThemeMode(mode).then(() => this.render());
         };
         seg.appendChild(b);
       }
@@ -1057,8 +1057,9 @@ export class App {
       {
         label: "Toggle theme",
         run: () => {
-          applyTheme(getThemeMode());
-          setThemeMode(getThemeMode() === "dark" ? "light" : "dark");
+          void setThemeMode(getThemeMode() === "dark" ? "light" : "dark").then(
+            () => this.render(),
+          );
         },
       },
     ];
@@ -1212,16 +1213,16 @@ export class App {
     save.className = "btn-secondary pressable";
     save.textContent = "Save nickname";
     save.onclick = () => {
-      setNickOverride(nick, name.value);
-      this.profileNick = null;
-      this.render();
+      void setNickOverride(nick, name.value).then(() => {
+        this.profileNick = null;
+        this.render();
+      });
     };
     const mute = document.createElement("button");
     mute.className = "btn-secondary pressable";
     mute.textContent = isMuted(nick) ? "Unmute" : "Mute";
     mute.onclick = () => {
-      setMuted(nick, !isMuted(nick));
-      this.render();
+      void setMuted(nick, !isMuted(nick)).then(() => this.render());
     };
     const report = document.createElement("button");
     report.className = "btn-secondary pressable";
@@ -1229,9 +1230,10 @@ export class App {
     report.textContent = "Report and remove";
     report.onclick = () => {
       if (confirm("Remove this contact from your list on this device?")) {
-        setBlocked(nick, true);
-        this.profileNick = null;
-        this.render();
+        void setBlocked(nick, true).then(() => {
+          this.profileNick = null;
+          this.render();
+        });
       }
     };
     const close = document.createElement("button");

@@ -1,6 +1,7 @@
 mod account_worker;
 mod paths;
 mod security;
+mod ui_prefs;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -173,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/backup/import", post(backup_import))
         .route("/api/recovery/pending", get(recovery_pending))
         .route("/api/recovery/acknowledge", post(recovery_acknowledge))
+        .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs))
         .layer(local_ui_cors())
         .with_state(state.clone());
 
@@ -533,6 +535,31 @@ async fn recovery_acknowledge(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(state.worker.recovery_ack().await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_ui_prefs(State(state): State<Arc<App>>) -> Json<ui_prefs::UiPrefs> {
+    Json(ui_prefs::load(&state.dir))
+}
+
+async fn put_ui_prefs(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ui_prefs::UiPrefs>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    if body.theme != "light" && body.theme != "dark" && body.theme != "system" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "theme must be light, dark, or system".into(),
+            }),
+        ));
+    }
+    ui_prefs::save(&state.dir, &body).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: e }),
+        )
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 

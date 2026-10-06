@@ -1,4 +1,6 @@
-/** Mock-only settings until daemon exposes these endpoints. */
+/** Session-only UI flags; contact prefs live in daemon ui-prefs.json (DR-05). */
+import { loadUiPrefs, patchUiPrefs, uiPrefsSnapshot } from "./uiPrefs";
+
 export interface MockSettings {
   autoLockMinutes: number;
   backupDone: boolean;
@@ -10,10 +12,6 @@ let settings: MockSettings = {
   backupDone: false,
   recoveryRevealed: false,
 };
-
-const muted = new Set<string>();
-const blocked = new Set<string>();
-const nickOverrides = new Map<string, string>();
 
 export function getMockSettings(): MockSettings {
   return { ...settings };
@@ -32,36 +30,45 @@ export function setRecoveryRevealed(v: boolean): void {
 }
 
 export function isMuted(nick: string): boolean {
-  return muted.has(nick);
+  return uiPrefsSnapshot().muted.includes(nick);
 }
 
-export function setMuted(nick: string, v: boolean): void {
+export async function setMuted(nick: string, v: boolean): Promise<void> {
+  const p = uiPrefsSnapshot();
+  const muted = new Set(p.muted);
   if (v) muted.add(nick);
   else muted.delete(nick);
+  await patchUiPrefs({ muted: [...muted] });
 }
 
 export function isBlocked(nick: string): boolean {
-  return blocked.has(nick);
+  return uiPrefsSnapshot().blocked.includes(nick);
 }
 
-export function setBlocked(nick: string, v: boolean): void {
+export async function setBlocked(nick: string, v: boolean): Promise<void> {
+  const p = uiPrefsSnapshot();
+  const blocked = new Set(p.blocked);
   if (v) blocked.add(nick);
   else blocked.delete(nick);
+  await patchUiPrefs({ blocked: [...blocked] });
 }
 
 export function displayNick(nick: string): string {
-  return nickOverrides.get(nick) ?? nick;
+  return uiPrefsSnapshot().nick_overrides[nick] ?? nick;
 }
 
-export function setNickOverride(nick: string, label: string): void {
-  nickOverrides.set(nick, label);
+export async function setNickOverride(nick: string, label: string): Promise<void> {
+  const p = uiPrefsSnapshot();
+  const nick_overrides = { ...p.nick_overrides, [nick]: label };
+  await patchUiPrefs({ nick_overrides });
 }
 
 export function clearMockLocal(): void {
-  muted.clear();
-  blocked.clear();
-  nickOverrides.clear();
-  settings = { autoLockMinutes: 15, backupDone: false, recoveryRevealed: false };
+  settings = { ...settings, recoveryRevealed: false };
+}
+
+export async function refreshContactPrefs(): Promise<void> {
+  await loadUiPrefs();
 }
 
 export function mockRecoveryCode(): string {
