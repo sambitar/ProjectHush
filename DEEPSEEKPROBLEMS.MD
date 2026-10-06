@@ -12,6 +12,66 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-06 — Passphrase change (vault format v2, daemon endpoint, Settings UI)
+
+### [FIXED] `pkill -f "vite"` killed the shell that ran it
+
+- **Attempted:** one cleanup call that killed the test daemon and Vite, then `rm -rf`'d the
+  temp dirs.
+- **Symptom:** the call returned completely empty output — not even the `echo "cleaned"` at
+  the end. `pkill -f` matches against full command lines, and the shell's own command line
+  contained the literal string `vite`, so it signalled itself. Everything after the `pkill`
+  never ran, leaving the daemon, Vite and both temp dirs alive while looking like a success.
+- **Resolution:** killed by explicit PID.
+- **Lesson:** `pkill -f <pattern>` can match the command line of the shell issuing it. This is
+  the same family as the earlier `pgrep -f` entry — pattern matching over command lines
+  includes the matcher.
+
+### [FIXED] `unwrap_err()` does not compile on a type without `Debug`
+
+- **Attempted:** `Account::open(dir, "old-pass").await.unwrap_err()` in the new recovery test.
+- **Symptom:** `error[E0277]: 'Account' doesn't implement 'Debug'` — `unwrap_err` needs the
+  `Ok` type to be `Debug` so it can print it in the panic message.
+- **Resolution:** matched on the `Result` and panicked on `Ok` explicitly. `Account` holds key
+  material, so adding a `Debug` impl just to satisfy a test helper would be the wrong fix.
+- **Lesson:** for a `Result` whose `Ok` type is deliberately opaque, match instead of
+  `unwrap_err()`.
+
+### [FIXED] `input.autocomplete` is `AutoFill`, not `string`
+
+- **Symptom:** `error TS2322: Type 'string' is not assignable to type 'AutoFill'` from a
+  helper taking `autocomplete: string` and assigning it to the input.
+- **Resolution:** typed the parameter as `AutoFill`. Caught by `tsc --noEmit` before any
+  runtime check.
+
+### [WORKED AROUND] Browser `Runtime.evaluate` fails in this environment
+
+- **Attempted:** read page text with `browser_cdp` + `Runtime.evaluate` to confirm state after
+  clicking Unlock.
+- **Symptom:** both attempts returned
+  `TypeError: Cannot read properties of null (reading 'split')` from the CDP bridge, for a
+  trivial expression. Cost two round trips.
+- **Resolution:** used `browser_snapshot` instead, which returns the accessibility tree and
+  was sufficient for every check (validation message, error text, disabled state, cleared
+  fields).
+- **Note:** tooling limitation, not a repo problem.
+
+### [OPEN] Existing vaults are not migrated to format v2 automatically
+
+- **Detail:** `Vault::create` writes v2 (random master key, wrapped by the passphrase) and
+  `Vault::change_passphrase` upgrades a v1 vault in place, but `Vault::open` deliberately does
+  **not** rewrite the header. So any vault created before this slice — including the dogfood
+  peers under `instances/` — stays on v1 until someone changes its passphrase.
+- **Impact:** the claim "vaults use format v2" is only true for new vaults. v1 vaults keep
+  working, and a passphrase change silently upgrades them, but nothing forces it.
+- **Why not auto-migrate:** `open` is also used on read-only and removable mounts, and
+  rewriting key material as a side effect of unlocking is a surprising thing to do. Verified
+  the v1 path explicitly (`v1_vault_opens_and_upgrades_without_re_encrypting`).
+- **Next:** if v1 should be retired, add an explicit upgrade on unlock with a logged
+  migration, or a `hush-cli` migration command.
+
+---
+
 ## 2026-10-06 — 5c.4 (relay HTTPS policy, relay unit, deploy checklist)
 
 ### [FIXED] IPv6 loopback was dead code in the HTTPS policy

@@ -1,4 +1,4 @@
-use hush_core::{Account, export_vault, import_vault};
+use hush_core::{export_vault, import_vault, Account, Error};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -37,4 +37,38 @@ async fn export_vault_contains_lockfile() {
         .unwrap();
     let archive = export_vault(dir.path()).unwrap();
     assert!(archive.len() > 100);
+}
+
+/// The recovery wrap pins the master key, so a passphrase change must re-wrap
+/// that same key. If it derived a new master instead, recovery would silently
+/// stop opening the vault and the account would be one forgotten passphrase
+/// away from permanent loss.
+#[tokio::test]
+async fn recovery_code_still_opens_after_passphrase_change() {
+    let dir = TempDir::new().unwrap();
+    let mut account = Account::create(dir.path(), "first-pass", "http://127.0.0.1:1")
+        .await
+        .unwrap();
+    let recovery_code = account
+        .take_pending_recovery_code()
+        .expect("recovery code at create");
+    let name = account.protocol_name().to_string();
+
+    account
+        .change_passphrase("first-pass", "second-pass")
+        .unwrap();
+    drop(account);
+
+    let err = match Account::open(dir.path(), "first-pass").await {
+        Ok(_) => panic!("the old passphrase must no longer open the vault"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, Error::WrongPassphrase));
+    let reopened = Account::open(dir.path(), "second-pass").await.unwrap();
+    assert_eq!(reopened.protocol_name(), name);
+
+    let via_recovery = Account::open_with_recovery(dir.path(), &recovery_code)
+        .await
+        .unwrap();
+    assert_eq!(via_recovery.protocol_name(), name);
 }

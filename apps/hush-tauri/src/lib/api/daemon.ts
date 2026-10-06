@@ -106,6 +106,11 @@ export const api = {
       body: JSON.stringify({ passphrase }),
     }),
   lock: () => request<null>("/api/lock", { method: "POST" }),
+  changePassphrase: (current_passphrase: string, new_passphrase: string) =>
+    request<null>("/api/change-passphrase", {
+      method: "POST",
+      body: JSON.stringify({ current_passphrase, new_passphrase }),
+    }),
   invite: () =>
     request<InviteResponse>("/api/invite", { method: "POST" }),
   contacts: () => request<ContactDto[]>("/api/contacts"),

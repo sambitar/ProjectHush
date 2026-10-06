@@ -78,6 +78,11 @@ enum Work {
     HeartbeatPresence {
         reply: oneshot::Sender<WorkResult>,
     },
+    ChangePassphrase {
+        current: String,
+        new: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -106,6 +111,8 @@ pub enum WorkResult {
     Messages(Vec<ChatRecord>),
     Blob(Vec<u8>),
     BlobId(String),
+    /// The supplied current passphrase did not match the vault.
+    WrongPassphrase,
     Err(String),
 }
 
@@ -310,6 +317,23 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::ChangePassphrase {
+                            current,
+                            new,
+                            reply,
+                        } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.change_passphrase(&current, &new) {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(hush_core::Error::WrongPassphrase) => {
+                                        WorkResult::WrongPassphrase
+                                    }
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::Blob { id_hex, reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
@@ -466,5 +490,14 @@ impl AccountWorker {
 
     pub async fn heartbeat_presence(&self) -> WorkResult {
         self.call(|reply| Work::HeartbeatPresence { reply }).await
+    }
+
+    pub async fn change_passphrase(&self, current: &str, new: &str) -> WorkResult {
+        self.call(|reply| Work::ChangePassphrase {
+            current: current.to_string(),
+            new: new.to_string(),
+            reply,
+        })
+        .await
     }
 }

@@ -79,6 +79,12 @@ struct UnlockRequest {
 }
 
 #[derive(Deserialize)]
+struct ChangePassphraseRequest {
+    current_passphrase: String,
+    new_passphrase: String,
+}
+
+#[derive(Deserialize)]
 struct AddContactRequest {
     nickname: String,
     invite: String,
@@ -205,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/status", get(status))
         .route("/api/unlock", post(unlock))
         .route("/api/lock", post(lock))
+        .route("/api/change-passphrase", post(change_passphrase))
         .route("/api/invite", post(invite))
         .route("/api/contacts", get(contacts))
         .route("/api/contacts/add", post(add_contact))
@@ -495,6 +502,52 @@ async fn lock(State(state): State<Arc<App>>) -> StatusCode {
     *state.unlocked.lock().await = false;
     *state.unlocked_at.lock().await = None;
     StatusCode::NO_CONTENT
+}
+
+/// Rotate the vault passphrase.
+///
+/// Requires the vault to be unlocked: the current passphrase is what proves the
+/// caller owns it, and the master key that gets re-wrapped only exists in memory
+/// while unlocked. A wrong current passphrase is a 403 rather than a 401, so the
+/// UI can tell "you typed the old passphrase wrong" apart from "you are locked
+/// out and need to unlock first".
+async fn change_passphrase(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ChangePassphraseRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    if !*state.unlocked.lock().await {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "locked".into(),
+            }),
+        ));
+    }
+    match state
+        .worker
+        .change_passphrase(&body.current_passphrase, &body.new_passphrase)
+        .await
+    {
+        WorkResult::Ok => {
+            touch(&state).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        WorkResult::WrongPassphrase => Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: "current passphrase is incorrect".into(),
+            }),
+        )),
+        WorkResult::Err(message) => {
+            Err((StatusCode::BAD_REQUEST, Json(ApiError { error: message })))
+        }
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
 }
 
 async fn invite(

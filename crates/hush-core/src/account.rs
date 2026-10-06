@@ -109,6 +109,16 @@ impl Account {
         Self::finish_open(dir, vault).await
     }
 
+    /// Rotate the vault passphrase.
+    ///
+    /// The master key is re-wrapped, not replaced, so `account.enc`,
+    /// `signal.enc`, the chat log, every blob and any recovery code keep
+    /// working. The account must already be open: the caller proves ownership
+    /// with `current`, and a locked vault has no master key to re-wrap.
+    pub fn change_passphrase(&self, current: &str, new: &str) -> Result<(), Error> {
+        self.vault.change_passphrase(current, new)
+    }
+
     async fn finish_open(dir: &Path, vault: Vault) -> Result<Self, Error> {
         let master = *vault.master_key();
         let packed = fs::read(dir.join("account.enc")).map_err(|_| Error::NotFound)?;

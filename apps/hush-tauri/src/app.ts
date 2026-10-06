@@ -1047,6 +1047,95 @@ export class App {
     return pane;
   }
 
+  /**
+   * Rotate the vault passphrase.
+   *
+   * The daemon re-wraps the vault key rather than re-encrypting anything, so
+   * this is fast regardless of vault size and the recovery code keeps working.
+   * All three fields are validated here so an obvious typo never reaches the
+   * daemon; the current passphrase itself can only be checked server-side.
+   */
+  private renderChangePassphraseForm(): HTMLElement {
+    const form = document.createElement("form");
+    form.style.marginTop = "var(--space-6)";
+
+    const title = document.createElement("h3");
+    title.className = "text-15";
+    title.textContent = "Change passphrase";
+
+    const note = document.createElement("p");
+    note.className = "muted text-13";
+    note.textContent =
+      "Your messages, files and recovery code keep working — nothing is re-encrypted.";
+
+    const fields: HTMLInputElement[] = [];
+    const makeField = (placeholder: string, autocomplete: AutoFill) => {
+      const input = document.createElement("input");
+      input.type = "password";
+      input.className = "input-field";
+      input.placeholder = placeholder;
+      input.autocomplete = autocomplete;
+      input.style.marginTop = "var(--space-3)";
+      fields.push(input);
+      return input;
+    };
+    const current = makeField("Current passphrase", "current-password");
+    const next = makeField("New passphrase", "new-password");
+    const confirm = makeField("Confirm new passphrase", "new-password");
+
+    const err = document.createElement("p");
+    err.className = "text-13";
+    err.style.color = "var(--danger)";
+    err.style.marginTop = "var(--space-2)";
+    err.hidden = true;
+
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.className = "btn-primary pressable";
+    submit.style.marginTop = "var(--space-4)";
+    submit.textContent = "Change passphrase";
+
+    const showError = (message: string) => {
+      err.textContent = message;
+      err.hidden = false;
+      form.classList.add("shake");
+      setTimeout(() => form.classList.remove("shake"), 300);
+    };
+
+    form.onsubmit = async (ev) => {
+      ev.preventDefault();
+      err.hidden = true;
+      if (fields.some((f) => !f.value)) {
+        showError("Fill in all three fields.");
+        return;
+      }
+      if (next.value !== confirm.value) {
+        showError("The new passphrases don't match.");
+        return;
+      }
+      if (next.value === current.value) {
+        showError("The new passphrase must be different from the current one.");
+        return;
+      }
+      submit.disabled = true;
+      try {
+        await api.changePassphrase(current.value, next.value);
+        for (const f of fields) f.value = "";
+        this.announce("Passphrase changed. Your recovery code still works.");
+        this.render();
+      } catch (e) {
+        showError(
+          e instanceof AppError ? e.message : "Could not change the passphrase.",
+        );
+      } finally {
+        submit.disabled = false;
+      }
+    };
+
+    form.append(title, note, current, next, confirm, err, submit);
+    return form;
+  }
+
   private renderSettings(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane settings-layout";
@@ -1127,7 +1216,7 @@ export class App {
           this.announce(e instanceof AppError ? e.message : "Could not start link");
         });
       };
-      body.append(label, sel, linkBtn);
+      body.append(label, sel, linkBtn, this.renderChangePassphraseForm());
     } else if (this.settingsSection === "recovery") {
       body.innerHTML = `<h2 class="text-22">Recovery</h2><p class="muted text-13">Your recovery code was shown once when the vault was created or when recovery was first set up. It unlocks the vault if you forget your passphrase (with your backup file).</p>`;
       const ack = this.status?.recovery_acknowledged;
