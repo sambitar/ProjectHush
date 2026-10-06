@@ -1,4 +1,5 @@
 mod account;
+mod backup;
 mod chat_log;
 mod crypto;
 mod error;
@@ -6,6 +7,7 @@ mod invite;
 mod lockfile;
 mod message;
 mod payload;
+mod recovery;
 mod relay_client;
 mod signal;
 mod signal_persist;
@@ -13,6 +15,8 @@ mod vault;
 mod wire;
 
 pub use account::{Account, Contact};
+pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
+pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
 pub use chat_log::{ChatRecord, ChatRecordPayload};
 pub use error::Error;
 pub use invite::InvitePayload;

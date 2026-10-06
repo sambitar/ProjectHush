@@ -4,6 +4,8 @@ export interface StatusResponse {
   protocol_name: string | null;
   vault_bytes: number;
   contacts: number;
+  recovery_acknowledged: boolean;
+  last_backup_unix: number;
 }
 
 export interface ContactDto {

@@ -12,8 +12,7 @@ These features use local mocks in `src/lib/api/mock.ts` and `src/lib/chatStore.t
 - Mute, block, report, remove contact (local flags only)
 - Nickname edit (local display override)
 - Auto-lock timeout configuration
-- Backup status and backup action
-- Recovery code reveal
+- Recovery code cannot be re-shown after acknowledge (by design — save offline)
 - Change passphrase
 - Trusted devices
 - QR camera scan

@@ -56,8 +56,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let passphrase = cli.passphrase.clone();
     match cli.command {
         Commands::Init { passphrase, relay } => {
-            Account::create(&dir, &passphrase, &relay).await?;
+            let mut account = Account::create(&dir, &passphrase, &relay).await?;
             println!("vault ready at {}", dir.display());
+            if let Some(code) = account.take_pending_recovery_code() {
+                println!("SAVE THIS RECOVERY CODE (shown once): {}", code);
+            }
         }
         Commands::Invite => {
             let mut account = open(&dir, &passphrase).await?;

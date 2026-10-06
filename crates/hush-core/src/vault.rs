@@ -79,6 +79,28 @@ impl Vault {
         })
     }
 
+    pub fn open_with_master(dir: &Path, master: Zeroizing<[u8; MASTER_KEY_LEN]>) -> Result<Self, Error> {
+        let lock_path = dir.join("vault.lock.json");
+        if !lock_path.exists() {
+            return Err(Error::NotFound);
+        }
+        let packed = fs::read(dir.join("identity.secret"))?;
+        let secret_bytes = decrypt(&master, &packed)?;
+        if secret_bytes.len() != 32 {
+            return Err(Error::Corrupt);
+        }
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&secret_bytes);
+        let signing = SigningKey::from_bytes(&sk);
+        sk.zeroize();
+        let identity_public = IdentityPub(signing.verifying_key().to_bytes());
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            master,
+            identity_public,
+        })
+    }
+
     pub fn open(dir: &Path, passphrase: &str) -> Result<Self, Error> {
         if passphrase.is_empty() {
             return Err(Error::EmptyPassphrase);

@@ -19,9 +19,14 @@ import {
   toggleReaction,
 } from "./lib/chatStore";
 import { MAX_FILE_BYTES, RECV_POLL_MS, AUTO_LOCK_MS } from "./lib/constants";
-import { displayNick, getMockSettings, setBackupDone, setBlocked, setMuted, setNickOverride, setRecoveryRevealed, clearMockLocal, mockRecoveryCode, isMuted } from "./lib/api/mock";
+import { displayNick, getMockSettings, setBlocked, setMuted, setNickOverride, clearMockLocal, isMuted } from "./lib/api/mock";
 import { fileToBase64, formatBytes, formatRelative } from "./lib/format";
-import { attachFileActions, resolveMessageFileBytes } from "./lib/fileBytes";
+import {
+  attachFileActions,
+  downloadBase64File,
+  readFileAsBase64,
+  resolveMessageFileBytes,
+} from "./lib/fileBytes";
 import { groupMessages } from "./lib/messageGroups";
 import { icon, type IconName } from "./lib/icons";
 import { createAvatarEl } from "./components/ui/Avatar";
@@ -47,6 +52,7 @@ export class App {
   private paletteOpen = false;
   private filesContactNick: string | null = null;
   private filesDirection: "received" | "sent" = "received";
+  private recoveryModalCode: string | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -96,7 +102,15 @@ export class App {
         this.stopPoll();
       }
     } catch {
-      this.status = { locked: true, vault_dir: "", protocol_name: null, vault_bytes: 0, contacts: 0 };
+      this.status = {
+        locked: true,
+        vault_dir: "",
+        protocol_name: null,
+        vault_bytes: 0,
+        contacts: 0,
+        recovery_acknowledged: true,
+        last_backup_unix: 0,
+      };
     }
   }
 
@@ -164,6 +178,45 @@ export class App {
     if (this.paletteOpen) this.root.appendChild(this.renderPalette());
     if (this.addFriendOpen) this.root.appendChild(this.renderAddFriend());
     if (this.profileNick) this.root.appendChild(this.renderProfile());
+    if (this.recoveryModalCode) this.root.appendChild(this.renderRecoveryModal());
+  }
+
+  private async maybeShowRecoveryCode(): Promise<void> {
+    try {
+      const pending = await api.recoveryPending();
+      if (pending?.code) this.recoveryModalCode = pending.code;
+    } catch {
+      /* no pending code */
+    }
+  }
+
+  private renderRecoveryModal(): HTMLElement {
+    const code = this.recoveryModalCode!;
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-label", "Recovery code");
+    modal.innerHTML = `<h2 class="text-22">Save your recovery code</h2><p class="muted text-13">Store this somewhere safe. It can unlock your vault if you forget your passphrase. We will only show it once.</p>`;
+    const pre = document.createElement("p");
+    pre.className = "text-15";
+    pre.style.fontFamily = "monospace";
+    pre.style.wordBreak = "break-all";
+    pre.textContent = code;
+    const btn = document.createElement("button");
+    btn.className = "btn-primary pressable";
+    btn.style.marginTop = "var(--space-4)";
+    btn.textContent = "I've saved it";
+    btn.onclick = async () => {
+      await api.recoveryAcknowledge();
+      this.recoveryModalCode = null;
+      await this.refreshStatus();
+      this.render();
+    };
+    modal.append(pre, btn);
+    back.appendChild(modal);
+    return back;
   }
 
   private renderUnlock(): HTMLElement {
@@ -221,6 +274,7 @@ export class App {
         await this.refreshStatus();
         const history = await api.messages();
         if (history) loadHistory(history);
+        await this.maybeShowRecoveryCode();
         this.render();
       } catch (e) {
         card.classList.add("shake");
@@ -790,12 +844,23 @@ export class App {
     lock.querySelector(".lock-now")!.addEventListener("click", () => void this.lock());
     const backup = document.createElement("div");
     backup.className = "tile";
-    const mock = getMockSettings();
-    if (!mock.backupDone) backup.style.background = "var(--warning-soft)";
-    backup.innerHTML = `<div class="text-15">Backup</div><div class="muted text-13">${mock.backupDone ? "Last backup recorded" : "Back up your vault so you never lose your chats"}</div><button class="btn-secondary pressable backup-btn" style="margin-top:12px">Back up now</button>`;
-    backup.querySelector(".backup-btn")!.addEventListener("click", () => {
-      setBackupDone(true);
-      this.render();
+    const lastBackup = s.last_backup_unix ?? 0;
+    if (!lastBackup) backup.style.background = "var(--warning-soft)";
+    const backupHint =
+      lastBackup > 0
+        ? `Last backup ${formatRelative(lastBackup * 1000)}`
+        : "Back up your vault so you never lose your chats";
+    backup.innerHTML = `<div class="text-15">Backup</div><div class="muted text-13">${backupHint}</div><button type="button" class="btn-secondary pressable backup-btn" style="margin-top:12px">Back up now</button>`;
+    backup.querySelector(".backup-btn")!.addEventListener("click", async () => {
+      try {
+        const r = await api.backupExport();
+        if (r) downloadBase64File(r.filename, r.data_base64);
+        await this.refreshStatus();
+        this.announce("Backup downloaded");
+        this.render();
+      } catch (e) {
+        this.announce(e instanceof AppError ? e.message : "Backup failed");
+      }
     });
     grid.append(storage, lock, backup);
     pane.append(h, grid);
@@ -842,19 +907,55 @@ export class App {
       }
       body.appendChild(seg);
     } else if (this.settingsSection === "recovery") {
-      body.innerHTML = `<h2 class="text-22">Recovery</h2><p class="muted">Reveal your recovery code only in a private place.</p>`;
-      const b = document.createElement("button");
-      b.className = "btn-primary pressable";
-      b.textContent = "I'm in a private place";
-      const code = document.createElement("p");
-      code.hidden = true;
-      code.className = "text-15";
-      b.onclick = () => {
-        setRecoveryRevealed(true);
-        code.hidden = false;
-        code.textContent = mockRecoveryCode();
+      body.innerHTML = `<h2 class="text-22">Recovery</h2><p class="muted text-13">Your recovery code was shown once when the vault was created or when recovery was first set up. It unlocks the vault if you forget your passphrase (with your backup file).</p>`;
+      const ack = this.status?.recovery_acknowledged;
+      const note = document.createElement("p");
+      note.className = "text-13 muted";
+      note.style.marginTop = "var(--space-3)";
+      note.textContent = ack
+        ? "Recovery code acknowledged. Keep your saved copy offline."
+        : "You still need to save your recovery code when prompted.";
+      body.appendChild(note);
+    } else if (this.settingsSection === "backup") {
+      body.innerHTML = `<h2 class="text-22">Backup</h2><p class="muted text-13">Download an encrypted archive of your vault. Restore by locking the app, then importing the file.</p>`;
+      const exportBtn = document.createElement("button");
+      exportBtn.type = "button";
+      exportBtn.className = "btn-primary pressable";
+      exportBtn.textContent = "Export backup";
+      exportBtn.style.marginTop = "var(--space-4)";
+      exportBtn.onclick = async () => {
+        const r = await api.backupExport();
+        if (r) downloadBase64File(r.filename, r.data_base64);
+        await this.refreshStatus();
+        this.announce("Backup downloaded");
       };
-      body.append(b, code);
+      const importBtn = document.createElement("button");
+      importBtn.type = "button";
+      importBtn.className = "btn-secondary pressable";
+      importBtn.style.marginTop = "var(--space-3)";
+      importBtn.textContent = "Import backup (vault must be locked)";
+      const fileIn = document.createElement("input");
+      fileIn.type = "file";
+      fileIn.accept = ".tar,application/x-tar";
+      fileIn.hidden = true;
+      importBtn.onclick = () => fileIn.click();
+      fileIn.onchange = async () => {
+        const f = fileIn.files?.[0];
+        fileIn.value = "";
+        if (!f) return;
+        if (!this.status?.locked) {
+          window.alert("Lock the vault before importing a backup.");
+          return;
+        }
+        try {
+          const b64 = await readFileAsBase64(f);
+          await api.backupImport(b64);
+          this.announce("Backup imported. Unlock with your passphrase.");
+        } catch (e) {
+          window.alert(e instanceof AppError ? e.message : "Import failed");
+        }
+      };
+      body.append(exportBtn, importBtn, fileIn);
     } else {
       body.innerHTML = `<h2 class="text-22">${this.settingsSection}</h2><p class="muted">More options coming soon.</p>`;
     }

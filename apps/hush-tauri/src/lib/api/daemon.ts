@@ -80,4 +80,17 @@ export const api = {
   messages: () => request<ChatRecordDto[]>("/api/messages"),
   blob: (id: string) =>
     request<{ data_base64: string }>(`/api/blob/${encodeURIComponent(id)}`),
+  backupExport: () =>
+    request<{ filename: string; data_base64: string }>("/api/backup/export", {
+      method: "POST",
+    }),
+  backupImport: (data_base64: string) =>
+    request<null>("/api/backup/import", {
+      method: "POST",
+      body: JSON.stringify({ data_base64 }),
+    }),
+  recoveryPending: () =>
+    request<{ code: string }>("/api/recovery/pending"),
+  recoveryAcknowledge: () =>
+    request<null>("/api/recovery/acknowledge", { method: "POST" }),
 };

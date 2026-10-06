@@ -5,7 +5,9 @@ use libsignal_protocol::{IdentityKeyStore, InMemSignalProtocolStore};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::backup::{export_vault, import_vault};
 use crate::chat_log::ChatLog;
+use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_files_exist, unwrap_master_with_recovery};
 use crate::crypto::{decrypt, encrypt, random_bytes};
 use crate::error::Error;
 use crate::invite::InvitePayload;
@@ -41,6 +43,10 @@ struct AccountState {
     /// Stable invite string so "Copy my invite" does not rotate keys every click.
     #[serde(default)]
     invite_cache: Option<String>,
+    #[serde(default)]
+    recovery_acknowledged: bool,
+    #[serde(default)]
+    last_backup_unix: u64,
 }
 
 pub struct Account {
@@ -49,6 +55,7 @@ pub struct Account {
     state: AccountState,
     dir: PathBuf,
     chat_log: ChatLog,
+    pending_recovery_code: Option<String>,
 }
 
 impl Account {
@@ -72,8 +79,12 @@ impl Account {
             receive_queue_token,
             contacts: Vec::new(),
             invite_cache: None,
+            recovery_acknowledged: false,
+            last_backup_unix: 0,
         };
         let master = *vault.master_key();
+        let recovery_code = generate_recovery_code();
+        ensure_recovery_files(dir, &master, &recovery_code)?;
         let chat_log = ChatLog::load(dir, &master)?;
         let account = Self {
             vault,
@@ -81,6 +92,7 @@ impl Account {
             state,
             dir: dir.to_path_buf(),
             chat_log,
+            pending_recovery_code: Some(recovery_code),
         };
         account.save().await?;
         Ok(account)
@@ -88,22 +100,79 @@ impl Account {
 
     pub async fn open(dir: &Path, passphrase: &str) -> Result<Self, Error> {
         let vault = Vault::open(dir, passphrase)?;
-        let packed = fs::read(dir.join("account.enc")).map_err(|_| Error::NotFound)?;
-        let master = vault.master_key();
-        let state_bytes = decrypt(master, &packed)?;
-        let state: AccountState = serde_json::from_slice(&state_bytes).map_err(|_| Error::Corrupt)?;
-        let signal_bytes = fs::read(dir.join("signal.enc")).map_err(|_| Error::NotFound)?;
-        let signal_plain = decrypt(master, &signal_bytes)?;
-        let store = import_store(&signal_plain).await?;
+        Self::finish_open(dir, vault).await
+    }
+
+    pub async fn open_with_recovery(dir: &Path, recovery_code: &str) -> Result<Self, Error> {
+        let master = unwrap_master_with_recovery(dir, recovery_code)?;
+        let vault = Vault::open_with_master(dir, master)?;
+        Self::finish_open(dir, vault).await
+    }
+
+    async fn finish_open(dir: &Path, vault: Vault) -> Result<Self, Error> {
         let master = *vault.master_key();
+        let packed = fs::read(dir.join("account.enc")).map_err(|_| Error::NotFound)?;
+        let state_bytes = decrypt(&master, &packed)?;
+        let mut state: AccountState =
+            serde_json::from_slice(&state_bytes).map_err(|_| Error::Corrupt)?;
+        let signal_bytes = fs::read(dir.join("signal.enc")).map_err(|_| Error::NotFound)?;
+        let signal_plain = decrypt(&master, &signal_bytes)?;
+        let store = import_store(&signal_plain).await?;
         let chat_log = ChatLog::load(dir, &master)?;
-        Ok(Self {
+
+        let mut pending_recovery_code = None;
+        if !recovery_files_exist(dir) {
+            let code = generate_recovery_code();
+            ensure_recovery_files(dir, &master, &code)?;
+            state.recovery_acknowledged = false;
+            pending_recovery_code = Some(code);
+        }
+
+        let needs_save = pending_recovery_code.is_some();
+        let account = Self {
             vault,
             store,
             state,
             dir: dir.to_path_buf(),
             chat_log,
-        })
+            pending_recovery_code,
+        };
+        if needs_save {
+            account.save().await?;
+        }
+        Ok(account)
+    }
+
+    pub fn recovery_acknowledged(&self) -> bool {
+        self.state.recovery_acknowledged
+    }
+
+    pub fn take_pending_recovery_code(&mut self) -> Option<String> {
+        self.pending_recovery_code.take()
+    }
+
+    pub async fn acknowledge_recovery(&mut self) -> Result<(), Error> {
+        self.state.recovery_acknowledged = true;
+        self.pending_recovery_code = None;
+        self.save().await
+    }
+
+    pub async fn export_backup(&mut self) -> Result<Vec<u8>, Error> {
+        let archive = export_vault(&self.dir)?;
+        self.state.last_backup_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.save().await?;
+        Ok(archive)
+    }
+
+    pub fn last_backup_unix(&self) -> u64 {
+        self.state.last_backup_unix
+    }
+
+    pub fn import_backup(dir: &Path, archive: &[u8]) -> Result<(), Error> {
+        import_vault(dir, archive)
     }
 
     pub fn chat_history(&self) -> &[crate::chat_log::ChatRecord] {

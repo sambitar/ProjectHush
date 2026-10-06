@@ -57,6 +57,20 @@ enum Work {
         id_hex: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    BackupExport {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    BackupImport {
+        dir: PathBuf,
+        data: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    RecoveryAck {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    RecoveryPending {
+        reply: oneshot::Sender<WorkResult>,
+    },
 }
 
 pub enum WorkResult {
@@ -68,7 +82,11 @@ pub enum WorkResult {
         protocol_name: String,
         vault_bytes: u64,
         contacts: usize,
+        recovery_acknowledged: bool,
+        last_backup_unix: u64,
     },
+    Backup(Vec<u8>),
+    RecoveryCode(String),
     Messages(Vec<ChatRecord>),
     Blob(Vec<u8>),
     Err(String),
@@ -183,6 +201,8 @@ impl AccountWorker {
                                     protocol_name: a.protocol_name().to_string(),
                                     vault_bytes: a.vault_bytes_on_disk(),
                                     contacts: a.contacts().len(),
+                                    recovery_acknowledged: a.recovery_acknowledged(),
+                                    last_backup_unix: a.last_backup_unix(),
                                 },
                             };
                             (reply, result)
@@ -193,6 +213,47 @@ impl AccountWorker {
                                 Some(a) => {
                                     WorkResult::Messages(a.chat_history().to_vec())
                                 }
+                            };
+                            (reply, result)
+                        }
+                        Work::BackupExport { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.export_backup().await {
+                                    Ok(data) => WorkResult::Backup(data),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::BackupImport { dir, data, reply } => {
+                            if account.is_some() {
+                                (reply, WorkResult::Err("unlock vault before import".into()))
+                            } else {
+                                let result = match Account::import_backup(&dir, &data) {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                };
+                                (reply, result)
+                            }
+                        }
+                        Work::RecoveryAck { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.acknowledge_recovery().await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RecoveryPending { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.take_pending_recovery_code() {
+                                    Some(code) => WorkResult::RecoveryCode(code),
+                                    None => WorkResult::Err("no pending recovery code".into()),
+                                },
                             };
                             (reply, result)
                         }
@@ -318,5 +379,27 @@ impl AccountWorker {
             reply,
         })
         .await
+    }
+
+    pub async fn backup_export(&self) -> WorkResult {
+        self.call(|reply| Work::BackupExport { reply }).await
+    }
+
+    pub async fn backup_import(&self, dir: &PathBuf, data: Vec<u8>) -> WorkResult {
+        let dir = dir.clone();
+        self.call(|reply| Work::BackupImport {
+            dir,
+            data,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn recovery_ack(&self) -> WorkResult {
+        self.call(|reply| Work::RecoveryAck { reply }).await
+    }
+
+    pub async fn recovery_pending(&self) -> WorkResult {
+        self.call(|reply| Work::RecoveryPending { reply }).await
     }
 }

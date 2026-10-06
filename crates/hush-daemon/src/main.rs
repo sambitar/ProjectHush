@@ -43,6 +43,8 @@ struct StatusResponse {
     protocol_name: Option<String>,
     vault_bytes: u64,
     contacts: usize,
+    recovery_acknowledged: bool,
+    last_backup_unix: u64,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/recv", post(recv))
         .route("/api/messages", get(messages))
         .route("/api/blob/{id}", get(blob))
+        .route("/api/backup/export", post(backup_export))
+        .route("/api/backup/import", post(backup_import))
+        .route("/api/recovery/pending", get(recovery_pending))
+        .route("/api/recovery/acknowledge", post(recovery_acknowledge))
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
@@ -179,24 +185,35 @@ fn map_err(result: WorkResult) -> Result<WorkResult, (StatusCode, Json<ApiError>
 
 async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
     let locked = !*state.unlocked.lock().await;
-    let (protocol_name, vault_bytes, contacts) = if locked {
-        (None, 0, 0)
-    } else {
-        match state.worker.meta().await {
-            WorkResult::Meta {
-                protocol_name,
-                vault_bytes,
-                contacts,
-            } => (Some(protocol_name), vault_bytes, contacts),
-            _ => (None, 0, 0),
-        }
-    };
+    let (protocol_name, vault_bytes, contacts, recovery_acknowledged, last_backup_unix) =
+        if locked {
+            (None, 0, 0, true, 0)
+        } else {
+            match state.worker.meta().await {
+                WorkResult::Meta {
+                    protocol_name,
+                    vault_bytes,
+                    contacts,
+                    recovery_acknowledged,
+                    last_backup_unix,
+                } => (
+                    Some(protocol_name),
+                    vault_bytes,
+                    contacts,
+                    recovery_acknowledged,
+                    last_backup_unix,
+                ),
+                _ => (None, 0, 0, true, 0),
+            }
+        };
     Json(StatusResponse {
         locked,
         vault_dir: state.dir.display().to_string(),
         protocol_name,
         vault_bytes,
         contacts,
+        recovery_acknowledged,
+        last_backup_unix,
     })
 }
 
@@ -381,6 +398,100 @@ async fn messages(
             }),
         )),
     }
+}
+
+#[derive(Serialize)]
+struct BackupExportResponse {
+    filename: String,
+    data_base64: String,
+}
+
+#[derive(Deserialize)]
+struct BackupImportRequest {
+    data_base64: String,
+}
+
+#[derive(Serialize)]
+struct RecoveryPendingResponse {
+    code: String,
+}
+
+async fn backup_export(
+    State(state): State<Arc<App>>,
+) -> Result<Json<BackupExportResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.backup_export().await)?;
+    match result {
+        WorkResult::Backup(data) => {
+            let stamp = chrono_lite_timestamp();
+            Ok(Json(BackupExportResponse {
+                filename: format!("hush-vault-backup-{}.tar", stamp),
+                data_base64: STANDARD.encode(data),
+            }))
+        }
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+async fn backup_import(
+    State(state): State<Arc<App>>,
+    Json(body): Json<BackupImportRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    if *state.unlocked.lock().await {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "lock vault before importing a backup".into(),
+            }),
+        ));
+    }
+    let data = STANDARD.decode(body.data_base64.trim()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "invalid base64 backup".into(),
+            }),
+        )
+    })?;
+    map_err(state.worker.backup_import(&state.dir, data).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn recovery_pending(
+    State(state): State<Arc<App>>,
+) -> Result<Json<RecoveryPendingResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.recovery_pending().await)?;
+    match result {
+        WorkResult::RecoveryCode(code) => Ok(Json(RecoveryPendingResponse { code })),
+        WorkResult::Err(msg) => Err((StatusCode::NOT_FOUND, Json(ApiError { error: msg }))),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+async fn recovery_acknowledge(
+    State(state): State<Arc<App>>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.recovery_ack().await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn chrono_lite_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".into())
 }
 
 async fn blob(

@@ -20,6 +20,26 @@ function toBlobPart(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
+export function downloadBase64File(name: string, dataBase64: string): void {
+  const bin = atob(dataBase64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  saveBytesAsFile(name, bytes);
+}
+
+export function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
 export function saveBytesAsFile(name: string, bytes: Uint8Array): void {
   const blob = new Blob([toBlobPart(bytes)]);
   const url = URL.createObjectURL(blob);

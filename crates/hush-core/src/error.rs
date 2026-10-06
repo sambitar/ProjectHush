@@ -6,6 +6,10 @@ pub enum Error {
     EmptyPassphrase,
     #[error("wrong passphrase")]
     WrongPassphrase,
+    #[error("wrong recovery code")]
+    WrongRecoveryCode,
+    #[error("invalid backup archive")]
+    InvalidBackup,
     #[error("vault already exists")]
     AlreadyExists,
     #[error("vault is missing or incomplete")]
