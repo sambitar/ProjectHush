@@ -74,6 +74,15 @@ Living record. Reasons and rejected alternatives. Not a marketing doc.
 - **Note:** If one is built first later, private rooms fit threat model C better than a public square.
 - **Rejected:** Committing to public follow-only, rooms-only, or never-any-social.
 
+### Calls (later — Task 17)
+
+- **Decision:** Audio (video later) is **direct peer-to-peer** WebRTC between contacts. No Hush server carries the media; the existing relay carries only the authenticated handshake. A contact learns your IP, which is **accepted** — contacts are mutually trusted and WebRTC always reveals it.
+- **No first-party media relay.** We do not run TURN, so we are never in a position to see a call graph. The relay must not map who talks to whom; a media relay would map it unambiguously.
+- **IP-level privacy** belongs to the OS/distro layer (a future distro can ship network protections) or an optional user-supplied relay/overlay for IP-hiding — not the app's default.
+- **Live-only, unlocked only.** A locked vault holds no keys, so it cannot even read an incoming call invite. No calls while locked or closed, and no third-party push (a push token is a metadata leak).
+- **No recording, no transcription, ever.** A call leaves nothing behind.
+- **Detail:** Task **17** ([`docs/tasks/member-calls.md`](tasks/member-calls.md)).
+
 ### Payments
 
 - **Decision:** Subscription via a normal card processor (Stripe or similar) as the default.

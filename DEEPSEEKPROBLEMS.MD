@@ -12,6 +12,46 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-06 — Member calls spec (Task 17, P2P WebRTC)
+
+### [FIXED] Assumed the Tauri webview could host WebRTC on Linux
+
+- **Attempted:** first pass at the audio/video design put the WebRTC peer connection in the
+  Tauri webview (browser `RTCPeerConnection` + `getUserMedia`), with the daemon relaying only
+  signaling. The webview is a browser, so this looked like the low-effort path.
+- **Symptom:** research contradicted it. WebKitGTK (Tauri's Linux renderer) does **not**
+  expose `RTCPeerConnection` by default — it is behind an experimental build-time flag that
+  no distro enables. Tauri maintainers: *"With Tauri/webkit no, with Electron/CEF yes"*
+  (`tauri-apps/wry#85`); users see *"ReferenceError: Can't find variable: RTCPeerConnection"*
+  (`tauri-apps/tauri#13143`). The earlier chat message to the user said WebRTC in WebKitGTK
+  is *"historically the flakiest part"*, which understated it: it is absent, not flaky.
+- **Resolution:** the spec
+  ([`docs/tasks/member-calls.md`](docs/tasks/member-calls.md)) moves the peer connection and
+  media pipeline into `hush-daemon`; the webview is UI chrome only. Media engine recommendation
+  is GStreamer `webrtcbin`.
+- **Lesson:** verify platform WebRTC support (not just `getUserMedia`) against the actual
+  renderer before designing a webview media path. A webview being "a browser" is not enough.
+
+### [FIXED] Set the call-transport default against the project's own threat model
+
+- **Attempted:** the first spec defaulted to **relay-only TURN** so a contact would never learn
+  your IP, on the reading that "hide the IP" was the priority.
+- **Symptom:** it contradicted `THREAT_MODEL.md`, which treats **us (operators)** as an attacker
+  and makes "our relay must not map who talks to whom" an explicit v1 constraint. A first-party
+  TURN puts us in a position to see the call graph — a *stronger* graph signal than chat,
+  because a real-time relay session links both IPs unambiguously. The stated goal ("P2P without
+  exposing the IP") is itself only achievable by relaying, so the default traded a small leak
+  for a bigger one.
+- **Resolution:** after discussion the default was flipped to **direct P2P**. Contact IP
+  disclosure is accepted (contacts are mutually trusted); there is **no first-party relay**;
+  IP-level privacy is deferred to the OS/distro layer or a user-supplied relay/overlay. Recorded
+  in [`docs/tasks/member-calls.md`](docs/tasks/member-calls.md).
+- **Lesson:** check a proposed default against the project's own threat model before writing it
+  down. "Protect the user from X" is not automatically aligned if it strengthens a different
+  adversary the model already names.
+
+---
+
 ## 2026-10-06 — Passphrase change (vault format v2, daemon endpoint, Settings UI)
 
 ### [FIXED] `pkill -f "vite"` killed the shell that ran it

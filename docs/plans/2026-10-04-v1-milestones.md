@@ -26,6 +26,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **H — Knowledge layer** | After 11 dogfood | **12–15** (see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)) | Backlog |
 | **I — Confidential** | Heavy; spec early, code late | **10** TPM + lease rail | Planning only |
 | **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | **Deferred** |
+| **K — Member calls** | After **C** stabilizes | **17** P2P audio/video between contacts | Planning only |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
 
 **Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce.
@@ -466,6 +467,22 @@ Full design, build order, and acceptance criteria:
 **Depends on (recommended):** Task **5c.2** (no plaintext messaging vault) before overlapping file workflows.
 
 **Distro-readiness:** **`KeyProvider`**; FIDO2/stick vs machine TPM; lease server separate from relay — [`DISTRO_READINESS.md`](../DISTRO_READINESS.md).
+
+---
+
+### Task 17: Member calls — P2P audio/video (planning only)
+
+**Status:** **Phase K** — planning only. Spec decisions resolved (2026-10-06); no code until a phase is approved.
+
+**Goal:** Two online contacts hold an **end-to-end encrypted, direct peer-to-peer audio** call (video later). Signaling rides the existing relay as an authenticated channel; media goes straight between the daemons, so **no Hush server carries it**. Each contact learns the other's IP (**accepted**); IP-level privacy is deferred to the OS/distro layer or a user-supplied relay.
+
+→ **[`docs/tasks/member-calls.md`](../tasks/member-calls.md)**
+
+**Key constraint:** Tauri on Linux renders through WebKitGTK, which does **not** expose `RTCPeerConnection` by default (experimental build flag, not enabled by any distro). The peer connection and media pipeline therefore live in **`hush-daemon`**, not the webview; the UI is chrome only. **LiveKit** is evaluated and **deferred** to the future group-call path (Task 15.3) — it is an SFU whose default mode sees media and maps the graph, which v1 1:1 does not need.
+
+**Depends on:** Task **5h** (presence), **5c** (opaque transport + encrypted log), **5** (daemon). **Independent of** **5d** / **16** / **11** / **10**.
+
+**Distro-readiness:** new runtime deps (GStreamer + plugins, `xdg-desktop-portal`); second egress (self-hosted STUN; optional user-supplied TURN); daemon capture-device/systemd exceptions — see the task doc.
 
 ---
 
