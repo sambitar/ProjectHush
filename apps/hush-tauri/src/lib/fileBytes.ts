@@ -1,5 +1,7 @@
+import { invoke } from "@tauri-apps/api/core";
 import { api } from "./api/daemon";
 import type { ChatMessage } from "./api/types";
+import { isTauriShell } from "./tauriEnv";
 
 export async function resolveMessageFileBytes(
   m: ChatMessage,
@@ -20,11 +22,14 @@ function toBlobPart(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
-export function downloadBase64File(name: string, dataBase64: string): void {
+export async function downloadBase64File(
+  name: string,
+  dataBase64: string,
+): Promise<void> {
   const bin = atob(dataBase64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  saveBytesAsFile(name, bytes);
+  await saveBytesAsFile(name, bytes);
 }
 
 export function readFileAsBase64(file: File): Promise<string> {
@@ -40,7 +45,28 @@ export function readFileAsBase64(file: File): Promise<string> {
   });
 }
 
-export function saveBytesAsFile(name: string, bytes: Uint8Array): void {
+async function saveBytesNative(name: string, bytes: Uint8Array): Promise<void> {
+  await invoke("hush_save_file", {
+    defaultName: name || "download",
+    bytes: Array.from(bytes),
+  });
+}
+
+async function openBytesNative(name: string, bytes: Uint8Array): Promise<void> {
+  await invoke("hush_open_file", {
+    fileName: name || "file",
+    bytes: Array.from(bytes),
+  });
+}
+
+export async function saveBytesAsFile(
+  name: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  if (isTauriShell()) {
+    await saveBytesNative(name, bytes);
+    return;
+  }
   const blob = new Blob([toBlobPart(bytes)]);
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -50,10 +76,17 @@ export function saveBytesAsFile(name: string, bytes: Uint8Array): void {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
-export function openBytesInNewTab(bytes: Uint8Array): void {
+export async function openBytesInNewTab(
+  name: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  if (isTauriShell()) {
+    await openBytesNative(name, bytes);
+    return;
+  }
   const blob = new Blob([toBlobPart(bytes)]);
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -84,9 +117,11 @@ export function attachFileActions(
     openBtn.disabled = true;
     try {
       const bytes = await loadBytes();
-      openBytesInNewTab(bytes);
+      await openBytesInNewTab(fileName, bytes);
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : "Could not open file");
+      const msg = e instanceof Error ? e.message : "Could not open file";
+      if (msg.toLowerCase().includes("cancel")) return;
+      window.alert(msg);
     } finally {
       openBtn.disabled = false;
     }
@@ -100,9 +135,11 @@ export function attachFileActions(
     saveBtn.disabled = true;
     try {
       const bytes = await loadBytes();
-      saveBytesAsFile(fileName, bytes);
+      await saveBytesAsFile(fileName, bytes);
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : "Could not save file");
+      const msg = e instanceof Error ? e.message : "Could not save file";
+      if (msg.toLowerCase().includes("cancel")) return;
+      window.alert(msg);
     } finally {
       saveBtn.disabled = false;
     }

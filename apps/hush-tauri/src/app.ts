@@ -904,7 +904,7 @@ export class App {
     backup.querySelector(".backup-btn")!.addEventListener("click", async () => {
       try {
         const r = await api.backupExport();
-        if (r) downloadBase64File(r.filename, r.data_base64);
+        if (r) await downloadBase64File(r.filename, r.data_base64);
         await this.refreshStatus();
         this.announce("Backup downloaded");
         this.render();
@@ -983,7 +983,7 @@ export class App {
       exportBtn.style.marginTop = "var(--space-4)";
       exportBtn.onclick = async () => {
         const r = await api.backupExport();
-        if (r) downloadBase64File(r.filename, r.data_base64);
+        if (r) await downloadBase64File(r.filename, r.data_base64);
         await this.refreshStatus();
         this.announce("Backup downloaded");
       };

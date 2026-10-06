@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-hush-files"
+description = "Save and open chat attachment bytes via native dialogs"
+commands.allow = ["hush_save_file", "hush_open_file"]
