@@ -50,7 +50,7 @@ When brainstorming features, prefer ideas that:
 - Separate **messaging identity** from **pen names** for anything public.
 - Use **argument + evidence** over popularity: typed links (supports/refutes/evidence), explainable feeds (“included because…”), local library with **private** annotations.
 - Keep graphs, briefing, debates, projects **on-device** (SQLite/FTS/edges) with optional **publish** to Nostr — not a Hush-hosted global social graph DB.
-- Ship in **phases**: v1 messaging → Task 11 Articles → Task 12 library/argument links → later theses/debates/projects/graph UI.
+- Ship in **phases** (see milestones **Recommended build order**): messaging polish (Phase C) → **5d** mail → outsider drop **5e/5f** → **16** notes → **11** Articles → **12–15** knowledge → **10** Confidential → **7** ship when producing.
 - For AI: **“ask my library”** with local retrieval + optional user API key — not default “send everything to OpenAI” or training on user data.
 
 Good product arc (long-term, staged):  
@@ -85,7 +85,8 @@ When an idea is partly good, **adapt** it: e.g. “Ideas feed” → theses + ta
 ## Repo truth (snapshot — human may update)
 
 - Stack: Rust workspace (hush-core, hush-relay, hush-daemon), apps/hush-tauri.
-- v1 goal: two people QR-add, encrypted text + small file via relay, unlock vault.
+- v1 goal: two people QR-add, encrypted text + small file via relay, unlock vault; live chat when both online (**5h**); async mail **5d** later.
+- Pre-ship dogfood: **Phase C** polish next; **Task 7** signed releases deferred until producing.
 - Planning docs: docs/DESIGN.md, docs/THREAT_MODEL.md, docs/plans/2026-10-04-v1-milestones.md, docs/plans/knowledge-layer-roadmap.md, docs/tasks/hush-articles.md.
 
 Acknowledge this context briefly when the human starts a new topic, then give concrete, policy-filtered advice.

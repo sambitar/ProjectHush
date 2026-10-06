@@ -27,7 +27,7 @@ Conversation (private) → Idea → Argument → Evidence → Knowledge → Proj
 | **Moderation B** | Local mute/block/report; NIP-56 to relays; **no** scanning DM/file ciphertext on our relay. Public content: user reports + relay policy, honest limits. |
 | **Vault per person** | Library, annotations, reading list, private documents → **encrypted local store** (Task 5c / data root), not a shared cloud folder. |
 | **Quiet positioning** | Product voice: calm capsule + “how it’s designed,” not “uncensored” hero marketing. |
-| **Scope** | One serious expansion at a time; **Task 11** first. |
+| **Scope** | One serious expansion at a time; **Task 16** notes (optional) → **Task 11** Articles → **12.x** (see milestones **Recommended build order**). |
 
 ---
 

@@ -8,9 +8,33 @@
 
 **Spec:** `docs/DESIGN.md`, `docs/THREAT_MODEL.md`, `docs/PROTOCOL.md`, `docs/WORKSPACE.md`, [`docs/DISTRO_READINESS.md`](../DISTRO_READINESS.md).
 
+**Product stance (2026-10):** Pre-ship **dogfood** — add features and harden the capsule before installers or signed releases. **Task 7** (signed builds / updater) stays **last** until you choose to produce.
+
+## Recommended build order
+
+Task IDs are stable for cross-links; **implement in this sequence** (not the section order below).
+
+| Phase | When | Tasks | Status |
+|-------|------|-------|--------|
+| **A — Foundation** | First | **1** workspace/vault, **2** relay, **3** two-party CLI, **4** files | ✅ Done |
+| **B — Capsule messaging** | Core product | **5** daemon + Tauri, **5c** opaque relay + encrypted log/blobs, **5b.1–5b.2** files UX, **5h** live presence, **6** recovery/backup | ✅ Mostly done |
+| **C — Messaging polish** | Next dogfood | **5b.3** (optional), remaining **5c.4** / transport review, **distro gaps** (DR-01–09, 14), contacts/settings (mute/block/remove, device link), UI gaps in `API_GAPS.md` | 🔜 **Now** |
+| **D — Async member mail** | When live chat feels solid | **5d** internal `@myserver.com` mail (replaces “message while offline”) | Planned |
+| **E — Outsider delivery** | After 5d | **5e** inbound drop, **5f** outbound to outsiders | Planned |
+| **F — Local notes** | Before public layer | **16** sticky-notes dashboard | Planned |
+| **G — Articles** | After notes or parallel late | **11** Nostr pen names | Planned |
+| **H — Knowledge layer** | After 11 dogfood | **12–15** (see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)) | Backlog |
+| **I — Confidential** | Heavy; spec early, code late | **10** TPM + lease rail | Planning only |
+| **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | **Deferred** |
+| **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
+
+**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce.
+
+Detailed specs follow **by task ID** (1, 2, …). Dependency order is in the table above.
+
 ## Global Constraints
 
-- No code until the user says to implement (this file is the plan only).
+- This file is the plan; implementation proceeds task-by-task on request.
 - Do not invent a ratchet; use libsignal.
 - UI must not fetch JS/HTML from the network.
 - Relay has no user directory.
@@ -48,6 +72,8 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 
 ### Task 1: Workspace and vault identity
 
+**Status:** ✅ Done.
+
 **Files:** `crates/hush-core/` (new)
 
 - Cargo workspace as in `WORKSPACE.md`.
@@ -62,6 +88,8 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 ---
 
 ### Task 2: Relay queues
+
+**Status:** ✅ Done (presence heartbeats added for live chat — see **5h**).
 
 **Files:** `crates/hush-relay/`
 
@@ -78,6 +106,8 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 
 ### Task 3: Two local clients through the relay
 
+**Status:** ✅ Done.
+
 **Files:** `hush-core` session layer, `hush-cli`
 
 - Two vaults on one machine.
@@ -91,6 +121,8 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 
 ### Task 4: Files
 
+**Status:** ✅ Done.
+
 **Files:** `hush-core`
 
 - Encrypt file to recipient, store in sender vault, send over session (or chunk if over 1 MiB — prefer small-file v1).
@@ -101,6 +133,8 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 ---
 
 ### Task 5: Daemon + minimal Tauri UI
+
+**Status:** ✅ Core done — remaining work lives in **Phase C** (distro, socket, CORS, mount loss, systemd).
 
 **Files:** `hush-daemon`, `apps/hush-tauri`
 
@@ -115,6 +149,8 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 ---
 
 ### Task 5b: Per-contact files (exchange view)
+
+**Status:** ✅ **5b.1** / **5b.2** done; **5b.3** optional (**Phase C**).
 
 **Goal:** Files you share with someone feel like a **folder for that contact**, but stay **1:1 E2E** — two private vault copies linked by encrypted sends, not a synced cloud drive or group share.
 
@@ -142,9 +178,11 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 
 ### Task 5c: Relay metadata privacy + encrypted vault (chat log + files on disk)
 
+**Status:** ✅ **5c.1–5c.3** done in tree; **5c.4** production HTTPS/VPS checklist remains (**Phase C**). Expert transport review still recommended before calling relay “done.”
+
 **Goal:** Match [`THREAT_MODEL.md`](../THREAT_MODEL.md) and [`PROTOCOL.md`](../PROTOCOL.md): relay sees **ciphertext blobs and queue IDs only** (no cleartext sender names in wire JSON); **everything durable under the vault directory is confidential when locked**, including **chat history** and received files.
 
-**Current gaps (dogfood audit):**
+**Historical gaps (addressed in code — keep for audit trail):**
 
 - `WireEnvelope` sends **`from` in the clear** inside the blob the relay stores (`hush-core`).
 - Daemon writes **`inbox/*` plaintext** after decrypt (`hush-daemon`).
@@ -180,7 +218,39 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 
 ---
 
+### Task 5h: Live chat presence (online-only send)
+
+**Status:** ✅ Done.
+
+**Goal:** Chat is **live** when both sides are online; no async chat while the contact is offline (async member mail = **5d**). Relay **presence** heartbeats (~90s TTL); daemon blocks send when recipient offline; UI shows online indicator (no “Delivered” delivery mock).
+
+**Files:** `hush-relay` (`/q/{id}/presence`), `hush-core` / `hush-daemon`, `apps/hush-tauri`.
+
+**Verify:** `./scripts/run-two-ui.sh` — both unlocked → green dot; one locked → other cannot send; mail hint in composer when offline.
+
+**Depends on:** **5**, **2**. **Before:** **5d**.
+
+---
+
+### Phase C: Messaging polish (next — not a numbered task)
+
+Work through these while dogfooding; split into PR-sized slices as needed.
+
+| Area | Examples | Tracks |
+|------|----------|--------|
+| **Distro / daemon** | `HUSH_DATA_DIR`, Unix socket default, tighten CORS, systemd unit, mount-loss lock, suspend lock | [`distro-readiness-gaps.md`](../tasks/distro-readiness-gaps.md) DR-01–09, 14 |
+| **Transport** | **5c.4** HTTPS on VPS relay; sealed-sender expert review | **5c.1** / PROTOCOL |
+| **Files** | **5b.3** per-contact vault layout (optional) | **5b** |
+| **Contacts / settings** | Real mute/block/remove; device-link QR (**6** slice); nick overrides in data root not `localStorage` | `API_GAPS.md`, DR-05 |
+| **UI dogfood** | Reactions, command palette polish, error states | `API_GAPS.md` |
+
+**Exit criteria:** Two-peer script is boring for a week; no plaintext surprises under vault; daemon ready for socket-first packaging.
+
+---
+
 ### Task 5d: Internal mail (`@myserver.com`, members only)
+
+**Status:** Planned — **Phase D** (after **Phase C**).
 
 **Goal:** Full **email-like** product for users on Hush keys + vault — threads, compose, **attachments**, contact list — **without** Internet SMTP between members. Addresses like `sandy@myserver.com` are **routing labels** bound to vault identity (protocol name / keys), not a public MX mailbox.
 
@@ -201,6 +271,8 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 ---
 
 ### Task 5e: External inbound drop (outsiders → member)
+
+**Status:** Planned — **Phase E** (after **5d**).
 
 **Goal:** People **without** a Hush account can deliver **one encrypted package** (body + attachments) to a member. **No passphrase in email body.** **No plaintext** accepted at the boundary — only a versioned **container file** from a lightweight **packager** (website or small app).
 
@@ -236,6 +308,8 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 ---
 
 ### Task 5f: Outbound to outsiders (`deliver@` + outsider contacts + PIN)
+
+**Status:** Planned — **Phase E** (after **5e**).
 
 **Goal:** Internal member sends an **encrypted package** (body + attachments) to someone **without** a Hush account. Same **container family** as **5e** (`hush-drop-v1`). Honest bounds: notification email (SMTP) is **not** E2E; payload on relay is **ciphertext only**.
 
@@ -292,6 +366,8 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 ### Task 6: Recovery paths (no social recovery)
 
+**Status:** ✅ Done (device-link QR remains optional slice in **Phase C**).
+
 **Files:** `hush-core`, settings UI
 
 - Buried recovery code at first unlock.
@@ -307,6 +383,8 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 ### Task 7: Signed builds (ship path)
 
+**Status:** **Deferred** — **Phase J** when producing installers/updater (not required for feature dogfood).
+
 **Files:** CI or a `scripts/` sign+verify helper, Tauri updater config
 
 - minisign/ed25519 (or Tauri’s scheme) key pinned in the app.
@@ -318,29 +396,27 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 ---
 
-### Task 10: Confidential section (TPM + lease — planning only)
+### Task 16: Notes dashboard (sticky papers — planning only)
 
-**Goal:** Linux-only **Confidential** rail: custom encrypted containers (hardware-bound via TPM 2.0), server-signed **lease** before KEK unseal, in-app editor with no plaintext on disk.
+**Status:** Planned — **Phase F** (before **11** Articles).
 
-**Status:** **Not implemented.** Full phased plan, checklists, acceptance criteria, and open questions:
+**Goal:** Private **sticky-note** board in the capsule: papers on a dashboard or **grouped** stacks, **drag-and-drop** layout, **checklists** with check-off — encrypted local store, backup via Task **6**. Visual metaphor: real note paper (Soft Daylight), not a collaborative whiteboard.
 
-→ **[`docs/tasks/confidential-section.md`](../tasks/confidential-section.md)**
+→ **[`docs/tasks/notes-dashboard.md`](../tasks/notes-dashboard.md)**
 
-**Phases (summary):** (1) spec + threat model → (2) crypto core `.cnf`/`.hcf` → (3) TPM seal → (4) lease server → (5) daemon lease client → (6) UI rail → (7) stolen-device + recovery → (8) security review.
+**Depends on:** Task **5c**, **6**. **Independent** of Articles (Task **11**). Optional link to **projects** (Task **14.2**) later.
 
-**Depends on (recommended):** Task **5c.2** (stop plaintext on disk in messaging vault) before overlapping file workflows.
-
-**Conflicts to resolve in Phase 1:** network lease API vs “no remote UI assets”; separate trust domain from `hush-relay`; Vault rail vs Confidential rail; passphrase vault vs TPM+lease unlock.
-
-**Distro-readiness:** Implement unlock via **`KeyProvider`**; support **FIDO2/stick** vs machine TPM config for portable USB; lease server separate from relay; no plaintext Confidential on disk — [`DISTRO_READINESS.md`](../DISTRO_READINESS.md), [`confidential-section.md`](confidential-section.md).
+**Not v1:** No multi-user live board on Hush infrastructure; no publishing notes to Nostr by default.
 
 ---
 
 ### Task 11: Articles (Nostr pen names — planning only)
 
+**Status:** Planned — **Phase G** (after **16** or in parallel once **Phase C** is stable).
+
 **Goal:** Pseudonymous long-form publishing: **pen names** (vault keypairs, isolated from messaging), **Nostr** articles/comments (NIP-23/22/09/50/56 — **verify before build**), **Tor** transport (`arti`), local follows/mutes/drafts, daemon-sanitized UI.
 
-**Status:** Not implemented. Full design, build order, and acceptance criteria:
+Full design, build order, and acceptance criteria:
 
 → **[`docs/tasks/hush-articles.md`](../tasks/hush-articles.md)**
 
@@ -360,7 +436,7 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 ### Tasks 12–15: Knowledge layer (backlog — planning only)
 
-**Status:** Not implemented. ChatGPT-style “Magazine / Ideas / Graph” ideas **filtered** against DESIGN and threat model C.
+**Status:** **Phase H** — not implemented. ChatGPT-style “Magazine / Ideas / Graph” ideas **filtered** against DESIGN and threat model C.
 
 → **[`docs/plans/knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)**
 
@@ -373,19 +449,23 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 **Do not start** until Task **11** is dogfooded unless explicitly reprioritized.
 
+**Status:** **Phase H** — backlog.
+
 ---
 
-### Task 16: Notes dashboard (sticky papers — planning only)
+### Task 10: Confidential section (TPM + lease — planning only)
 
-**Goal:** Private **sticky-note** board in the capsule: papers on a dashboard or **grouped** stacks, **drag-and-drop** layout, **checklists** with check-off — encrypted local store, backup via Task **6**. Visual metaphor: real note paper (Soft Daylight), not a collaborative whiteboard.
+**Status:** **Phase I** — spec/threat model can proceed anytime; **implementation** after messaging + notes/articles unless reprioritized.
 
-**Status:** Not implemented.
+**Goal:** Linux-only **Confidential** rail: custom encrypted containers (hardware-bound via TPM 2.0), server-signed **lease** before KEK unseal, in-app editor with no plaintext on disk.
 
-→ **[`docs/tasks/notes-dashboard.md`](../tasks/notes-dashboard.md)**
+→ **[`docs/tasks/confidential-section.md`](../tasks/confidential-section.md)**
 
-**Depends on:** Task **5c**, **6**. **Independent** of Articles (Task **11**). Optional link to **projects** (Task **14.2**) later.
+**Phases (summary):** (1) spec + threat model → (2) crypto core `.cnf`/`.hcf` → (3) TPM seal → (4) lease server → (5) daemon lease client → (6) UI rail → (7) stolen-device + recovery → (8) security review.
 
-**Not v1:** No multi-user live board on Hush infrastructure; no publishing notes to Nostr by default.
+**Depends on (recommended):** Task **5c.2** (no plaintext messaging vault) before overlapping file workflows.
+
+**Distro-readiness:** **`KeyProvider`**; FIDO2/stick vs machine TPM; lease server separate from relay — [`DISTRO_READINESS.md`](../DISTRO_READINESS.md).
 
 ---
 
@@ -400,6 +480,5 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 - Full SMTP/IMAP product for `@myserver.com` on the public Internet (partial inbound via **5e** only)
 - Confidential **implementation** (spec in Task **10** may proceed earlier; ship after v1 dogfood unless reprioritized)
 - **Distro / OS image** (stages 2–5 in [`DISTRO_READINESS.md`](../DISTRO_READINESS.md)) — app must meet distro-ready acceptance criteria first
-- **Articles implementation** (Task **11**) — after v1 messaging dogfood + **5c**/**6** foundations unless reprioritized
-- **Knowledge layer Phases B–D** (Tasks **13–15**) — see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)
-- **Notes dashboard** (Task **16**) — sticky papers, groups, checklists on encrypted local board
+- **Signed releases** (Task **7**) — when producing, not during feature dogfood
+- See **Recommended build order** at top of this file for **11 / 16 / 12–15 / 10** sequencing
