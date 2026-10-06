@@ -3,7 +3,9 @@ import type { ContactDto, StatusResponse } from "./lib/api/types";
 import {
   addOutgoingFile,
   addOutgoingText,
-  allFileMessages,
+  contactsWithFiles,
+  fileMessagesForContact,
+  fileCountForContact,
   clearChatStore,
   loadHistory,
   deliveryLabel,
@@ -43,6 +45,8 @@ export class App {
   private addFriendOpen = false;
   private profileNick: string | null = null;
   private paletteOpen = false;
+  private filesContactNick: string | null = null;
+  private filesDirection: "received" | "sent" = "received";
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -67,6 +71,7 @@ export class App {
         this.paletteOpen = false;
         this.addFriendOpen = false;
         this.profileNick = null;
+        if (this.filesContactNick) this.filesContactNick = null;
         this.render();
       }
     });
@@ -129,6 +134,7 @@ export class App {
     clearChatStore();
     clearMockLocal();
     this.selectedNick = null;
+    this.filesContactNick = null;
     this.unlockedAt = 0;
     this.stopPoll();
     await this.refreshStatus();
@@ -581,39 +587,186 @@ export class App {
   }
 
   private renderFiles(): HTMLElement {
+    if (this.filesContactNick) {
+      return this.renderFilesForContact(this.filesContactNick);
+    }
+    return this.renderFilesContactList();
+  }
+
+  private renderFilesContactList(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane";
     pane.style.padding = "var(--space-5)";
     const h = document.createElement("h1");
     h.className = "text-22";
     h.textContent = "Files";
-    const files = allFileMessages();
-    const grid = document.createElement("div");
-    grid.className = "bento";
+    const hint = document.createElement("p");
+    hint.className = "muted text-13";
+    hint.style.marginTop = "var(--space-2)";
+    hint.textContent =
+      "Choose a contact to see files you’ve exchanged — stored only on your devices.";
+    const list = document.createElement("div");
+    list.style.marginTop = "var(--space-5)";
+    list.style.display = "flex";
+    list.style.flexDirection = "column";
+    list.style.gap = "var(--space-2)";
+
+    const nicks = contactsWithFiles(
+      this.contacts.map((c) => c.nickname),
+    );
+    const also = this.contacts.filter((c) => !nicks.includes(c.nickname));
+
+    for (const nick of [...nicks, ...also.map((c) => c.nickname)]) {
+      const c = this.contacts.find((x) => x.nickname === nick);
+      if (!c) continue;
+      const count = fileCountForContact(nick);
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "conv-row pressable";
+      row.style.width = "100%";
+      row.style.textAlign = "left";
+      const left = document.createElement("div");
+      left.style.display = "flex";
+      left.style.gap = "var(--space-3)";
+      left.style.alignItems = "center";
+      left.appendChild(createAvatarEl(c.protocol_name, "sm"));
+      const meta = document.createElement("div");
+      const title = document.createElement("div");
+      title.className = "text-15";
+      title.style.fontWeight = "500";
+      title.textContent = displayNick(nick);
+      const sub = document.createElement("div");
+      sub.className = "text-13 muted";
+      sub.textContent =
+        count > 0
+          ? `${count} file${count === 1 ? "" : "s"} exchanged`
+          : "No files yet — open to send";
+      meta.append(title, sub);
+      left.append(meta);
+      row.append(left);
+      row.onclick = () => {
+        this.filesContactNick = nick;
+        this.filesDirection = "received";
+        this.render();
+      };
+      list.appendChild(row);
+    }
+
+    if (!this.contacts.length) {
+      const p = document.createElement("p");
+      p.className = "muted";
+      p.textContent = "Add a contact in Chats to exchange files.";
+      list.appendChild(p);
+    }
+
+    pane.append(h, hint, list);
+    return pane;
+  }
+
+  private renderFilesForContact(nick: string): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+    pane.style.padding = "var(--space-5)";
+
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-secondary text-13 pressable";
+    back.textContent = "← All contacts";
+    back.onclick = () => {
+      this.filesContactNick = null;
+      this.render();
+    };
+
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.style.marginTop = "var(--space-4)";
+    h.textContent = displayNick(nick);
+    const hint = document.createElement("p");
+    hint.className = "muted text-13";
+    hint.textContent = `Files you’ve exchanged with ${displayNick(nick)} — stored only on your devices.`;
+
+    const tabs = document.createElement("div");
+    tabs.className = "segmented";
+    tabs.style.marginTop = "var(--space-4)";
+    tabs.style.maxWidth = "280px";
+    const recvTab = document.createElement("button");
+    recvTab.type = "button";
+    recvTab.className = this.filesDirection === "received" ? "active" : "";
+    recvTab.textContent = "Received";
+    recvTab.onclick = () => {
+      this.filesDirection = "received";
+      this.render();
+    };
+    const sentTab = document.createElement("button");
+    sentTab.type = "button";
+    sentTab.className = this.filesDirection === "sent" ? "active" : "";
+    sentTab.textContent = "Sent";
+    sentTab.onclick = () => {
+      this.filesDirection = "sent";
+      this.render();
+    };
+    tabs.append(recvTab, sentTab);
+
+    const sendRow = document.createElement("div");
+    sendRow.style.marginTop = "var(--space-4)";
+    const sendBtn = document.createElement("button");
+    sendBtn.type = "button";
+    sendBtn.className = "btn-primary pressable";
+    sendBtn.textContent = "Send file";
+    const fileIn = document.createElement("input");
+    fileIn.type = "file";
+    fileIn.hidden = true;
+    sendBtn.onclick = () => fileIn.click();
+    fileIn.onchange = async () => {
+      const f = fileIn.files?.[0];
+      fileIn.value = "";
+      if (f) await this.sendFile(nick, f);
+    };
+    sendRow.append(sendBtn, fileIn);
+
+    const list = document.createElement("div");
+    list.style.marginTop = "var(--space-4)";
+    list.style.display = "flex";
+    list.style.flexDirection = "column";
+    list.style.gap = "var(--space-3)";
+
+    const files = fileMessagesForContact(nick, this.filesDirection);
     for (const m of files) {
-      const t = document.createElement("div");
-      t.className = "tile";
-      t.innerHTML = `<div class="text-15">${m.fileName}</div><div class="muted text-13">${formatBytes(m.fileSize ?? 0)} · ${displayNick(m.contactNick)}</div>`;
+      const card = document.createElement("div");
+      card.className = "tile";
+      card.innerHTML = `<div class="text-15" style="font-weight:500">${m.fileName}</div><div class="text-13 muted">${formatBytes(m.fileSize ?? 0)} · ${formatRelative(m.createdAt)}</div>`;
       if (m.fileData || m.blobId) {
-        attachFileActions(t, m.fileName ?? "file", () =>
+        attachFileActions(card, m.fileName ?? "file", () =>
           resolveMessageFileBytes(m),
         );
       }
-      t.onclick = (e) => {
-        if ((e.target as HTMLElement).closest("button")) return;
+      const chatLink = document.createElement("button");
+      chatLink.type = "button";
+      chatLink.className = "text-13 pressable";
+      chatLink.style.marginTop = "var(--space-2)";
+      chatLink.style.color = "var(--accent)";
+      chatLink.textContent = "View in chat";
+      chatLink.onclick = () => {
         this.rail = "chats";
-        this.selectedNick = m.contactNick;
+        this.selectedNick = nick;
+        this.filesContactNick = null;
         this.render();
       };
-      grid.appendChild(t);
+      card.appendChild(chatLink);
+      list.appendChild(card);
     }
+
     if (!files.length) {
       const p = document.createElement("p");
-      p.className = "muted";
-      p.textContent = "No files yet";
-      grid.appendChild(p);
+      p.className = "muted text-13";
+      p.textContent =
+        this.filesDirection === "received"
+          ? "Nothing received yet."
+          : "You haven’t sent a file here yet.";
+      list.appendChild(p);
     }
-    pane.append(h, grid);
+
+    pane.append(back, h, hint, tabs, sendRow, list);
     return pane;
   }
 

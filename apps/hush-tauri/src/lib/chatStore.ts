@@ -187,6 +187,43 @@ export function allFileMessages(): ChatMessage[] {
   return out.sort((a, b) => b.createdAt - a.createdAt);
 }
 
+export type FileDirection = "received" | "sent";
+
+export function fileMessagesForContact(
+  nick: string,
+  direction: FileDirection,
+): ChatMessage[] {
+  return getThread(nick)
+    .filter((m) => m.kind === "file")
+    .filter((m) => (direction === "received" ? !m.outgoing : m.outgoing))
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+export function fileCountForContact(nick: string): number {
+  return getThread(nick).filter((m) => m.kind === "file").length;
+}
+
+export function lastFileTimeForContact(nick: string): number | null {
+  const files = fileMessagesForContact(nick, "received").concat(
+    fileMessagesForContact(nick, "sent"),
+  );
+  if (!files.length) return null;
+  return Math.max(...files.map((m) => m.createdAt));
+}
+
+/** Contacts with at least one file, most recent exchange first. */
+export function contactsWithFiles(contactNicks: string[]): string[] {
+  return contactNicks
+    .map((nick) => ({
+      nick,
+      at: lastFileTimeForContact(nick) ?? 0,
+      n: fileCountForContact(nick),
+    }))
+    .filter((x) => x.n > 0)
+    .sort((a, b) => b.at - a.at)
+    .map((x) => x.nick);
+}
+
 export function deliveryLabel(d: DeliveryState): string {
   switch (d) {
     case "sealed":
