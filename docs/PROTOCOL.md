@@ -21,6 +21,8 @@ Not a crypto paper. We use **Signal protocol (`libsignal`)** for 1:1 sessions. T
 
 Device link (old device alive): show a QR from the unlocked old device; new device becomes a second Signal device in that identity. Exact linking follows libsignal’s device model; we do not invent a second identity system.
 
+**v1 implementation (one-time transfer, not yet a live second device):** the unlocked old device exports its encrypted backup once and publishes it under a short-lived, single-use **link id** (`POST /api/link-device/start`). The new device, while **locked**, fetches and imports it (`POST /api/link-device/pull` with the pairing payload's `source_api` + `link_id`) and then unlocks with the same passphrase. The pairing payload is JSON (`kind: "hush-link-device"`, `source_api`, `link_id`, `expires_unix`); QR and clipboard carry the same bytes. TTL is ~10 minutes and the link id is consumed on first read. Treat the link id as a bearer secret: the payload it returns is the passphrase-encrypted vault, and anyone who can reach the source daemon and guess the id could download it (so keep the source on a trusted network, and prefer a LAN address only for the brief window). This is an identity/vault copy, **not** concurrent multi-device: both devices hold the same keys and do not ratchet with each other. Real multi-device (per-device sessions, libsignal device model) is a later slice.
+
 ## Queues
 
 - Creating a contact mints (or rotates) a queue the *other* party can send into.

@@ -43,6 +43,12 @@ export interface InviteResponse {
   invite: string;
 }
 
+export interface LinkDeviceStartResponse {
+  link_id: string;
+  expires_unix: number;
+  payload: string;
+}
+
 export interface ChatMessage {
   id: string;
   contactNick: string;

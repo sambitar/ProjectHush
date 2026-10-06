@@ -241,7 +241,7 @@ Work through these while dogfooding; split into PR-sized slices as needed.
 | **Distro / daemon** | `HUSH_DATA_DIR`, Unix socket default, tighten CORS, systemd unit, mount-loss lock, suspend lock | [`distro-readiness-gaps.md`](../tasks/distro-readiness-gaps.md) DR-01–09, 14 |
 | **Transport** | **5c.4** HTTPS on VPS relay; sealed-sender expert review | **5c.1** / PROTOCOL |
 | **Files** | **5b.3** per-contact vault layout (optional) | **5b** |
-| **Contacts / settings** | Real mute/block/remove; device-link QR (**6** slice); nick overrides in data root not `localStorage` | `API_GAPS.md`, DR-05 |
+| **Contacts / settings** | Real mute/block/remove (**done**); device-link QR one-time transfer (**6** slice, **done** — Settings → Security + unlock “Transfer from another device”); nick overrides in data root not `localStorage` | `API_GAPS.md`, DR-05 |
 | **UI dogfood** | Reactions, command palette polish, error states | `API_GAPS.md` |
 
 **Exit criteria:** Two-peer script is boring for a week; no plaintext surprises under vault; daemon ready for socket-first packaging.
@@ -366,7 +366,7 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 ### Task 6: Recovery paths (no social recovery)
 
-**Status:** ✅ Done (device-link QR remains optional slice in **Phase C**).
+**Status:** ✅ Done. Device-link QR slice implemented as a one-time encrypted transfer (unlocked old device → locked new device); live multi-device sessions remain a later slice.
 
 **Files:** `hush-core`, settings UI
 

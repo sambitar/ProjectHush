@@ -57,6 +57,8 @@ export class App {
   private filesContactNick: string | null = null;
   private filesDirection: "received" | "sent" = "received";
   private recoveryModalCode: string | null = null;
+  private linkDevicePayload: string | null = null;
+  private unlockLinkMode = false;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -170,6 +172,10 @@ export class App {
 
   private render(): void {
     this.root.innerHTML = "";
+    if (this.linkDevicePayload) {
+      this.root.appendChild(this.renderLinkDeviceModal());
+      return;
+    }
     if (!this.status || this.status.locked) {
       this.root.appendChild(this.renderUnlock());
       return;
@@ -302,9 +308,111 @@ export class App {
     daemon.className = "faint text-12";
     daemon.style.marginTop = "var(--space-4)";
     daemon.textContent = getApiBase();
-    card.append(logoWrap, title, hint, pass, showRow, err, btn, daemon);
+    const linkToggle = document.createElement("button");
+    linkToggle.type = "button";
+    linkToggle.className = "text-13 pressable";
+    linkToggle.style.marginTop = "var(--space-4)";
+    linkToggle.style.color = "var(--accent)";
+    linkToggle.textContent = this.unlockLinkMode
+      ? "Back to unlock"
+      : "Transfer from another device";
+    linkToggle.onclick = () => {
+      this.unlockLinkMode = !this.unlockLinkMode;
+      this.render();
+    };
+    card.append(logoWrap, title, hint);
+    if (this.unlockLinkMode) {
+      const p = document.createElement("p");
+      p.className = "muted text-13";
+      p.textContent =
+        "On your unlocked device: Settings → Security → Link a new device. Paste the pairing payload, or enter the source URL + link ID. This device must be locked. If the code shows 127.0.0.1 and this is a different machine, type the source PC's LAN URL below.";
+      const payloadIn = document.createElement("textarea");
+      payloadIn.className = "input-field";
+      payloadIn.placeholder = 'Paste {"kind":"hush-link-device",...}';
+      payloadIn.rows = 3;
+      payloadIn.style.marginTop = "var(--space-3)";
+      const sourceIn = document.createElement("input");
+      sourceIn.className = "input-field";
+      sourceIn.placeholder = "Source daemon URL (e.g. http://192.168.1.10:9876)";
+      sourceIn.style.marginTop = "var(--space-2)";
+      const idIn = document.createElement("input");
+      idIn.className = "input-field";
+      idIn.placeholder = "Link ID (if not using payload JSON)";
+      idIn.style.marginTop = "var(--space-2)";
+      const pullBtn = document.createElement("button");
+      pullBtn.className = "btn-primary pressable";
+      pullBtn.style.marginTop = "var(--space-3)";
+      pullBtn.textContent = "Import vault copy";
+      pullBtn.onclick = async () => {
+        err.hidden = true;
+        try {
+          const parsed = parseLinkDevicePayload(payloadIn.value);
+          const typedSource = sourceIn.value.trim();
+          const source_api = typedSource || parsed?.source_api || "";
+          const link_id = parsed?.link_id ?? idIn.value.trim();
+          if (!source_api || !link_id) {
+            throw new AppError("Enter a payload or both URL and link ID.");
+          }
+          await api.linkDevicePull(source_api, link_id);
+          this.unlockLinkMode = false;
+          await this.refreshStatus();
+          this.announce("Vault copied. Unlock with your passphrase.");
+          this.render();
+        } catch (e) {
+          err.hidden = false;
+          err.textContent =
+            e instanceof AppError ? e.message : "Transfer failed.";
+        }
+      };
+      card.append(p, payloadIn, sourceIn, idIn, err, pullBtn, linkToggle, daemon);
+    } else {
+      card.append(pass, showRow, err, btn, linkToggle, daemon);
+    }
     wrap.appendChild(card);
     return wrap;
+  }
+
+  private renderLinkDeviceModal(): HTMLElement {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal";
+    modal.innerHTML = `<h2 class="text-22">Link a new device</h2><p class="muted text-13">Scan or copy this pairing code on the <strong>new</strong> device while it is locked. The transfer works once and expires in about 10 minutes. Both devices must reach each other on your network (use the source PC's LAN IP if not on the same machine).</p>`;
+    const qr = document.createElement("div");
+    qr.className = "qr-tile";
+    qr.style.marginTop = "var(--space-4)";
+    const payload = this.linkDevicePayload ?? "";
+    const canvas = document.createElement("canvas");
+    void QRCode.toCanvas(canvas, payload, { width: 200, margin: 1 });
+    qr.appendChild(canvas);
+    const pre = document.createElement("pre");
+    pre.className = "text-12 muted";
+    pre.style.marginTop = "var(--space-3)";
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.wordBreak = "break-all";
+    pre.textContent = payload;
+    const copy = document.createElement("button");
+    copy.className = "btn-secondary pressable";
+    copy.style.marginTop = "var(--space-3)";
+    copy.textContent = "Copy pairing payload";
+    copy.onclick = () => navigator.clipboard.writeText(payload);
+    const done = document.createElement("button");
+    done.className = "btn-primary pressable";
+    done.style.marginTop = "var(--space-2)";
+    done.textContent = "Done";
+    done.onclick = () => {
+      this.linkDevicePayload = null;
+      this.render();
+    };
+    modal.append(qr, pre, copy, done);
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.linkDevicePayload = null;
+        this.render();
+      }
+    };
+    return back;
   }
 
   private railBtn(id: Rail, label: string, ic: IconName): HTMLElement {
@@ -1000,7 +1108,22 @@ export class App {
         const v = Number(sel.value);
         void patchUiPrefs({ auto_lock_minutes: v }).then(() => this.render());
       };
-      body.append(label, sel);
+      const linkBtn = document.createElement("button");
+      linkBtn.type = "button";
+      linkBtn.className = "btn-secondary pressable";
+      linkBtn.style.marginTop = "var(--space-5)";
+      linkBtn.textContent = "Link a new device";
+      linkBtn.onclick = () => {
+        void api.linkDeviceStart().then((r) => {
+          if (r?.payload) {
+            this.linkDevicePayload = r.payload;
+            this.render();
+          }
+        }).catch((e) => {
+          this.announce(e instanceof AppError ? e.message : "Could not start link");
+        });
+      };
+      body.append(label, sel, linkBtn);
     } else if (this.settingsSection === "recovery") {
       body.innerHTML = `<h2 class="text-22">Recovery</h2><p class="muted text-13">Your recovery code was shown once when the vault was created or when recovery was first set up. It unlocks the vault if you forget your passphrase (with your backup file).</p>`;
       const ack = this.status?.recovery_acknowledged;
@@ -1300,6 +1423,30 @@ export class App {
     back.appendChild(modal);
     return back;
   }
+}
+
+function parseLinkDevicePayload(
+  raw: string,
+): { source_api: string; link_id: string } | null {
+  const t = raw.trim();
+  if (!t) return null;
+  try {
+    const j = JSON.parse(t) as {
+      kind?: string;
+      source_api?: string;
+      link_id?: string;
+    };
+    if (
+      j.kind === "hush-link-device" &&
+      typeof j.source_api === "string" &&
+      typeof j.link_id === "string"
+    ) {
+      return { source_api: j.source_api, link_id: j.link_id };
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 function sleep(ms: number): Promise<void> {

@@ -106,4 +106,14 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(prefs),
     }),
+  linkDeviceStart: () =>
+    request<import("./types").LinkDeviceStartResponse>(
+      "/api/link-device/start",
+      { method: "POST" },
+    ),
+  linkDevicePull: (source_api: string, link_id: string) =>
+    request<null>("/api/link-device/pull", {
+      method: "POST",
+      body: JSON.stringify({ source_api, link_id }),
+    }),
 };

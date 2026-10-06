@@ -1,4 +1,5 @@
 mod account_worker;
+mod link_device;
 mod paths;
 mod security;
 mod suspend_lock;
@@ -10,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use account_worker::{AccountWorker, ContactDto, WorkResult};
 use axum::{
-    extract::State,
+    body::Bytes,
+    extract::{Path, State},
     http::{header, Method, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -36,6 +38,7 @@ struct App {
     worker: AccountWorker,
     unlocked: Mutex<bool>,
     unlocked_at: Mutex<Option<Instant>>,
+    link_device: link_device::LinkDeviceStore,
 }
 
 #[derive(Serialize)]
@@ -158,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker: AccountWorker::spawn(),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
+        link_device: link_device::LinkDeviceStore::new(),
     };
     let state = Arc::new(app);
 
@@ -185,6 +189,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/recovery/pending", get(recovery_pending))
         .route("/api/recovery/acknowledge", post(recovery_acknowledge))
         .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs))
+        .route("/api/link-device/start", post(link_device_start))
+        .route("/api/link-device/pull", post(link_device_pull))
+        .route("/api/link-device/{id}", get(link_device_get))
         .layer(local_ui_cors())
         .with_state(state.clone());
 
@@ -561,6 +568,119 @@ async fn recovery_acknowledge(
 
 async fn get_ui_prefs(State(state): State<Arc<App>>) -> Json<ui_prefs::UiPrefs> {
     Json(ui_prefs::load(&state.dir))
+}
+
+#[derive(Serialize)]
+struct LinkDeviceStartResponse {
+    link_id: String,
+    expires_unix: u64,
+    /// Paste or scan on the new device together with your daemon URL on the LAN.
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct LinkDevicePullRequest {
+    source_api: String,
+    link_id: String,
+}
+
+async fn link_device_start(
+    State(state): State<Arc<App>>,
+) -> Result<Json<LinkDeviceStartResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    if !*state.unlocked.lock().await {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "unlock vault to link a new device".into(),
+            }),
+        ));
+    }
+    let result = map_err(state.worker.backup_export().await)?;
+    match result {
+        WorkResult::Backup(data) => {
+            let (link_id, expires_unix) = state.link_device.store(data).await;
+            let api = std::env::var("HUSH_DAEMON_ADDR").unwrap_or_else(|_| "127.0.0.1:9876".into());
+            let payload = serde_json::json!({
+                "v": 1,
+                "kind": "hush-link-device",
+                "link_id": link_id,
+                "source_api": format!("http://{}", api),
+                "expires_unix": expires_unix,
+            });
+            Ok(Json(LinkDeviceStartResponse {
+                link_id,
+                expires_unix,
+                payload: payload.to_string(),
+            }))
+        }
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "could not export vault for link".into(),
+            }),
+        )),
+    }
+}
+
+async fn link_device_get(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Bytes, StatusCode> {
+    let data = state.link_device.take(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Bytes::from(data))
+}
+
+async fn link_device_pull(
+    State(state): State<Arc<App>>,
+    Json(body): Json<LinkDevicePullRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    if *state.unlocked.lock().await {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "lock vault before importing from another device".into(),
+            }),
+        ));
+    }
+    if let Err(msg) = link_device::validate_source_api(&body.source_api) {
+        return Err((StatusCode::BAD_REQUEST, Json(ApiError { error: msg })));
+    }
+    let base = body.source_api.trim().trim_end_matches('/');
+    let url = format!("{}/api/link-device/{}", base, body.link_id.trim());
+    let bytes = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: format!("could not reach source device: {}", e),
+                }),
+            )
+        })?
+        .error_for_status()
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: format!("source device rejected link: {}", e),
+                }),
+            )
+        })?
+        .bytes()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: format!("download failed: {}", e),
+                }),
+            )
+        })?;
+    map_err(state.worker.backup_import(&state.dir, bytes.to_vec()).await)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn put_ui_prefs(
