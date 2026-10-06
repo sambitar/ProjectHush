@@ -375,6 +375,20 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 ---
 
+### Task 16: Notes dashboard (sticky papers — planning only)
+
+**Goal:** Private **sticky-note** board in the capsule: papers on a dashboard or **grouped** stacks, **drag-and-drop** layout, **checklists** with check-off — encrypted local store, backup via Task **6**. Visual metaphor: real note paper (Soft Daylight), not a collaborative whiteboard.
+
+**Status:** Not implemented.
+
+→ **[`docs/tasks/notes-dashboard.md`](../tasks/notes-dashboard.md)**
+
+**Depends on:** Task **5c**, **6**. **Independent** of Articles (Task **11**). Optional link to **projects** (Task **14.2**) later.
+
+**Not v1:** No multi-user live board on Hush infrastructure; no publishing notes to Nostr by default.
+
+---
+
 ### Task 8: Deliberately later (do not start)
 
 - Stripe
@@ -388,3 +402,4 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 - **Distro / OS image** (stages 2–5 in [`DISTRO_READINESS.md`](../DISTRO_READINESS.md)) — app must meet distro-ready acceptance criteria first
 - **Articles implementation** (Task **11**) — after v1 messaging dogfood + **5c**/**6** foundations unless reprioritized
 - **Knowledge layer Phases B–D** (Tasks **13–15**) — see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)
+- **Notes dashboard** (Task **16**) — sticky papers, groups, checklists on encrypted local board

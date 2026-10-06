@@ -24,7 +24,7 @@ Device link (old device alive): show a QR from the unlocked old device; new devi
 ## Queues
 
 - Creating a contact mints (or rotates) a queue the *other* party can send into.
-- Sender uploads: `PUT /q/{queue_id}` with ciphertext + proof they know the slot secret (exact auth: spec during implementation; must not require a global user id).
+- Sender uploads: `PUT /q/{queue_id}` with **opaque ciphertext bytes** (Signal message only; no cleartext sender id in the relay blob) + proof they know the slot secret (exact auth: spec during implementation; must not require a global user id).
 - Recipient lists/drains their queues; then deletes blobs.
 - TTL: **7 days**, then the relay drops the blob.
 - Max blob: **1 MiB** for v1 messages; larger files: encrypt in the vault, send a pointer + chunks as multiple blobs or a follow-up (keep v1 files small if needed rather than inventing a CDN).

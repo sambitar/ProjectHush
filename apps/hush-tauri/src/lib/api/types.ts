@@ -17,7 +17,18 @@ export interface ReceivedDto {
   kind: string;
   text?: string;
   file_name?: string;
-  saved_path?: string;
+  file_size?: number;
+  blob_id?: string;
+}
+
+export interface ChatRecordDto {
+  id: string;
+  contact_nick: string;
+  outgoing: boolean;
+  ts_ms: number;
+  payload:
+    | { t: "text"; body: string }
+    | { t: "file"; name: string; blob_id_hex: string; size: number };
 }
 
 export interface RecvResponse {
@@ -41,6 +52,7 @@ export interface ChatMessage {
   fileSize?: number;
   fileData?: Uint8Array;
   savedPath?: string;
+  blobId?: string;
   createdAt: number;
   delivery: DeliveryState;
   queuedUntil?: number;

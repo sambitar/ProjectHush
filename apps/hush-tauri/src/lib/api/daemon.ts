@@ -1,4 +1,5 @@
 import type {
+  ChatRecordDto,
   ContactDto,
   InviteResponse,
   RecvResponse,
@@ -76,4 +77,7 @@ export const api = {
       body: JSON.stringify({ to, name, data_base64 }),
     }),
   recv: () => request<RecvResponse>("/api/recv", { method: "POST" }),
+  messages: () => request<ChatRecordDto[]>("/api/messages"),
+  blob: (id: string) =>
+    request<{ data_base64: string }>(`/api/blob/${encodeURIComponent(id)}`),
 };

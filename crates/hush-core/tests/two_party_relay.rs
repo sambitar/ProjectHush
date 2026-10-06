@@ -1,4 +1,4 @@
-use hush_core::Account;
+use hush_core::{Account, InvitePayload, RelayClient};
 use hush_relay::{RelayConfig, router};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
@@ -59,5 +59,83 @@ async fn two_accounts_exchange_encrypted_text() {
         hush_core::MessagePayload::Text {
             body: "hello back from alice".into()
         }
+    );
+}
+
+#[tokio::test]
+async fn relay_blob_has_no_cleartext_sender_json() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    let alice_invite = alice.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+
+    bob.send_text("alice", "opaque wire test").await.unwrap();
+
+    let alice_inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
+    let client = RelayClient::new(&relay);
+    let ids = client
+        .list(&alice_inv.queue_id, &alice_inv.queue_token)
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    let body = client
+        .get(&alice_inv.queue_id, &alice_inv.queue_token, &ids[0])
+        .await
+        .unwrap();
+    assert!(
+        !body.windows(7).any(|w| w == b"\"from\""),
+        "relay blob must not be legacy JSON envelope"
+    );
+    let bob_id = bob.protocol_name();
+    assert!(
+        !body
+            .windows(bob_id.len())
+            .any(|w| w == bob_id.as_bytes()),
+        "relay blob must not contain sender protocol name"
+    );
+
+    let inbox = alice.recv().await.unwrap();
+    assert_eq!(inbox.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn chat_history_survives_reopen() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    let alice_invite = alice.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+
+    bob.send_text("alice", "persist me").await.unwrap();
+    alice.recv().await.unwrap();
+
+    let alice2 = Account::open(alice_dir.path(), "alice-pass").await.unwrap();
+    assert_eq!(alice2.chat_history().len(), 1);
+    assert_eq!(
+        alice2.chat_history()[0].contact_nick,
+        "bob"
     );
 }

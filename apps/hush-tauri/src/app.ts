@@ -5,6 +5,7 @@ import {
   addOutgoingText,
   allFileMessages,
   clearChatStore,
+  loadHistory,
   deliveryLabel,
   getThread,
   hasUnread,
@@ -211,6 +212,8 @@ export class App {
         ring.classList.add("bloom");
         await sleep(400);
         await this.refreshStatus();
+        const history = await api.messages();
+        if (history) loadHistory(history);
         this.render();
       } catch (e) {
         card.classList.add("shake");

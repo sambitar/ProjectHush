@@ -1,5 +1,10 @@
 import { RELAY_TTL_MS } from "./constants";
-import type { ChatMessage, DeliveryState, ReceivedDto } from "./api/types";
+import type {
+  ChatMessage,
+  ChatRecordDto,
+  DeliveryState,
+  ReceivedDto,
+} from "./api/types";
 
 const threads = new Map<string, ChatMessage[]>();
 const unread = new Set<string>();
@@ -14,6 +19,31 @@ export function clearChatStore(): void {
   threads.clear();
   unread.clear();
   idSeq = 0;
+}
+
+export function loadHistory(records: ChatRecordDto[]): void {
+  clearChatStore();
+  for (const r of records) {
+    const base = {
+      id: r.id,
+      contactNick: r.contact_nick,
+      outgoing: r.outgoing,
+      createdAt: r.ts_ms,
+      delivery: "delivered" as DeliveryState,
+      reactions: [] as string[],
+    };
+    if (r.payload.t === "text") {
+      push(r.contact_nick, { ...base, kind: "text", text: r.payload.body });
+    } else {
+      push(r.contact_nick, {
+        ...base,
+        kind: "file",
+        fileName: r.payload.name,
+        fileSize: r.payload.size,
+        blobId: r.payload.blob_id_hex,
+      });
+    }
+  }
 }
 
 export function getThread(nick: string): ChatMessage[] {
@@ -108,7 +138,8 @@ export function ingestIncoming(from: string, dto: ReceivedDto): ChatMessage {
     kind: dto.kind === "file" ? "file" : "text",
     text: dto.text,
     fileName: dto.file_name,
-    savedPath: dto.saved_path,
+    blobId: dto.blob_id,
+    fileSize: dto.file_size,
     createdAt: Date.now(),
     delivery: "delivered",
     reactions: [],

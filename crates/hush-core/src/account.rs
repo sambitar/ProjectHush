@@ -5,6 +5,7 @@ use libsignal_protocol::{IdentityKeyStore, InMemSignalProtocolStore};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::chat_log::ChatLog;
 use crate::crypto::{decrypt, encrypt, random_bytes};
 use crate::error::Error;
 use crate::invite::InvitePayload;
@@ -16,7 +17,8 @@ use crate::signal::{
     process_contact_bundle, protocol_name_from_identity,
 };
 use crate::signal_persist::{export_store, import_store};
-use crate::vault::Vault;
+use crate::vault::{BlobId, Vault};
+use crate::wire::{decode_relay_blob, encode_relay_blob};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Contact {
@@ -41,17 +43,12 @@ struct AccountState {
     invite_cache: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct WireEnvelope {
-    from: String,
-    ct: Vec<u8>,
-}
-
 pub struct Account {
     vault: Vault,
     store: InMemSignalProtocolStore,
     state: AccountState,
     dir: PathBuf,
+    chat_log: ChatLog,
 }
 
 impl Account {
@@ -75,11 +72,14 @@ impl Account {
             contacts: Vec::new(),
             invite_cache: None,
         };
+        let master = *vault.master_key();
+        let chat_log = ChatLog::load(dir, &master)?;
         let account = Self {
             vault,
             store,
             state,
             dir: dir.to_path_buf(),
+            chat_log,
         };
         account.save().await?;
         Ok(account)
@@ -94,12 +94,23 @@ impl Account {
         let signal_bytes = fs::read(dir.join("signal.enc")).map_err(|_| Error::NotFound)?;
         let signal_plain = decrypt(master, &signal_bytes)?;
         let store = import_store(&signal_plain).await?;
+        let master = *vault.master_key();
+        let chat_log = ChatLog::load(dir, &master)?;
         Ok(Self {
             vault,
             store,
             state,
             dir: dir.to_path_buf(),
+            chat_log,
         })
+    }
+
+    pub fn chat_history(&self) -> &[crate::chat_log::ChatRecord] {
+        self.chat_log.messages()
+    }
+
+    pub fn read_blob(&self, id: &BlobId) -> Result<Vec<u8>, Error> {
+        self.vault.get_blob(id)
     }
 
     pub fn vault_dir(&self) -> &Path {
@@ -179,7 +190,11 @@ impl Account {
                 body: text.to_string(),
             },
         )
-        .await
+        .await?;
+        let master = *self.vault.master_key();
+        self.chat_log
+            .append_text(&master, nickname, true, text)?;
+        Ok(())
     }
 
     pub async fn send_file(&mut self, nickname: &str, path: &Path) -> Result<(), Error> {
@@ -201,7 +216,7 @@ impl Account {
         if data.len() > MAX_INLINE_FILE_BYTES {
             return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
         }
-        self.vault.put_blob(data)?;
+        let blob_id = self.vault.put_blob(data)?;
         self.send_payload(
             nickname,
             MessagePayload::File {
@@ -209,7 +224,17 @@ impl Account {
                 data: data.to_vec(),
             },
         )
-        .await
+        .await?;
+        let master = *self.vault.master_key();
+        self.chat_log.append_file(
+            &master,
+            nickname,
+            true,
+            name,
+            &blob_id,
+            data.len() as u64,
+        )?;
+        Ok(())
     }
 
     async fn send_payload(&mut self, nickname: &str, payload: MessagePayload) -> Result<(), Error> {
@@ -225,11 +250,7 @@ impl Account {
             plain.as_slice(),
         )
         .await?;
-        let wire = WireEnvelope {
-            from: self.state.protocol_name.clone(),
-            ct,
-        };
-        let body = serde_json::to_vec(&wire).map_err(|_| Error::Corrupt)?;
+        let body = encode_relay_blob(&ct);
         let relay = RelayClient::new(&self.state.relay);
         relay
             .put(&contact.queue_id, &contact.queue_token, &body)
@@ -254,47 +275,79 @@ impl Account {
                     &blob_id,
                 )
                 .await?;
-            let wire: WireEnvelope = serde_json::from_slice(&body).map_err(|_| Error::Corrupt)?;
-            let plain = match decrypt_message(
-                &mut self.store,
-                &self.state.protocol_name,
-                &wire.from,
-                &wire.ct,
-            )
-            .await
-            {
-                Ok(p) => p,
-                Err(Error::Session) => {
-                    warnings.push(format!(
-                        "Could not read a message from {} — they may not have added your invite yet (use Copy my invite on your side, they paste it under Add contact).",
-                        short_name(&wire.from)
-                    ));
-                    continue;
-                }
-                Err(e) => return Err(e),
+            let (ct, legacy_from) = decode_relay_blob(&body)?;
+            let (plain, from_protocol) = match legacy_from {
+                Some(from) => match decrypt_message(
+                    &mut self.store,
+                    &self.state.protocol_name,
+                    &from,
+                    &ct,
+                )
+                .await
+                {
+                    Ok(p) => (p, from),
+                    Err(Error::Session) => {
+                        warnings.push(format!(
+                            "Could not read a message from {} — they may not have added your invite yet (use Copy my invite on your side, they paste it under Add contact).",
+                            short_name(&from)
+                        ));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                },
+                None => match self.try_decrypt_from_any_contact(&ct).await {
+                    Ok(pair) => pair,
+                    Err(Error::Session) => {
+                        warnings.push(
+                            "Could not decrypt a queued message — unknown sender or session not ready.".into(),
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                },
             };
             let payload = decode_legacy_payload(&plain)?;
-            if let MessagePayload::File { data, .. } = &payload {
-                self.vault.put_blob(data)?;
-            }
+            let file_blob_id = if let MessagePayload::File { data, name } = &payload {
+                let id = self.vault.put_blob(data)?;
+                let master = *self.vault.master_key();
+                let nick = self
+                    .contact_nick_for_protocol(&from_protocol)
+                    .unwrap_or_else(|| short_name(&from_protocol));
+                self.chat_log.append_file(
+                    &master,
+                    &nick,
+                    false,
+                    name,
+                    &id,
+                    data.len() as u64,
+                )?;
+                Some(id)
+            } else {
+                let master = *self.vault.master_key();
+                let nick = self
+                    .contact_nick_for_protocol(&from_protocol)
+                    .unwrap_or_else(|| short_name(&from_protocol));
+                if let MessagePayload::Text { body } = &payload {
+                    self.chat_log
+                        .append_text(&master, &nick, false, body)?;
+                }
+                None
+            };
             if let Some(c) = self
                 .state
                 .contacts
                 .iter_mut()
-                .find(|c| c.protocol_name == wire.from)
+                .find(|c| c.protocol_name == from_protocol)
             {
                 c.inbound_ready = true;
             }
             let nick = self
-                .state
-                .contacts
-                .iter()
-                .find(|c| c.protocol_name == wire.from)
-                .map(|c| c.nickname.clone())
-                .unwrap_or_else(|| short_name(&wire.from));
+                .contact_nick_for_protocol(&from_protocol)
+                .unwrap_or_else(|| short_name(&from_protocol));
             out.push(ReceivedMessage {
                 from_nick: nick,
                 payload,
+                file_blob_id,
             });
             relay
                 .delete(
@@ -316,6 +369,39 @@ impl Account {
 
     fn find_contact(&self, nickname: &str) -> Option<&Contact> {
         self.state.contacts.iter().find(|c| c.nickname == nickname)
+    }
+
+    fn contact_nick_for_protocol(&self, protocol_name: &str) -> Option<String> {
+        self.state
+            .contacts
+            .iter()
+            .find(|c| c.protocol_name == protocol_name)
+            .map(|c| c.nickname.clone())
+    }
+
+    async fn try_decrypt_from_any_contact(
+        &mut self,
+        ct: &[u8],
+    ) -> Result<(Vec<u8>, String), Error> {
+        let names: Vec<String> = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| c.protocol_name.clone())
+            .collect();
+        for name in names {
+            if let Ok(plain) = decrypt_message(
+                &mut self.store,
+                &self.state.protocol_name,
+                &name,
+                ct,
+            )
+            .await
+            {
+                return Ok((plain, name));
+            }
+        }
+        Err(Error::Session)
     }
 
     async fn save(&self) -> Result<(), Error> {

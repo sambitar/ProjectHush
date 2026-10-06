@@ -129,6 +129,8 @@ Conversation (private) → Idea → Argument → Evidence → Knowledge → Proj
   Chats/Mail         Articles               Doc→Article
   Confidential       Pen names              Evidence extract
   Library (local)    Comments               Redaction UI
+  Notes board        (public only via       (optional excerpt)
+  (Task 16)          publish bridge)
      │                    │                    │
      └────────────────────┼────────────────────┘
                           │
@@ -147,6 +149,7 @@ Conversation (private) → Idea → Argument → Evidence → Knowledge → Proj
 | **11** | [`docs/tasks/hush-articles.md`](../tasks/hush-articles.md) |
 | **12 (Phase A)** | [`docs/tasks/knowledge-layer-phase-a.md`](../tasks/knowledge-layer-phase-a.md) |
 | **13–15** | This file (Phase B–D); add `docs/tasks/` slices when Phase A is done |
+| **16** | [`docs/tasks/notes-dashboard.md`](../tasks/notes-dashboard.md) — private sticky notes (not Nostr) |
 
 ---
 

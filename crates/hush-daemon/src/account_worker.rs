@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::thread;
 
-use hush_core::{Account, Contact, InboxResult};
+use hush_core::{Account, ChatRecord, Contact, InboxResult};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct AccountWorker {
@@ -50,6 +50,13 @@ enum Work {
     Meta {
         reply: oneshot::Sender<WorkResult>,
     },
+    Messages {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    Blob {
+        id_hex: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
 }
 
 pub enum WorkResult {
@@ -62,6 +69,8 @@ pub enum WorkResult {
         vault_bytes: u64,
         contacts: usize,
     },
+    Messages(Vec<ChatRecord>),
+    Blob(Vec<u8>),
     Err(String),
 }
 
@@ -178,6 +187,40 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::Messages { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    WorkResult::Messages(a.chat_history().to_vec())
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::Blob { id_hex, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    let bytes = hex::decode(&id_hex).map_err(|_| {
+                                        WorkResult::Err("invalid blob id".into())
+                                    });
+                                    match bytes {
+                                        Err(e) => e,
+                                        Ok(b) if b.len() != 32 => {
+                                            WorkResult::Err("invalid blob id".into())
+                                        }
+                                        Ok(b) => {
+                                            let mut id = [0u8; 32];
+                                            id.copy_from_slice(&b);
+                                            match a.read_blob(&hush_core::BlobId(id)) {
+                                                Ok(data) => WorkResult::Blob(data),
+                                                Err(e) => WorkResult::Err(e.to_string()),
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
                     };
                     reply.send(result).ok();
                 }
@@ -263,5 +306,17 @@ impl AccountWorker {
 
     pub async fn meta(&self) -> WorkResult {
         self.call(|reply| Work::Meta { reply }).await
+    }
+
+    pub async fn messages(&self) -> WorkResult {
+        self.call(|reply| Work::Messages { reply }).await
+    }
+
+    pub async fn blob(&self, id_hex: &str) -> WorkResult {
+        self.call(|reply| Work::Blob {
+            id_hex: id_hex.to_string(),
+            reply,
+        })
+        .await
     }
 }

@@ -1,4 +1,5 @@
 mod account;
+mod chat_log;
 mod crypto;
 mod error;
 mod invite;
@@ -9,10 +10,13 @@ mod relay_client;
 mod signal;
 mod signal_persist;
 mod vault;
+mod wire;
 
 pub use account::{Account, Contact};
+pub use chat_log::{ChatRecord, ChatRecordPayload};
 pub use error::Error;
 pub use invite::InvitePayload;
 pub use message::{InboxResult, ReceivedMessage};
 pub use payload::{MessagePayload, MAX_INLINE_FILE_BYTES};
+pub use relay_client::RelayClient;
 pub use vault::{BlobId, IdentityPub, Vault};

@@ -13,7 +13,7 @@ use axum::{
 };
 use clap::Parser;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hush_core::{Contact, MessagePayload, ReceivedMessage};
+use hush_core::{ChatRecord, Contact, MessagePayload, ReceivedMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -99,7 +99,13 @@ struct ReceivedDto {
     kind: String,
     text: Option<String>,
     file_name: Option<String>,
-    saved_path: Option<String>,
+    file_size: Option<u64>,
+    blob_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BlobResponse {
+    data_base64: String,
 }
 
 /// libsignal protocol futures are not `Send`; account ops run on a dedicated worker thread.
@@ -127,6 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/send-file", post(send_file))
         .route("/api/send-file-data", post(send_file_data))
         .route("/api/recv", post(recv))
+        .route("/api/messages", get(messages))
+        .route("/api/blob/{id}", get(blob))
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
@@ -331,19 +339,13 @@ async fn recv(
             ))
         }
     };
-    let inbox_dir = state.dir.join("inbox");
-    let _ = std::fs::create_dir_all(&inbox_dir);
     Ok(Json(RecvResponse {
-        messages: inbox
-            .messages
-            .into_iter()
-            .map(|m| to_dto(m, &inbox_dir))
-            .collect(),
+        messages: inbox.messages.into_iter().map(to_dto).collect(),
         warnings: inbox.warnings,
     }))
 }
 
-fn to_dto(msg: ReceivedMessage, inbox: &std::path::Path) -> ReceivedDto {
+fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
     let from = msg.from_nick;
     match msg.payload {
         MessagePayload::Text { body } => ReceivedDto {
@@ -351,18 +353,51 @@ fn to_dto(msg: ReceivedMessage, inbox: &std::path::Path) -> ReceivedDto {
             kind: "text".into(),
             text: Some(body),
             file_name: None,
-            saved_path: None,
+            file_size: None,
+            blob_id: None,
         },
-        MessagePayload::File { name, data } => {
-            let path = inbox.join(format!("{}-{}", from, name));
-            let saved = std::fs::write(&path, &data).ok().map(|_| path.display().to_string());
-            ReceivedDto {
-                from,
-                kind: "file".into(),
-                text: None,
-                file_name: Some(name),
-                saved_path: saved,
-            }
-        }
+        MessagePayload::File { name, data } => ReceivedDto {
+            from,
+            kind: "file".into(),
+            text: None,
+            file_name: Some(name),
+            file_size: Some(data.len() as u64),
+            blob_id: msg.file_blob_id.map(|id| hex::encode(id.0)),
+        },
+    }
+}
+
+async fn messages(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<ChatRecord>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.messages().await)?;
+    match result {
+        WorkResult::Messages(list) => Ok(Json(list)),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+async fn blob(
+    State(state): State<Arc<App>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<BlobResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.blob(&id).await)?;
+    match result {
+        WorkResult::Blob(data) => Ok(Json(BlobResponse {
+            data_base64: STANDARD.encode(data),
+        })),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
     }
 }
