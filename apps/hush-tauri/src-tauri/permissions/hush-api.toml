@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-hush-api"
+description = "Proxy daemon API calls over the local Unix socket"
+commands.allow = ["hush_api"]

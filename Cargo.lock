@@ -2429,11 +2429,19 @@ dependencies = [
 name = "hush-tauri"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "open",
  "rfd",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tokio",
+ "tower-service",
 ]
 
 [[package]]

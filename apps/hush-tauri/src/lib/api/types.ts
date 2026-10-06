@@ -8,6 +8,8 @@ export interface StatusResponse {
   last_backup_unix: number;
   relay: string;
   relay_source: string;
+  socket: string | null;
+  tcp_addr: string | null;
 }
 
 export interface ContactDto {

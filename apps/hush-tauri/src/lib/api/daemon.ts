@@ -1,3 +1,5 @@
+import { invoke } from "@tauri-apps/api/core";
+import { isTauriShell } from "../tauriEnv";
 import type {
   ChatRecordDto,
   ContactDto,
@@ -6,8 +8,23 @@ import type {
   StatusResponse,
 } from "./types";
 
+type Transport =
+  | { kind: "unix"; path: string }
+  | { kind: "tcp"; base: string };
+
+/**
+ * How to reach the daemon. The desktop shell injects the real transport
+ * (Unix socket by default, DR-02); a plain browser falls back to loopback HTTP.
+ */
+function transport(): Transport {
+  const t = window.__HUSH_TRANSPORT__;
+  if (t && (t.kind === "unix" || t.kind === "tcp")) return t;
+  return { kind: "tcp", base: window.__HUSH_API__ || "http://127.0.0.1:9876" };
+}
+
 export function getApiBase(): string {
-  return window.__HUSH_API__ || "http://127.0.0.1:9876";
+  const t = transport();
+  return t.kind === "unix" ? `unix://${t.path}` : t.base;
 }
 
 export class AppError extends Error {
@@ -17,37 +34,68 @@ export class AppError extends Error {
   }
 }
 
+interface RawReply {
+  status: number;
+  body: string;
+}
+
+async function send(
+  method: string,
+  path: string,
+  body: string | undefined,
+): Promise<RawReply> {
+  const t = transport();
+  if (t.kind === "unix") {
+    if (!isTauriShell()) {
+      throw new AppError(
+        `The daemon is on a Unix socket (${t.path}); open the Hush desktop app to use it.`,
+      );
+    }
+    const reply = await invoke<RawReply>("hush_api", {
+      method,
+      path,
+      body: body ?? null,
+    });
+    return { status: reply.status, body: reply.body };
+  }
+  const res = await fetch(t.base + path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body,
+  });
+  return { status: res.status, body: await res.text() };
+}
+
 async function request<T>(
   path: string,
   opts: RequestInit = {},
 ): Promise<T | null> {
-  let res: Response;
+  const method = typeof opts.method === "string" ? opts.method : "GET";
+  const body = typeof opts.body === "string" ? opts.body : undefined;
+  let reply: RawReply;
   try {
-    res = await fetch(getApiBase() + path, {
-      headers: { "Content-Type": "application/json" },
-      ...opts,
-    });
-  } catch {
+    reply = await send(method, path, body);
+  } catch (e) {
+    if (e instanceof AppError) throw e;
     throw new AppError(
       `Can't reach the Hush daemon at ${getApiBase()}. Start it with: cargo run -p hush-daemon -- --dir <vault>`,
     );
   }
-  if (!res.ok) {
+  if (reply.status < 200 || reply.status >= 300) {
     let msg = "Something went wrong";
-    const body = await res.text();
     try {
-      const j = JSON.parse(body) as { error?: string };
+      const j = JSON.parse(reply.body) as { error?: string };
       if (j.error) msg = j.error;
     } catch {
-      if (body && body.length < 200) msg = body;
+      if (reply.body && reply.body.length < 200) msg = reply.body;
     }
-    if (res.status === 401 && path.includes("unlock")) {
+    if (reply.status === 401 && path.includes("unlock")) {
       throw new AppError("That passphrase didn't work. Try again.");
     }
     throw new AppError(msg);
   }
-  if (res.status === 204) return null;
-  return res.json() as Promise<T>;
+  if (reply.status === 204 || !reply.body) return null;
+  return JSON.parse(reply.body) as T;
 }
 
 export const api = {

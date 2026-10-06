@@ -17,18 +17,23 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::paths::default_runtime_dir;
 use crate::relay_client::normalize_relay_base;
 
 /// Default relay for a fresh local dogfood run.
 pub const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8787";
-/// Default daemon HTTP bind address.
+/// Default daemon HTTP bind address, used only when TCP is explicitly enabled.
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:9876";
 /// Environment override for the relay URL.
 pub const ENV_RELAY_URL: &str = "HUSH_RELAY_URL";
-/// Environment override for the daemon bind address.
+/// Environment override for the daemon bind address (enables the TCP listener).
 pub const ENV_DAEMON_ADDR: &str = "HUSH_DAEMON_ADDR";
+/// Environment override for the daemon Unix socket path.
+pub const ENV_DAEMON_SOCKET: &str = "HUSH_DAEMON_SOCKET";
 
 pub const CONFIG_FILE_NAME: &str = "client-config.json";
+/// Unix socket file name inside the runtime dir (DR-02).
+pub const SOCKET_FILE_NAME: &str = "hush-daemon.sock";
 
 /// Where a resolved value came from, for `config show` and status reporting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,9 +62,13 @@ pub struct ClientConfig {
     /// Relay used when creating a new vault.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
-    /// Address the daemon binds to.
+    /// TCP bind address for the daemon. Setting this opts the TCP listener back in;
+    /// the default is Unix socket only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_addr: Option<String>,
+    /// Unix socket path for the daemon API, overriding the runtime-dir default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_socket: Option<String>,
 }
 
 fn default_version() -> u32 {
@@ -72,6 +81,7 @@ impl Default for ClientConfig {
             v: 1,
             relay_url: None,
             daemon_addr: None,
+            daemon_socket: None,
         }
     }
 }
@@ -130,25 +140,55 @@ pub fn resolve_relay_url(data_dir: &Path, explicit: Option<&str>) -> String {
 }
 
 /// Effective daemon bind address plus the source that supplied it.
+///
+/// `None` means "no TCP listener": the Unix socket is the default API (DR-02),
+/// and TCP only opens when a flag, env var, or the config file asks for it.
 pub fn resolve_daemon_addr_with_source(
     data_dir: &Path,
     explicit: Option<&str>,
-) -> (String, ConfigSource) {
+) -> (Option<String>, ConfigSource) {
     if let Some(v) = non_empty(explicit) {
-        return (v.to_string(), ConfigSource::Argument);
+        return (Some(v.to_string()), ConfigSource::Argument);
     }
     if let Some(v) = non_empty(std::env::var(ENV_DAEMON_ADDR).ok().as_deref()) {
-        return (v.to_string(), ConfigSource::Env);
+        return (Some(v.to_string()), ConfigSource::Env);
     }
     if let Some(v) = non_empty(load(data_dir).daemon_addr.as_deref()) {
-        return (v.to_string(), ConfigSource::File);
+        return (Some(v.to_string()), ConfigSource::File);
     }
-    (DEFAULT_DAEMON_ADDR.to_string(), ConfigSource::Default)
+    (None, ConfigSource::Default)
 }
 
-/// Effective daemon bind address.
-pub fn resolve_daemon_addr(data_dir: &Path, explicit: Option<&str>) -> String {
+/// Effective daemon bind address, or `None` when TCP is not enabled.
+pub fn resolve_daemon_addr(data_dir: &Path, explicit: Option<&str>) -> Option<String> {
     resolve_daemon_addr_with_source(data_dir, explicit).0
+}
+
+/// Default Unix socket path: `{runtime_dir}/hush-daemon.sock`.
+pub fn default_socket_path() -> PathBuf {
+    default_runtime_dir().join(SOCKET_FILE_NAME)
+}
+
+/// Effective daemon Unix socket path plus the source that supplied it.
+pub fn resolve_daemon_socket_with_source(
+    data_dir: &Path,
+    explicit: Option<&str>,
+) -> (PathBuf, ConfigSource) {
+    if let Some(v) = non_empty(explicit) {
+        return (PathBuf::from(v), ConfigSource::Argument);
+    }
+    if let Some(v) = non_empty(std::env::var(ENV_DAEMON_SOCKET).ok().as_deref()) {
+        return (PathBuf::from(v), ConfigSource::Env);
+    }
+    if let Some(v) = non_empty(load(data_dir).daemon_socket.as_deref()) {
+        return (PathBuf::from(v), ConfigSource::File);
+    }
+    (default_socket_path(), ConfigSource::Default)
+}
+
+/// Effective daemon Unix socket path.
+pub fn resolve_daemon_socket(data_dir: &Path, explicit: Option<&str>) -> PathBuf {
+    resolve_daemon_socket_with_source(data_dir, explicit).0
 }
 
 fn non_empty(v: Option<&str>) -> Option<&str> {
@@ -177,7 +217,38 @@ mod tests {
             let (relay, source) = resolve_relay_url_with_source(dir.path(), None);
             assert_eq!(relay, DEFAULT_RELAY_URL);
             assert_eq!(source, ConfigSource::Default);
-            assert_eq!(resolve_daemon_addr(dir.path(), None), DEFAULT_DAEMON_ADDR);
+            // DR-02: no TCP unless asked for; socket is the default API.
+            assert_eq!(resolve_daemon_addr(dir.path(), None), None);
+            assert_eq!(resolve_daemon_socket(dir.path(), None), default_socket_path());
+        });
+    }
+
+    #[test]
+    fn socket_path_precedence_is_argument_then_env_then_file() {
+        with_clean_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            save(
+                dir.path(),
+                &ClientConfig {
+                    daemon_socket: Some("/tmp/from-file.sock".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                resolve_daemon_socket(dir.path(), None),
+                PathBuf::from("/tmp/from-file.sock")
+            );
+
+            std::env::set_var(ENV_DAEMON_SOCKET, "/tmp/from-env.sock");
+            assert_eq!(
+                resolve_daemon_socket(dir.path(), None),
+                PathBuf::from("/tmp/from-env.sock")
+            );
+            assert_eq!(
+                resolve_daemon_socket(dir.path(), Some("/tmp/from-flag.sock")),
+                PathBuf::from("/tmp/from-flag.sock")
+            );
         });
     }
 
@@ -199,7 +270,10 @@ mod tests {
                 resolve_relay_url_with_source(dir.path(), None),
                 ("http://10.0.0.5:8787".into(), ConfigSource::File)
             );
-            assert_eq!(resolve_daemon_addr(dir.path(), None), "127.0.0.1:9999");
+            assert_eq!(
+                resolve_daemon_addr(dir.path(), None),
+                Some("127.0.0.1:9999".to_string())
+            );
             assert_eq!(
                 resolve_relay_url_with_source(dir.path(), Some("http://127.0.0.1:1")),
                 ("http://127.0.0.1:1".into(), ConfigSource::Argument)

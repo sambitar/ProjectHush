@@ -5,7 +5,7 @@
 | ID | Violation | Location / notes | Suggested owner task |
 |----|-----------|------------------|----------------------|
 | DR-01 | No unified **`HUSH_DATA_DIR`**; vault via `--dir` only; relay DB often `relay.db` in cwd | `hush-core::paths`, daemon/cli/relay | Task 5 — **done** (`resolve_data_dir`, relay under data root) |
-| DR-02 | Daemon listens on **TCP** `127.0.0.1:9876` by default, not Unix socket in runtime dir | `crates/hush-daemon/src/main.rs` | Task 5 — **open** (Tauri fetch needs loopback HTTP for now) |
+| DR-02 | Daemon listens on **TCP** `127.0.0.1:9876` by default, not Unix socket in runtime dir | `crates/hush-daemon/src/main.rs` | Task 5 — **done** (socket `{runtime_dir}/hush-daemon.sock` at `0600` by default; TCP only via `--addr` / `HUSH_DAEMON_ADDR` / config; Tauri proxies over the socket) |
 | DR-03 | **`CorsLayer::permissive()`** on daemon HTTP API | `hush-daemon/src/main.rs` | Task 5 — **done** (loopback + Tauri origins only) |
 | DR-04 | **Plaintext `inbox/*`** after file recv | `hush-daemon` `to_dto` | Task 5c.2 — **done** |
 | DR-05 | UI state in **`localStorage`** (theme, avatar photos) outside data root | `ui-prefs.json` + `/api/ui-prefs` | Task 5 — **done** |

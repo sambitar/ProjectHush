@@ -29,15 +29,25 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 struct Args {
     #[arg(long, default_value = ".")]
     dir: PathBuf,
-    /// HTTP bind address. Defaults to HUSH_DAEMON_ADDR, then client-config.json.
+    /// TCP bind address. TCP is off unless this, HUSH_DAEMON_ADDR, or
+    /// client-config.json sets one; the Unix socket is always the default API.
     #[arg(long, env = "HUSH_DAEMON_ADDR")]
     addr: Option<String>,
+    /// Unix socket path. Defaults to HUSH_DAEMON_SOCKET, then client-config.json,
+    /// then `{runtime_dir}/hush-daemon.sock`.
+    #[arg(long, env = "HUSH_DAEMON_SOCKET")]
+    socket: Option<String>,
+    /// Skip the Unix socket listener (TCP-only debugging).
+    #[arg(long)]
+    no_socket: bool,
 }
 
 struct App {
     dir: PathBuf,
-    /// Resolved HTTP bind address (flag/env > client-config.json > default).
-    addr: String,
+    /// Unix socket the API is bound to; `None` when `--no-socket` (DR-02).
+    socket: Option<PathBuf>,
+    /// Resolved TCP bind address, if TCP was explicitly enabled.
+    tcp_addr: Option<String>,
     worker: AccountWorker,
     unlocked: Mutex<bool>,
     unlocked_at: Mutex<Option<Instant>>,
@@ -57,6 +67,10 @@ struct StatusResponse {
     relay: String,
     /// Where the relay value came from when it is not the vault's stored one.
     relay_source: String,
+    /// Unix socket the daemon API is bound to (`null` when disabled).
+    socket: Option<String>,
+    /// TCP bind address, when the TCP listener is enabled.
+    tcp_addr: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,10 +177,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     security::harden_process();
     let args = Args::parse();
     let vault_dir = paths::vault_dir_from_args(args.dir);
-    let addr = hush_core::config::resolve_daemon_addr(&vault_dir, args.addr.as_deref());
+    let tcp_addr = hush_core::config::resolve_daemon_addr(&vault_dir, args.addr.as_deref());
+    let socket = hush_core::config::resolve_daemon_socket(&vault_dir, args.socket.as_deref());
+    if args.no_socket && tcp_addr.is_none() {
+        return Err("--no-socket needs a TCP address (--addr / HUSH_DAEMON_ADDR)".into());
+    }
     let app = App {
         dir: vault_dir,
-        addr: addr.clone(),
+        socket: if args.no_socket {
+            None
+        } else {
+            Some(socket.clone())
+        },
+        tcp_addr: tcp_addr.clone(),
         worker: AccountWorker::spawn(),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
@@ -204,14 +227,170 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(local_ui_cors())
         .with_state(state.clone());
 
-    let vault_dir = state.dir.display().to_string();
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let socket_listener = if args.no_socket {
+        None
+    } else {
+        Some(bind_socket(&socket)?)
+    };
+    let tcp_listener = match tcp_addr.as_deref() {
+        Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
+        None => None,
+    };
+    let shutdown_rx = spawn_shutdown_watch();
+
     eprintln!(
-        "hush-daemon on http://{} vault={} (set HUSH_DATA_DIR for default data root)",
-        addr, vault_dir
+        "hush-daemon vault={} socket={}{}",
+        state.dir.display(),
+        if args.no_socket {
+            "(disabled)".to_string()
+        } else {
+            socket.display().to_string()
+        },
+        match &tcp_addr {
+            Some(a) => format!(" tcp=http://{}", a),
+            None => String::new(),
+        }
     );
-    axum::serve(listener, router).await?;
+
+    match (socket_listener, tcp_listener) {
+        (Some(unix), Some(tcp)) => {
+            let tcp_router = router.clone();
+            let mut tcp_rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let res = axum::serve(tcp, tcp_router)
+                    .with_graceful_shutdown(async move {
+                        let _ = tcp_rx.changed().await;
+                    })
+                    .await;
+                if let Err(e) = res {
+                    eprintln!("hush-daemon: tcp listener stopped: {e}");
+                }
+            });
+            let mut unix_rx = shutdown_rx.clone();
+            axum::serve(unix, router)
+                .with_graceful_shutdown(async move {
+                    let _ = unix_rx.changed().await;
+                })
+                .await?;
+        }
+        (Some(unix), None) => {
+            let mut unix_rx = shutdown_rx.clone();
+            axum::serve(unix, router)
+                .with_graceful_shutdown(async move {
+                    let _ = unix_rx.changed().await;
+                })
+                .await?;
+        }
+        (None, Some(tcp)) => {
+            let mut tcp_rx = shutdown_rx.clone();
+            axum::serve(tcp, router)
+                .with_graceful_shutdown(async move {
+                    let _ = tcp_rx.changed().await;
+                })
+                .await?;
+        }
+        (None, None) => return Err("no listener configured".into()),
+    }
+
+    if !args.no_socket {
+        let _ = std::fs::remove_file(&socket);
+    }
     Ok(())
+}
+
+/// Resolve on SIGINT or SIGTERM so the socket file is removed, not leaked.
+fn spawn_shutdown_watch() -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut term) = signal(SignalKind::terminate()) {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        let _ = tx.send(true);
+    });
+    rx
+}
+
+/// Create the runtime dir, clear a stale socket, and bind with `0600`.
+///
+/// A socket that still accepts connections belongs to a live daemon: we refuse
+/// rather than unlink it out from under that process.
+fn bind_socket(path: &std::path::Path) -> std::io::Result<tokio::net::UnixListener> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) if is_socket_file(path) => {
+            if socket_is_live(path) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "another hush-daemon is already listening on {} (use --socket to pick a different path)",
+                        path.display()
+                    ),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let listener = tokio::net::UnixListener::bind(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(listener)
+}
+
+fn is_socket_file(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// A socket that still accepts connections belongs to a running daemon.
+#[cfg(unix)]
+fn socket_is_live(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn socket_is_live(_path: &std::path::Path) -> bool {
+    false
 }
 
 async fn auto_lock_loop(state: Arc<App>) {
@@ -291,6 +470,8 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
         last_backup_unix,
         relay,
         relay_source,
+        socket: state.socket.as_ref().map(|p| p.display().to_string()),
+        tcp_addr: state.tcp_addr.clone(),
     })
 }
 
@@ -619,12 +800,22 @@ async fn link_device_start(
     let result = map_err(state.worker.backup_export().await)?;
     match result {
         WorkResult::Backup(data) => {
+            let Some(tcp) = state.tcp_addr.clone() else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError {
+                        error: "device link needs the source daemon reachable over TCP; \
+                                restart it with --addr <lan-ip>:9876"
+                            .into(),
+                    }),
+                ));
+            };
             let (link_id, expires_unix) = state.link_device.store(data).await;
             let payload = serde_json::json!({
                 "v": 1,
                 "kind": "hush-link-device",
                 "link_id": link_id,
-                "source_api": format!("http://{}", state.addr),
+                "source_api": format!("http://{}", tcp),
                 "expires_unix": expires_unix,
             });
             Ok(Json(LinkDeviceStartResponse {

@@ -63,8 +63,12 @@ enum ConfigCmd {
     Set {
         #[arg(long)]
         relay: Option<String>,
+        /// TCP bind address; empty string disables the TCP listener (socket only).
         #[arg(long)]
         daemon_addr: Option<String>,
+        /// Unix socket path; empty string restores the runtime-dir default.
+        #[arg(long)]
+        daemon_socket: Option<String>,
     },
     /// Print the config file path.
     Path,
@@ -141,22 +145,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ConfigCmd::Show => {
                 let (relay, relay_src) = config::resolve_relay_url_with_source(&dir, None);
                 let (addr, addr_src) = config::resolve_daemon_addr_with_source(&dir, None);
+                let (sock, sock_src) = config::resolve_daemon_socket_with_source(&dir, None);
                 println!("config file: {}", config::config_path(&dir).display());
                 println!("relay_url:   {}  ({})", relay, relay_src.as_str());
-                println!("daemon_addr: {}  ({})", addr, addr_src.as_str());
+                match addr {
+                    Some(a) => println!("daemon_addr: {}  ({})", a, addr_src.as_str()),
+                    None => println!("daemon_addr: (TCP off — Unix socket only)"),
+                }
+                println!("socket:      {}  ({})", sock.display(), sock_src.as_str());
                 println!(
-                    "env overrides: {} / {}",
+                    "env overrides: {} / {} / {}",
                     config::ENV_RELAY_URL,
-                    config::ENV_DAEMON_ADDR
+                    config::ENV_DAEMON_ADDR,
+                    config::ENV_DAEMON_SOCKET
                 );
             }
-            ConfigCmd::Set { relay, daemon_addr } => {
+            ConfigCmd::Set {
+                relay,
+                daemon_addr,
+                daemon_socket,
+            } => {
                 let mut cfg = config::load(&dir);
                 if let Some(v) = relay {
                     cfg.relay_url = normalize_optional(&v);
                 }
                 if let Some(v) = daemon_addr {
                     cfg.daemon_addr = normalize_optional(&v);
+                }
+                if let Some(v) = daemon_socket {
+                    cfg.daemon_socket = normalize_optional(&v);
                 }
                 config::save(&dir, &cfg).map_err(std::io::Error::other)?;
                 println!("wrote {}", config::config_path(&dir).display());

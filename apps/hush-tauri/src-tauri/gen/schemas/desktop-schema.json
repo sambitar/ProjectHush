@@ -177,6 +177,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Proxy daemon API calls over the local Unix socket",
+          "type": "string",
+          "const": "allow-hush-api",
+          "markdownDescription": "Proxy daemon API calls over the local Unix socket"
+        },
+        {
           "description": "Save and open chat attachment bytes via native dialogs",
           "type": "string",
           "const": "allow-hush-files",

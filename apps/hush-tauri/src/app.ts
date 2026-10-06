@@ -118,6 +118,8 @@ export class App {
         last_backup_unix: 0,
         relay: getApiBase(),
         relay_source: "unknown",
+        socket: null,
+        tcp_addr: null,
       };
     }
   }
@@ -1182,7 +1184,12 @@ export class App {
         ["Relay", this.status?.relay ?? "—"],
         ["Relay source", this.status?.relay_source ?? "—"],
         ["Vault", this.status?.vault_dir ?? "—"],
-        ["Daemon", getApiBase()],
+        ["API", getApiBase()],
+        [
+          "TCP",
+          this.status?.tcp_addr ??
+            "off (Unix socket only — restart with --addr to enable)",
+        ],
       ];
       const list = document.createElement("dl");
       list.className = "about-list";
