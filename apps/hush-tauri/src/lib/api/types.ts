@@ -12,6 +12,7 @@ export interface ContactDto {
   nickname: string;
   protocol_name: string;
   inbound_ready: boolean;
+  online: boolean;
 }
 
 export interface ReceivedDto {
@@ -42,8 +43,6 @@ export interface InviteResponse {
   invite: string;
 }
 
-export type DeliveryState = "sealed" | "queued" | "delivered" | "expired";
-
 export interface ChatMessage {
   id: string;
   contactNick: string;
@@ -56,8 +55,6 @@ export interface ChatMessage {
   savedPath?: string;
   blobId?: string;
   createdAt: number;
-  delivery: DeliveryState;
-  queuedUntil?: number;
   reactions: string[];
   sendProgress?: number;
 }

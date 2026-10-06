@@ -274,7 +274,8 @@ impl Account {
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
-        self.send_file_bytes(nickname, &name, &data).await
+        self.send_file_bytes(nickname, &name, &data).await?;
+        Ok(())
     }
 
     pub async fn send_file_bytes(
@@ -282,7 +283,7 @@ impl Account {
         nickname: &str,
         name: &str,
         data: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<BlobId, Error> {
         if data.len() > MAX_INLINE_FILE_BYTES {
             return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
         }
@@ -304,7 +305,27 @@ impl Account {
             &blob_id,
             data.len() as u64,
         )?;
-        Ok(())
+        Ok(blob_id)
+    }
+
+    pub async fn heartbeat_presence(&self) -> Result<(), Error> {
+        let relay = RelayClient::try_new(&self.state.relay)?;
+        relay
+            .touch_presence(
+                &self.state.receive_queue_id,
+                &self.state.receive_queue_token,
+            )
+            .await
+    }
+
+    pub async fn contact_is_online(&self, nickname: &str) -> Result<bool, Error> {
+        let contact = self
+            .find_contact(nickname)
+            .ok_or(Error::ContactNotFound)?;
+        let relay = RelayClient::try_new(&self.state.relay)?;
+        relay
+            .contact_presence_online(&contact.queue_id, &contact.queue_token)
+            .await
     }
 
     async fn send_payload(&mut self, nickname: &str, payload: MessagePayload) -> Result<(), Error> {
@@ -312,6 +333,9 @@ impl Account {
             .find_contact(nickname)
             .ok_or(Error::ContactNotFound)?
             .clone();
+        if !self.contact_is_online(nickname).await? {
+            return Err(Error::ContactOffline);
+        }
         let plain = payload.encode()?;
         let ct = encrypt_message(
             &mut self.store,

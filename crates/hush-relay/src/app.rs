@@ -27,6 +27,12 @@ struct ListResponse {
     blobs: Vec<BlobMeta>,
 }
 
+#[derive(Serialize)]
+struct PresenceResponse {
+    last_at: u64,
+    online: bool,
+}
+
 fn bearer_token(headers: &HeaderMap) -> Result<&str, RelayError> {
     let value = headers
         .get(header::AUTHORIZATION)
@@ -92,6 +98,38 @@ async fn report_queue(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn touch_presence(
+    State(state): State<Arc<AppState>>,
+    Path(queue_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, RelayError> {
+    let token = bearer_token(&headers)?;
+    state.store.touch_presence(&queue_id, token)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_presence(
+    State(state): State<Arc<AppState>>,
+    Path(queue_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<PresenceResponse>, RelayError> {
+    let token = bearer_token(&headers)?;
+    let last_at = state.store.presence_last_at(&queue_id, token)?;
+    let online = presence_is_live(last_at);
+    Ok(Json(PresenceResponse { last_at, online }))
+}
+
+fn presence_is_live(last_at: u64) -> bool {
+    if last_at == 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_secs();
+    now.saturating_sub(last_at) <= 90
+}
+
 async fn health() -> StatusCode {
     StatusCode::OK
 }
@@ -102,6 +140,10 @@ pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> 
     Ok(Router::new()
         .route("/health", get(health))
         .route("/q/{queue_id}", put(put_blob).get(list_blobs))
+        .route(
+            "/q/{queue_id}/presence",
+            put(touch_presence).get(get_presence),
+        )
         .route("/q/{queue_id}/report", post(report_queue))
         .route("/q/{queue_id}/{blob_id}", get(get_blob).delete(delete_blob))
         .with_state(state))

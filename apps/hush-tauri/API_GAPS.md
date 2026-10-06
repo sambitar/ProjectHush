@@ -7,7 +7,7 @@ The Soft Daylight UI uses real daemon endpoints for unlock, lock, invite, contac
 These features use local mocks in `src/lib/api/mock.ts` and `src/lib/chatStore.ts` until the daemon grows:
 
 - Message history: loaded from **`GET /api/messages`** after unlock (Task **5c.3**); new messages still arrive via **`POST /api/recv`**
-- Delivery states and 7-day queue expiry countdown
+- Live presence: **`POST /api/presence/heartbeat`** + **`online`** on contacts; chat send blocked when contact offline (async mail = Task **5d**)
 - Reactions
 - Mute, block, report, remove contact (local flags only)
 - Nickname edit (local display override)

@@ -23,7 +23,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS queues (
                 id TEXT PRIMARY KEY,
                 token_hash BLOB NOT NULL,
-                burned INTEGER NOT NULL DEFAULT 0
+                burned INTEGER NOT NULL DEFAULT 0,
+                presence_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS blobs (
                 id TEXT PRIMARY KEY,
@@ -36,6 +37,10 @@ impl Store {
             ",
         )
         .map_err(|_| RelayError::Internal)?;
+        let _ = conn.execute(
+            "ALTER TABLE queues ADD COLUMN presence_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
             config,
@@ -188,6 +193,34 @@ impl Store {
             return Err(RelayError::NotFound);
         }
         Ok(())
+    }
+
+    pub fn touch_presence(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {
+        self.authorize(queue_id, token)?;
+        let now = Self::now_secs() as i64;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        conn.execute(
+            "UPDATE queues SET presence_at = ?1 WHERE id = ?2",
+            params![now, queue_id],
+        )
+        .map_err(|_| RelayError::Internal)?;
+        Ok(())
+    }
+
+    pub fn presence_last_at(&self, queue_id: &str, token: &str) -> Result<u64, RelayError> {
+        self.authorize_existing(queue_id, token)?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let mut stmt = conn
+            .prepare("SELECT presence_at FROM queues WHERE id = ?1")
+            .map_err(|_| RelayError::Internal)?;
+        let mut rows = stmt
+            .query(params![queue_id])
+            .map_err(|_| RelayError::Internal)?;
+        if let Some(row) = rows.next().map_err(|_| RelayError::Internal)? {
+            let at: i64 = row.get(0).map_err(|_| RelayError::Internal)?;
+            return Ok(at.max(0) as u64);
+        }
+        Ok(0)
     }
 
     pub fn report_queue(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {

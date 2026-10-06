@@ -412,6 +412,62 @@
   box-shadow: 0 0 0 2px var(--accent);
 }
 
+.avatar-presence-wrap {
+  position: relative;
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+}
+
+.avatar-presence-wrap .avatar.lg {
+  width: 56px;
+  height: 56px;
+}
+
+.avatar-presence-wrap:has(.avatar.lg) {
+  width: 56px;
+  height: 56px;
+}
+
+.presence-dot {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--surface);
+  background: var(--text-faint);
+  box-sizing: border-box;
+  transition: background 0.35s ease, box-shadow 0.35s ease;
+}
+
+.avatar-presence-wrap.is-online .presence-dot {
+  background: #3ecf8e;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #3ecf8e 35%, transparent),
+    0 0 10px color-mix(in srgb, #3ecf8e 55%, transparent);
+}
+
+.presence-label {
+  font-weight: 500;
+  color: var(--text-faint);
+}
+
+.presence-label.online {
+  color: #2da870;
+}
+
+.composer-offline-hint {
+  padding: var(--space-2) var(--space-4) 0;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.composer-inner.composer-disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
 .tabs {
   display: flex;
   gap: var(--space-2);

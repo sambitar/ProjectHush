@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use account_worker::{AccountWorker, WorkResult};
+use account_worker::{AccountWorker, ContactDto, WorkResult};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -13,7 +13,7 @@ use axum::{
 };
 use clap::Parser;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hush_core::{ChatRecord, Contact, MessagePayload, ReceivedMessage};
+use hush_core::{ChatRecord, MessagePayload, ReceivedMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -76,14 +76,6 @@ struct InviteResponse {
 }
 
 #[derive(Serialize)]
-struct ContactDto {
-    nickname: String,
-    protocol_name: String,
-    /// They have added your invite (we received from them at least once).
-    inbound_ready: bool,
-}
-
-#[derive(Serialize)]
 struct ApiError {
     error: String,
 }
@@ -134,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/send", post(send_text))
         .route("/api/send-file", post(send_file))
         .route("/api/send-file-data", post(send_file_data))
+        .route("/api/presence/heartbeat", post(presence_heartbeat))
         .route("/api/recv", post(recv))
         .route("/api/messages", get(messages))
         .route("/api/blob/{id}", get(blob))
@@ -260,15 +253,7 @@ async fn contacts(
     touch(&state).await;
     let result = map_err(state.worker.contacts().await)?;
     match result {
-        WorkResult::Contacts(list) => Ok(Json(
-            list.iter()
-                .map(|c: &Contact| ContactDto {
-                    nickname: c.nickname.clone(),
-                    protocol_name: c.protocol_name.clone(),
-                    inbound_ready: c.inbound_ready,
-                })
-                .collect(),
-        )),
+        WorkResult::Contacts(list) => Ok(Json(list)),
         _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
@@ -276,6 +261,14 @@ async fn contacts(
             }),
         )),
     }
+}
+
+async fn presence_heartbeat(
+    State(state): State<Arc<App>>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.heartbeat_presence().await)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn add_contact(
@@ -310,10 +303,15 @@ async fn send_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Serialize)]
+struct SendFileDataResponse {
+    blob_id: String,
+}
+
 async fn send_file_data(
     State(state): State<Arc<App>>,
     Json(body): Json<SendFileDataRequest>,
-) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<SendFileDataResponse>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let data = STANDARD
         .decode(body.data_base64.trim())
@@ -325,13 +323,21 @@ async fn send_file_data(
                 }),
             )
         })?;
-    map_err(
+    let result = map_err(
         state
             .worker
             .send_file_bytes(&body.to, &body.name, data)
             .await,
     )?;
-    Ok(StatusCode::NO_CONTENT)
+    match result {
+        WorkResult::BlobId(blob_id) => Ok(Json(SendFileDataResponse { blob_id })),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
 }
 
 #[derive(Serialize)]

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::thread;
 
-use hush_core::{Account, ChatRecord, Contact, InboxResult};
+use hush_core::{Account, ChatRecord, InboxResult};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct AccountWorker {
@@ -71,12 +71,23 @@ enum Work {
     RecoveryPending {
         reply: oneshot::Sender<WorkResult>,
     },
+    HeartbeatPresence {
+        reply: oneshot::Sender<WorkResult>,
+    },
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct ContactDto {
+    pub nickname: String,
+    pub protocol_name: String,
+    pub inbound_ready: bool,
+    pub online: bool,
 }
 
 pub enum WorkResult {
     Ok,
     Invite(String),
-    Contacts(Vec<Contact>),
+    Contacts(Vec<ContactDto>),
     Inbox(InboxResult),
     Meta {
         protocol_name: String,
@@ -89,6 +100,7 @@ pub enum WorkResult {
     RecoveryCode(String),
     Messages(Vec<ChatRecord>),
     Blob(Vec<u8>),
+    BlobId(String),
     Err(String),
 }
 
@@ -131,7 +143,32 @@ impl AccountWorker {
                         Work::Contacts { reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
-                                Some(a) => WorkResult::Contacts(a.contacts().to_vec()),
+                                Some(a) => {
+                                    let mut list = Vec::new();
+                                    for c in a.contacts() {
+                                        let online = a
+                                            .contact_is_online(&c.nickname)
+                                            .await
+                                            .unwrap_or(false);
+                                        list.push(ContactDto {
+                                            nickname: c.nickname.clone(),
+                                            protocol_name: c.protocol_name.clone(),
+                                            inbound_ready: c.inbound_ready,
+                                            online,
+                                        });
+                                    }
+                                    WorkResult::Contacts(list)
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::HeartbeatPresence { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.heartbeat_presence().await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
                             };
                             (reply, result)
                         }
@@ -178,7 +215,7 @@ impl AccountWorker {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => match a.send_file_bytes(&to, &name, &data).await {
-                                    Ok(()) => WorkResult::Ok,
+                                    Ok(id) => WorkResult::BlobId(hex::encode(id.0)),
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
@@ -401,5 +438,9 @@ impl AccountWorker {
 
     pub async fn recovery_pending(&self) -> WorkResult {
         self.call(|reply| Work::RecoveryPending { reply }).await
+    }
+
+    pub async fn heartbeat_presence(&self) -> WorkResult {
+        self.call(|reply| Work::HeartbeatPresence { reply }).await
     }
 }

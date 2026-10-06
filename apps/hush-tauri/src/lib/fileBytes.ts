@@ -6,7 +6,7 @@ export async function resolveMessageFileBytes(
 ): Promise<Uint8Array> {
   if (m.fileData?.length) return m.fileData;
   if (m.blobId) {
-    const r = await api.blob(m.blobId);
+    const r = await api.blob(m.blobId.toLowerCase());
     if (!r?.data_base64) throw new Error("Could not load file from vault");
     const bin = atob(r.data_base64);
     const out = new Uint8Array(bin.length);
@@ -56,7 +56,13 @@ export function saveBytesAsFile(name: string, bytes: Uint8Array): void {
 export function openBytesInNewTab(bytes: Uint8Array): void {
   const blob = new Blob([toBlobPart(bytes)]);
   const url = URL.createObjectURL(blob);
-  window.open(url, "_blank", "noopener,noreferrer");
+  const a = document.createElement("a");
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 120_000);
 }
 

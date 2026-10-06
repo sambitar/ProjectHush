@@ -8,14 +8,16 @@ import {
   fileCountForContact,
   clearChatStore,
   loadHistory,
-  deliveryLabel,
   getThread,
   hasUnread,
   ingestIncoming,
   lastPreview,
-  markOutgoingDelivered,
   markRead,
+  removeOutgoingMessage,
+  clearSendProgress,
+  setMessageBlobId,
   setSendProgress,
+  allFileMessages,
   toggleReaction,
 } from "./lib/chatStore";
 import { MAX_FILE_BYTES, RECV_POLL_MS, AUTO_LOCK_MS } from "./lib/constants";
@@ -29,7 +31,7 @@ import {
 } from "./lib/fileBytes";
 import { groupMessages } from "./lib/messageGroups";
 import { icon, type IconName } from "./lib/icons";
-import { createAvatarEl } from "./components/ui/Avatar";
+import { avatarWithPresence, createAvatarEl } from "./components/ui/Avatar";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
 import QRCode from "qrcode";
 
@@ -127,17 +129,26 @@ export class App {
   private async pollRecv(): Promise<void> {
     if (!this.status || this.status.locked) return;
     try {
+      await api.presenceHeartbeat();
       const r = await api.recv();
-      if (!r) return;
+      const fresh = (await api.contacts()) ?? [];
+      const prevOnline = new Map(
+        this.contacts.map((c) => [c.nickname, c.online]),
+      );
+      const presenceChanged =
+        fresh.length !== this.contacts.length ||
+        fresh.some((c) => prevOnline.get(c.nickname) !== c.online);
+      this.contacts = fresh;
+      if (!r) {
+        if (presenceChanged) this.render();
+        return;
+      }
       for (const w of r.warnings) this.announce(w);
       for (const m of r.messages) {
         ingestIncoming(m.from, m);
         this.announce(`New message from ${m.from}`);
       }
-      if (r.messages.length) {
-        this.contacts = (await api.contacts()) ?? [];
-        this.render();
-      }
+      if (r.messages.length || presenceChanged) this.render();
     } catch {
       /* daemon busy */
     }
@@ -374,7 +385,12 @@ export class App {
     for (const c of list) {
       const row = document.createElement("button");
       row.className = `conv-row pressable${this.selectedNick === c.nickname ? " selected" : ""}`;
-      const av = createAvatarEl(c.protocol_name, "sm", hasUnread(c.nickname));
+      const av = avatarWithPresence(
+        c.protocol_name,
+        c.online,
+        "sm",
+        hasUnread(c.nickname),
+      );
       const meta = document.createElement("div");
       meta.style.flex = "1";
       meta.style.minWidth = "0";
@@ -439,7 +455,7 @@ export class App {
     left.style.display = "flex";
     left.style.gap = "var(--space-3)";
     left.style.alignItems = "center";
-    left.appendChild(createAvatarEl(contact.protocol_name, "lg"));
+    left.appendChild(avatarWithPresence(contact.protocol_name, contact.online, "lg"));
     const titles = document.createElement("div");
     const n = document.createElement("div");
     n.className = "text-17";
@@ -449,8 +465,18 @@ export class App {
     sub.className = "text-13 muted";
     sub.style.display = "flex";
     sub.style.alignItems = "center";
-    sub.style.gap = "4px";
-    sub.append(icon("lock"), document.createTextNode(`Only you and ${displayNick(nick)} can read this`));
+    sub.style.gap = "6px";
+    sub.style.flexWrap = "wrap";
+    const presence = document.createElement("span");
+    presence.className = contact.online ? "presence-label online" : "presence-label";
+    presence.textContent = contact.online ? "Online" : "Offline";
+    sub.append(presence, document.createTextNode("·"));
+    const lockLine = document.createElement("span");
+    lockLine.style.display = "inline-flex";
+    lockLine.style.alignItems = "center";
+    lockLine.style.gap = "4px";
+    lockLine.append(icon("lock"), document.createTextNode("End-to-end encrypted"));
+    sub.append(lockLine);
     titles.append(n, sub);
     left.append(titles);
     const more = document.createElement("button");
@@ -498,19 +524,21 @@ export class App {
             bar.appendChild(fill);
             fc.appendChild(bar);
           }
-          if (m.sendProgress === undefined && (m.fileData || m.blobId)) {
+          const uploading =
+            m.sendProgress !== undefined && m.sendProgress < 100;
+          if (!uploading && (m.fileData || m.blobId)) {
             attachFileActions(fc, m.fileName ?? "file", () =>
               resolveMessageFileBytes(m),
             );
+          } else if (!uploading && !m.fileData && !m.blobId) {
+            const hint = document.createElement("p");
+            hint.className = "text-12 muted";
+            hint.style.marginTop = "var(--space-2)";
+            hint.textContent =
+              "File bytes are not on this device. Ask your contact to send again.";
+            fc.appendChild(hint);
           }
           b.appendChild(fc);
-        }
-        if (tail && group.outgoing) {
-          const d = document.createElement("div");
-          d.className = "text-12 faint";
-          d.style.marginTop = "4px";
-          d.textContent = deliveryLabel(m.delivery);
-          b.appendChild(d);
         }
         if (m.reactions.length) {
           const pills = document.createElement("div");
@@ -541,7 +569,7 @@ export class App {
     }
     scroll.scrollTop = scroll.scrollHeight;
 
-    const composer = this.renderComposer(nick);
+    const composer = this.renderComposer(nick, contact.online);
     pane.append(header, scroll, composer);
 
     pane.ondragover = (e) => {
@@ -556,11 +584,19 @@ export class App {
     return pane;
   }
 
-  private renderComposer(nick: string): HTMLElement {
+  private renderComposer(nick: string, contactOnline: boolean): HTMLElement {
     const wrap = document.createElement("div");
     wrap.className = "composer";
+    if (!contactOnline) {
+      const hint = document.createElement("p");
+      hint.className = "text-13 muted composer-offline-hint";
+      hint.textContent =
+        `${displayNick(nick)} is offline. Live chat works when you're both online — mail (coming soon) will reach them later.`;
+      wrap.appendChild(hint);
+    }
     const inner = document.createElement("div");
     inner.className = "composer-inner";
+    if (!contactOnline) inner.classList.add("composer-disabled");
     const attach = document.createElement("button");
     attach.className = "pressable";
     attach.appendChild(icon("attach"));
@@ -575,7 +611,8 @@ export class App {
     };
     const ta = document.createElement("textarea");
     ta.rows = 1;
-    ta.placeholder = "Message";
+    ta.placeholder = contactOnline ? "Message" : "Waiting for them to come online…";
+    ta.disabled = !contactOnline;
     const send = document.createElement("button");
     send.className = "send-fab btn-icon-round pressable";
     send.appendChild(icon("send"));
@@ -593,7 +630,9 @@ export class App {
         void this.sendText(nick, ta.value.trim(), ta, send);
       }
     };
+    send.disabled = !contactOnline;
     send.onclick = () => void this.sendText(nick, ta.value.trim(), ta, send);
+    attach.disabled = !contactOnline;
     inner.append(attach, fileIn, ta, send);
     wrap.appendChild(inner);
     syncSend();
@@ -602,22 +641,30 @@ export class App {
 
   private async sendText(nick: string, text: string, ta: HTMLTextAreaElement, send: HTMLButtonElement): Promise<void> {
     if (!text) return;
-    addOutgoingText(nick, text);
+    const contact = this.contacts.find((c) => c.nickname === nick);
+    if (!contact?.online) {
+      this.announce(`${displayNick(nick)} is offline. Live chat only when you're both online.`);
+      return;
+    }
+    const msg = addOutgoingText(nick, text);
     ta.value = "";
     send.classList.remove("ready");
     this.render();
     try {
       await api.sendText(nick, text);
-      const thread = getThread(nick);
-      const last = thread[thread.length - 1];
-      if (last) markOutgoingDelivered(nick, last.id);
+    } catch (e) {
+      removeOutgoingMessage(nick, msg.id);
+      this.announce(e instanceof AppError ? e.message : "Couldn't send. Try again.");
       this.render();
-    } catch {
-      this.announce("Couldn't send. Try again.");
     }
   }
 
   private async sendFile(nick: string, file: File): Promise<void> {
+    const contact = this.contacts.find((c) => c.nickname === nick);
+    if (!contact?.online) {
+      this.announce(`${displayNick(nick)} is offline. Live chat only when you're both online.`);
+      return;
+    }
     if (file.size > MAX_FILE_BYTES) {
       this.announce(`Files are limited to ${Math.round(MAX_FILE_BYTES / 1024)} KB for now`);
       return;
@@ -632,11 +679,14 @@ export class App {
         await sleep(80);
       }
       const b64 = await fileToBase64(file);
-      await api.sendFileData(nick, file.name, b64);
-      markOutgoingDelivered(nick, msg.id);
+      const resp = await api.sendFileData(nick, file.name, b64);
+      if (resp?.blob_id) setMessageBlobId(nick, msg.id, resp.blob_id);
+      clearSendProgress(nick, msg.id);
       this.render();
-    } catch {
-      this.announce("Couldn't send. Try again.");
+    } catch (e) {
+      removeOutgoingMessage(nick, msg.id);
+      this.announce(e instanceof AppError ? e.message : "Couldn't send. Try again.");
+      this.render();
     }
   }
 
@@ -862,7 +912,15 @@ export class App {
         this.announce(e instanceof AppError ? e.message : "Backup failed");
       }
     });
-    grid.append(storage, lock, backup);
+    const filesTile = document.createElement("div");
+    filesTile.className = "tile";
+    const fileCount = allFileMessages().length;
+    filesTile.innerHTML = `<div class="text-15">Exchanged files</div><div class="muted text-13">${fileCount} in your sealed vault (encrypted blobs)</div><button type="button" class="btn-secondary pressable files-rail-btn" style="margin-top:12px">Open Files</button>`;
+    filesTile.querySelector(".files-rail-btn")!.addEventListener("click", () => {
+      this.rail = "files";
+      this.render();
+    });
+    grid.append(storage, lock, backup, filesTile);
     pane.append(h, grid);
     return pane;
   }

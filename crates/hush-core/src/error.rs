@@ -28,6 +28,8 @@ pub enum Error {
     Session,
     #[error("contact not found")]
     ContactNotFound,
+    #[error("contact is offline — chat is live only; use mail when available")]
+    ContactOffline,
     #[error("contact already exists")]
     ContactExists,
     #[error("unsupported invite version")]

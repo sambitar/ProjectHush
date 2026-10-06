@@ -1,4 +1,7 @@
+mod presence_helper;
+
 use hush_core::{Account, InvitePayload, RelayClient};
+use presence_helper::recipient_online;
 use hush_relay::{RelayConfig, router};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
@@ -36,6 +39,7 @@ async fn two_accounts_exchange_encrypted_text() {
     bob.add_contact("alice", &alice_invite).await.unwrap();
     alice.add_contact("bob", &bob_invite).await.unwrap();
 
+    recipient_online(&alice).await;
     bob.send_text("alice", "hello from bob").await.unwrap();
 
     let inbox = alice.recv().await.unwrap();
@@ -48,6 +52,7 @@ async fn two_accounts_exchange_encrypted_text() {
         }
     );
 
+    recipient_online(&bob).await;
     alice
         .send_text("bob", "hello back from alice")
         .await
@@ -81,6 +86,7 @@ async fn relay_blob_has_no_cleartext_sender_json() {
     bob.add_contact("alice", &alice_invite).await.unwrap();
     alice.add_contact("bob", &bob_invite).await.unwrap();
 
+    recipient_online(&alice).await;
     bob.send_text("alice", "opaque wire test").await.unwrap();
 
     let alice_inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
@@ -111,6 +117,32 @@ async fn relay_blob_has_no_cleartext_sender_json() {
 }
 
 #[tokio::test]
+async fn send_rejected_when_recipient_offline() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    let alice_invite = alice.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+
+    let err = bob.send_text("alice", "nope").await.unwrap_err();
+    assert!(
+        err.to_string().contains("offline"),
+        "expected offline error, got {err}"
+    );
+}
+
+#[tokio::test]
 async fn chat_history_survives_reopen() {
     let (relay, _relay_dir) = spawn_relay().await;
     let alice_dir = TempDir::new().unwrap();
@@ -129,6 +161,7 @@ async fn chat_history_survives_reopen() {
     bob.add_contact("alice", &alice_invite).await.unwrap();
     alice.add_contact("bob", &bob_invite).await.unwrap();
 
+    recipient_online(&alice).await;
     bob.send_text("alice", "persist me").await.unwrap();
     alice.recv().await.unwrap();
 

@@ -72,10 +72,12 @@ export const api = {
       body: JSON.stringify({ to, text }),
     }),
   sendFileData: (to: string, name: string, data_base64: string) =>
-    request<null>("/api/send-file-data", {
+    request<{ blob_id: string }>("/api/send-file-data", {
       method: "POST",
       body: JSON.stringify({ to, name, data_base64 }),
     }),
+  presenceHeartbeat: () =>
+    request<null>("/api/presence/heartbeat", { method: "POST" }),
   recv: () => request<RecvResponse>("/api/recv", { method: "POST" }),
   messages: () => request<ChatRecordDto[]>("/api/messages"),
   blob: (id: string) =>

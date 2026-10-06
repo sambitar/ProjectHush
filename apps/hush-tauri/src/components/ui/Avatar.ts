@@ -36,3 +36,20 @@ export function createAvatarEl(
   wrap.style.background = `linear-gradient(135deg, hsl(${h},55%,62%), hsl(${h2},50%,55%), hsl(${h3},45%,48%))`;
   return wrap;
 }
+
+/** Avatar with live presence ring (green when online). */
+export function avatarWithPresence(
+  protocolName: string,
+  online: boolean,
+  size: "sm" | "lg" = "sm",
+  ring = false,
+): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = `avatar-presence-wrap${online ? " is-online" : ""}`;
+  wrap.appendChild(createAvatarEl(protocolName, size, ring));
+  const dot = document.createElement("span");
+  dot.className = "presence-dot";
+  dot.setAttribute("aria-hidden", "true");
+  wrap.appendChild(dot);
+  return wrap;
+}

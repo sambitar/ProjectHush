@@ -71,6 +71,43 @@ impl RelayClient {
         format!("Bearer {token}")
     }
 
+    pub async fn touch_presence(&self, queue_id: &str, token: &str) -> Result<(), Error> {
+        let res = self
+            .http
+            .put(format!("{}/q/{}/presence", self.base, queue_id))
+            .header("authorization", Self::auth(token))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("presence failed: {}", res.status())));
+        }
+        Ok(())
+    }
+
+    pub async fn contact_presence_online(
+        &self,
+        queue_id: &str,
+        token: &str,
+    ) -> Result<bool, Error> {
+        let res = self
+            .http
+            .get(format!("{}/q/{}/presence", self.base, queue_id))
+            .header("authorization", Self::auth(token))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Ok(false);
+        }
+        #[derive(serde::Deserialize)]
+        struct Body {
+            online: bool,
+        }
+        let body: Body = res.json().await.map_err(|e| Error::Relay(e.to_string()))?;
+        Ok(body.online)
+    }
+
     pub async fn put(&self, queue_id: &str, token: &str, body: &[u8]) -> Result<(), Error> {
         let res = self
             .http

@@ -1,8 +1,6 @@
-import { RELAY_TTL_MS } from "./constants";
 import type {
   ChatMessage,
   ChatRecordDto,
-  DeliveryState,
   ReceivedDto,
 } from "./api/types";
 
@@ -29,7 +27,6 @@ export function loadHistory(records: ChatRecordDto[]): void {
       contactNick: r.contact_nick,
       outgoing: r.outgoing,
       createdAt: r.ts_ms,
-      delivery: "delivered" as DeliveryState,
       reactions: [] as string[],
     };
     if (r.payload.t === "text") {
@@ -40,7 +37,7 @@ export function loadHistory(records: ChatRecordDto[]): void {
         kind: "file",
         fileName: r.payload.name,
         fileSize: r.payload.size,
-        blobId: r.payload.blob_id_hex,
+        blobId: r.payload.blob_id_hex.toLowerCase(),
       });
     }
   }
@@ -81,11 +78,9 @@ export function addOutgoingText(nick: string, text: string): ChatMessage {
     kind: "text",
     text,
     createdAt: Date.now(),
-    delivery: "sealed",
     reactions: [],
   };
   push(nick, msg);
-  advanceDelivery(msg);
   return msg;
 }
 
@@ -104,12 +99,18 @@ export function addOutgoingFile(
     fileSize: size,
     fileData: data,
     createdAt: Date.now(),
-    delivery: "sealed",
     reactions: [],
     sendProgress: 0,
   };
   push(nick, msg);
   return msg;
+}
+
+export function removeOutgoingMessage(nick: string, id: string): void {
+  const list = threads.get(nick);
+  if (!list) return;
+  const i = list.findIndex((x) => x.id === id && x.outgoing);
+  if (i >= 0) list.splice(i, 1);
 }
 
 export function setSendProgress(id: string, p: number): void {
@@ -122,12 +123,18 @@ export function setSendProgress(id: string, p: number): void {
   }
 }
 
-export function markOutgoingDelivered(nick: string, id: string): void {
+export function clearSendProgress(nick: string, id: string): void {
   const m = threads.get(nick)?.find((x) => x.id === id);
-  if (m) {
-    m.delivery = "delivered";
-    m.sendProgress = undefined;
-  }
+  if (m) m.sendProgress = undefined;
+}
+
+export function setMessageBlobId(
+  nick: string,
+  id: string,
+  blobId: string,
+): void {
+  const m = threads.get(nick)?.find((x) => x.id === id);
+  if (m) m.blobId = blobId.toLowerCase();
 }
 
 export function ingestIncoming(from: string, dto: ReceivedDto): ChatMessage {
@@ -138,10 +145,9 @@ export function ingestIncoming(from: string, dto: ReceivedDto): ChatMessage {
     kind: dto.kind === "file" ? "file" : "text",
     text: dto.text,
     fileName: dto.file_name,
-    blobId: dto.blob_id,
+    blobId: dto.blob_id?.toLowerCase(),
     fileSize: dto.file_size,
     createdAt: Date.now(),
-    delivery: "delivered",
     reactions: [],
   };
   push(from, msg);
@@ -153,16 +159,6 @@ function push(nick: string, msg: ChatMessage): void {
   const list = threads.get(nick) ?? [];
   list.push(msg);
   threads.set(nick, list);
-}
-
-function advanceDelivery(msg: ChatMessage): void {
-  setTimeout(() => {
-    msg.delivery = "queued";
-    msg.queuedUntil = Date.now() + RELAY_TTL_MS;
-  }, 400);
-  setTimeout(() => {
-    if (msg.delivery === "queued") msg.delivery = "delivered";
-  }, 1200);
 }
 
 export function toggleReaction(msgId: string, emoji: string): void {
@@ -222,17 +218,4 @@ export function contactsWithFiles(contactNicks: string[]): string[] {
     .filter((x) => x.n > 0)
     .sort((a, b) => b.at - a.at)
     .map((x) => x.nick);
-}
-
-export function deliveryLabel(d: DeliveryState): string {
-  switch (d) {
-    case "sealed":
-      return "Sealed";
-    case "queued":
-      return "In queue";
-    case "delivered":
-      return "Delivered";
-    case "expired":
-      return "Expired";
-  }
 }

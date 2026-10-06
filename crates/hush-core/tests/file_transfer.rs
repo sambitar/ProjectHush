@@ -1,6 +1,9 @@
 use std::io::Write;
 
+mod presence_helper;
+
 use hush_core::{Account, MessagePayload};
+use presence_helper::recipient_online;
 use hush_relay::{RelayConfig, router};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::time::{sleep, Duration};
@@ -37,6 +40,7 @@ async fn send_file_roundtrip_and_not_on_relay_disk() {
     fixture.write_all(marker).unwrap();
     fixture.flush().unwrap();
 
+    recipient_online(&alice).await;
     bob.send_file("alice", fixture.path()).await.unwrap();
 
     let inbox = alice.recv().await.unwrap();
