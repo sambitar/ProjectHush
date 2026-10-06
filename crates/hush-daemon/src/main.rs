@@ -1,6 +1,7 @@
 mod account_worker;
 mod paths;
 mod security;
+mod suspend_lock;
 mod ui_prefs;
 
 use std::path::PathBuf;
@@ -20,8 +21,6 @@ use hush_core::{ChatRecord, MessagePayload, ReceivedMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-
-const AUTO_LOCK: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Parser)]
 #[command(name = "hush-daemon")]
@@ -136,12 +135,16 @@ async fn vault_mount_watch(state: Arc<App>) {
             .await
             .unwrap_or(false);
         if !ok {
-            state.worker.lock().await;
-            *state.unlocked.lock().await = false;
-            *state.unlocked_at.lock().await = None;
+            force_lock(&state).await;
             eprintln!("hush-daemon: vault path unavailable — auto-locked");
         }
     }
+}
+
+pub(crate) async fn force_lock(state: &Arc<App>) {
+    state.worker.lock().await;
+    *state.unlocked.lock().await = false;
+    *state.unlocked_at.lock().await = None;
 }
 
 /// libsignal protocol futures are not `Send`; account ops run on a dedicated worker thread.
@@ -160,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(auto_lock_loop(state.clone()));
     tokio::spawn(vault_mount_watch(state.clone()));
+    suspend_lock::spawn_suspend_lock_watch(state.clone());
 
     let router = Router::new()
         .route("/api/status", get(status))
@@ -202,12 +206,14 @@ async fn auto_lock_loop(state: Arc<App>) {
         if !unlocked {
             continue;
         }
+        let limit = ui_prefs::auto_lock_duration(&state.dir);
+        if limit.is_none() {
+            continue;
+        }
         let at = *state.unlocked_at.lock().await;
         if let Some(at) = at {
-            if at.elapsed() >= AUTO_LOCK {
-                let _ = state.worker.lock().await;
-                *state.unlocked.lock().await = false;
-                *state.unlocked_at.lock().await = None;
+            if at.elapsed() >= limit.unwrap() {
+                force_lock(&state).await;
             }
         }
     }
@@ -566,6 +572,14 @@ async fn put_ui_prefs(
             StatusCode::BAD_REQUEST,
             Json(ApiError {
                 error: "theme must be light, dark, or system".into(),
+            }),
+        ));
+    }
+    if body.auto_lock_minutes != 0 && (body.auto_lock_minutes < 5 || body.auto_lock_minutes > 24 * 60) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "auto_lock_minutes must be 0 (off) or between 5 and 1440".into(),
             }),
         ));
     }

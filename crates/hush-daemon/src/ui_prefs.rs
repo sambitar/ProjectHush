@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,10 +16,26 @@ pub struct UiPrefs {
     pub blocked: Vec<String>,
     #[serde(default)]
     pub nick_overrides: HashMap<String, String>,
+    /// Minutes of inactivity before the daemon locks; `0` disables idle auto-lock.
+    #[serde(default = "default_auto_lock_minutes")]
+    pub auto_lock_minutes: u32,
 }
 
 fn default_theme() -> String {
     "system".into()
+}
+
+fn default_auto_lock_minutes() -> u32 {
+    15
+}
+
+pub fn auto_lock_duration(data_dir: &Path) -> Option<Duration> {
+    let mins = load(data_dir).auto_lock_minutes;
+    if mins == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(mins as u64 * 60))
+    }
 }
 
 pub fn prefs_path(data_dir: &Path) -> PathBuf {

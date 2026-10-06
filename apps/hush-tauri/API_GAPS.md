@@ -11,7 +11,7 @@ These features use local mocks in `src/lib/api/mock.ts` and `src/lib/chatStore.t
 - Reactions
 - Mute, block, nickname override (persisted in **`ui-prefs.json`** under data root via **`GET/PUT /api/ui-prefs`**)
 - Report abusive relay slot (local block list exists; no server report API yet)
-- Auto-lock timeout configuration
+- Auto-lock timeout: **`auto_lock_minutes`** in ui-prefs (Settings → Security); daemon enforces idle lock + Linux suspend lock
 - Recovery code cannot be re-shown after acknowledge (by design — save offline)
 - Change passphrase
 - Trusted devices

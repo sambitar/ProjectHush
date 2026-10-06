@@ -6,6 +6,8 @@ export interface UiPrefsDto {
   muted: string[];
   blocked: string[];
   nick_overrides: Record<string, string>;
+  /** 0 = idle auto-lock off (daemon); 5–1440 minutes otherwise */
+  auto_lock_minutes: number;
 }
 
 const defaultPrefs = (): UiPrefsDto => ({
@@ -14,6 +16,7 @@ const defaultPrefs = (): UiPrefsDto => ({
   muted: [],
   blocked: [],
   nick_overrides: {},
+  auto_lock_minutes: 15,
 });
 
 let cache: UiPrefsDto | null = null;
@@ -69,11 +72,24 @@ function normalize(raw: UiPrefsDto): UiPrefsDto {
     raw.theme === "light" || raw.theme === "dark" || raw.theme === "system"
       ? raw.theme
       : "system";
+  const auto_lock_minutes =
+    typeof raw.auto_lock_minutes === "number" ? raw.auto_lock_minutes : 15;
   return {
     theme,
     avatars: raw.avatars ?? {},
     muted: raw.muted ?? [],
     blocked: raw.blocked ?? [],
     nick_overrides: raw.nick_overrides ?? {},
+    auto_lock_minutes,
   };
+}
+
+export function getAutoLockMinutes(): number {
+  return uiPrefsSnapshot().auto_lock_minutes;
+}
+
+export function getAutoLockMs(): number {
+  const m = getAutoLockMinutes();
+  if (m <= 0) return Number.POSITIVE_INFINITY;
+  return m * 60 * 1000;
 }

@@ -12,7 +12,7 @@
 | DR-06 | No **systemd** unit or hardening directives in repo | `packaging/systemd/user/` | Task 5 — **partial** (user unit shipped; full hardening TBD) |
 | DR-07 | No **core dump disable** / `mlock` for daemon secrets | `hush-daemon/security.rs` | Task 5 — **partial** (core dumps off on Linux; mlock TBD) |
 | DR-08 | No handling for **vault mount loss** (USB unplug) | vault path watch | Task 5 — **done** (auto-lock when path missing) |
-| DR-09 | No **auto-lock on suspend** / lid close | daemon auto-lock is idle-time only | Task 5 |
+| DR-09 | No **auto-lock on suspend** / lid close | `suspend_lock.rs` (Linux logind) + `auto_lock_minutes` in ui-prefs | Task 5 — **done** (lid close ≈ suspend on most laptops) |
 | DR-10 | No **`rust-toolchain.toml`**; no **`cargo-deny` / `cargo-audit`** in CI | repo root | Task 7 |
 | DR-11 | Signing (Task 7) not yet a **standalone library + CLI** | planned Tauri-only | Task 7 |
 | DR-12 | No **`KeyProvider`** trait; passphrase hardcoded in unlock path | `hush-core`, `hush-daemon` | Task 6 + 10 |

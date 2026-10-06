@@ -20,7 +20,8 @@ import {
   allFileMessages,
   toggleReaction,
 } from "./lib/chatStore";
-import { MAX_FILE_BYTES, RECV_POLL_MS, AUTO_LOCK_MS } from "./lib/constants";
+import { MAX_FILE_BYTES, RECV_POLL_MS } from "./lib/constants";
+import { getAutoLockMs, getAutoLockMinutes, patchUiPrefs } from "./lib/api/uiPrefs";
 import { displayNick, getMockSettings, setMuted, setNickOverride, clearMockLocal, isMuted, refreshContactPrefs } from "./lib/api/mock";
 import { clearContactUiPrefs } from "./lib/api/uiPrefs";
 import { fileToBase64, formatBytes, formatRelative } from "./lib/format";
@@ -891,8 +892,15 @@ export class App {
     storage.innerHTML = `<div class="text-15">Storage</div><div class="text-28">${formatBytes(s.vault_bytes)}</div><button class="btn-secondary pressable" style="margin-top:12px">Manage</button>`;
     const lock = document.createElement("div");
     lock.className = "tile";
-    const remain = Math.max(0, AUTO_LOCK_MS - (Date.now() - this.unlockedAt));
-    lock.innerHTML = `<div class="text-15">Auto-lock</div><div class="muted text-13">15 minutes</div><div class="text-13">${Math.ceil(remain / 60000)}m until lock</div><button class="btn-secondary pressable lock-now" style="margin-top:12px">Lock now</button>`;
+    const mins = getAutoLockMinutes();
+    const idleLabel =
+      mins <= 0 ? "Idle lock off" : `${mins} minute${mins === 1 ? "" : "s"}`;
+    const remain = Math.max(0, getAutoLockMs() - (Date.now() - this.unlockedAt));
+    const countdown =
+      mins <= 0
+        ? "Only manual lock or suspend"
+        : `${Math.ceil(remain / 60000)}m until lock`;
+    lock.innerHTML = `<div class="text-15">Auto-lock</div><div class="muted text-13">${idleLabel}</div><div class="text-13">${countdown}</div><button class="btn-secondary pressable lock-now" style="margin-top:12px">Lock now</button>`;
     lock.querySelector(".lock-now")!.addEventListener("click", () => void this.lock());
     const backup = document.createElement("div");
     backup.className = "tile";
@@ -965,6 +973,34 @@ export class App {
         seg.appendChild(b);
       }
       body.appendChild(seg);
+    } else if (this.settingsSection === "security") {
+      body.innerHTML = `<h2 class="text-22">Security</h2><p class="muted text-13">Idle auto-lock is enforced by the daemon. Suspend / sleep also locks the vault on Linux when logind is available.</p>`;
+      const label = document.createElement("p");
+      label.className = "muted";
+      label.style.marginTop = "var(--space-4)";
+      label.textContent = "Lock after inactivity";
+      const sel = document.createElement("select");
+      sel.className = "input-field";
+      sel.style.marginTop = "var(--space-2)";
+      const options: { v: number; t: string }[] = [
+        { v: 5, t: "5 minutes" },
+        { v: 15, t: "15 minutes" },
+        { v: 30, t: "30 minutes" },
+        { v: 60, t: "1 hour" },
+        { v: 0, t: "Never (idle only)" },
+      ];
+      for (const o of options) {
+        const opt = document.createElement("option");
+        opt.value = String(o.v);
+        opt.textContent = o.t;
+        sel.appendChild(opt);
+      }
+      sel.value = String(getAutoLockMinutes());
+      sel.onchange = () => {
+        const v = Number(sel.value);
+        void patchUiPrefs({ auto_lock_minutes: v }).then(() => this.render());
+      };
+      body.append(label, sel);
     } else if (this.settingsSection === "recovery") {
       body.innerHTML = `<h2 class="text-22">Recovery</h2><p class="muted text-13">Your recovery code was shown once when the vault was created or when recovery was first set up. It unlocks the vault if you forget your passphrase (with your backup file).</p>`;
       const ack = this.status?.recovery_acknowledged;

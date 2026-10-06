@@ -18,7 +18,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 |-------|------|-------|--------|
 | **A — Foundation** | First | **1** workspace/vault, **2** relay, **3** two-party CLI, **4** files | ✅ Done |
 | **B — Capsule messaging** | Core product | **5** daemon + Tauri, **5c** opaque relay + encrypted log/blobs, **5b.1–5b.2** files UX, **5h** live presence, **6** recovery/backup | ✅ Mostly done |
-| **C — Messaging polish** | Next dogfood | **5b.3** (optional), remaining **5c.4** / transport review, **distro gaps** (DR-02, 05, 09, 14; partial 06–07), contacts/settings (mute/block/remove, device link), UI gaps in `API_GAPS.md` | 🔜 **In progress** (DR-01, 03, 08 landed) |
+| **C — Messaging polish** | Next dogfood | **5b.3** (optional), **5c.4** VPS checklist (`docs/ops/relay-https-checklist.md`), **distro gaps** (DR-02, 14; partial 06–07), device link QR, remaining `API_GAPS.md` | 🔜 **In progress** (DR-01, 03, 05, 08, 09; remove contact done) |
 | **D — Async member mail** | When live chat feels solid | **5d** internal `@myserver.com` mail (replaces “message while offline”) | Planned |
 | **E — Outsider delivery** | After 5d | **5e** inbound drop, **5f** outbound to outsiders | Planned |
 | **F — Local notes** | Before public layer | **16** sticky-notes dashboard | Planned |
