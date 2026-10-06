@@ -90,6 +90,16 @@ Living record. Reasons and rejected alternatives. Not a marketing doc.
 - **Hard line:** Plaintext we actually host (website, support, logs) — remove and report illegal content as required. Ciphertext: act on **relay abuse** (flood, spam slots), not speech inside chats.
 - **Rejected:** Content filters on payloads (C); on-device scanning as a product feature (D).
 
+### Public knowledge (later — after private capsule is real)
+
+- **Decision:** Optional **pseudonymous publishing** (Nostr-shaped **Articles**), not a Hush-hosted social graph or viral feed. Private chat stays on libsignal + blind queues; public work uses **pen names** isolated from messaging keys.
+- **Product arc (one pipeline, many surfaces):** Conversation (private) → publish idea → link evidence → local library → optional **project** index — without likes, trending, or our relay learning who follows whom.
+- **Feeds:** Follow-based and **explainable** (“included because…”), not engagement ML. “Editor’s picks” = curated pubkey lists in config, not ranking.
+- **Reputation (if any):** Structured links (supports / refutes / evidence), optional local “I changed my view” notes — **not** follower counts or upvotes as the primary signal.
+- **Storage:** Reading list, shelves, annotations, and graph edges live in the **encrypted local vault** (per person). Nostr cache is public-by-design; UI must say so.
+- **Rejected for this layer:** Global “For You” algorithm; Hush-operated follow graph; in-app crowdfunding; activist/“uncensored” positioning; first-party Nostr relay at launch.
+- **Detail:** Task **11** ([`docs/tasks/hush-articles.md`](tasks/hush-articles.md)); Tasks **12–15** backlog in [`docs/plans/knowledge-layer-roadmap.md`](plans/knowledge-layer-roadmap.md).
+
 ### Public positioning
 
 - **Decision:** Quiet ownership (A). Landing: your data on your machine; we cannot read it. Calm capsule, not a cause.

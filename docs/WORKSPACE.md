@@ -9,6 +9,7 @@ hush/                         # working name; product name later
     hush-relay/               # HTTP relay binary (dumb)
     hush-daemon/              # local API over the core (unix socket or localhost)
     hush-cli/                 # optional dogfood without UI
+    hush-articles/            # (Task 11) Nostr pen names, feed, cache; Phase A library/edges (Task 12) — not in workspace yet
   apps/
     hush-tauri/               # Tauri shell; UI talks only to hush-daemon
   docs/                       # already started at repo root docs/

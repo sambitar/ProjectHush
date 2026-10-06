@@ -1,5 +1,7 @@
 # Daemon API gaps (UI mocks)
 
+**Future rails:** Task **11** `/api/articles/*` and Task **12** library/edges/briefing — `docs/tasks/hush-articles.md`, `docs/tasks/knowledge-layer-phase-a.md`.
+
 The Soft Daylight UI uses real daemon endpoints for unlock, lock, invite, contacts, send, send-file-data, recv, and status.
 
 These features use local mocks in `src/lib/api/mock.ts` and `src/lib/chatStore.ts` until the daemon grows:

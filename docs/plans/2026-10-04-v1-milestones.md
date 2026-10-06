@@ -6,7 +6,7 @@
 
 **Tech stack:** Rust, libsignal, SQLite, axum (or equivalent), Tauri, signed updater (later milestone).
 
-**Spec:** `docs/DESIGN.md`, `docs/THREAT_MODEL.md`, `docs/PROTOCOL.md`, `docs/WORKSPACE.md`.
+**Spec:** `docs/DESIGN.md`, `docs/THREAT_MODEL.md`, `docs/PROTOCOL.md`, `docs/WORKSPACE.md`, [`docs/DISTRO_READINESS.md`](../DISTRO_READINESS.md).
 
 ## Global Constraints
 
@@ -17,6 +17,21 @@
 - No seed phrases on the home screen.
 - Unpaid users must still open the vault (payments are after dogfood).
 - Tests on core and relay before polishing UI.
+- When implementing, follow **Rules for the app now** in [`DISTRO_READINESS.md`](../DISTRO_READINESS.md). If a task conflicts, flag before proceeding.
+
+## Distro-readiness checks (apply while implementing)
+
+Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DISTRO_READINESS.md`](../DISTRO_READINESS.md). Known violations: [`docs/tasks/distro-readiness-gaps.md`](../tasks/distro-readiness-gaps.md).
+
+- [ ] Persistent state only under configurable **data root** (`HUSH_DATA_DIR` / vault dir); runtime/socket/temp only under **runtime dir**.
+- [ ] Vault path works as a **removable mount**; daemon handles **mount loss** (lock + key wipe + recovery).
+- [ ] **No plaintext** secrets or message/file content on disk; no secrets in logs.
+- [ ] Daemon API: prefer **Unix socket** in runtime dir; **no TCP by default** in release; document sandbox paths/syscalls.
+- [ ] **systemd** unit with hardening directives shipped in repo (when daemon packaging lands).
+- [ ] Network: relay client is the **single outbound** abstraction; **HTTPS** for non-loopback in release (5c.4).
+- [ ] **`KeyProvider`** for unlock (passphrase first; TPM/FIDO/lease later) — no hardcoded TPM/passphrase in vault core.
+- [ ] UI remains a **thin daemon client**; no untrusted file auto-open.
+- [ ] Builds: **`--locked`**, reproducibility docs, signing layer reusable beyond Tauri (Task 7).
 
 ## Files to create (when implementation starts)
 
@@ -27,6 +42,7 @@
 | `crates/hush-daemon/` | Unlock, local API |
 | `crates/hush-cli/` | Send/recv without GUI |
 | `apps/hush-tauri/` | Contacts, conversation, send file, vault status |
+| `crates/hush-articles/` | (Task 11) Nostr pen names, feed, cache — **planned** |
 
 ---
 
@@ -41,6 +57,8 @@
 
 **Verify:** `cargo test -p hush-core`
 
+**Distro-readiness:** Introduce **`HUSH_DATA_DIR`** layout (vault + config); all durable paths under data root; parsing treats vault bytes as untrusted. See DR-01, DR-17 in [`distro-readiness-gaps.md`](../tasks/distro-readiness-gaps.md).
+
 ---
 
 ### Task 2: Relay queues
@@ -53,6 +71,8 @@
 - Tests: unauthorized put fails; expire drops blob; report burns queue.
 
 **Verify:** `cargo test -p hush-relay` and a local binary on localhost.
+
+**Distro-readiness:** Relay URL config must be consumable from a **single client config** (future Tor/firewall); no implicit cwd `relay.db` as product default — DR-14.
 
 ---
 
@@ -89,6 +109,8 @@
 - No remote UI assets.
 
 **Verify:** manual on Linux: two app instances, QR/invite, send text and file. (Browser tools are not the app.)
+
+**Distro-readiness:** Ship **systemd user unit** + hardening; migrate daemon to **Unix socket** in `HUSH_RUNTIME_DIR`; remove permissive CORS; move UI prefs out of `localStorage` into data root or daemon; mount-loss + suspend lock; core dump disable — DR-02–DR-09, DR-05. Flag any new TCP listener.
 
 ---
 
@@ -153,6 +175,8 @@
 **Ordering:** **5c.1** and **5c.2** before **5b** file open/save that depends on stable blob IDs; **5c.3** can parallel UI work once daemon exposes `GET` history or paginated thread API.
 
 **Verify (end-to-end):** `./scripts/run-two-ui.sh` — chat history survives app restart; received file openable from vault blob; relay `relay.db` blobs fail a “no identity substring” assertion; locked vault directory has no plaintext message or attachment content.
+
+**Distro-readiness:** **5c.2** closes DR-04 (plaintext `inbox/`); **5c.3** closes DR-17; **5c.4** enforces HTTPS policy; encrypted store must live under **data root** only; `zeroize`/`mlock` on DB keys — DR-07, DR-13.
 
 ---
 
@@ -273,8 +297,11 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 - Buried recovery code at first unlock.
 - Export/import encrypted vault to a folder (stand-in for WebDAV/S3).
 - Device-link QR if time; else document as next slice.
+- **Articles (Task 11):** pen-name keypairs and articles DB/cache in backup manifest (pen name loss = identity loss).
 
 **Verify:** destroy local vault copy, restore with passphrase + backup file; recover keys with recovery code in a test.
+
+**Distro-readiness:** Mandatory **encrypted backup** + first-run prompt; introduce **`KeyProvider`** (passphrase impl first); USB wear / dead stick recovery path — DR-12, DR-16. Align with [`DISTRO_READINESS.md`](../DISTRO_READINESS.md) Confidential/USB notes.
 
 ---
 
@@ -287,6 +314,65 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 **Verify:** verify command on a built artifact; a tampered file fails.
 
+**Distro-readiness:** Extract **`hush-verify`** (or similar) crate/CLI reused by Tauri and future OS updater; add `rust-toolchain.toml`, CI `cargo deny`/`audit`, reproducible release doc — DR-10, DR-11.
+
+---
+
+### Task 10: Confidential section (TPM + lease — planning only)
+
+**Goal:** Linux-only **Confidential** rail: custom encrypted containers (hardware-bound via TPM 2.0), server-signed **lease** before KEK unseal, in-app editor with no plaintext on disk.
+
+**Status:** **Not implemented.** Full phased plan, checklists, acceptance criteria, and open questions:
+
+→ **[`docs/tasks/confidential-section.md`](../tasks/confidential-section.md)**
+
+**Phases (summary):** (1) spec + threat model → (2) crypto core `.cnf`/`.hcf` → (3) TPM seal → (4) lease server → (5) daemon lease client → (6) UI rail → (7) stolen-device + recovery → (8) security review.
+
+**Depends on (recommended):** Task **5c.2** (stop plaintext on disk in messaging vault) before overlapping file workflows.
+
+**Conflicts to resolve in Phase 1:** network lease API vs “no remote UI assets”; separate trust domain from `hush-relay`; Vault rail vs Confidential rail; passphrase vault vs TPM+lease unlock.
+
+**Distro-readiness:** Implement unlock via **`KeyProvider`**; support **FIDO2/stick** vs machine TPM config for portable USB; lease server separate from relay; no plaintext Confidential on disk — [`DISTRO_READINESS.md`](../DISTRO_READINESS.md), [`confidential-section.md`](confidential-section.md).
+
+---
+
+### Task 11: Articles (Nostr pen names — planning only)
+
+**Goal:** Pseudonymous long-form publishing: **pen names** (vault keypairs, isolated from messaging), **Nostr** articles/comments (NIP-23/22/09/50/56 — **verify before build**), **Tor** transport (`arti`), local follows/mutes/drafts, daemon-sanitized UI.
+
+**Status:** Not implemented. Full design, build order, and acceptance criteria:
+
+→ **[`docs/tasks/hush-articles.md`](../tasks/hush-articles.md)**
+
+**Crate:** `crates/hush-articles/` on **rust-nostr**; daemon **`/api/articles/*`**; UI never talks to relays directly.
+
+**Build order (summary):** pen names + relay pool → publish/read → feed phase 1 → media pipeline → editor → comments/search/mute/report → feed phase 2 (opt-in global) → Tor per-pen-name hardening.
+
+**Depends on:** Task **5** (daemon API), **5c** (encrypted local store), **6** (backup includes pen-name keys). **Independent** of `hush-relay` / libsignal messaging.
+
+**Distro-readiness:** Cache/drafts under data root; document **second egress** (Nostr over Tor); sanitized-only UI — see Task 11 doc.
+
+**Not at launch:** Operating a first-party Nostr relay.
+
+**Future (post-11):** Magazine sections, argument graph, library, briefing, ideas/debates/research, projects, graph UI — phased and policy-filtered in [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md) (Tasks **12–15** backlog, not scheduled).
+
+---
+
+### Tasks 12–15: Knowledge layer (backlog — planning only)
+
+**Status:** Not implemented. ChatGPT-style “Magazine / Ideas / Graph” ideas **filtered** against DESIGN and threat model C.
+
+→ **[`docs/plans/knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)**
+
+| Phase | Tasks | Theme |
+|-------|-------|--------|
+| **A (12.x)** | Magazine filters, argument links, library, explainable briefing, doc→publish | → [`docs/tasks/knowledge-layer-phase-a.md`](../tasks/knowledge-layer-phase-a.md) |
+| **B (13.x)** | Theses, research templates, debates | Discourse without likes |
+| **C (14.x)** | Local knowledge graph UI, projects, investigations | Organize work |
+| **D (15.x)** | Audio, courses, private messaging rooms, local library AI | Defer; strict privacy |
+
+**Do not start** until Task **11** is dogfooded unless explicitly reprioritized.
+
 ---
 
 ### Task 8: Deliberately later (do not start)
@@ -294,7 +380,11 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 - Stripe
 - WebDAV/S3 live providers
 - Android
-- Groups, follow-model
+- Groups; **messaging** follow-model (Articles Task **11** uses **local-only** follows, not published lists)
 - Flathub
 - Expert review pass on queue auth (covered in Task **5c.1** / **5c.4** before calling transport “done”)
 - Full SMTP/IMAP product for `@myserver.com` on the public Internet (partial inbound via **5e** only)
+- Confidential **implementation** (spec in Task **10** may proceed earlier; ship after v1 dogfood unless reprioritized)
+- **Distro / OS image** (stages 2–5 in [`DISTRO_READINESS.md`](../DISTRO_READINESS.md)) — app must meet distro-ready acceptance criteria first
+- **Articles implementation** (Task **11**) — after v1 messaging dogfood + **5c**/**6** foundations unless reprioritized
+- **Knowledge layer Phases B–D** (Tasks **13–15**) — see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)

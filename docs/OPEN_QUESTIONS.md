@@ -16,6 +16,17 @@ Handoff list (section 9) is settled. See `DESIGN.md`.
 12. ~~Frontend stack~~ → A Tauri
 13. ~~Updates and signing~~ → B
 
+## Knowledge layer (not blocking v1 — decide before Task 12)
+
+Tracked in [`docs/plans/knowledge-layer-roadmap.md`](plans/knowledge-layer-roadmap.md) and [`docs/tasks/knowledge-layer-phase-a.md`](tasks/knowledge-layer-phase-a.md):
+
+- NIP/kind for “thesis” vs tagged NIP-23 articles
+- Argument link tags (Hush-specific vs pure `a`/`e` tags only)
+- Whether any aggregate “changed my mind” signal may be published without becoming a popularity game
+- Project index on Nostr (kind?) vs local-only with optional publish
+- Private messaging rooms vs Nostr “circles” — **DESIGN** favors capsule rooms first (Task **15.3**)
+- Library AI: on-device model vs user API key vs defer
+
 ## Not blocking v1 spec
 
 These can wait until implementation or a later pass:
