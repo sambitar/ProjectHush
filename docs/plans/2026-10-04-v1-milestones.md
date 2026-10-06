@@ -18,7 +18,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 |-------|------|-------|--------|
 | **A — Foundation** | First | **1** workspace/vault, **2** relay, **3** two-party CLI, **4** files | ✅ Done |
 | **B — Capsule messaging** | Core product | **5** daemon + Tauri, **5c** opaque relay + encrypted log/blobs, **5b.1–5b.2** files UX, **5h** live presence, **6** recovery/backup | ✅ Mostly done |
-| **C — Messaging polish** | Next dogfood | **5b.3** (optional), **5c.4** VPS checklist (`docs/ops/relay-https-checklist.md`), **distro gaps** (partial 06–07), remaining `API_GAPS.md` | 🔜 **In progress** (DR-01, 02, 03, 05, 08, 09, 14; remove contact; device link done) |
+| **C — Messaging polish** | Next dogfood | **5b.3** (optional), remaining `API_GAPS.md` | 🔜 **In progress** (DR-01–09, 14; 5c.4; remove contact; device link done) |
 | **D — Async member mail** | When live chat feels solid | **5d** internal `@myserver.com` mail (replaces “message while offline”) | Planned |
 | **E — Outsider delivery** | After 5d | **5e** inbound drop, **5f** outbound to outsiders | Planned |
 | **F — Local notes** | Before public layer | **16** sticky-notes dashboard | Planned |
@@ -47,12 +47,12 @@ Detailed specs follow **by task ID** (1, 2, …). Dependency order is in the tab
 
 Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DISTRO_READINESS.md`](../DISTRO_READINESS.md). Known violations: [`docs/tasks/distro-readiness-gaps.md`](../tasks/distro-readiness-gaps.md).
 
-- [ ] Persistent state only under configurable **data root** (`HUSH_DATA_DIR` / vault dir); runtime/socket/temp only under **runtime dir**.
-- [ ] Vault path works as a **removable mount**; daemon handles **mount loss** (lock + key wipe + recovery).
+- [x] Persistent state only under configurable **data root** (`HUSH_DATA_DIR` / vault dir); runtime/socket/temp only under **runtime dir**.
+- [x] Vault path works as a **removable mount**; daemon handles **mount loss** (lock + key wipe + recovery).
 - [ ] **No plaintext** secrets or message/file content on disk; no secrets in logs.
-- [ ] Daemon API: prefer **Unix socket** in runtime dir; **no TCP by default** in release; document sandbox paths/syscalls.
-- [ ] **systemd** unit with hardening directives shipped in repo (when daemon packaging lands).
-- [ ] Network: relay client is the **single outbound** abstraction; **HTTPS** for non-loopback in release (5c.4).
+- [x] Daemon API: prefer **Unix socket** in runtime dir; **no TCP by default** in release; document sandbox paths/syscalls.
+- [x] **systemd** unit with hardening directives shipped in repo (when daemon packaging lands).
+- [x] Network: relay client is the **single outbound** abstraction; **HTTPS** for non-loopback in release (5c.4).
 - [ ] **`KeyProvider`** for unlock (passphrase first; TPM/FIDO/lease later) — no hardcoded TPM/passphrase in vault core.
 - [ ] UI remains a **thin daemon client**; no untrusted file auto-open.
 - [ ] Builds: **`--locked`**, reproducibility docs, signing layer reusable beyond Tauri (Task 7).
@@ -144,7 +144,7 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 
 **Verify:** manual on Linux: two app instances, QR/invite, send text and file. (Browser tools are not the app.)
 
-**Distro-readiness:** Ship **systemd user unit** + hardening; migrate daemon to **Unix socket** in `HUSH_RUNTIME_DIR`; remove permissive CORS; move UI prefs out of `localStorage` into data root or daemon; mount-loss + suspend lock; core dump disable — DR-02–DR-09, DR-05. Flag any new TCP listener.
+**Distro-readiness:** Ship **systemd user unit** + hardening; migrate daemon to **Unix socket** in `HUSH_RUNTIME_DIR`; remove permissive CORS; move UI prefs out of `localStorage` into data root or daemon; mount-loss + suspend lock; core dump disable — DR-02–DR-09, DR-05. Flag any new TCP listener. **Done:** socket-first API (DR-02) and the hardened unit + `mlock`/dumpable secret handling (DR-06, DR-07, `scripts/smoke-daemon-hardening.sh`).
 
 ---
 
@@ -178,7 +178,7 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 
 ### Task 5c: Relay metadata privacy + encrypted vault (chat log + files on disk)
 
-**Status:** ✅ **5c.1–5c.3** done in tree; **5c.4** production HTTPS/VPS checklist remains (**Phase C**). Expert transport review still recommended before calling relay “done.”
+**Status:** ✅ **5c.1–5c.4** done in tree (**5c.4** ships the tested HTTPS policy, `packaging/systemd/system/hush-relay.service`, and a deployable [`docs/ops/relay-https-checklist.md`](../ops/relay-https-checklist.md)). Expert transport review still recommended before calling relay “done.”
 
 **Goal:** Match [`THREAT_MODEL.md`](../THREAT_MODEL.md) and [`PROTOCOL.md`](../PROTOCOL.md): relay sees **ciphertext blobs and queue IDs only** (no cleartext sender names in wire JSON); **everything durable under the vault directory is confidential when locked**, including **chat history** and received files.
 
@@ -239,7 +239,7 @@ Work through these while dogfooding; split into PR-sized slices as needed.
 | Area | Examples | Tracks |
 |------|----------|--------|
 | **Distro / daemon** | `HUSH_DATA_DIR`, Unix socket default (**done**), tighten CORS, systemd unit, mount-loss lock, suspend lock, central client config | [`distro-readiness-gaps.md`](../tasks/distro-readiness-gaps.md) DR-01–09, 14 |
-| **Transport** | **5c.4** HTTPS on VPS relay; sealed-sender expert review | **5c.1** / PROTOCOL |
+| **Transport** | **5c.4** done (HTTPS policy tested, relay unit, deploy checklist); sealed-sender expert review remains | **5c.1** / PROTOCOL |
 | **Files** | **5b.3** per-contact vault layout (optional) | **5b** |
 | **Contacts / settings** | Real mute/block/remove (**done**); device-link QR one-time transfer (**6** slice, **done** — Settings → Security + unlock “Transfer from another device”); nick overrides in data root not `localStorage` | `API_GAPS.md`, DR-05 |
 | **UI dogfood** | Reactions, command palette polish, error states | `API_GAPS.md` |
