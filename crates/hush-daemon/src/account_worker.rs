@@ -28,6 +28,10 @@ enum Work {
         invite: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    RemoveContact {
+        nickname: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
     SendText {
         to: String,
         text: String,
@@ -180,6 +184,16 @@ impl AccountWorker {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => match a.add_contact(&nickname, &invite).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RemoveContact { nickname, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.remove_contact(&nickname).await {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
@@ -365,6 +379,14 @@ impl AccountWorker {
         self.call(|reply| Work::AddContact {
             nickname: nickname.to_string(),
             invite: invite.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_contact(&self, nickname: &str) -> WorkResult {
+        self.call(|reply| Work::RemoveContact {
+            nickname: nickname.to_string(),
             reply,
         })
         .await

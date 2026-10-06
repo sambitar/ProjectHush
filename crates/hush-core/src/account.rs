@@ -253,6 +253,18 @@ impl Account {
         Ok(())
     }
 
+    pub async fn remove_contact(&mut self, nickname: &str) -> Result<(), Error> {
+        let pos = self
+            .state
+            .contacts
+            .iter()
+            .position(|c| c.nickname == nickname)
+            .ok_or(Error::ContactNotFound)?;
+        self.state.contacts.remove(pos);
+        self.save().await?;
+        Ok(())
+    }
+
     pub async fn send_text(&mut self, nickname: &str, text: &str) -> Result<(), Error> {
         self.send_payload(
             nickname,

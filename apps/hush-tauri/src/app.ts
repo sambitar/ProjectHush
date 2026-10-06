@@ -21,7 +21,8 @@ import {
   toggleReaction,
 } from "./lib/chatStore";
 import { MAX_FILE_BYTES, RECV_POLL_MS, AUTO_LOCK_MS } from "./lib/constants";
-import { displayNick, getMockSettings, setBlocked, setMuted, setNickOverride, clearMockLocal, isMuted, refreshContactPrefs } from "./lib/api/mock";
+import { displayNick, getMockSettings, setMuted, setNickOverride, clearMockLocal, isMuted, refreshContactPrefs } from "./lib/api/mock";
+import { clearContactUiPrefs } from "./lib/api/uiPrefs";
 import { fileToBase64, formatBytes, formatRelative } from "./lib/format";
 import {
   attachFileActions,
@@ -1227,13 +1228,29 @@ export class App {
     const report = document.createElement("button");
     report.className = "btn-secondary pressable";
     report.style.color = "var(--danger)";
-    report.textContent = "Report and remove";
+    report.textContent = "Remove contact";
     report.onclick = () => {
-      if (confirm("Remove this contact from your list on this device?")) {
-        void setBlocked(nick, true).then(() => {
-          this.profileNick = null;
-          this.render();
-        });
+      if (
+        confirm(
+          `Remove ${displayNick(nick)} from your contact list? Chat history stays in your vault.`,
+        )
+      ) {
+        void (async () => {
+          try {
+            await api.removeContact(nick);
+            await clearContactUiPrefs(nick);
+            this.contacts = (await api.contacts()) ?? [];
+            if (this.selectedNick === nick) this.selectedNick = null;
+            if (this.filesContactNick === nick) this.filesContactNick = null;
+            this.profileNick = null;
+            this.announce("Contact removed");
+            this.render();
+          } catch (e) {
+            this.announce(
+              e instanceof AppError ? e.message : "Could not remove contact",
+            );
+          }
+        })();
       }
     };
     const close = document.createElement("button");

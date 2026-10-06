@@ -62,6 +62,11 @@ struct AddContactRequest {
 }
 
 #[derive(Deserialize)]
+struct RemoveContactRequest {
+    nickname: String,
+}
+
+#[derive(Deserialize)]
 struct SendTextRequest {
     to: String,
     text: String,
@@ -163,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/invite", post(invite))
         .route("/api/contacts", get(contacts))
         .route("/api/contacts/add", post(add_contact))
+        .route("/api/contacts/remove", post(remove_contact))
         .route("/api/send", post(send_text))
         .route("/api/send-file", post(send_file))
         .route("/api/send-file-data", post(send_file_data))
@@ -322,6 +328,15 @@ async fn add_contact(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(state.worker.add_contact(&body.nickname, &body.invite).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_contact(
+    State(state): State<Arc<App>>,
+    Json(body): Json<RemoveContactRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.remove_contact(&body.nickname).await)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

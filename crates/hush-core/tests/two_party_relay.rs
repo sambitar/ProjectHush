@@ -143,6 +143,31 @@ async fn send_rejected_when_recipient_offline() {
 }
 
 #[tokio::test]
+async fn remove_contact_drops_from_list() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    let alice_invite = alice.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+    assert_eq!(alice.contacts().len(), 1);
+
+    alice.remove_contact("bob").await.unwrap();
+    assert_eq!(alice.contacts().len(), 0);
+    assert!(alice.remove_contact("bob").await.is_err());
+}
+
+#[tokio::test]
 async fn chat_history_survives_reopen() {
     let (relay, _relay_dir) = spawn_relay().await;
     let alice_dir = TempDir::new().unwrap();

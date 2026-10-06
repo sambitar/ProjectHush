@@ -66,6 +66,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ nickname, invite }),
     }),
+  removeContact: (nickname: string) =>
+    request<null>("/api/contacts/remove", {
+      method: "POST",
+      body: JSON.stringify({ nickname }),
+    }),
   sendText: (to: string, text: string) =>
     request<null>("/api/send", {
       method: "POST",

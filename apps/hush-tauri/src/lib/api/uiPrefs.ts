@@ -53,6 +53,17 @@ export async function patchUiPrefs(
   return merged;
 }
 
+export async function clearContactUiPrefs(nick: string): Promise<void> {
+  const p = uiPrefsSnapshot();
+  const nick_overrides = { ...p.nick_overrides };
+  delete nick_overrides[nick];
+  await patchUiPrefs({
+    muted: p.muted.filter((n) => n !== nick),
+    blocked: p.blocked.filter((n) => n !== nick),
+    nick_overrides,
+  });
+}
+
 function normalize(raw: UiPrefsDto): UiPrefsDto {
   const theme =
     raw.theme === "light" || raw.theme === "dark" || raw.theme === "system"

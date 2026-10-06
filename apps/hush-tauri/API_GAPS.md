@@ -10,7 +10,7 @@ These features use local mocks in `src/lib/api/mock.ts` and `src/lib/chatStore.t
 - Live presence: **`POST /api/presence/heartbeat`** + **`online`** on contacts; chat send blocked when contact offline (async mail = Task **5d**)
 - Reactions
 - Mute, block, nickname override (persisted in **`ui-prefs.json`** under data root via **`GET/PUT /api/ui-prefs`**)
-- Remove contact from vault (block is local-only flag today)
+- Report abusive relay slot (local block list exists; no server report API yet)
 - Auto-lock timeout configuration
 - Recovery code cannot be re-shown after acknowledge (by design — save offline)
 - Change passphrase
