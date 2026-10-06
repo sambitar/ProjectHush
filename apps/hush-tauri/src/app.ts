@@ -19,6 +19,7 @@ import {
 import { MAX_FILE_BYTES, RECV_POLL_MS, AUTO_LOCK_MS } from "./lib/constants";
 import { displayNick, getMockSettings, setBackupDone, setBlocked, setMuted, setNickOverride, setRecoveryRevealed, clearMockLocal, mockRecoveryCode, isMuted } from "./lib/api/mock";
 import { fileToBase64, formatBytes, formatRelative } from "./lib/format";
+import { attachFileActions, resolveMessageFileBytes } from "./lib/fileBytes";
 import { groupMessages } from "./lib/messageGroups";
 import { icon, type IconName } from "./lib/icons";
 import { createAvatarEl } from "./components/ui/Avatar";
@@ -437,6 +438,11 @@ export class App {
             bar.appendChild(fill);
             fc.appendChild(bar);
           }
+          if (m.sendProgress === undefined && (m.fileData || m.blobId)) {
+            attachFileActions(fc, m.fileName ?? "file", () =>
+              resolveMessageFileBytes(m),
+            );
+          }
           b.appendChild(fc);
         }
         if (tail && group.outgoing) {
@@ -588,7 +594,13 @@ export class App {
       const t = document.createElement("div");
       t.className = "tile";
       t.innerHTML = `<div class="text-15">${m.fileName}</div><div class="muted text-13">${formatBytes(m.fileSize ?? 0)} · ${displayNick(m.contactNick)}</div>`;
-      t.onclick = () => {
+      if (m.fileData || m.blobId) {
+        attachFileActions(t, m.fileName ?? "file", () =>
+          resolveMessageFileBytes(m),
+        );
+      }
+      t.onclick = (e) => {
+        if ((e.target as HTMLElement).closest("button")) return;
         this.rail = "chats";
         this.selectedNick = m.contactNick;
         this.render();

@@ -18,14 +18,53 @@ struct BlobMeta {
     id: String,
 }
 
+/// Task 5c.4: HTTPS for non-loopback relays; plain HTTP allowed for localhost (and any HTTP in debug builds).
+pub fn normalize_relay_base(base: &str) -> Result<String, Error> {
+    let base = base.trim().trim_end_matches('/').to_string();
+    if base.starts_with("https://") {
+        return Ok(base);
+    }
+    if base.starts_with("http://") {
+        if relay_http_allowed(&base) {
+            return Ok(base);
+        }
+        return Err(Error::Relay(
+            "insecure relay URL: use HTTPS except for localhost".into(),
+        ));
+    }
+    Err(Error::Relay(
+        "relay URL must start with http:// or https://".into(),
+    ))
+}
+
+fn relay_http_allowed(url: &str) -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    let rest = url.strip_prefix("http://").unwrap_or("");
+    let host = rest.split('/').next().unwrap_or("");
+    let host = host.split(':').next().unwrap_or(host);
+    host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1"
+}
+
 impl RelayClient {
     pub fn new(base: &str) -> Self {
-        Self {
-            base: base.trim_end_matches('/').to_string(),
+        Self::try_new(base).unwrap_or_else(|_| Self {
+            base: base.trim().trim_end_matches('/').to_string(),
             http: Client::builder()
                 .build()
                 .expect("http client"),
-        }
+        })
+    }
+
+    pub fn try_new(base: &str) -> Result<Self, Error> {
+        let base = normalize_relay_base(base)?;
+        Ok(Self {
+            base,
+            http: Client::builder()
+                .build()
+                .expect("http client"),
+        })
     }
 
     fn auth(token: &str) -> String {
@@ -96,5 +135,21 @@ impl RelayClient {
             return Err(Error::Relay(format!("delete failed: {}", res.status())));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_relay_base;
+
+    #[test]
+    fn https_relay_ok() {
+        assert!(normalize_relay_base("https://relay.example.com").is_ok());
+    }
+
+    #[test]
+    fn loopback_http_ok() {
+        assert!(normalize_relay_base("http://127.0.0.1:8080").is_ok());
+        assert!(normalize_relay_base("http://localhost:9999").is_ok());
     }
 }

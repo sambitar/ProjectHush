@@ -18,5 +18,5 @@ pub use error::Error;
 pub use invite::InvitePayload;
 pub use message::{InboxResult, ReceivedMessage};
 pub use payload::{MessagePayload, MAX_INLINE_FILE_BYTES};
-pub use relay_client::RelayClient;
+pub use relay_client::{normalize_relay_base, RelayClient};
 pub use vault::{BlobId, IdentityPub, Vault};

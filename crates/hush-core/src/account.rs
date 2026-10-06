@@ -11,7 +11,7 @@ use crate::error::Error;
 use crate::invite::InvitePayload;
 use crate::message::{InboxResult, ReceivedMessage};
 use crate::payload::{MessagePayload, MAX_INLINE_FILE_BYTES};
-use crate::relay_client::RelayClient;
+use crate::relay_client::{normalize_relay_base, RelayClient};
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
     process_contact_bundle, protocol_name_from_identity,
@@ -53,6 +53,7 @@ pub struct Account {
 
 impl Account {
     pub async fn create(dir: &Path, passphrase: &str, relay: &str) -> Result<Self, Error> {
+        let relay = normalize_relay_base(relay)?;
         let vault = Vault::create(dir, passphrase)?;
         let mut store = crate::signal::new_protocol_store()?;
         let _bundle = mint_prekey_bundle(&mut store).await?;
@@ -65,7 +66,7 @@ impl Account {
         let receive_queue_id = Uuid::new_v4().to_string();
         let receive_queue_token = hex::encode(random_bytes::<32>());
         let state = AccountState {
-            relay: relay.to_string(),
+            relay,
             protocol_name,
             receive_queue_id,
             receive_queue_token,
@@ -251,7 +252,7 @@ impl Account {
         )
         .await?;
         let body = encode_relay_blob(&ct);
-        let relay = RelayClient::new(&self.state.relay);
+        let relay = RelayClient::try_new(&self.state.relay)?;
         relay
             .put(&contact.queue_id, &contact.queue_token, &body)
             .await?;
@@ -260,7 +261,7 @@ impl Account {
     }
 
     pub async fn recv(&mut self) -> Result<InboxResult, Error> {
-        let relay = RelayClient::new(&self.state.relay);
+        let relay = RelayClient::try_new(&self.state.relay)?;
         let ids = relay
             .list(&self.state.receive_queue_id, &self.state.receive_queue_token)
             .await?;
