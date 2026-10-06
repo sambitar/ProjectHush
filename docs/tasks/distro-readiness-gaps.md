@@ -9,8 +9,8 @@
 | DR-03 | **`CorsLayer::permissive()`** on daemon HTTP API | `hush-daemon/src/main.rs` | Task 5 — **done** (loopback + Tauri origins only) |
 | DR-04 | **Plaintext `inbox/*`** after file recv | `hush-daemon` `to_dto` | Task 5c.2 — **done** |
 | DR-05 | UI state in **`localStorage`** (theme, avatar photos) outside data root | `ui-prefs.json` + `/api/ui-prefs` | Task 5 — **done** |
-| DR-06 | No **systemd** unit or hardening directives in repo | `packaging/systemd/user/` | Task 5 — **partial** (user unit shipped; full hardening TBD) |
-| DR-07 | No **core dump disable** / `mlock` for daemon secrets | `hush-daemon/security.rs` | Task 5 — **partial** (core dumps off on Linux; mlock TBD) |
+| DR-06 | No **systemd** unit or hardening directives in repo | `packaging/systemd/user/` | Task 5 — **done** (user unit with `ProtectSystem=strict`, `ProtectHome=read-only` + `ReadWritePaths` for the data root, `PrivateTmp`/`PrivateDevices`, `SystemCallFilter=@system-service`, empty `CapabilityBoundingSet=`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`; verified by running the daemon under the directives) |
+| DR-07 | No **core dump disable** / `mlock` for daemon secrets | `hush-daemon/security.rs` | Task 5 — **done** (`PR_SET_DUMPABLE=0`, `RLIMIT_CORE=0`, `mlockall` with `LimitMEMLOCK=infinity` + `MemorySwapMax=0` in the unit; `scripts/smoke-daemon-hardening.sh`) |
 | DR-08 | No handling for **vault mount loss** (USB unplug) | vault path watch | Task 5 — **done** (auto-lock when path missing) |
 | DR-09 | No **auto-lock on suspend** / lid close | `suspend_lock.rs` (Linux logind) + `auto_lock_minutes` in ui-prefs | Task 5 — **done** (lid close ≈ suspend on most laptops) |
 | DR-10 | No **`rust-toolchain.toml`**; no **`cargo-deny` / `cargo-audit`** in CI | repo root | Task 7 |

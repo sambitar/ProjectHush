@@ -1,11 +1,18 @@
 # User unit for local dogfood / distro packaging. Install:
+#   cargo install --path crates/hush-daemon --locked
 #   mkdir -p ~/.config/systemd/user
 #   cp packaging/systemd/user/hush-daemon.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now hush-daemon
+# ExecStart assumes the binary landed in %h/.cargo/bin; edit it if you installed
+# elsewhere.
 #
 # The daemon API is a Unix socket in the runtime dir (DR-02); TCP is off unless
 # HUSH_DAEMON_ADDR is set. The Tauri UI reaches the socket by default, or point
 # it explicitly with HUSH_DAEMON_SOCKET=%t/hush/hush-daemon.sock.
+#
+# The sandbox below is deliberately strict. If you point HUSH_DATA_DIR at a
+# different data root, or keep the vault on a removable mount, add that path to
+# ReadWritePaths= or the daemon cannot write the vault.
 
 [Unit]
 Description=Hush vault daemon (local API)
@@ -15,19 +22,46 @@ After=network.target
 Type=simple
 ExecStart=%h/.cargo/bin/hush-daemon
 Environment=HUSH_DATA_DIR=%h/.local/share/hush
-# RuntimeDirectory creates %t/hush with 0700 and cleans it up on stop; the
-# daemon puts hush-daemon.sock inside it.
+# RuntimeDirectory creates %t/hush with 0700, cleans it on stop, and is
+# implicitly writable under ProtectSystem=strict; the daemon puts
+# hush-daemon.sock inside it.
 RuntimeDirectory=hush
 RuntimeDirectoryMode=0700
 Restart=on-failure
 RestartSec=2
+UMask=0077
 
+# --- sandbox ----------------------------------------------------------------
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/hush
 ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
 LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# --- secret handling --------------------------------------------------------
+# Room for mlockall so key material never reaches swap, and no swap for the
+# cgroup even if locking is unavailable.
+LimitMEMLOCK=infinity
+MemorySwapMax=0
 
 [Install]
 WantedBy=default.target

@@ -174,7 +174,7 @@ pub(crate) async fn force_lock(state: &Arc<App>) {
 /// libsignal protocol futures are not `Send`; account ops run on a dedicated worker thread.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    security::harden_process();
+    let hardening = security::harden_process();
     let args = Args::parse();
     let vault_dir = paths::vault_dir_from_args(args.dir);
     let tcp_addr = hush_core::config::resolve_daemon_addr(&vault_dir, args.addr.as_deref());
@@ -251,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => String::new(),
         }
     );
+    eprintln!("hush-daemon hardening: {}", hardening.summary());
 
     match (socket_listener, tcp_listener) {
         (Some(unix), Some(tcp)) => {
