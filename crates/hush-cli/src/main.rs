@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf as StdPathBuf;
 
-use hush_core::{Account, MessagePayload, resolve_data_dir};
-
-const DEFAULT_RELAY: &str = "http://127.0.0.1:8787";
+use hush_core::{
+    Account, MessagePayload, config, resolve_data_dir,
+};
 
 #[derive(Parser)]
 #[command(name = "hush-cli", about = "Dogfood client for Hush")]
@@ -24,8 +24,9 @@ enum Commands {
     Init {
         #[arg(long)]
         passphrase: String,
-        #[arg(long, default_value = DEFAULT_RELAY)]
-        relay: String,
+        /// Relay URL for this vault. Defaults to HUSH_RELAY_URL, then client-config.json.
+        #[arg(long)]
+        relay: Option<String>,
     },
     Invite,
     AddContact {
@@ -47,6 +48,26 @@ enum Commands {
         save_dir: Option<StdPathBuf>,
     },
     Contacts,
+    /// Read or change the central client config (DR-14).
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Show effective relay URL and daemon address with their source.
+    Show,
+    /// Write values into `client-config.json` under the data root (empty string clears).
+    Set {
+        #[arg(long)]
+        relay: Option<String>,
+        #[arg(long)]
+        daemon_addr: Option<String>,
+    },
+    /// Print the config file path.
+    Path,
 }
 
 #[tokio::main]
@@ -56,8 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let passphrase = cli.passphrase.clone();
     match cli.command {
         Commands::Init { passphrase, relay } => {
+            let relay = config::resolve_relay_url(&dir, relay.as_deref());
             let mut account = Account::create(&dir, &passphrase, &relay).await?;
             println!("vault ready at {}", dir.display());
+            println!("relay: {}", relay);
             if let Some(code) = account.take_pending_recovery_code() {
                 println!("SAVE THIS RECOVERY CODE (shown once): {}", code);
             }
@@ -111,8 +134,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{} ({})", c.nickname, c.protocol_name);
             }
         }
+        Commands::Config { cmd } => match cmd {
+            ConfigCmd::Path => {
+                println!("{}", config::config_path(&dir).display());
+            }
+            ConfigCmd::Show => {
+                let (relay, relay_src) = config::resolve_relay_url_with_source(&dir, None);
+                let (addr, addr_src) = config::resolve_daemon_addr_with_source(&dir, None);
+                println!("config file: {}", config::config_path(&dir).display());
+                println!("relay_url:   {}  ({})", relay, relay_src.as_str());
+                println!("daemon_addr: {}  ({})", addr, addr_src.as_str());
+                println!(
+                    "env overrides: {} / {}",
+                    config::ENV_RELAY_URL,
+                    config::ENV_DAEMON_ADDR
+                );
+            }
+            ConfigCmd::Set { relay, daemon_addr } => {
+                let mut cfg = config::load(&dir);
+                if let Some(v) = relay {
+                    cfg.relay_url = normalize_optional(&v);
+                }
+                if let Some(v) = daemon_addr {
+                    cfg.daemon_addr = normalize_optional(&v);
+                }
+                config::save(&dir, &cfg).map_err(std::io::Error::other)?;
+                println!("wrote {}", config::config_path(&dir).display());
+                println!(
+                    "note: an existing vault keeps the relay it was created with ({} for new vaults).",
+                    config::resolve_relay_url(&dir, None)
+                );
+            }
+        },
     }
     Ok(())
+}
+
+fn normalize_optional(v: &str) -> Option<String> {
+    let t = v.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 async fn open(dir: &PathBuf, passphrase: &Option<String>) -> Result<Account, hush_core::Error> {

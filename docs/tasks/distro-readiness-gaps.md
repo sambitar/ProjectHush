@@ -17,7 +17,7 @@
 | DR-11 | Signing (Task 7) not yet a **standalone library + CLI** | planned Tauri-only | Task 7 |
 | DR-12 | No **`KeyProvider`** trait; passphrase hardcoded in unlock path | `hush-core`, `hush-daemon` | Task 6 + 10 |
 | DR-13 | **Cleartext `from`** in relay wire envelope | `hush-core` `WireEnvelope` | Task 5c.1 — **done** |
-| DR-14 | Relay URL not centralized in single client config surface for Tor/firewall policy | `RelayClient`, env per script | Task 2 + 5 |
+| DR-14 | Relay URL not centralized in single client config surface for Tor/firewall policy | `RelayClient`, env per script | Task 2 + 5 — **done** (`hush-core::config`, `client-config.json` in the data root, precedence flag/env > file > default, `hush-cli config show/set`; daemon reports the active relay in `/api/status`) |
 | DR-15 | Received files may be opened/saved to **user Downloads** via browser (plaintext export) | Tauri uses native open/save | Task 5b.1 — **mitigated** (export is explicit user action) |
 | DR-16 | **Recovery / first-run backup** not implemented | — | Task 6 — **done** |
 | DR-17 | Chat history only in **UI memory** (not in data root encrypted store) | `chat.enc` + API | Task 5c.3 — **done** |

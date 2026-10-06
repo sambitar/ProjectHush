@@ -116,6 +116,8 @@ export class App {
         contacts: 0,
         recovery_acknowledged: true,
         last_backup_unix: 0,
+        relay: getApiBase(),
+        relay_source: "unknown",
       };
     }
   }
@@ -1174,6 +1176,33 @@ export class App {
         }
       };
       body.append(exportBtn, importBtn, fileIn);
+    } else if (this.settingsSection === "about") {
+      body.innerHTML = `<h2 class="text-22">About</h2><p class="muted text-13">Where this client sends ciphertext, and where your vault lives. The relay value comes from the vault once it is unlocked; while locked it shows the configured default.</p>`;
+      const rows: [string, string][] = [
+        ["Relay", this.status?.relay ?? "—"],
+        ["Relay source", this.status?.relay_source ?? "—"],
+        ["Vault", this.status?.vault_dir ?? "—"],
+        ["Daemon", getApiBase()],
+      ];
+      const list = document.createElement("dl");
+      list.className = "about-list";
+      list.style.marginTop = "var(--space-4)";
+      for (const [k, v] of rows) {
+        const dt = document.createElement("dt");
+        dt.className = "muted text-13";
+        dt.textContent = k;
+        const dd = document.createElement("dd");
+        dd.className = "text-13";
+        dd.style.wordBreak = "break-all";
+        dd.textContent = v;
+        list.append(dt, dd);
+      }
+      const hint = document.createElement("p");
+      hint.className = "faint text-12";
+      hint.style.marginTop = "var(--space-4)";
+      hint.textContent =
+        "Change the default with: hush-cli config set --relay <url>. Existing vaults keep the relay they were created with.";
+      body.append(list, hint);
     } else {
       body.innerHTML = `<h2 class="text-22">${this.settingsSection}</h2><p class="muted">More options coming soon.</p>`;
     }

@@ -6,6 +6,8 @@ export interface StatusResponse {
   contacts: number;
   recovery_acknowledged: boolean;
   last_backup_unix: number;
+  relay: string;
+  relay_source: string;
 }
 
 export interface ContactDto {

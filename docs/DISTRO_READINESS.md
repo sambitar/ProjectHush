@@ -27,6 +27,7 @@ When implementing any milestone task, follow these rules. If a task conflicts, *
 ### State and storage
 
 - **One data root.** All persistent state (vault, config, keys, identity, relay settings, lease state, outsider contacts) under a single configurable directory, e.g. `HUSH_DATA_DIR`, defaulting to an XDG path. No scattered state in `~/.cache`, `/tmp`, `/var`, or ad hoc dotfiles.
+- **One client config surface.** Relay endpoint and daemon address resolve in `hush-core::config` from `{data_root}/client-config.json`, overridable by `HUSH_RELAY_URL` / `HUSH_DAEMON_ADDR` and per-invocation flags (flag/env > file > default). Binaries and scripts must not re-implement this. A vault keeps the relay it was created with; `client-config.json` decides the default for new vaults. `hush-cli config show|set` reads and writes it; the daemon reports the active relay in `/api/status`.
 - **Vault path is configurable** and must work when pointed at a **mount point** (LUKS volume that appears/disappears).
 - **Volatile data** in a configurable runtime dir (`XDG_RUNTIME_DIR` or `HUSH_RUNTIME_DIR`, often tmpfs): sockets, locks, temp files — **not** in the data root.
 - **No plaintext on disk, ever.** No plaintext temp files, swap-friendly secret buffers, crash dumps, or logs with content/keys. Use `mlock` / `zeroize` for key material where practical. Disable core dumps for the daemon (`PR_SET_DUMPABLE`, `RLIMIT_CORE=0`).

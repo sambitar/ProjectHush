@@ -29,12 +29,15 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 struct Args {
     #[arg(long, default_value = ".")]
     dir: PathBuf,
-    #[arg(long, env = "HUSH_DAEMON_ADDR", default_value = "127.0.0.1:9876")]
-    addr: String,
+    /// HTTP bind address. Defaults to HUSH_DAEMON_ADDR, then client-config.json.
+    #[arg(long, env = "HUSH_DAEMON_ADDR")]
+    addr: Option<String>,
 }
 
 struct App {
     dir: PathBuf,
+    /// Resolved HTTP bind address (flag/env > client-config.json > default).
+    addr: String,
     worker: AccountWorker,
     unlocked: Mutex<bool>,
     unlocked_at: Mutex<Option<Instant>>,
@@ -50,6 +53,10 @@ struct StatusResponse {
     contacts: usize,
     recovery_acknowledged: bool,
     last_backup_unix: u64,
+    /// Relay this vault actually uses; the resolved config relay while locked.
+    relay: String,
+    /// Where the relay value came from when it is not the vault's stored one.
+    relay_source: String,
 }
 
 #[derive(Deserialize)]
@@ -156,8 +163,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     security::harden_process();
     let args = Args::parse();
     let vault_dir = paths::vault_dir_from_args(args.dir);
+    let addr = hush_core::config::resolve_daemon_addr(&vault_dir, args.addr.as_deref());
     let app = App {
         dir: vault_dir,
+        addr: addr.clone(),
         worker: AccountWorker::spawn(),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
@@ -196,11 +205,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state.clone());
 
     let vault_dir = state.dir.display().to_string();
-    let listener = tokio::net::TcpListener::bind(&args.addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!(
         "hush-daemon on http://{} vault={} (set HUSH_DATA_DIR for default data root)",
-        args.addr,
-        vault_dir
+        addr, vault_dir
     );
     axum::serve(listener, router).await?;
     Ok(())
@@ -242,9 +250,9 @@ fn map_err(result: WorkResult) -> Result<WorkResult, (StatusCode, Json<ApiError>
 
 async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
     let locked = !*state.unlocked.lock().await;
-    let (protocol_name, vault_bytes, contacts, recovery_acknowledged, last_backup_unix) =
+    let (protocol_name, vault_bytes, contacts, recovery_acknowledged, last_backup_unix, relay) =
         if locked {
-            (None, 0, 0, true, 0)
+            (None, 0, 0, true, 0, None)
         } else {
             match state.worker.meta().await {
                 WorkResult::Meta {
@@ -253,16 +261,26 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
                     contacts,
                     recovery_acknowledged,
                     last_backup_unix,
+                    relay,
                 } => (
                     Some(protocol_name),
                     vault_bytes,
                     contacts,
                     recovery_acknowledged,
                     last_backup_unix,
+                    Some(relay),
                 ),
-                _ => (None, 0, 0, true, 0),
+                _ => (None, 0, 0, true, 0, None),
             }
         };
+    let (relay, relay_source) = match relay {
+        Some(stored) => (stored, "vault".to_string()),
+        None => {
+            let (value, source) =
+                hush_core::config::resolve_relay_url_with_source(&state.dir, None);
+            (value, source.as_str().to_string())
+        }
+    };
     Json(StatusResponse {
         locked,
         vault_dir: state.dir.display().to_string(),
@@ -271,6 +289,8 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
         contacts,
         recovery_acknowledged,
         last_backup_unix,
+        relay,
+        relay_source,
     })
 }
 
@@ -600,12 +620,11 @@ async fn link_device_start(
     match result {
         WorkResult::Backup(data) => {
             let (link_id, expires_unix) = state.link_device.store(data).await;
-            let api = std::env::var("HUSH_DAEMON_ADDR").unwrap_or_else(|_| "127.0.0.1:9876".into());
             let payload = serde_json::json!({
                 "v": 1,
                 "kind": "hush-link-device",
                 "link_id": link_id,
-                "source_api": format!("http://{}", api),
+                "source_api": format!("http://{}", state.addr),
                 "expires_unix": expires_unix,
             });
             Ok(Json(LinkDeviceStartResponse {

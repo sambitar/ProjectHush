@@ -99,6 +99,7 @@ pub enum WorkResult {
         contacts: usize,
         recovery_acknowledged: bool,
         last_backup_unix: u64,
+        relay: String,
     },
     Backup(Vec<u8>),
     RecoveryCode(String),
@@ -254,6 +255,7 @@ impl AccountWorker {
                                     contacts: a.contacts().len(),
                                     recovery_acknowledged: a.recovery_acknowledged(),
                                     last_backup_unix: a.last_backup_unix(),
+                                    relay: a.relay().to_string(),
                                 },
                             };
                             (reply, result)
