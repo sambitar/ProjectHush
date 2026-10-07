@@ -39,6 +39,36 @@ async fn export_vault_contains_lockfile() {
     assert!(archive.len() > 100);
 }
 
+/// A backup is the thing we hand to another device, so it must not carry this
+/// device's identity private key. That is what makes a linked device revocable:
+/// a device holding our identity key could impersonate us forever.
+#[tokio::test]
+async fn backup_excludes_device_key_material() {
+    let dir = TempDir::new().unwrap();
+    Account::create(dir.path(), "pw", "http://127.0.0.1:1")
+        .await
+        .unwrap();
+
+    let archive = export_vault(dir.path()).unwrap();
+    let mut tar = tar::Archive::new(&archive[..]);
+    let names: Vec<String> = tar
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+        .collect();
+
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.ends_with("device.enc") || n.ends_with("signal.enc")),
+        "backup must not carry this device's private identity: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with("account.enc")),
+        "shared vault data must still be included: {names:?}"
+    );
+}
+
 /// The recovery wrap pins the master key, so a passphrase change must re-wrap
 /// that same key. If it derived a new master instead, recovery would silently
 /// stop opening the vault and the account would be one forgotten passphrase

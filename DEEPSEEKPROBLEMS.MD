@@ -12,6 +12,140 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-07 — Multi-device Phase 1 (per-device key material)
+
+### [FIXED] Plan's Task 1 test could not compile as written
+
+- **Attempted:** followed `docs/plans/2026-10-06-multi-device.md` Task 1 literally, which puts the
+  `DeviceKeys` tests in an integration test at `crates/hush-core/tests/device_identity.rs` and calls
+  `vault.master_key()`.
+- **Symptom:** `Vault::master_key()` is `pub(crate)`, so an integration test cannot call it —
+  the file would not have compiled. The plan had also written those tests as `#[test]` while
+  `DeviceKeys::load`/`create` have to be `async`.
+- **Resolution:** the `DeviceKeys` tests live in `#[cfg(test)] mod tests` inside
+  `crates/hush-core/src/device.rs`, where `pub(crate)` is reachable. The plan's self-review notes
+  flagged the `async` part but not the visibility part.
+- **Lesson:** a plan that calls a crate-internal accessor from an integration test is wrong before
+  it is written. Check visibility when choosing where a test lives.
+
+### [FIXED] `DeviceKeys` had no `Debug`, breaking `unwrap_err` in its own tests
+
+- **Attempted:** asserted a missing device file with
+  `DeviceKeys::load(..).await.unwrap_err()`.
+- **Symptom:** `error[E0277]: device::DeviceKeys doesn't implement Debug`, because `unwrap_err`
+  requires the `Ok` type to be `Debug`. This is the second time this exact trap has been hit — the
+  earlier `Account::open(..).unwrap_err()` in `backup_recovery.rs` failed the same way.
+- **Resolution:** added a manual `impl Debug for DeviceKeys` that prints only `device_id` and calls
+  `finish_non_exhaustive()`, mirroring `Vault`. That is the better fix anyway: a derived `Debug`
+  would happily dump key material into a log line.
+- **Lesson:** types holding secrets should get a hand-written `Debug` up front, not after a test
+  failure. `Account` still lacks one and will hit this again.
+
+### [FIXED] Corrupted grep output from misusing `rg -r`
+
+- **Attempted:** `rg -rn "signal\.enc|receive_queue_id"` to find call sites.
+- **Symptom:** the output came back with every match replaced by the letter `n`, e.g.
+  `let signal_bytes = fs::read(dir.join("n"))`. `-r` is ripgrep's *replace* flag, so `-rn` means
+  "replace matches with n", not "recursive with line numbers".
+- **Resolution:** re-ran as `rg -n`. No code was changed on the basis of the bad output, but the
+  corrupted result was briefly read as "references are in other files".
+- **Lesson:** `rg` is already recursive; `-r` is never what is wanted for a search.
+
+### [FIXED] Ambiguous `as_ref()` in `backup.rs` after the exclusion change
+
+- **Attempted:** added an exclusion check to the tar loop, which required owning the relative path
+  as a `String` (`into_owned()`) to test it.
+- **Symptom:** `error[E0283]: type annotations needed` on
+  `append_path_with_name(&entry, rel.as_ref())` — `String` implements `AsRef` for `str`, `Path`,
+  `OsStr` and `[u8]`, so the call became ambiguous. The previous `Cow<str>` had resolved it.
+- **Resolution:** pass `rel.as_str()` explicitly.
+- **Lesson:** changing a `Cow<str>` to `String` can break an `as_ref()` that was previously
+  unambiguous.
+
+### [FIXED] Test asserted a file that a fresh vault does not have
+
+- **Attempted:** asserted the backup still contained `chat.enc` to prove history was preserved.
+- **Symptom:** `history must still be included: ["hush-backup-manifest.json", "account.enc",
+  "identity.pub", "vault.lock.json", "recovery.lock.json", "recovery.enc", "identity.secret"]` —
+  `chat.enc` is only written once there is a message, so a fresh vault has none.
+- **Resolution:** assert `account.enc` instead, which is the shared vault state that always exists.
+- **Lesson:** the assertion was testing an incidental file, not the property (shared data survives,
+  device data does not). Asserting the property would have avoided the failure.
+
+### [FIXED] Plan specified the wrong signature primitive for the device list
+
+- **Attempted:** plan Task 3 signs the device list with `ed25519_dalek::SigningKey` and verifies with
+  `VerifyingKey`, matching how `Vault` signs.
+- **Symptom:** the device identity is a **libsignal Curve25519** key, not an Ed25519 key, so it
+  cannot be passed to `ed25519_dalek` at all. The plan would not have compiled at Phase 2.
+- **Resolution:** not yet applied — Task 3 is Phase 2. The device list must be signed with libsignal's
+  `PrivateKey::calculate_signature` (XEd25519, as `mint_prekey_bundle` already does for signed
+  prekeys) and verified with `IdentityKey::verify_signature`. `docs/plans/2026-10-06-multi-device.md`
+  still shows the Ed25519 version and needs correcting before Phase 2 starts.
+- **Lesson:** "sign it" is not specific enough. Identify which key type holds the signing key before
+  choosing a signature library.
+
+### [OPEN] `identity.secret` is unused and still rides along in backups
+
+- **Attempted:** excluding this device's key material from backups surfaced that the archive
+  contains `identity.secret` and `identity.pub`.
+- **Symptom:** neither is used anywhere in the codebase outside `Vault`'s own tests —
+  not relay auth, not invites, not the Signal identity. The account's `protocol_name` comes from the
+  **signal** identity key, not this one. So it is a per-vault Ed25519 keypair that nothing reads.
+- **Why it matters:** it is a private key that is currently included in every backup. Harmless while
+  nothing consumes it, but Q9 of the multi-device design requires signing the device list with an
+  account-level key, and this is the obvious candidate. If it is adopted, it must be excluded from
+  backups exactly like `device.enc`, or the linked-device transfer hands over an account signing key.
+- **Resolution:** needs a decision, not a patch. Either delete the keypair as dead code or adopt it
+  as the account signing key and exclude it from backups. Not touched in this slice.
+
+### [OPEN] A restored backup now gets a fresh identity, and contacts are not told
+
+- **Attempted:** excluding `device.enc` from backups means `import_vault` produces a vault with no
+  device keys, so restore has to mint a new device identity or the vault is unusable.
+- **Symptom:** implemented and tested (`a_restored_backup_gets_a_fresh_device_identity`), and the
+  existing round-trip test still passes because it only compares `protocol_name`. But the restored
+  device now has a **different identity key** from the one contacts have pinned for it, so sessions
+  with existing contacts will fail to establish until they re-verify.
+- **Resolution:** correct behaviour for this model, but not yet surfaced anywhere in the UI or the
+  daemon. Phase 4/5 has to handle identity-change on the receiving side and the UI has to say
+  something other than "restored". Recorded rather than hidden.
+- **Lesson:** removing a key from a backup changes the restore path's semantics. The old test passing
+  was not evidence the behaviour was still correct.
+
+### [FIXED] Migration had to move from Phase 5 into Phase 1
+
+- **Attempted:** the plan schedules the legacy migration (`signal.enc` -> `device.enc`) as Task 10
+  in Phase 5.
+- **Symptom:** Phase 1 stops writing `signal.enc`, so an existing vault would have neither file and
+  every `Account::open` on a real vault would fail immediately. Migration is not optional work that
+  can wait for a later phase.
+- **Resolution:** migration landed in Phase 1 (`migrate_legacy_device` in `account.rs`, plus
+  `legacy_vault_migrates_keeping_identity_name_and_inbox`). The legacy file is deleted only after
+  `device.enc` is written, so a failed save cannot destroy the identity.
+- **Lesson:** when a change removes a file, the read path for that file is part of the same task,
+  not a follow-up.
+
+### [OPEN] The tree is not `cargo fmt`-clean, so "run the linters" had no baseline
+
+- **Attempted:** ran `cargo fmt --all -- --check` and `cargo clippy` before calling Phase 1 done,
+  per the completion standard.
+- **Symptom:** `cargo fmt` reports diffs in files this slice never touched —
+  `apps/hush-tauri/src-tauri/src/daemon_client.rs`, `crates/hush-core/src/signal.rs`,
+  `crates/hush-core/src/vault.rs`, `crates/hush-daemon/src/main.rs`. Checking the committed version
+  (`git show HEAD:crates/hush-core/src/backup.rs | rustfmt --check`) also fails, so `backup.rs` was
+  already unformatted before this slice edited it. There is no `rustfmt.toml`.
+- **Resolution:** deliberately not fixed here. Running `cargo fmt` across the tree would bury the
+  slice in unrelated diff; only the new file `crates/hush-core/src/device.rs` was formatted.
+  Reformatting the tree wants its own commit.
+- **Also:** 8 clippy `redundant closure` warnings, all pre-existing, in `backup.rs`
+  (`.map_err(|e| Error::Io(e))`) and `signal.rs`. Not introduced by this slice and not fixed
+  mid-feature, per the feature protocol.
+- **Lesson:** establish the linter baseline before reading a diff as caused by the current change.
+  Otherwise pre-existing noise looks like a regression.
+
+---
+
 ## 2026-10-06 — Member calls spec (Task 17, P2P WebRTC)
 
 ### [FIXED] Assumed the Tauri webview could host WebRTC on Linux

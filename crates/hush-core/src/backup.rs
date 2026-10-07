@@ -9,6 +9,18 @@ use crate::error::Error;
 pub const BACKUP_FORMAT_VERSION: u32 = 1;
 const MANIFEST_NAME: &str = "hush-backup-manifest.json";
 
+/// Per-device material is deliberately never part of a backup.
+///
+/// A backup is the thing we hand to another device, and handing over our
+/// identity private key would make that device impossible to revoke. The legacy
+/// name is included too: a vault that has not migrated yet still carries the
+/// same key in the old file.
+const DEVICE_LOCAL_FILES: &[&str] = &["device.enc", "signal.enc"];
+
+fn is_device_local(rel: &str) -> bool {
+    DEVICE_LOCAL_FILES.iter().any(|f| rel.ends_with(f))
+}
+
 #[derive(Serialize, Deserialize)]
 struct BackupManifest {
     version: u32,
@@ -43,9 +55,13 @@ pub fn export_vault(dir: &Path) -> Result<Vec<u8>, Error> {
             let rel = entry
                 .strip_prefix(dir)
                 .map_err(|_| Error::Corrupt)?
-                .to_string_lossy();
+                .to_string_lossy()
+                .into_owned();
+            if is_device_local(&rel) {
+                continue;
+            }
             builder
-                .append_path_with_name(&entry, rel.as_ref())
+                .append_path_with_name(&entry, rel.as_str())
                 .map_err(|e| Error::Io(e))?;
         }
         builder.finish().map_err(|e| Error::Io(e))?;

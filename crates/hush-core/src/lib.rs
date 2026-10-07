@@ -4,6 +4,7 @@ mod backup;
 mod chat_log;
 pub mod config;
 mod crypto;
+mod device;
 mod error;
 mod invite;
 mod lockfile;
@@ -25,6 +26,7 @@ pub use config::{
     resolve_daemon_socket_with_source, resolve_relay_url, resolve_relay_url_with_source,
 };
 pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
+pub use device::DeviceKeys;
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
 pub use chat_log::{ChatRecord, ChatRecordPayload};
 pub use error::Error;

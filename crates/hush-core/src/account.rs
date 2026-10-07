@@ -1,14 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use libsignal_protocol::{IdentityKeyStore, InMemSignalProtocolStore};
+use libsignal_protocol::IdentityKeyStore;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::backup::{export_vault, import_vault};
 use crate::chat_log::ChatLog;
+use crate::device::{DeviceKeys, LEGACY_DEVICE_FILE};
 use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_files_exist, unwrap_master_with_recovery};
-use crate::crypto::{decrypt, encrypt, random_bytes};
+use crate::crypto::{decrypt, encrypt};
 use crate::error::Error;
 use crate::invite::InvitePayload;
 use crate::message::{InboxResult, ReceivedMessage};
@@ -18,7 +18,7 @@ use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
     process_contact_bundle, protocol_name_from_identity,
 };
-use crate::signal_persist::{export_store, import_store};
+use crate::signal_persist::import_store;
 use crate::vault::{BlobId, Vault};
 use crate::wire::{decode_relay_blob, encode_relay_blob};
 
@@ -37,8 +37,6 @@ pub struct Contact {
 struct AccountState {
     relay: String,
     protocol_name: String,
-    receive_queue_id: String,
-    receive_queue_token: String,
     contacts: Vec<Contact>,
     /// Stable invite string so "Copy my invite" does not rotate keys every click.
     #[serde(default)]
@@ -47,11 +45,19 @@ struct AccountState {
     recovery_acknowledged: bool,
     #[serde(default)]
     last_backup_unix: u64,
+    /// Legacy: this device's relay inbox used to live in `account.enc`. Read
+    /// once when migrating to `device.enc`, then never written again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receive_queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receive_queue_token: Option<String>,
 }
 
 pub struct Account {
     vault: Vault,
-    store: InMemSignalProtocolStore,
+    /// This device's own keys and relay inbox, kept out of the shared vault so
+    /// it is never handed to another device.
+    device: DeviceKeys,
     state: AccountState,
     dir: PathBuf,
     chat_log: ChatLog,
@@ -62,33 +68,32 @@ impl Account {
     pub async fn create(dir: &Path, passphrase: &str, relay: &str) -> Result<Self, Error> {
         let relay = normalize_relay_base(relay)?;
         let vault = Vault::create(dir, passphrase)?;
-        let mut store = crate::signal::new_protocol_store()?;
-        let _bundle = mint_prekey_bundle(&mut store).await?;
+        let master = *vault.master_key();
+        let mut device = DeviceKeys::create(dir, &master, 1).await?;
+        let _bundle = mint_prekey_bundle(device.store_mut()).await?;
         let protocol_name = protocol_name_from_identity(
-            &store
+            &device
+                .store_mut()
                 .get_identity_key_pair()
                 .await
                 .map_err(|_| Error::Corrupt)?,
         );
-        let receive_queue_id = Uuid::new_v4().to_string();
-        let receive_queue_token = hex::encode(random_bytes::<32>());
         let state = AccountState {
             relay,
             protocol_name,
-            receive_queue_id,
-            receive_queue_token,
             contacts: Vec::new(),
             invite_cache: None,
             recovery_acknowledged: false,
             last_backup_unix: 0,
+            receive_queue_id: None,
+            receive_queue_token: None,
         };
-        let master = *vault.master_key();
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
         let chat_log = ChatLog::load(dir, &master)?;
         let account = Self {
             vault,
-            store,
+            device,
             state,
             dir: dir.to_path_buf(),
             chat_log,
@@ -125,9 +130,26 @@ impl Account {
         let state_bytes = decrypt(&master, &packed)?;
         let mut state: AccountState =
             serde_json::from_slice(&state_bytes).map_err(|_| Error::Corrupt)?;
-        let signal_bytes = fs::read(dir.join("signal.enc")).map_err(|_| Error::NotFound)?;
-        let signal_plain = decrypt(&master, &signal_bytes)?;
-        let store = import_store(&signal_plain).await?;
+
+        let mut migrated = false;
+        let mut fresh_device = false;
+        let device = match DeviceKeys::load(dir, &master).await {
+            Ok(device) => device,
+            Err(Error::NotFound) if dir.join(LEGACY_DEVICE_FILE).exists() => {
+                migrated = true;
+                migrate_legacy_device(dir, &master, &mut state).await?
+            }
+            Err(Error::NotFound) => {
+                // A restored backup carries the shared vault but not this
+                // device's keys, by design: a backup must never hand our
+                // identity private key to another device. Mint a new device
+                // identity so the restored vault is usable.
+                fresh_device = true;
+                DeviceKeys::create(dir, &master, 1).await?
+            }
+            Err(e) => return Err(e),
+        };
+
         let chat_log = ChatLog::load(dir, &master)?;
 
         let mut pending_recovery_code = None;
@@ -138,10 +160,10 @@ impl Account {
             pending_recovery_code = Some(code);
         }
 
-        let needs_save = pending_recovery_code.is_some();
+        let needs_save = migrated || fresh_device || pending_recovery_code.is_some();
         let account = Self {
             vault,
-            store,
+            device,
             state,
             dir: dir.to_path_buf(),
             chat_log,
@@ -149,6 +171,12 @@ impl Account {
         };
         if needs_save {
             account.save().await?;
+        }
+        if migrated {
+            // Safe only now that `device.enc` holds the same identity: the
+            // legacy file carries the identity private key and would otherwise
+            // ride along in the next backup.
+            let _ = fs::remove_file(dir.join(LEGACY_DEVICE_FILE));
         }
         Ok(account)
     }
@@ -217,12 +245,12 @@ impl Account {
         if let Some(cached) = &self.state.invite_cache {
             return Ok(cached.clone());
         }
-        let bundle = mint_prekey_bundle(&mut self.store).await?;
+        let bundle = mint_prekey_bundle(self.device.store_mut()).await?;
         let payload = invite_from_bundle(
             &self.state.relay,
             &self.state.protocol_name,
-            &self.state.receive_queue_id,
-            &self.state.receive_queue_token,
+            self.device.queue_id(),
+            self.device.queue_token(),
             &bundle,
         )?;
         let encoded = payload.encode()?;
@@ -246,7 +274,7 @@ impl Account {
         }
         let bundle = payload.to_prekey_bundle()?;
         process_contact_bundle(
-            &mut self.store,
+            self.device.store_mut(),
             &self.state.protocol_name,
             &payload.protocol_name,
             &bundle,
@@ -333,10 +361,7 @@ impl Account {
     pub async fn heartbeat_presence(&self) -> Result<(), Error> {
         let relay = RelayClient::try_new(&self.state.relay)?;
         relay
-            .touch_presence(
-                &self.state.receive_queue_id,
-                &self.state.receive_queue_token,
-            )
+            .touch_presence(self.device.queue_id(), self.device.queue_token())
             .await
     }
 
@@ -360,7 +385,7 @@ impl Account {
         }
         let plain = payload.encode()?;
         let ct = encrypt_message(
-            &mut self.store,
+            self.device.store_mut(),
             &self.state.protocol_name,
             &contact.protocol_name,
             plain.as_slice(),
@@ -378,23 +403,19 @@ impl Account {
     pub async fn recv(&mut self) -> Result<InboxResult, Error> {
         let relay = RelayClient::try_new(&self.state.relay)?;
         let ids = relay
-            .list(&self.state.receive_queue_id, &self.state.receive_queue_token)
+            .list(self.device.queue_id(), self.device.queue_token())
             .await?;
         let mut out = Vec::new();
         let mut warnings = Vec::new();
         let mut dirty = false;
         for blob_id in ids {
             let body = relay
-                .get(
-                    &self.state.receive_queue_id,
-                    &self.state.receive_queue_token,
-                    &blob_id,
-                )
+                .get(self.device.queue_id(), self.device.queue_token(), &blob_id)
                 .await?;
             let (ct, legacy_from) = decode_relay_blob(&body)?;
             let (plain, from_protocol) = match legacy_from {
                 Some(from) => match decrypt_message(
-                    &mut self.store,
+                    self.device.store_mut(),
                     &self.state.protocol_name,
                     &from,
                     &ct,
@@ -466,11 +487,7 @@ impl Account {
                 file_blob_id,
             });
             relay
-                .delete(
-                    &self.state.receive_queue_id,
-                    &self.state.receive_queue_token,
-                    &blob_id,
-                )
+                .delete(self.device.queue_id(), self.device.queue_token(), &blob_id)
                 .await?;
             dirty = true;
         }
@@ -507,7 +524,7 @@ impl Account {
             .collect();
         for name in names {
             if let Ok(plain) = decrypt_message(
-                &mut self.store,
+                self.device.store_mut(),
                 &self.state.protocol_name,
                 &name,
                 ct,
@@ -532,11 +549,28 @@ impl Account {
             .iter()
             .map(|c| c.protocol_name.clone())
             .collect();
-        let signal_plain = export_store(&self.store, &session_names).await?;
-        let signal_enc = encrypt(master, &signal_plain)?;
-        fs::write(self.dir.join("signal.enc"), signal_enc)?;
+        self.device.save(&self.dir, master, &session_names).await?;
         Ok(())
     }
+}
+
+/// Move a pre-multi-device vault onto `device.enc`.
+///
+/// The identity key is preserved exactly, so the protocol name, every contact
+/// and every session are unaffected. The legacy file is deleted by the caller
+/// once the new one is written.
+async fn migrate_legacy_device(
+    dir: &Path,
+    master: &[u8; crate::crypto::MASTER_KEY_LEN],
+    state: &mut AccountState,
+) -> Result<DeviceKeys, Error> {
+    let signal_bytes = fs::read(dir.join(LEGACY_DEVICE_FILE)).map_err(|_| Error::NotFound)?;
+    let signal_plain = decrypt(master, &signal_bytes)?;
+    let store = import_store(&signal_plain).await?;
+    let queue_id = state.receive_queue_id.take().ok_or(Error::Corrupt)?;
+    let queue_token = state.receive_queue_token.take().ok_or(Error::Corrupt)?;
+    // Device 1 is the identity that already existed, so it keeps its key.
+    Ok(DeviceKeys::from_store(1, store, queue_id, queue_token))
 }
 
 fn decode_legacy_payload(plain: &[u8]) -> Result<MessagePayload, Error> {
@@ -572,4 +606,142 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::DEVICE_FILE;
+    use crate::signal_persist::export_store;
+    use crate::vault::Vault;
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("hush-account-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// Write the on-disk layout a vault had before the multi-device model: the
+    /// device identity in `signal.enc`, and this device's relay inbox in
+    /// `account.enc`.
+    async fn write_legacy_vault(dir: &Path, passphrase: &str) -> (String, String, Vec<u8>) {
+        let vault = Vault::create(dir, passphrase).unwrap();
+        let master = *vault.master_key();
+        let mut device = DeviceKeys::create(dir, &master, 1).await.unwrap();
+        let _ = mint_prekey_bundle(device.store_mut()).await.unwrap();
+        let protocol_name = protocol_name_from_identity(
+            &device
+                .store_mut()
+                .get_identity_key_pair()
+                .await
+                .unwrap(),
+        );
+        let identity = device.identity_public().await.unwrap();
+        let queue_id = device.queue_id().to_string();
+        let queue_token = device.queue_token().to_string();
+
+        let store_bytes = export_store(device.store_mut(), &[]).await.unwrap();
+        fs::write(
+            dir.join(LEGACY_DEVICE_FILE),
+            encrypt(&master, &store_bytes).unwrap(),
+        )
+        .unwrap();
+
+        let state = AccountState {
+            relay: "http://127.0.0.1:1".into(),
+            protocol_name: protocol_name.clone(),
+            contacts: Vec::new(),
+            invite_cache: None,
+            recovery_acknowledged: true,
+            last_backup_unix: 0,
+            receive_queue_id: Some(queue_id.clone()),
+            receive_queue_token: Some(queue_token.clone()),
+        };
+        let state_bytes = serde_json::to_vec(&state).unwrap();
+        fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();
+
+        // The whole point: this vault predates device.enc.
+        fs::remove_file(dir.join(DEVICE_FILE)).unwrap();
+        (protocol_name, queue_id, identity)
+    }
+
+    #[tokio::test]
+    async fn legacy_vault_migrates_keeping_identity_name_and_inbox() {
+        let dir = scratch("legacy");
+        let (protocol_name, queue_id, identity) = write_legacy_vault(&dir, "pw").await;
+
+        let account = Account::open(&dir, "pw").await.unwrap();
+
+        assert_eq!(
+            account.protocol_name(),
+            protocol_name,
+            "migration must not rename the account, or every contact breaks"
+        );
+        assert_eq!(
+            account.device.queue_id(),
+            queue_id,
+            "the relay inbox must move across, not be regenerated"
+        );
+        assert!(dir.join(DEVICE_FILE).exists(), "migration must write device.enc");
+        assert!(
+            !dir.join(LEGACY_DEVICE_FILE).exists(),
+            "the legacy key file holds the identity private key and must not linger"
+        );
+
+        let master = *account.vault.master_key();
+        let reloaded = DeviceKeys::load(&dir, &master).await.unwrap();
+        assert_eq!(
+            reloaded.identity_public().await.unwrap(),
+            identity,
+            "the identity key must be preserved exactly, or sessions with existing contacts break"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_backup_gets_a_fresh_device_identity() {
+        let dir = scratch("restore-source");
+        let account = Account::create(&dir, "pw", "http://127.0.0.1:1")
+            .await
+            .unwrap();
+        let original = account
+            .device
+            .identity_public()
+            .await
+            .unwrap();
+        let archive = export_vault(&dir).unwrap();
+        drop(account);
+
+        let restored = scratch("restore-target");
+        import_vault(&restored, &archive).unwrap();
+        let account = Account::open(&restored, "pw").await.unwrap();
+
+        assert!(
+            restored.join(DEVICE_FILE).exists(),
+            "a restored vault must mint a device identity, or it cannot be used"
+        );
+        assert_ne!(
+            account.device.identity_public().await.unwrap(),
+            original,
+            "the restore must not resurrect the backed-up identity key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_vault_does_not_leak_its_identity_through_backup() {
+        let dir = scratch("legacy-backup");
+        let (_, _, _) = write_legacy_vault(&dir, "pw").await;
+        let archive = export_vault(&dir).unwrap();
+
+        let mut tar = tar::Archive::new(&archive[..]);
+        let names: Vec<String> = tar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.ends_with(LEGACY_DEVICE_FILE)),
+            "an unmigrated vault must not export its identity key: {names:?}"
+        );
+    }
 }

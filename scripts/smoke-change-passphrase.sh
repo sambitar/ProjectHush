@@ -2,7 +2,7 @@
 # Passphrase rotation smoke: changing the passphrase re-wraps the master key and
 # must not touch anything encrypted by it.
 #
-# The important property is negative: account.enc, signal.enc, the chat log and
+# The important property is negative: account.enc, device.enc, the chat log and
 # the recovery wrap are all encrypted with the master key, so if rotation derived
 # a new master they would have to be rewritten. We hash them before and after and
 # require the bytes to be identical, which is only possible if the master key
@@ -53,12 +53,13 @@ trap cleanup EXIT
 
 # Fingerprint everything the master key protects, plus the recovery wrap.
 BEFORE_ACCOUNT=$(digest "$T/account.enc")
-BEFORE_SIGNAL=$(digest "$T/signal.enc")
+BEFORE_DEVICE=$(digest "$T/device.enc")
 BEFORE_CHAT=$(digest "$T/chat.enc")
 BEFORE_RECOVERY=$(digest "$T/recovery.enc")
 BEFORE_IDENTITY=$(digest "$T/identity.secret")
 BEFORE_LOCK=$(digest "$T/vault.lock.json")
 [[ "$BEFORE_RECOVERY" != "absent" ]] || fail "init did not write a recovery wrap"
+[[ "$BEFORE_DEVICE" != "absent" ]] || fail "init did not write this device's key material"
 pass "vault created; master-protected files fingerprinted"
 
 HUSH_RUNTIME_DIR="$R" "$DMN" --dir "$T" >"$T/daemon.log" 2>&1 &
@@ -85,7 +86,7 @@ api POST /api/change-passphrase '{"current_passphrase":"first-pass","new_passphr
 pass "passphrase rotated (204)"
 
 # --- nothing the master key protects was rewritten ---------------------------
-for pair in "account.enc:$BEFORE_ACCOUNT" "signal.enc:$BEFORE_SIGNAL" "chat.enc:$BEFORE_CHAT" \
+for pair in "account.enc:$BEFORE_ACCOUNT" "device.enc:$BEFORE_DEVICE" "chat.enc:$BEFORE_CHAT" \
             "recovery.enc:$BEFORE_RECOVERY" "identity.secret:$BEFORE_IDENTITY"; do
   file="${pair%%:*}"; want="${pair##*:}"
   got=$(digest "$T/$file")
