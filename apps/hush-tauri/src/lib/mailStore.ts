@@ -30,6 +30,7 @@ export interface MailThread {
  * records into threads for the Mail rail. Nothing is persisted here.
  */
 const byThread = new Map<string, MailMessage[]>();
+const unread = new Set<string>();
 let seq = 0;
 
 function nextId(): string {
@@ -39,7 +40,25 @@ function nextId(): string {
 
 export function clearMailStore(): void {
   byThread.clear();
+  unread.clear();
   seq = 0;
+}
+
+/** A thread's display subject: the earliest message that set one. */
+export function threadSubject(msgs: MailMessage[]): string {
+  return msgs.find((m) => m.subject)?.subject || "(no subject)";
+}
+
+export function markThreadRead(threadId: string): void {
+  unread.delete(threadId);
+}
+
+export function threadHasUnread(threadId: string): boolean {
+  return unread.has(threadId);
+}
+
+export function hasUnreadMail(): boolean {
+  return unread.size > 0;
 }
 
 function push(m: MailMessage): void {
@@ -48,8 +67,14 @@ function push(m: MailMessage): void {
   byThread.set(m.threadId, list);
 }
 
+/**
+ * Rebuild thread contents from the daemon's mail log. Unread state is deliberately
+ * preserved: a rebuild only carries content, and wiping unread here would drop the
+ * badge whenever a refresh raced an ingest. The log cannot tell us which records are
+ * new, so a rebuild never marks anything unread on its own.
+ */
 export function loadMail(records: ChatRecordDto[]): void {
-  clearMailStore();
+  byThread.clear();
   for (const r of records) {
     if (r.payload.t !== "mail") continue;
     push({
@@ -86,6 +111,7 @@ export function ingestIncomingMail(dto: ReceivedDto): MailMessage | null {
     createdAt: Date.now(),
   };
   push(m);
+  unread.add(m.threadId);
   return m;
 }
 
@@ -122,7 +148,7 @@ export function listThreads(): MailThread[] {
     out.push({
       threadId,
       contactNick: last.contactNick,
-      subject: msgs[0].subject || "(no subject)",
+      subject: threadSubject(msgs),
       lastAt: last.createdAt,
       count: msgs.length,
     });

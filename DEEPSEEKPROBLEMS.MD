@@ -14,6 +14,44 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ## 2026-10-07 — Internal member mail (Task 5d)
 
+### [FIXED] A stale second browser tab drained the relay queue and looked like UI staleness
+
+- **Attempted:** verifying the new unread badge by reading the rail badge and thread list from the
+  live page while a hand-rolled two-peer harness delivered mail.
+- **Symptom:** intermittently the daemon's `/api/mail` held records while the UI store did not, and
+  the badge stayed off. Instrumenting `window.fetch` in the page showed every `/api/recv` returning
+  `{"messages":[],"warnings":[]}` even though new mail had just been sent — so the queue was being
+  drained by someone else before the observed tab's poll.
+- **Root cause:** `browser_tabs` listed two Hush tabs: the current one on `:4174` and a leftover tab
+  on `:4173` from an earlier session. The `:4173` preview server was long dead, but the already
+  loaded page kept running and polling the same daemon on `:9876`. It won the drain race and kept
+  the mail in its own JS context; the tab under test then legitimately saw an empty queue. This is a
+  harness problem, not an app defect.
+- **Resolution:** closed the stale tab, then re-verified with a single polling client: the badge
+  appears on incoming mail, the thread shows one unread dot, opening the thread clears both, and a
+  thread whose first message had no subject displays the later subject.
+- **Lesson:** before trusting a UI-observation mismatch, list the open tabs. A dead preview server
+  does not stop an already-loaded page from continuing to talk to a shared daemon.
+- **Related fix:** `loadMail` used to call `clearMailStore`, which also wiped unread. Any refresh
+  that ran after an ingest (backup download, saving the mail handle, re-unlock) would have dropped
+  the badge. `loadMail` now rebuilds thread content only and leaves unread alone.
+
+### [WORKED AROUND] Re-seeding the manual UI harness produced a spurious relay `401`
+
+- **Attempted:** built a two-peer harness (relay + two daemons) to check the Mail polish in a real
+  browser, ran it, then re-ran it to pick up a port change. The second run began with
+  `rm -rf /tmp/hush-mail-polish` while the first run's relay was still running and holding
+  `relay.db`.
+- **Symptom:** the recipient's `/api/recv` returned `{"error":"relay error: list failed: 401
+  Unauthorized"}` and `/api/mail` stayed `[]`, which looks like a queue-credential regression. It
+  is not: `scripts/smoke-mail.sh` (clean single run, fresh dir) passes the same store-and-forward
+  path end to end, including the offline send and the reply.
+- **Resolution:** stopped reusing a directory while processes hold it. The harness is disposable:
+  kill relay + daemons first, then wipe, then seed once. This is a tooling/harness problem, not a
+  repo problem.
+- **Lesson:** a `401` from a hand-rolled harness is not evidence of a code regression until the
+  hermetic smoke script reproduces it. Run the script first.
+
 ### [WORKED AROUND] `CODE` from a shell helper is lost inside `$(...)`
 
 - **Attempted:** in `scripts/smoke-mail.sh`, captured the response of `api_at` (a helper that sets

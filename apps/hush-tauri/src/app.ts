@@ -24,9 +24,13 @@ import { MAX_FILE_BYTES, RECV_POLL_MS } from "./lib/constants";
 import {
   clearMailStore,
   getThread as getMailThread,
+  hasUnreadMail,
   ingestIncomingMail,
   listThreads,
   loadMail,
+  markThreadRead,
+  threadHasUnread,
+  threadSubject,
   type MailAttachmentRef,
 } from "./lib/mailStore";
 import { getAutoLockMs, getAutoLockMinutes, patchUiPrefs } from "./lib/api/uiPrefs";
@@ -457,13 +461,19 @@ export class App {
     return back;
   }
 
-  private railBtn(id: Rail, label: string, ic: IconName): HTMLElement {
+  private railBtn(id: Rail, label: string, ic: IconName, badge = false): HTMLElement {
     const b = document.createElement("button");
     b.className = `rail-btn pressable${this.rail === id ? " active" : ""}`;
     b.appendChild(icon(ic));
     const span = document.createElement("span");
     span.textContent = label;
     b.appendChild(span);
+    if (badge) {
+      const dot = document.createElement("span");
+      dot.className = "rail-badge";
+      dot.setAttribute("aria-label", "Unread");
+      b.appendChild(dot);
+    }
     b.onclick = () => {
       this.rail = id;
       this.render();
@@ -482,7 +492,7 @@ export class App {
     logo.appendChild(icon("vault"));
     rail.appendChild(logo);
     rail.appendChild(this.railBtn("chats", "Chats", "chats"));
-    rail.appendChild(this.railBtn("mail", "Mail", "mail"));
+    rail.appendChild(this.railBtn("mail", "Mail", "mail", hasUnreadMail()));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
     rail.appendChild(spacer);
@@ -1098,8 +1108,15 @@ export class App {
       const time = document.createElement("span");
       time.className = "text-12 faint";
       time.textContent = formatRelative(t.lastAt);
+      if (threadHasUnread(t.threadId)) {
+        const dot = document.createElement("span");
+        dot.className = "mail-unread-dot";
+        dot.setAttribute("aria-label", "Unread");
+        row.append(dot);
+      }
       row.append(meta, time);
       row.onclick = () => {
+        markThreadRead(t.threadId);
         this.mailThreadId = t.threadId;
         this.mailComposeOpen = false;
         this.render();
@@ -1127,7 +1144,7 @@ export class App {
     const h = document.createElement("h1");
     h.className = "text-22";
     h.style.marginTop = "var(--space-4)";
-    h.textContent = msgs[0]?.subject || "(no subject)";
+    h.textContent = threadSubject(msgs);
     const sub = document.createElement("p");
     sub.className = "muted text-13";
     sub.textContent = `With ${displayNick(contact)}`;
@@ -1157,7 +1174,7 @@ export class App {
       this.renderMailComposer({
         to: contact,
         threadId,
-        subject: msgs[0]?.subject,
+        subject: msgs.find((m) => m.subject)?.subject,
       }),
     );
     return pane;
@@ -1250,6 +1267,31 @@ export class App {
     files.multiple = true;
     files.className = "mail-file-input";
 
+    const preview = document.createElement("div");
+    preview.className = "mail-attachment-preview";
+    files.onchange = () => {
+      preview.innerHTML = "";
+      const picked = Array.from(files.files ?? []);
+      if (!picked.length) return;
+      const total = picked.reduce((n, f) => n + f.size, 0);
+      const summary = document.createElement("div");
+      summary.className = "text-12 faint";
+      summary.textContent = `${picked.length} file${picked.length === 1 ? "" : "s"} · ${formatBytes(total)}`;
+      preview.appendChild(summary);
+      for (const f of picked) {
+        const row = document.createElement("div");
+        row.className = "mail-attachment";
+        const name = document.createElement("span");
+        name.className = "text-13";
+        name.textContent = f.name;
+        const size = document.createElement("span");
+        size.className = "text-12 faint";
+        size.textContent = formatBytes(f.size);
+        row.append(name, size);
+        preview.appendChild(row);
+      }
+    };
+
     const err = document.createElement("p");
     err.className = "text-13";
     err.style.color = "var(--danger)";
@@ -1269,7 +1311,7 @@ export class App {
       isReply,
     });
 
-    wrap.append(toSel, subj, body, files, send, err);
+    wrap.append(toSel, subj, body, files, preview, send, err);
     return wrap;
   }
 
