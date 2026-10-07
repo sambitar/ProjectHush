@@ -12,6 +12,94 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-07 — Two-peer presence: Alice and Bob could not see each other
+
+Symptom: in the `scripts/run-two-ui.sh` harness both peers listed each other with
+`inbound_ready: true` but `online: false`, so the composer stayed disabled and a message sat
+undelivered in the relay.
+
+### [FIXED] A rotated relay inbox was republished only once, so a lost publish left the peer unreachable
+
+- **Attempted:** traced presence end to end. `POST /api/presence/heartbeat` on both daemons returned
+  204 and advanced `presence_at` for both live queues (`61c4082e` = Alice, `ec716fd5` = Bob), yet
+  `GET /api/contacts` still reported `online: false`.
+- **Symptom:** both contact records named inboxes no daemon reads. Alice's contact `bob` held
+  `917eae3e` (a blob was sitting in it, delivered minutes earlier and never received); Bob's contact
+  `alice` held `53050bc1`, last heartbeated the previous day. Both peers' real inboxes had changed —
+  the read/delivery credential split rotates every pre-split vault's queue once — but the contacts
+  still pointed at the abandoned ones.
+- **Cause:** the republish that tells peers about the new inbox ran only on the unlock that rotated
+  (`if a.queue_rotated()`), and it was best effort. `Account::open` rewrites `device.enc` as v2 on
+  that same call, so `queue_rotated()` is false on every later open — the comment claiming "the next
+  unlock retries" was wrong, and a publish that failed (relay not up yet) was lost for good.
+  `device_dirs` on the relay held Alice's list and no row at all for Bob, so nothing could ever point
+  Alice at Bob's real inbox.
+- **Resolution:** `Account::ensure_device_list_published()` compares the *published* list against this
+  device's current inbox and republishes when they disagree (including "no list at all"), so the
+  repair is durable and also heals a vault whose publish was lost before the check existed. The daemon
+  unlock path calls it unconditionally instead of gating on `queue_rotated()`.
+- **Lesson:** a one-shot flag is not a retry policy. When the condition is cleared by the same
+  operation that consumes it, "best effort" silently becomes "never". Compare against durable state
+  (what is actually published) instead of trusting a one-shot marker.
+
+### [FIXED] Presence read a cached inbox, and the UI refuses to send to an offline contact, so a moved inbox stayed offline forever
+
+- **Attempted:** looked for anything that would refresh a contact's cached queue. Only
+  `send_payload_inner` called `refresh_contact_devices_if_stale`.
+- **Symptom:** `contact_is_online` checks the cached `queue_id`, so a contact whose inbox moved read as
+  offline; and the UI disables the composer and send button for an offline contact (`renderComposer`,
+  `ta.disabled = !contactOnline`), so the one action that would refresh the cache could never run.
+  Alice could not learn Bob's new inbox even after he republished, because she had no way to trigger
+  the refresh.
+- **Resolution:** the daemon's `/api/contacts` handler now refreshes any stale contact device list
+  before reporting presence (`refresh_contact_devices_if_stale`, made `pub`), bounded by the same
+  5-minute TTL the send path already used. Presence polling is the natural healing point.
+- **Lesson:** when a UI gate depends on a cached value, something other than the gated action has to
+  be able to refresh it. "We only refresh on send" plus "we never send while stale" is a closed loop.
+
+### [OPEN] Desktop screenshot under Wayland is a black root, so the UI windows could not be verified visually
+
+- **Attempted:** captured the screen with `ffmpeg -f x11grab -i :0` to confirm the two Tauri windows
+  show "Online".
+- **Symptom:** the PNG is 1920x1080 and 100% black (68 distinct colours, all antialiasing noise). The
+  session runs Wayland (`WAYLAND_DISPLAY=wayland-0`); x11grab only sees the empty XWayland root, and no
+  Wayland-native tool (`grim`, `spectacle`) is installed.
+- **Resolution:** not resolved. Verified through the daemon instead: both `/api/contacts` responses
+  report `online: true`, and both queues' `presence_at` advance on their own every few seconds, which
+  only happens if the two UI windows are up, unlocked and polling.
+- **Lesson:** tooling-related, not a repo problem. On this host the UI has to be verified through the
+  daemon API; a desktop screenshot is not evidence here.
+
+---
+
+## 2026-10-07 — Repo consolidation (two worktrees merged into master)
+
+### [FIXED] `pkill -f '<pattern>'` killed its own shell before the build could start
+
+- **Attempted:** stop a stale `cargo check` by pattern and launch a fresh one in the same command:
+  `pkill -f 'cargo check -p hush-core'; … ; nohup cargo check … > /tmp/check3.log &`.
+- **Symptom:** `/tmp/check3.log` was never created and none of the follow-up commands ran. `pkill -f`
+  matches the full command line, and the invoking shell's own command line contained the literal
+  pattern, so it signalled itself before the redirect was set up.
+- **Resolution:** killed by pid (`pgrep -x cargo` / `pgrep -x rustc`) instead of by a pattern that
+  appears in the caller's own command line.
+- **Lesson:** `pkill -f` / `pgrep -f` match the caller's own command line. Never pattern-kill on a
+  string the command itself contains; use exact process names or the `[c]argo` bracket trick.
+
+### [FIXED] `AwaitShell` returned instantly because the launcher shell had already exited
+
+- **Attempted:** polled a backgrounded build with `AwaitShell` using the shell id of the command that
+  started it (`nohup cargo check … & echo started`).
+- **Symptom:** the poll reported the job "completed" in ~5s with exit 0 and "pattern did not match"
+  while cargo was still compiling. The launcher shell only ran `echo` and exited; `nohup` had
+  detached cargo, so the shell job's completion said nothing about the build.
+- **Resolution:** polled the process (`pgrep -x cargo`) and the log file instead of the launcher's
+  shell id.
+- **Lesson:** a shell id tracks the shell, not the process it backgrounded. Detached jobs need
+  process or log polling.
+
+---
+
 ## 2026-10-07 — Tooling: backgrounded build, and a wrong "it died" call
 
 ### [FIXED] A running background build was reported dead, then started a second time

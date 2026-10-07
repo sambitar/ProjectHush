@@ -159,20 +159,16 @@ impl AccountWorker {
                         Work::Unlock { dir, passphrase, reply } => {
                             let result = match Account::open(&dir, &passphrase).await {
                                 Ok(mut a) => {
-                                    // A vault written before the queue credential
-                                    // split comes back with a replaced inbox. If
-                                    // we do not republish, peers keep delivering
-                                    // to the abandoned one and this device goes
+                                    // Peers reach this device only through the
+                                    // published device list, so a rotated inbox
+                                    // has to be republished or this device goes
                                     // silent. Best effort: a relay that is down
                                     // must not block an unlock, and the next
                                     // unlock retries.
-                                    if a.queue_rotated() {
-                                        if let Err(e) = a.publish_device_list().await {
-                                            eprintln!(
-                                                "hush: could not republish device list after \
-                                                 queue rotation: {e}"
-                                            );
-                                        }
+                                    if let Err(e) = a.ensure_device_list_published().await {
+                                        eprintln!(
+                                            "hush: could not publish device list: {e}"
+                                        );
                                     }
                                     account = Some(a);
                                     WorkResult::Ok
@@ -196,9 +192,29 @@ impl AccountWorker {
                             (reply, result)
                         }
                         Work::Contacts { reply } => {
-                            let result = match account.as_ref() {
+                            let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => {
+                                    // Presence reads the cached inbox, and the UI
+                                    // will not send to a contact it shows offline.
+                                    // A contact whose queue has moved would then be
+                                    // stuck offline forever, so pick up a moved
+                                    // inbox here rather than only on send. Bounded
+                                    // by the same TTL the send path uses.
+                                    let nicknames: Vec<String> = a
+                                        .contacts()
+                                        .iter()
+                                        .map(|c| c.nickname.clone())
+                                        .collect();
+                                    for nick in &nicknames {
+                                        if let Err(e) =
+                                            a.refresh_contact_devices_if_stale(nick).await
+                                        {
+                                            eprintln!(
+                                                "hush: could not refresh devices for {nick}: {e}"
+                                            );
+                                        }
+                                    }
                                     let mut list = Vec::new();
                                     for c in a.contacts() {
                                         let online = a

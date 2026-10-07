@@ -327,3 +327,62 @@ async fn a_message_reaches_every_device_of_the_recipient_and_our_own() {
         "the linked device must file what device 1 sent as ours, under the right contact"
     );
 }
+
+/// Peers can only discover an inbox that moved (the credential split, a vault
+/// migration) through the published device list, and the publish on the unlock
+/// that rotates is best effort. A device whose publish was lost — or that never
+/// published — has to publish on a later unlock instead of never.
+#[tokio::test]
+async fn a_device_with_no_published_list_publishes_one() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let dir = TempDir::new().unwrap();
+    let mut alice = Account::create(dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+
+    assert!(
+        alice.ensure_device_list_published().await.unwrap(),
+        "an account with nothing published must publish, or a moved inbox is undiscoverable"
+    );
+    assert!(
+        !alice.ensure_device_list_published().await.unwrap(),
+        "a list that already names this inbox must not be rewritten on every unlock"
+    );
+}
+
+/// What is published has to name the inbox this device actually reads, so a peer
+/// that refreshes from the list keeps delivering somewhere that works.
+#[tokio::test]
+async fn the_published_list_agrees_with_the_inbox_that_receives() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    let bob_invite = bob.invite().await.unwrap();
+    let alice_invite = alice.invite().await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    let from_invite = alice.contacts()[0].devices[0].queue_id.clone();
+
+    bob.ensure_device_list_published().await.unwrap();
+    alice.refresh_contact_devices("bob").await.unwrap();
+
+    assert_eq!(
+        alice.contacts()[0].devices[0].queue_id, from_invite,
+        "the published list must not move a peer off the inbox that receives"
+    );
+
+    recipient_online(&bob).await;
+    alice.send_text("bob", "still reachable").await.unwrap();
+    assert_eq!(
+        bob.recv().await.unwrap().messages.len(),
+        1,
+        "the inbox named by the published list must be the one that receives"
+    );
+}

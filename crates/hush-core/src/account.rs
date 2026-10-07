@@ -853,6 +853,40 @@ impl Account {
             .await
     }
 
+    /// Make sure the published device list names this device's current inbox.
+    ///
+    /// A rotated inbox is reachable by peers only through the published list.
+    /// [`DeviceKeys::queue_rotated`] covers the single unlock that performed the
+    /// rotation, and the publish there is best effort: if the relay is down, the
+    /// flag is already spent (the device file is rewritten on that same open), so
+    /// nothing ever retries and peers keep delivering to an inbox this device no
+    /// longer reads. Comparing against what is actually published instead of
+    /// trusting a one-shot flag makes the repair durable, and also heals a vault
+    /// whose publish was lost before this check existed.
+    ///
+    /// Only device 1 can sign the list (Q11); a linked device has no way to
+    /// republish its own inbox, so it is left alone here.
+    ///
+    /// Returns whether a publish was needed. A relay error is the caller's to
+    /// log: the next unlock retries.
+    pub async fn ensure_device_list_published(&mut self) -> Result<bool, Error> {
+        if self.device.device_id() != 1 {
+            return Ok(false);
+        }
+        // Also seeds `own_devices` with the stored `added_unix`, so republishing
+        // does not redate this device.
+        self.refresh_own_devices().await?;
+        if published_list_names_inbox(
+            &self.state.own_devices,
+            self.device.device_id(),
+            self.device.queue_id(),
+        ) {
+            return Ok(false);
+        }
+        self.publish_device_list().await?;
+        Ok(true)
+    }
+
     /// Learn this account's own device set from the list published to the relay.
     ///
     /// The list is signed by device 1, so a relay cannot add a device to it and
@@ -956,10 +990,14 @@ impl Account {
 
     /// Refresh a contact's device set if the cached one has aged out (Q5).
     ///
-    /// Called before a send. A failure here is deliberately not fatal to the
-    /// send: a relay hiccup should not stop a message that the devices we
-    /// already know can receive.
-    async fn refresh_contact_devices_if_stale(&mut self, nickname: &str) -> Result<(), Error> {
+    /// Called before a send, and by the daemon before it reports presence. Both
+    /// read the cached inbox: a contact whose queue has moved (the credential
+    /// split, or a newly linked device) would otherwise read as offline and stay
+    /// that way, because the UI refuses to send to a contact shown offline — so
+    /// the send that would have refreshed the cache never happens. A failure
+    /// here is deliberately not fatal: a relay hiccup should not stop a message
+    /// the devices we already know can receive.
+    pub async fn refresh_contact_devices_if_stale(&mut self, nickname: &str) -> Result<(), Error> {
         let fetched = self
             .find_contact(nickname)
             .ok_or(Error::ContactNotFound)?
@@ -1443,6 +1481,21 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a published device set already names `queue_id` for `device_id`.
+///
+/// Used to decide whether this device's inbox is reachable by peers through the
+/// published list, so a republish happens only when the list has actually fallen
+/// behind — including the case where no list was ever published.
+fn published_list_names_inbox(
+    devices: &[ContactDevice],
+    device_id: u32,
+    queue_id: &str,
+) -> bool {
+    devices
+        .iter()
+        .any(|d| d.device_id == device_id && d.queue_id == queue_id)
+}
+
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = fs::read_dir(path) {
@@ -1727,6 +1780,34 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.ends_with(LEGACY_DEVICE_FILE)),
             "an unmigrated vault must not export its identity key: {names:?}"
+        );
+    }
+
+    /// The decision behind [`Account::ensure_device_list_published`]: a list that
+    /// does not name this device's inbox has to be treated as behind, because
+    /// that is exactly the state a lost publish leaves behind.
+    #[test]
+    fn a_published_list_is_behind_when_it_does_not_name_our_inbox() {
+        let device = |device_id: u32, queue_id: &str| ContactDevice {
+            device_id,
+            identity_key: vec![0u8; 33],
+            queue_id: queue_id.into(),
+            queue_token: "token".into(),
+            added_unix: 0,
+        };
+
+        assert!(published_list_names_inbox(&[device(1, "q1")], 1, "q1"));
+        assert!(
+            !published_list_names_inbox(&[device(1, "abandoned")], 1, "q1"),
+            "a moved inbox means the list is behind, even for a device we know"
+        );
+        assert!(
+            !published_list_names_inbox(&[device(2, "q1")], 1, "q1"),
+            "another device's entry must not stand in for ours"
+        );
+        assert!(
+            !published_list_names_inbox(&[], 1, "q1"),
+            "no list at all is the state a publish that never landed leaves"
         );
     }
 }
