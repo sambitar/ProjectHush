@@ -92,12 +92,14 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 - **Symptom:** neither is used anywhere in the codebase outside `Vault`'s own tests —
   not relay auth, not invites, not the Signal identity. The account's `protocol_name` comes from the
   **signal** identity key, not this one. So it is a per-vault Ed25519 keypair that nothing reads.
-- **Why it matters:** it is a private key that is currently included in every backup. Harmless while
-  nothing consumes it, but Q9 of the multi-device design requires signing the device list with an
-  account-level key, and this is the obvious candidate. If it is adopted, it must be excluded from
-  backups exactly like `device.enc`, or the linked-device transfer hands over an account signing key.
-- **Resolution:** needs a decision, not a patch. Either delete the keypair as dead code or adopt it
-  as the account signing key and exclude it from backups. Not touched in this slice.
+- **Why it matters:** Q9 of the multi-device design requires signing the device list with an
+  account-level key, and this is the obvious candidate. **Correction (same day):** the first version
+  of this entry claimed the key must be excluded from backups like `device.enc`. That is backwards. A
+  linked device has to be able to *publish* the device list, so the account signing key belongs in the
+  **shared** vault and must be transferred at link time; keeping it out of backups would leave a
+  restored vault permanently unable to publish a list at all. Security comes from rotating that key
+  on revocation, not from keeping it out of the transfer.
+- **Resolution:** needs a decision, not a patch. See the Phase 2 trust-chaining problem below.
 
 ### [OPEN] A restored backup now gets a fresh identity, and contacts are not told
 
@@ -143,6 +145,31 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
   mid-feature, per the feature protocol.
 - **Lesson:** establish the linter baseline before reading a diff as caused by the current change.
   Otherwise pre-existing noise looks like a regression.
+
+### [FIXED] The device list had no workable trust root — resolved as Q11 (device 1 signs)
+
+- **Attempted:** correct Task 3 of the plan so the device list is signed with a libsignal key
+  (`PrivateKey::calculate_signature`, XEd25519) instead of `ed25519_dalek`.
+- **Symptom:** fixing the primitive exposed that the design never said *which* key signs, and no
+  answer survived contact with the threat model on the first pass. The relay is untrusted
+  (`THREAT_MODEL.md` treats us, the operators, as an attacker), so peers cannot take device
+  membership on the relay's word. The signature must chain to something the peer already pinned, and
+  the only thing pinned is the account id.
+- **Resolution:** settled as **Q11 — device 1 is the signing root.** The list is signed with device 1's
+  libsignal identity private key and verified against the account id, which *is* device 1's identity
+  key hash (Q7). No new pinned trust material is needed: the peer verifies with the one thing it
+  already has. Costs accepted: device 1 must be online and unlocked to add or revoke, and device 1
+  cannot itself be revoked (losing it means rotating the account and re-inviting everyone). A linked
+  device cannot sign, because device 1's private key is never transferred — which is precisely what
+  Phase 1 guarantees by keeping `device.enc` out of backups.
+- **Also settled by this:** the Q9 account token and the signature answer *different* questions and
+  both are needed. The signature proves authenticity to peers (defeating a tampering relay); the token
+  gates who may write, so a revoked device cannot overwrite the list with garbage. The original design
+  conflated the two.
+- **Consequence:** `identity.secret` is not the account signing key after all, so it stays unused dead
+  code. Still an open cleanup decision.
+- **Lesson:** "authorize the write" and "sign the payload" are separate questions. Settling one and
+  assuming it settles the other leaves a design that cannot be implemented.
 
 ---
 

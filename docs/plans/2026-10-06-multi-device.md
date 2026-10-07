@@ -40,6 +40,7 @@ device cannot re-publish itself.
 | Q8 | No device cap |
 | Q9 | Device-list writes require a shared account token, rotated on every revocation |
 | Q10 | Existing vaults migrate silently on unlock; the device list is published lazily |
+| Q11 | Device 1 is the device-list **signing root**: it must be online and unlocked to add or revoke, and cannot itself be revoked |
 
 ### Known limitations to document in the UI, not hide
 
@@ -279,14 +280,22 @@ Run: `cargo test -p hush-core --test backup_recovery`
 > `mint_prekey_bundle` uses for signed prekeys) and verification through
 > `PublicKey::verify_signature(msg, sig) -> bool`.
 >
-> **Open question this exposed — resolve before implementing.** Q9 settled that a shared account token
-> authorizes device-list *writes*, but never said which key *signs* the list. Signing with device 1's
-> key contradicts the chosen Q9 option, because a second device does not hold device 1's private key
-> (that separation is the whole point), so device 1 would have to be online for every add and revoke.
-> The consistent answer is a dedicated **account signing key** held in the *shared* vault and rotated
-> alongside the token on revocation: the signature then protects peers against a tampering relay, and
-> the token rotation is what stops a revoked device publishing. Confirm before writing code, since it
-> decides whether the key lives in `device.enc` (never transferred) or the shared vault (transferred).
+> **Resolved 2026-10-07 — device 1 is the signing root (Q11).** The list is signed with device 1's
+> libsignal identity private key and verified against the account id, which *is* device 1's identity
+> key hash (Q7). That means no new pinned trust material: a peer verifies with the one thing it
+> already has. Consequences to hold onto:
+>
+> - Device 1 must be **online and unlocked** to add or revoke a device. It holds the only signing key.
+> - Device 1 **cannot be revoked**; it is the root. Losing it means rotating the account and
+>   re-inviting every contact — the Q4 alternative, applied to the one case that genuinely needs it.
+> - A linked device cannot sign, because device 1's private key is never transferred. Phase 1
+>   guarantees exactly that by keeping `device.enc` out of backups.
+> - The account token (Q9) is still needed, but for a different job: it gates *who may write* to the
+>   relay, so a revoked device cannot overwrite the list with garbage. The signature proves
+>   authenticity to peers; the token protects availability. They are independent questions, which is
+>   what the original design conflated.
+> - `identity.secret` is therefore **not** the account signing key and remains unused dead code. That
+>   is still an open cleanup decision, tracked in `DEEPSEEKPROBLEMS.MD`.
 
 - [ ] **Step 1: Write the failing test**
 
