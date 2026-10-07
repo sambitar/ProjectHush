@@ -7,8 +7,8 @@ linked device can be listed and revoked honestly.
 today's `protocol_name`, so existing invites and contacts are unaffected. Each device owns its own
 identity key pair, prekeys, sessions and relay queue; peers encrypt to every device in the account's
 signed device list, which is published to the relay and cached by peers with a TTL. Device-list
-writes are authorized by a shared account token that rotates on every revocation, so a revoked
-device cannot re-publish itself.
+writes are authorized by device 1's signature on the blob, verified by the relay against the account
+id, so a revoked device cannot re-publish itself.
 
 **Tech Stack:** Rust (`hush-core`, `hush-relay`, `hush-daemon`), `libsignal-protocol`, axum, SQLite
 (relay), TypeScript + Vite (UI).
@@ -38,7 +38,7 @@ device cannot re-publish itself.
 | Q6 | Sent messages fan out a copy to the sender's own other devices |
 | Q7 | `account_id` = device 1's identity public key hash (= today's `protocol_name`) |
 | Q8 | No device cap |
-| Q9 | Device-list writes require a shared account token, rotated on every revocation |
+| Q9 | ~~Device-list writes require a shared account token, rotated on every revocation~~ **Superseded 2026-10-07: writes are authorized by device 1's signature on the blob. The token was deleted — see Phase 3.** |
 | Q10 | Existing vaults migrate silently on unlock; the device list is published lazily |
 | Q11 | Device 1 is the device-list **signing root**: it must be online and unlocked to add or revoke, and cannot itself be revoked |
 
@@ -464,6 +464,23 @@ Run: `cargo test -p hush-core --test device_list`
 
 ### Task 4: Account token, rotated on revocation
 
+> **Dropped 2026-10-07 — this task was not implemented, and its machinery was deleted.** The
+> token could not do the job it was written for. Rotating it to revoke a device cannot work under a
+> trust-on-first-use rule: the relay stores the *old* token's hash, so the account's very next publish
+> with the rotated token is rejected `401`. `rotating_the_token_currently_breaks_publishing` proved
+> this — the account could not perform the rotation that revokes anyone. Even patched, the window
+> between rotating locally and the relay learning the new hash leaves the revoked device holding a
+> working credential.
+>
+> Authorization now comes from the same signature that gives the list its authenticity. The relay
+> verifies device 1's signature on the body against the account id, and a revoked device does not hold
+> device 1's private key, so it cannot produce an acceptable body. No credential to rotate means no
+> rotation race and no window. `AccountToken`, `DeviceList::token` and `DeviceList::token_epoch` were
+> deleted; `epoch` survives as a peer-visible freshness counter so a peer holding a cached list can
+> tell that revocation happened.
+>
+> The steps below are kept for the record and should not be executed.
+
 **Files:**
 - Modify: `crates/hush-core/src/device_list.rs`
 - Test: `crates/hush-core/tests/device_list.rs`
@@ -525,7 +542,30 @@ Run: `cargo test -p hush-core --test device_list`
 
 ## Phase 3 — Relay device directory
 
+> **Status: done 2026-10-07** on `feat/multi-device-phase1`. Deviations from the plan as written:
+>
+> - **Task 5's auth model was replaced.** The route is no longer token-authenticated. `PUT` is
+>   authorized by verifying device 1's signature on the body against the account id
+>   (`hush_core::DeviceList::verify(body, account_id)`), and `GET` is deliberately unauthenticated
+>   because a peer fetching a contact's list holds no credential for that account and does not need
+>   one — the signature is what makes the contents trustworthy. See Task 4's note for why the token
+>   could not work.
+> - The relay therefore does parse enough of the blob to check the signature, which narrows the
+>   "relay stays content-blind" constraint: it must know the device-list format to verify it. It still
+>   does not *trust* the contents — a peer verifies the same signature independently — so a relay that
+>   stored something else would have it rejected on the far side.
+> - `device_dirs.token_hash` does not exist; the column was removed before the table was ever
+>   committed, so there is no migration to write.
+> - Tests: 7 in `crates/hush-relay/tests/device_directory.rs`, including the revocation path
+>   (a smaller list publishes with no rotation step) and the negative case that a list signed by any
+>   key other than device 1's is rejected `401` and stores nothing.
+
 ### Task 5: `GET`/`PUT /d/{account_id}` with account-token auth
+
+> **Corrected 2026-10-07 — auth is signature-based, not token-based.** `PUT` carries no bearer
+> credential; the relay rejects the write with `401` unless the body carries a valid device-1
+> signature over the payload for that `account_id`. `GET` requires no auth at all. The steps below
+> still describe the token model and are kept only for the record.
 
 **Files:**
 - Modify: `crates/hush-relay/src/app.rs`, `crates/hush-relay/src/store.rs`
@@ -586,6 +626,15 @@ Run: `cargo test -p hush-relay --test device_directory`
 ---
 
 ### Task 6: Burn a revoked device's queue
+
+> **Status: done 2026-10-07.** `RelayClient::report_queue` added as a thin wrapper over the existing
+> `POST /q/{queue_id}/report`, mirroring `RelayClient::delete`. The relay side already existed and was
+> already tested in `crates/hush-relay/tests/relay_queues.rs`.
+>
+> The test landed in `crates/hush-core/tests/two_party_relay.rs` as `reporting_a_queue_burns_it`, and
+> covers slightly more than the plan asked: after the burn, `list` fails, a second `report` fails, and
+> a peer's `send_text` fails — so nothing further can be delivered into the burned inbox, not just
+> read out of it.
 
 **Files:**
 - Modify: `crates/hush-core/src/relay_client.rs`

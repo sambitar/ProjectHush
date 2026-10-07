@@ -222,6 +222,25 @@ impl RelayClient {
         }
         Ok(())
     }
+
+    /// Burn a queue so nothing more can be delivered to it.
+    ///
+    /// Used on revocation: the revoked device's inbox is destroyed and its token
+    /// stops working, so anything a peer still has queued for it is dropped
+    /// rather than sitting on the relay for a device that should not receive it.
+    pub async fn report_queue(&self, queue_id: &str, token: &str) -> Result<(), Error> {
+        let res = self
+            .http
+            .post(format!("{}/q/{}/report", self.base, queue_id))
+            .header("authorization", Self::auth(token))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("report failed: {}", res.status())));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

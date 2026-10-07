@@ -162,10 +162,11 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
   cannot itself be revoked (losing it means rotating the account and re-inviting everyone). A linked
   device cannot sign, because device 1's private key is never transferred — which is precisely what
   Phase 1 guarantees by keeping `device.enc` out of backups.
-- **Also settled by this:** the Q9 account token and the signature answer *different* questions and
-  both are needed. The signature proves authenticity to peers (defeating a tampering relay); the token
-  gates who may write, so a revoked device cannot overwrite the list with garbage. The original design
-  conflated the two.
+- **Also settled by this (superseded — see the Phase 2/3 entry below):** the Q9 account token and the
+  signature were initially held to answer *different* questions, with the signature proving
+  authenticity to peers and the token gating who may write. That split did not survive implementation:
+  the token was deleted, and the signature now does both jobs. Recorded here because the original
+  reasoning is what made the wrong design look coherent.
 - **Consequence:** `identity.secret` is not the account signing key after all, so it stays unused dead
   code. Still an open cleanup decision.
 - **Lesson:** "authorize the write" and "sign the payload" are separate questions. Settling one and
@@ -185,6 +186,70 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
   verification fails. Re-ran the mutation: with `verify_signature` disabled, both tests now fail.
 - **Lesson:** a test named after a security property is not evidence of that property. Disable the check
   and confirm the test fails, or the assertion may be riding on a completely different code path.
+
+---
+
+## 2026-10-07 — Multi-device Phase 3 (relay device directory, revocation)
+
+### [FIXED] Trust-on-first-use token auth made revocation impossible
+
+- **Attempted:** implemented `PUT /d/{account_id}` with the Q9 account token as the write credential,
+  mirroring the queue rule: the first writer mints the token and every later write must present it.
+  Revocation was then supposed to rotate the token, so the revoked device's copy stopped working.
+- **Symptom:** wrote `rotating_the_token_currently_breaks_publishing` to exercise the revocation path
+  end to end, and it failed. Device 1 rotates the token, publishes the updated list with the new token,
+  and the relay answers `401` — because the stored `token_hash` is still the *old* token's hash. The
+  account cannot perform the rotation that revokes anyone. Under first-write-wins there is no way for a
+  new token to authenticate itself before the relay has already accepted it, so rotation is not a
+  recoverable operation at all.
+- **Also wrong with the model, independent of the bug:** even patched, the gap between "token rotated
+  locally" and "relay has the new hash" is a window in which the revoked device still holds a working
+  credential. And a first-write-wins rule makes any two-writer race a coin flip on arrival order, which
+  is not an acceptable property for the operation that revokes a device.
+- **Resolution:** user decision — `PUT /d/{account_id}` is authorized by **device 1's signature on the
+  body**, verified by the relay against the account id (`hush_core::DeviceList::verify(body,
+  account_id)`), and the account token is deleted outright. There is no credential to rotate, so there
+  is no rotation race and no window: a revoked device does not hold device 1's private key and
+  therefore cannot produce a body the relay will accept. `GET` stays unauthenticated, because a peer
+  fetching a contact's list holds no credential for that account and does not need one — the signature
+  is what makes the contents trustworthy.
+- **Consequence:** `AccountToken`, `DeviceList::token`, `DeviceList::token_epoch` and the
+  `device_dirs.token_hash` column are gone. `epoch` survives as a peer-visible freshness counter only,
+  so a peer holding a cached list can tell that revocation happened. `identity.secret` remains unused
+  dead code, as noted in the Q11 entry above.
+- **Lesson:** trust-on-first-use fits a queue — a resource with one owner and no membership changes.
+  It does not fit a resource whose whole purpose is to change membership, because the operation that
+  changes membership is precisely the one that needs the new credential to already be trusted. If the
+  write is signed by a key the reader already pins, authorization comes free and the token is
+  redundant.
+
+### [FIXED] The relay test could not construct a signed list
+
+- **Attempted:** wrote `crates/hush-relay/tests/device_directory.rs` so a valid `PUT` carries a real
+  device-1 signature, which is the only way to exercise the new authorization rule.
+- **Symptom:** `error[E0432]: unresolved import libsignal_protocol` — `hush-relay`'s
+  `[dev-dependencies]` contained no libsignal and no `rand`, so the test could not build an
+  `IdentityKeyPair` to sign with.
+- **Resolution:** added `libsignal-protocol` and `rand` to `crates/hush-relay/[dev-dependencies]`,
+  pinned to match `hush-core`. The relay's own code still has no dependency on libsignal; only its
+  tests do.
+- **Lesson:** moving an authorization decision into a shared library makes the enforcing service's
+  tests depend on that library's types. Budget the dev-dependency when relocating the check, or the
+  test that proves the rule cannot be written.
+
+### Checked and clear: dropping `token_hash` from an uncommitted table is not a migration risk
+
+- **Concern:** `device_dirs` was created in this same uncommitted slice with `token_hash BLOB NOT NULL`.
+  Changing the DDL to drop the column is safe only if no database exists with the old shape, because
+  `Store::open` uses `CREATE TABLE IF NOT EXISTS` plus a best-effort `ALTER TABLE ... ADD COLUMN` and
+  has no way to drop a column or migrate a schema version. A stale table would make every publish fail
+  with `NOT NULL constraint failed: device_dirs.token_hash`, surfacing as a `500`.
+- **Evidence:** `git show HEAD:crates/hush-relay/src/store.rs` has no `device_dirs` — the table has
+  never been committed. Both dev databases (`./relay.db`, `./instances/relay/relay.db`) contain only
+  `queues` and `blobs`, so they predate the table entirely and will get the new shape on next open.
+- **Resolution:** no migration needed. Recorded so the check is not repeated.
+- **Lesson:** with an append-only `CREATE TABLE IF NOT EXISTS` schema and no version table, a column
+  can only be removed safely while the table is still unreleased. Confirm that before editing DDL.
 
 ---
 

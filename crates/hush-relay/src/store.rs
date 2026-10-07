@@ -34,6 +34,11 @@ impl Store {
                 FOREIGN KEY (queue_id) REFERENCES queues(id)
             );
             CREATE INDEX IF NOT EXISTS idx_blobs_queue ON blobs(queue_id);
+            CREATE TABLE IF NOT EXISTS device_dirs (
+                account_id TEXT PRIMARY KEY,
+                blob BLOB NOT NULL,
+                updated_unix INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|_| RelayError::Internal)?;
@@ -234,6 +239,61 @@ impl Store {
         conn.execute("DELETE FROM blobs WHERE queue_id = ?1", params![queue_id])
             .map_err(|_| RelayError::Internal)?;
         Ok(())
+    }
+
+    /// Store an account's signed device list.
+    ///
+    /// The blob must be a device list signed by **device 1** of that account,
+    /// verified against `account_id`, which *is* device 1's identity key hash
+    /// (Q7). That single check replaces any bearer credential, and it is what
+    /// makes revocation real: a revoked device does not hold device 1's private
+    /// key, so it cannot produce a list the relay will accept. There is no token
+    /// to rotate and therefore no window in which a revoked device could race
+    /// the account and lock it out.
+    ///
+    /// The relay still does not *trust* the contents. A peer verifies the same
+    /// signature independently, so a relay that stored something else would
+    /// simply have it rejected on the far side. This check is about refusing to
+    /// be a party to an unauthorized write, not about vouching for the data.
+    pub fn put_device_dir(&self, account_id: &str, body: &[u8]) -> Result<(), RelayError> {
+        if body.len() > self.config.max_blob_bytes {
+            return Err(RelayError::TooLarge);
+        }
+        if hush_core::DeviceList::verify(body, account_id).is_err() {
+            return Err(RelayError::Unauthorized);
+        }
+        let now = Self::now_secs() as i64;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        conn.execute(
+            "INSERT INTO device_dirs (account_id, blob, updated_unix) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id) DO UPDATE SET blob = ?2, updated_unix = ?3",
+            params![account_id, body, now],
+        )
+        .map_err(|_| RelayError::Internal)?;
+        Ok(())
+    }
+
+    /// Read an account's device list.
+    ///
+    /// Deliberately unauthenticated: a peer fetching a contact's list holds no
+    /// credential for that account and does not need one. The signature is what
+    /// makes the contents trustworthy, so access control here would buy nothing
+    /// while making the list unreadable by the only parties that need it. The
+    /// account id is an identity key hash, so the directory is not enumerable
+    /// without already knowing the account.
+    pub fn get_device_dir(&self, account_id: &str) -> Result<Vec<u8>, RelayError> {
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let mut stmt = conn
+            .prepare("SELECT blob FROM device_dirs WHERE account_id = ?1")
+            .map_err(|_| RelayError::Internal)?;
+        let mut rows = stmt
+            .query(params![account_id])
+            .map_err(|_| RelayError::Internal)?;
+        if let Some(row) = rows.next().map_err(|_| RelayError::Internal)? {
+            let body: Vec<u8> = row.get(0).map_err(|_| RelayError::Internal)?;
+            return Ok(body);
+        }
+        Err(RelayError::NotFound)
     }
 
     fn authorize_existing(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {

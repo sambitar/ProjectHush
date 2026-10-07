@@ -2,7 +2,7 @@ use libsignal_protocol::IdentityKeyPair;
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 
-use hush_core::device_list::{AccountToken, DeviceList, DeviceRecord};
+use hush_core::device_list::{DeviceList, DeviceRecord};
 
 fn account_key() -> (IdentityKeyPair, String) {
     let mut csprng = OsRng.unwrap_err();
@@ -30,7 +30,7 @@ fn signed_list_verifies_and_detects_tampering() {
 
     let parsed = DeviceList::verify(&signed, &account_id).unwrap();
     assert_eq!(parsed.devices.len(), 2);
-    assert_eq!(parsed.token_epoch, 0);
+    assert_eq!(parsed.epoch, 0);
 
     // Tamper in a way that keeps the JSON valid, so this exercises the signature
     // check rather than the parser. Flipping an arbitrary byte in the middle
@@ -102,8 +102,8 @@ fn removing_a_device_drops_it_and_bumps_the_epoch() {
     assert_eq!(after.devices.len(), 1);
     assert_eq!(after.devices[0].device_id, 1);
     assert!(
-        after.token_epoch > list.token_epoch,
-        "revocation must rotate the token epoch"
+        after.epoch > list.epoch,
+        "revocation must advance the epoch"
     );
 }
 
@@ -115,8 +115,8 @@ fn adding_a_device_keeps_the_epoch_and_replaces_a_duplicate() {
     list.add(record(2, 2));
     assert_eq!(list.devices.len(), 2);
     assert_eq!(
-        list.token_epoch, 0,
-        "adding a device must not rotate the token: only revocation does"
+        list.epoch, 0,
+        "adding a device must not advance the epoch: only revocation does"
     );
 
     // Re-adding the same id replaces rather than duplicates.
@@ -128,7 +128,7 @@ fn adding_a_device_keeps_the_epoch_and_replaces_a_duplicate() {
 }
 
 #[test]
-fn a_round_tripped_list_survives_a_removal() {
+fn the_epoch_lets_a_peer_spot_a_stale_list() {
     let (key, account_id) = account_key();
     let list = DeviceList::new(account_id.clone(), vec![record(1, 1), record(2, 2)]);
     let revoked = list.without(2);
@@ -137,37 +137,9 @@ fn a_round_tripped_list_survives_a_removal() {
     let parsed = DeviceList::verify(&signed, &account_id).unwrap();
 
     assert_eq!(parsed.devices.len(), 1);
-    assert_eq!(parsed.token_epoch, 1);
+    assert_eq!(
+        parsed.epoch, 1,
+        "the epoch must advance so a peer can tell a cached list from a current one"
+    );
     assert!(parsed.find(2).is_none());
-}
-
-#[test]
-fn rotating_the_token_invalidates_the_old_one() {
-    let old = AccountToken::generate();
-    let new = old.rotate();
-
-    assert_ne!(old.expose(), new.expose());
-    assert!(
-        old.matches(old.expose()),
-        "the old token still matches itself"
-    );
-    assert!(
-        !old.matches(new.expose()),
-        "a rotated token must not accept the previous value"
-    );
-    assert!(new.matches(new.expose()));
-    assert!(
-        !old.matches(""),
-        "an empty candidate must not match a real token"
-    );
-}
-
-#[test]
-fn the_token_is_never_printed() {
-    let token = AccountToken::generate();
-    let rendered = format!("{token:?}");
-    assert!(
-        !rendered.contains(token.expose()),
-        "Debug must not leak the token: {rendered}"
-    );
 }

@@ -2,7 +2,6 @@ use libsignal_protocol::{IdentityKey, IdentityKeyPair};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 
 use crate::error::Error;
 
@@ -42,9 +41,13 @@ pub struct DeviceList {
     /// know this account by.
     pub account_id: String,
     pub devices: Vec<DeviceRecord>,
-    /// Bumped on every revocation. The account token is rotated whenever this
-    /// moves, which is what stops a revoked device re-publishing itself.
-    pub token_epoch: u64,
+    /// Bumped on every revocation.
+    ///
+    /// Peers cache device lists, so they need a way to tell a stale cache from a
+    /// current one. Authorization does *not* depend on this: only device 1 can
+    /// produce a valid signature at all, and that is what stops a revoked device
+    /// re-publishing itself.
+    pub epoch: u64,
     pub updated_unix: u64,
 }
 
@@ -54,7 +57,7 @@ impl DeviceList {
             v: DEVICE_LIST_VERSION,
             account_id,
             devices,
-            token_epoch: 0,
+            epoch: 0,
             updated_unix: now_unix(),
         }
     }
@@ -70,11 +73,11 @@ impl DeviceList {
         self.updated_unix = now_unix();
     }
 
-    /// Remove a device and bump the token epoch.
+    /// Remove a device and bump the epoch.
     pub fn without(&self, device_id: u32) -> Self {
         let mut next = self.clone();
         next.devices.retain(|d| d.device_id != device_id);
-        next.token_epoch += 1;
+        next.epoch += 1;
         next.updated_unix = now_unix();
         next
     }
@@ -126,45 +129,6 @@ impl DeviceList {
             return Err(Error::Corrupt);
         }
         Ok(list)
-    }
-}
-
-/// Shared secret authorizing device-list writes for one account.
-///
-/// This is not what proves the list is genuine to a peer, the signature is. Its
-/// job is availability: without it anyone could overwrite the published list
-/// with garbage, even though peers would reject the contents.
-///
-/// Rotated on every revocation. A revoked device keeps a copy of the old token,
-/// so leaving it valid would let that device overwrite the list.
-pub struct AccountToken(String);
-
-impl AccountToken {
-    pub fn generate() -> Self {
-        Self(hex::encode(crate::crypto::random_bytes::<32>()))
-    }
-
-    /// Mint a fresh token, invalidating the previous one.
-    pub fn rotate(&self) -> Self {
-        Self::generate()
-    }
-
-    /// The wire value. Only for putting it in a request or in the vault.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    /// Compare without leaking where the first difference is.
-    pub fn matches(&self, candidate: &str) -> bool {
-        self.0.as_bytes().ct_eq(candidate.as_bytes()).into()
-    }
-}
-
-impl std::fmt::Debug for AccountToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never print the secret, and avoid the `unwrap_err` trap that a missing
-        // Debug causes.
-        f.write_str("AccountToken(<redacted>)")
     }
 }
 

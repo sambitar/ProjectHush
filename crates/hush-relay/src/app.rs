@@ -134,11 +134,41 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
+/// Store this account's signed device list.
+///
+/// No bearer credential: the blob must carry a signature by device 1 that
+/// verifies against the account id, and that is what authorizes the write. A
+/// revoked device cannot produce one.
+async fn put_device_dir(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, RelayError> {
+    state.store.put_device_dir(&account_id, &body)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Read an account's device list.
+///
+/// Unauthenticated on purpose: a peer fetching a contact's list holds no
+/// credential for that account and does not need one, because the signature is
+/// what makes the contents trustworthy. Access control here would buy nothing
+/// while making the list unreadable by the only parties that need it. The
+/// account id is an identity key hash, so the directory is not enumerable
+/// without already knowing the account.
+async fn get_device_dir(
+    State(state): State<Arc<AppState>>,
+    Path(account_id): Path<String>,
+) -> Result<Vec<u8>, RelayError> {
+    state.store.get_device_dir(&account_id)
+}
+
 pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> {
     let store = Store::open(db_path, config)?;
     let state = Arc::new(AppState { store });
     Ok(Router::new()
         .route("/health", get(health))
+        .route("/d/{account_id}", put(put_device_dir).get(get_device_dir))
         .route("/q/{queue_id}", put(put_blob).get(list_blobs))
         .route(
             "/q/{queue_id}/presence",

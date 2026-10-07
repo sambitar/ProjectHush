@@ -197,3 +197,62 @@ async fn chat_history_survives_reopen() {
         "bob"
     );
 }
+
+/// Revocation's effect on the wire. Once an account burns its own queue the
+/// inbox is destroyed and its credential stops authorizing anything, so a
+/// revoked device cannot read what it was sent and peers cannot queue more.
+#[tokio::test]
+async fn reporting_a_queue_burns_it() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    let alice_invite = alice.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+
+    recipient_online(&alice).await;
+    bob.send_text("alice", "delivered before revocation")
+        .await
+        .unwrap();
+
+    let inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
+    let client = RelayClient::new(&relay);
+
+    // The device is live and its inbox holds the pending message.
+    let ids = client.list(&inv.queue_id, &inv.queue_token).await.unwrap();
+    assert_eq!(ids.len(), 1);
+
+    client
+        .report_queue(&inv.queue_id, &inv.queue_token)
+        .await
+        .unwrap();
+
+    // The credential still parses, but it no longer authorizes anything: the
+    // queue is gone, so there is nothing to read and nothing to report again.
+    assert!(
+        client.list(&inv.queue_id, &inv.queue_token).await.is_err(),
+        "a burned queue must not be readable"
+    );
+    assert!(
+        client
+            .report_queue(&inv.queue_id, &inv.queue_token)
+            .await
+            .is_err(),
+        "a burned queue must not accept further reports"
+    );
+
+    // And nothing further can be delivered into it.
+    assert!(
+        bob.send_text("alice", "after revocation").await.is_err(),
+        "a burned queue must reject new deliveries"
+    );
+}

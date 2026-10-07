@@ -28,7 +28,7 @@ pub use config::{
 };
 pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
 pub use device::DeviceKeys;
-pub use device_list::{AccountToken, DeviceList, DeviceRecord};
+pub use device_list::{DeviceList, DeviceRecord};
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
 pub use chat_log::{ChatRecord, ChatRecordPayload};
 pub use error::Error;
