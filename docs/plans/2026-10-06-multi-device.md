@@ -660,6 +660,44 @@ Run: `cargo test -p hush-core --test two_party_relay`
 
 ## Phase 4 — Contacts as device sets, and send/recv fan-out
 
+> **Status: complete and verified end-to-end 2026-10-07.** On `feat/multi-device-phase1`.
+> Deviations from the plan as written:
+>
+> - **Task 9's core landed early, because Task 8's test needed it.** Fan-out to a contact's *second*
+>   device is unreachable until an account can have a second device at all: a contact's `devices` set
+>   only grows from an invite (one device), and `own_devices` only fills from a signed list that
+>   nothing could publish a second entry into. `Account::adopt_linked_vault`,
+>   `Account::link_request` and `Account::record_linked_device` are therefore implemented here. The
+>   daemon endpoints, the CLI and link-channel authentication that Task 9 also lists are **not**, and
+>   Task 9 stays open for them.
+> - **`ContactDevice` carries no `pre_key_*`.** The plan's Task 7 interface lists them; the user's
+>   decision was a per-device prekey endpoint (`/k/{account_id}/{device_id}`), so a bundle is fetched
+>   and consumed per session instead of being cached in the contact, where it would go stale on the
+>   next republish. See the Phase 4 problem-log entry.
+> - **`ContactDevice` gained `added_unix`**, which the plan's Task 7 interface does not list.
+>   `publish_device_list` writes that field on every republish, so without it on the contact the
+>   value was dropped and every device was redated on the next list write. Task 14's "added date"
+>   column needs it.
+> - `Contact` gets a hand-written `Deserialize` rather than a `#[serde(alias)]` plus a `default`
+>   upgrade: the legacy shape has `queue_id`/`queue_token` and the current shape has `devices`, so an
+>   untagged enum cleanly distinguishes them instead of guessing which fields are absent.
+> - The legacy `protocol_name` is a hex identity key in practice, so migration recovers
+>   `identity_key` by hex-decoding it. A contact whose `protocol_name` is not hex gets an empty
+>   `identity_key` and will re-fetch it from the device list rather than fail to load.
+> - `signal_persist` had to learn device ids too: sessions and known identities are now keyed by
+>   `(name, device_id)`, with an untagged enum keeping pre-multi-device entries loadable.
+>
+> Evidence: `cargo test --workspace` (all suites, 0 failures) and `cargo clippy --workspace
+> --all-targets` with no new warnings. The 7 `multi_device.rs` tests cover the contact shape, legacy
+> migration, and `a_message_reaches_every_device_of_the_recipient_and_our_own`, which links a real
+> second device over the real transfer path (`export_backup` minus device material, then
+> `adopt_linked_vault`) and asserts both fan-out directions. That test was mutation-checked: with the
+> own-device copy disabled it fails on the "linked device must file what device 1 sent" assertion.
+>
+> **Known gap this slice does not close:** a newly linked device is invisible to a peer for up to the
+> 5 minute list TTL, because `add_contact` marks the cache fresh. See the problem-log entry on the
+> fan-out test for the failing assertion that surfaced it.
+
 ### Task 7: `Contact` holds a device set
 
 **Files:**
@@ -671,7 +709,7 @@ Run: `cargo test -p hush-core --test two_party_relay`
 - Migration: `#[serde(alias = "protocol_name")] account_id`, and a `#[serde(default)]` upgrade that
   turns a legacy single-queue contact into a one-device set.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -690,13 +728,13 @@ fn a_legacy_contact_deserializes_into_a_single_device_set() {
 }
 ```
 
-- [ ] **Step 2: Run test — expect FAIL**
+- [x] **Step 2: Run test — expect FAIL**
 
 Run: `cargo test -p hush-core --test multi_device legacy_contact`
 
-- [ ] **Step 3: Minimal implementation** — the new structs plus a `Deserialize` shim that detects
+- [x] **Step 3: Minimal implementation** — the new structs plus a `Deserialize` shim that detects
   the flat legacy shape (presence of `queue_id`) and folds it into one `ContactDevice`.
-- [ ] **Step 4: Run test — expect PASS**
+- [x] **Step 4: Run test — expect PASS**
 
 Run: `cargo test -p hush-core --test multi_device`
 
@@ -712,7 +750,7 @@ Run: `cargo test -p hush-core --test multi_device`
 - Consumes: `Contact.devices`, `DeviceKeys.device_id`
 - Produces: `Account::send_text` encrypting once per recipient device and `PUT`ting to each queue; an additional copy to each of our own other devices' queues
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[tokio::test]
@@ -723,16 +761,26 @@ async fn a_message_reaches_every_device_of_the_recipient_and_our_own() {
 }
 ```
 
-- [ ] **Step 2: Run test — expect FAIL**
+Landed as written, plus the link setup it needs: the second device is created by
+`export_backup` (which excludes `device.enc`) then `Account::adopt_linked_vault`, and device 1 signs
+it in with `record_linked_device` before it publishes prekeys. Bob's list refresh is called
+explicitly, because `add_contact` had already marked the cache fresh and the send inside the TTL
+would otherwise skip it.
 
-Run: `cargo test -p hush-core --test multi_device fan_out`
+- [x] **Step 2: Run test — expect FAIL** — observed `Relay("list failed: 404 Not Found")` from
+  `alice_2.recv()`: the second device's queue was never written to, because Bob delivered to device 1
+  only.
 
-- [ ] **Step 3: Minimal implementation** — loop over `contact.devices`, calling
+Run: `cargo test -p hush-core --test multi_device a_message_reaches`
+
+- [x] **Step 3: Minimal implementation** — loop over `contact.devices`, calling
   `encrypt_message(store, local_name, remote_name, device_id, plaintext)`; then loop over
   `self_devices` excluding our own `device_id`. Change `protocol_address` to accept a real
-  `device_id` instead of the hardcoded `device_id()`.
+  `device_id` instead of the hardcoded `device_id()`. Landed as `Account::deliver` plus the fan-out
+  loop in `send_payload`.
 
-- [ ] **Step 4: Run test — expect PASS**
+- [x] **Step 4: Run test — expect PASS** — passes, and was mutation-checked by disabling the
+  own-device copy (fails on the "must file what device 1 sent" assertion).
 
 Run: `cargo test -p hush-core --test multi_device`
 
@@ -751,13 +799,29 @@ Run: `cargo test -p hush-core --test multi_device`
 - Produces: `Account::adopt_linked_vault(dir, passphrase)` — imports history, then generates a new
   `DeviceKeys` with the next free `device_id` and publishes an updated device list
 
+> **Partial: core landed 2026-10-07 with Phase 4, because Task 8's test needed it.**
+> `Account::adopt_linked_vault(dir, passphrase, device_id)`, `Account::link_request()` and
+> `Account::record_linked_device(&ContactDevice)` exist and are covered end-to-end by
+> `a_message_reaches_every_device_of_the_recipient_and_our_own`, which asserts that the linked
+> device's identity key differs from device 1's, that both share the account id, and that the
+> transferred vault carries the contact list and the chat history (Q4).
+>
+> Deviations: `adopt_linked_vault` takes the `device_id` as an argument rather than deriving "the next
+> free id", because only device 1 can sign the list entry that makes an id real, so only device 1 can
+> assign one. The transfer is `export_backup` / `import_backup`, which already excludes `device.enc`.
+>
+> **Still open:** the daemon `link-device/start` (returning the assigned id) and `link-device/complete`
+> endpoints, the CLI, and any authentication on the link channel. `record_linked_device` trusts the
+> request it is given — it cannot verify a device against the list it is writing — so the link channel
+> is the only thing standing between "a device the user linked" and "a device a stranger claimed".
+
 - [ ] **Step 1: Write the failing test** — link a vault to a second directory, assert the second
   device's `identity_public()` differs from the first's, and that it can still read the chat history.
 - [ ] **Step 2: Run test — expect FAIL**
 
 Run: `cargo test -p hush-core --test multi_device new_device_keys`
 
-- [ ] **Step 3: Minimal implementation**
+- [ ] **Step 3: Minimal implementation** — core done; daemon and CLI wiring remain.
 - [ ] **Step 4: Run test — expect PASS**
 
 Run: `cargo test -p hush-core --test multi_device`

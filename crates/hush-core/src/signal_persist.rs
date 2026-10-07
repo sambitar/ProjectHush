@@ -1,7 +1,7 @@
 use libsignal_protocol::{
-    GenericSignedPreKey, IdentityKey, IdentityKeyPair, InMemSignalProtocolStore, KyberPreKeyId,
-    KyberPreKeyRecord, PreKeyId, PreKeyRecord, ProtocolAddress, SessionRecord, SignedPreKeyId,
-    SignedPreKeyRecord,
+    DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair, InMemSignalProtocolStore,
+    KyberPreKeyId, KyberPreKeyRecord, PreKeyId, PreKeyRecord, ProtocolAddress, SessionRecord,
+    SignedPreKeyId, SignedPreKeyRecord,
 };
 use libsignal_protocol::{
     IdentityKeyStore, KyberPreKeyStore, PreKeyStore, SessionStore, SignedPreKeyStore,
@@ -9,7 +9,6 @@ use libsignal_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::signal::device_id;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedSignal {
@@ -18,13 +17,69 @@ struct PersistedSignal {
     pre_keys: Vec<(u32, Vec<u8>)>,
     signed_pre_keys: Vec<(u32, Vec<u8>)>,
     kyber_pre_keys: Vec<(u32, Vec<u8>)>,
-    sessions: Vec<(String, Vec<u8>)>,
-    known_identities: Vec<(String, Vec<u8>)>,
+    sessions: Vec<SessionEntry>,
+    known_identities: Vec<IdentityEntry>,
+}
+
+/// One persisted session.
+///
+/// The address a session lives under is an account id *and* a device id, and both
+/// have to survive a reload or a device could end up ratcheting with the wrong
+/// one. The legacy shape is still read: before multi-device there was only ever
+/// device 1, so the device id was not stored, and a vault written then must not
+/// lose its sessions on the next unlock.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum SessionEntry {
+    Named {
+        name: String,
+        device_id: u32,
+        record: Vec<u8>,
+    },
+    Legacy((String, Vec<u8>)),
+}
+
+impl SessionEntry {
+    fn into_parts(self) -> (String, u32, Vec<u8>) {
+        match self {
+            SessionEntry::Named {
+                name,
+                device_id,
+                record,
+            } => (name, device_id, record),
+            SessionEntry::Legacy((name, record)) => (name, 1, record),
+        }
+    }
+}
+
+/// One persisted pinned identity key. Same shape story as `SessionEntry`.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum IdentityEntry {
+    Named {
+        name: String,
+        device_id: u32,
+        key: Vec<u8>,
+    },
+    Legacy((String, Vec<u8>)),
+}
+
+impl IdentityEntry {
+    fn into_parts(self) -> (String, u32, Vec<u8>) {
+        match self {
+            IdentityEntry::Named {
+                name,
+                device_id,
+                key,
+            } => (name, device_id, key),
+            IdentityEntry::Legacy((name, key)) => (name, 1, key),
+        }
+    }
 }
 
 pub async fn export_store(
     store: &InMemSignalProtocolStore,
-    session_names: &[String],
+    session_addresses: &[(String, u32)],
 ) -> Result<Vec<u8>, Error> {
     let identity_key_pair = store
         .get_identity_key_pair()
@@ -74,17 +129,21 @@ pub async fn export_store(
     }
 
     let mut sessions = Vec::new();
-    for name in session_names {
-        let addr = ProtocolAddress::new(name.clone(), device_id());
+    for (name, device_id) in session_addresses {
+        let addr = ProtocolAddress::new(
+            name.clone(),
+            DeviceId::try_from(*device_id).map_err(|_| Error::Corrupt)?,
+        );
         if let Some(record) = store
             .load_session(&addr)
             .await
             .map_err(|_| Error::Corrupt)?
         {
-            sessions.push((
-                name.clone(),
-                record.serialize().map_err(|_| Error::Corrupt)?,
-            ));
+            sessions.push(SessionEntry::Named {
+                name: name.clone(),
+                device_id: *device_id,
+                record: record.serialize().map_err(|_| Error::Corrupt)?,
+            });
         }
     }
 
@@ -129,16 +188,24 @@ pub async fn import_store(bytes: &[u8]) -> Result<InMemSignalProtocolStore, Erro
             .await
             .map_err(|_| Error::Corrupt)?;
     }
-    for (name, bytes) in persisted.sessions {
-        let addr = ProtocolAddress::new(name, device_id());
+    for entry in persisted.sessions {
+        let (name, device_id, bytes) = entry.into_parts();
+        let addr = ProtocolAddress::new(
+            name,
+            DeviceId::try_from(device_id).map_err(|_| Error::Corrupt)?,
+        );
         let record = SessionRecord::deserialize(&bytes).map_err(|_| Error::Corrupt)?;
         store
             .store_session(&addr, &record)
             .await
             .map_err(|_| Error::Corrupt)?;
     }
-    for (name, bytes) in persisted.known_identities {
-        let addr = ProtocolAddress::new(name, device_id());
+    for entry in persisted.known_identities {
+        let (name, device_id, bytes) = entry.into_parts();
+        let addr = ProtocolAddress::new(
+            name,
+            DeviceId::try_from(device_id).map_err(|_| Error::Corrupt)?,
+        );
         let key = IdentityKey::try_from(bytes.as_slice()).map_err(|_| Error::Corrupt)?;
         store
             .save_identity(&addr, &key)

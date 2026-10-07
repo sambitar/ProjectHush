@@ -18,7 +18,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 |-------|------|-------|--------|
 | **A — Foundation** | First | **1** workspace/vault, **2** relay, **3** two-party CLI, **4** files | ✅ Done |
 | **B — Capsule messaging** | Core product | **5** daemon + Tauri, **5c** opaque relay + encrypted log/blobs, **5b.1–5b.2** files UX, **5h** live presence, **6** recovery/backup | ✅ Mostly done |
-| **C — Messaging polish** | Next dogfood | **5b.3** (optional), remaining `API_GAPS.md` | 🔜 **In progress** (DR-01–09, 14; 5c.4; remove contact; device link; passphrase change done; multi-device **1–3 of 7** done — per-device keys, signed device list, relay device directory + revocation) |
+| **C — Messaging polish** | Next dogfood | **5b.3** (optional), remaining `API_GAPS.md` | 🔜 **In progress** (DR-01–09, 14; 5c.4; remove contact; device link; passphrase change done; multi-device **1–4 of 7 done** — per-device keys, signed device list, relay device directory + revocation, contacts as device sets with send/recv fan-out verified end-to-end. Phase 5's linking core landed with it, so a linked device now works; its daemon/CLI endpoints and Phase 6–7 remain) |
 | **D — Async member mail** | When live chat feels solid | **5d** internal `@myserver.com` mail (replaces “message while offline”) | Planned |
 | **E — Outsider delivery** | After 5d | **5e** inbound drop, **5f** outbound to outsiders | Planned |
 | **F — Local notes** | Before public layer | **16** sticky-notes dashboard | Planned |

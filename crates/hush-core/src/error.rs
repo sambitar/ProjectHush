@@ -40,6 +40,10 @@ pub enum Error {
     FileTooLarge(usize),
     #[error("invite relay {0} does not match this vault relay {1}")]
     RelayMismatch(String, String),
+    #[error("only device 1 can sign the device list")]
+    NotSigningDevice,
+    #[error("invalid device link request")]
+    InvalidLink,
 }
 
 impl From<argon2::Error> for Error {

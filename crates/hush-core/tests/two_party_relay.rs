@@ -91,13 +91,15 @@ async fn relay_blob_has_no_cleartext_sender_json() {
 
     let alice_inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
     let client = RelayClient::new(&relay);
+    // Reading our own inbox needs the private read credential; the invite carries
+    // only the delivery token, which must not authorize a read.
     let ids = client
-        .list(&alice_inv.queue_id, &alice_inv.queue_token)
+        .list(&alice_inv.queue_id, alice.own_read_token())
         .await
         .unwrap();
     assert_eq!(ids.len(), 1);
     let body = client
-        .get(&alice_inv.queue_id, &alice_inv.queue_token, &ids[0])
+        .get(&alice_inv.queue_id, alice.own_read_token(), &ids[0])
         .await
         .unwrap();
     assert!(
@@ -227,24 +229,26 @@ async fn reporting_a_queue_burns_it() {
     let inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
     let client = RelayClient::new(&relay);
 
-    // The device is live and its inbox holds the pending message.
-    let ids = client.list(&inv.queue_id, &inv.queue_token).await.unwrap();
+    // The device is live and its inbox holds the pending message. Only the
+    // private read credential can see it — the published delivery token cannot.
+    let read_token = alice.own_read_token().to_string();
+    let ids = client.list(&inv.queue_id, &read_token).await.unwrap();
     assert_eq!(ids.len(), 1);
 
     client
-        .report_queue(&inv.queue_id, &inv.queue_token)
+        .report_queue(&inv.queue_id, &read_token)
         .await
         .unwrap();
 
     // The credential still parses, but it no longer authorizes anything: the
     // queue is gone, so there is nothing to read and nothing to report again.
     assert!(
-        client.list(&inv.queue_id, &inv.queue_token).await.is_err(),
+        client.list(&inv.queue_id, &read_token).await.is_err(),
         "a burned queue must not be readable"
     );
     assert!(
         client
-            .report_queue(&inv.queue_id, &inv.queue_token)
+            .report_queue(&inv.queue_id, &read_token)
             .await
             .is_err(),
         "a burned queue must not accept further reports"

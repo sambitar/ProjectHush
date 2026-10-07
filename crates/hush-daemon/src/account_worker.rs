@@ -88,6 +88,12 @@ enum Work {
 #[derive(Clone, serde::Serialize)]
 pub struct ContactDto {
     pub nickname: String,
+    /// The contact's account id.
+    ///
+    /// Still called `protocol_name` on the wire: it is the same value the UI has
+    /// always keyed avatars and photos off, and renaming it would churn the UI
+    /// for no behavioural gain. Multi-device made it the *account* identifier
+    /// rather than a single device's, which is what it effectively already was.
     pub protocol_name: String,
     pub inbound_ready: bool,
     pub online: bool,
@@ -130,7 +136,22 @@ impl AccountWorker {
                     let (reply, result) = match work {
                         Work::Unlock { dir, passphrase, reply } => {
                             let result = match Account::open(&dir, &passphrase).await {
-                                Ok(a) => {
+                                Ok(mut a) => {
+                                    // A vault written before the queue credential
+                                    // split comes back with a replaced inbox. If
+                                    // we do not republish, peers keep delivering
+                                    // to the abandoned one and this device goes
+                                    // silent. Best effort: a relay that is down
+                                    // must not block an unlock, and the next
+                                    // unlock retries.
+                                    if a.queue_rotated() {
+                                        if let Err(e) = a.publish_device_list().await {
+                                            eprintln!(
+                                                "hush: could not republish device list after \
+                                                 queue rotation: {e}"
+                                            );
+                                        }
+                                    }
                                     account = Some(a);
                                     WorkResult::Ok
                                 }
@@ -164,7 +185,7 @@ impl AccountWorker {
                                             .unwrap_or(false);
                                         list.push(ContactDto {
                                             nickname: c.nickname.clone(),
-                                            protocol_name: c.protocol_name.clone(),
+                                            protocol_name: c.account_id.clone(),
                                             inbound_ready: c.inbound_ready,
                                             online,
                                         });

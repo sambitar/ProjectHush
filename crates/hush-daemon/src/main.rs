@@ -691,30 +691,34 @@ async fn recv(
         }
     };
     Ok(Json(RecvResponse {
-        messages: inbox.messages.into_iter().map(to_dto).collect(),
+        messages: inbox.messages.into_iter().filter_map(to_dto).collect(),
         warnings: inbox.warnings,
     }))
 }
 
-fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
+/// `None` for an own-copy envelope: `recv` files those into the chat log itself
+/// and never surfaces them, so one reaching here would be a bug rather than a
+/// message to show.
+fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
     let from = msg.from_nick;
     match msg.payload {
-        MessagePayload::Text { body } => ReceivedDto {
+        MessagePayload::Text { body } => Some(ReceivedDto {
             from,
             kind: "text".into(),
             text: Some(body),
             file_name: None,
             file_size: None,
             blob_id: None,
-        },
-        MessagePayload::File { name, data } => ReceivedDto {
+        }),
+        MessagePayload::File { name, data } => Some(ReceivedDto {
             from,
             kind: "file".into(),
             text: None,
             file_name: Some(name),
             file_size: Some(data.len() as u64),
             blob_id: msg.file_blob_id.map(|id| hex::encode(id.0)),
-        },
+        }),
+        MessagePayload::OwnCopy { .. } => None,
     }
 }
 

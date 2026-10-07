@@ -27,8 +27,15 @@ Plain language. If we cannot say it here, we do not say it on the website.
 - Identity keys and Signal session state
 - Vault (messages, files, local nicknames)
 - Recovery code
-- Invite/queue tokens
+- Queue **read** tokens — per device, never published, and the only credential that lists, reads,
+  deletes from or burns that device's inbox.
 - Update signing key (operator)
+
+Deliberately *not* assets, because they are published by design: the invite string, the
+device-list blob, and the per-device queue **delivery** token. A delivery token authorizes putting
+a message in that inbox and nothing else, so handing it to a contact — or to anyone who reads the
+device list — does not let them read the inbox or destroy it. Flooding it is still possible, which
+is what the relay's rate limit is for.
 
 ## Trust
 

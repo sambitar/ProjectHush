@@ -163,12 +163,47 @@ async fn get_device_dir(
     state.store.get_device_dir(&account_id)
 }
 
+/// Publish a device's prekey record.
+///
+/// No bearer credential, for the same reason the device list has none: the
+/// record is signed by the device's own identity private key, and the relay
+/// checks that signature against the identity key the account's signed device
+/// list carries for this device. That is strictly stronger than a token, because
+/// a revoked device's key is no longer in the list.
+async fn put_prekey_record(
+    State(state): State<Arc<AppState>>,
+    Path((account_id, device_id)): Path<(String, u32)>,
+    body: Bytes,
+) -> Result<StatusCode, RelayError> {
+    state
+        .store
+        .put_prekey_record(&account_id, device_id, &body)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Fetch a device's prekey record, consuming one one-time prekey.
+///
+/// Unauthenticated on purpose: a peer starting a session holds no credential for
+/// the account, and the record is self-authenticating. The response is the
+/// record with at most one one-time prekey left in it, which the peer uses and
+/// discards.
+async fn get_prekey_record(
+    State(state): State<Arc<AppState>>,
+    Path((account_id, device_id)): Path<(String, u32)>,
+) -> Result<Vec<u8>, RelayError> {
+    state.store.take_prekey_record(&account_id, device_id)
+}
+
 pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> {
     let store = Store::open(db_path, config)?;
     let state = Arc::new(AppState { store });
     Ok(Router::new()
         .route("/health", get(health))
         .route("/d/{account_id}", put(put_device_dir).get(get_device_dir))
+        .route(
+            "/k/{account_id}/{device_id}",
+            put(put_prekey_record).get(get_prekey_record),
+        )
         .route("/q/{queue_id}", put(put_blob).get(list_blobs))
         .route(
             "/q/{queue_id}/presence",

@@ -18,12 +18,15 @@ pub fn protocol_name_from_identity(pair: &IdentityKeyPair) -> String {
     hex::encode(pair.identity_key().serialize())
 }
 
-pub fn device_id() -> DeviceId {
-    DeviceId::try_from(1u32).expect("device 1")
-}
-
-pub fn protocol_address(name: &str) -> ProtocolAddress {
-    ProtocolAddress::new(name.to_string(), device_id())
+/// Build the address of one device of an account.
+///
+/// `name` is the *account* id, not the device's own identity hash: every device
+/// of an account shares it and the device id distinguishes them. That is exactly
+/// what libsignal's `ProtocolAddress` models, and it is why a peer holds one
+/// session per device under a single contact instead of a session per key.
+pub fn protocol_address(name: &str, device_id: u32) -> Result<ProtocolAddress, Error> {
+    let device_id = DeviceId::try_from(device_id).map_err(|_| Error::Corrupt)?;
+    Ok(ProtocolAddress::new(name.to_string(), device_id))
 }
 
 pub fn new_protocol_store() -> Result<InMemSignalProtocolStore, Error> {
@@ -35,6 +38,7 @@ pub fn new_protocol_store() -> Result<InMemSignalProtocolStore, Error> {
 
 pub async fn mint_prekey_bundle(
     store: &mut InMemSignalProtocolStore,
+    device_id: u32,
 ) -> Result<PreKeyBundle, Error> {
     use libsignal_protocol::kem;
 
@@ -61,7 +65,7 @@ pub async fn mint_prekey_bundle(
         .calculate_signature(&kyber_pre_key_public, &mut csprng)
         .map_err(|_| Error::Corrupt)?;
 
-    let device_id = device_id();
+    let device_id = DeviceId::try_from(device_id).map_err(|_| Error::Corrupt)?;
     let pre_key_id: u32 = csprng.random();
     let signed_pre_key_id: u32 = csprng.random();
     let kyber_pre_key_id: u32 = csprng.random();
@@ -123,6 +127,104 @@ pub async fn mint_prekey_bundle(
     Ok(pre_key_bundle)
 }
 
+/// Mint a device's publishable prekey record: a fresh pool of one-time prekeys
+/// plus the signed and kyber prekeys that carry the forward-secrecy guarantee.
+///
+/// The private halves are saved into the store, because that is what a peer's
+/// first message will be decrypted against. Only the public halves go on the
+/// wire.
+pub async fn mint_publishable_prekeys(
+    store: &mut InMemSignalProtocolStore,
+    device_id: u32,
+    one_time_count: usize,
+) -> Result<crate::prekey::PreKeyRecord, Error> {
+    use libsignal_protocol::kem;
+    // Aliased: libsignal already has a `PreKeyRecord`, and this one is the
+    // publishable *set* of keys rather than a single prekey.
+    use crate::prekey::{OneTimePreKey, PreKeyRecord as PublishablePreKeys};
+
+    let mut csprng = OsRng.unwrap_err();
+    let identity_key_pair = store
+        .get_identity_key_pair()
+        .await
+        .map_err(|_| Error::Corrupt)?;
+    let identity_key = identity_key_pair.identity_key().serialize().to_vec();
+
+    let mut one_time_prekeys = Vec::with_capacity(one_time_count);
+    for _ in 0..one_time_count {
+        let key_pair = KeyPair::generate(&mut csprng);
+        let key_id: u32 = csprng.random();
+        store
+            .save_pre_key(
+                PreKeyId::from(key_id),
+                &PreKeyRecord::new(PreKeyId::from(key_id), &key_pair),
+            )
+            .await
+            .map_err(|_| Error::Corrupt)?;
+        one_time_prekeys.push(OneTimePreKey {
+            key_id,
+            public_key: key_pair.public_key.serialize().to_vec(),
+        });
+    }
+
+    let signed_pre_key_pair = KeyPair::generate(&mut csprng);
+    let signed_pre_key_public = signed_pre_key_pair.public_key.serialize();
+    let signed_pre_key_signature = identity_key_pair
+        .private_key()
+        .calculate_signature(&signed_pre_key_public, &mut csprng)
+        .map_err(|_| Error::Corrupt)?;
+    let signed_pre_key_id: u32 = csprng.random();
+    store
+        .save_signed_pre_key(
+            SignedPreKeyId::from(signed_pre_key_id),
+            &SignedPreKeyRecord::new(
+                SignedPreKeyId::from(signed_pre_key_id),
+                Timestamp::from_epoch_millis(csprng.random_range(1_000_000..2_000_000)),
+                &signed_pre_key_pair,
+                &signed_pre_key_signature,
+            ),
+        )
+        .await
+        .map_err(|_| Error::Corrupt)?;
+
+    let kyber_pre_key_pair = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut csprng);
+    let kyber_pre_key_public = kyber_pre_key_pair.public_key.serialize();
+    let kyber_pre_key_signature = identity_key_pair
+        .private_key()
+        .calculate_signature(&kyber_pre_key_public, &mut csprng)
+        .map_err(|_| Error::Corrupt)?;
+    let kyber_pre_key_id: u32 = csprng.random();
+    store
+        .save_kyber_pre_key(
+            KyberPreKeyId::from(kyber_pre_key_id),
+            &KyberPreKeyRecord::new(
+                KyberPreKeyId::from(kyber_pre_key_id),
+                Timestamp::from_epoch_millis(43),
+                &kyber_pre_key_pair,
+                &kyber_pre_key_signature,
+            ),
+        )
+        .await
+        .map_err(|_| Error::Corrupt)?;
+
+    Ok(PublishablePreKeys {
+        v: crate::prekey::PREKEY_RECORD_VERSION,
+        device_id,
+        registration_id: store
+            .get_local_registration_id()
+            .await
+            .map_err(|_| Error::Corrupt)?,
+        identity_key,
+        signed_pre_key_id,
+        signed_pre_key_public: signed_pre_key_public.to_vec(),
+        signed_pre_key_signature: signed_pre_key_signature.to_vec(),
+        kyber_pre_key_id,
+        kyber_pre_key_public: kyber_pre_key_public.to_vec(),
+        kyber_pre_key_signature: kyber_pre_key_signature.to_vec(),
+        one_time_prekeys,
+    })
+}
+
 pub fn invite_from_bundle(
     relay: &str,
     protocol_name: &str,
@@ -145,7 +247,7 @@ pub fn invite_from_bundle(
             .map_err(|_| Error::Corrupt)?
             .serialize()
             .to_vec(),
-        pre_key_id: pre_key_id.map(|id| u32::from(id)),
+        pre_key_id: pre_key_id.map(u32::from),
         pre_key_public: pre_key_public.map(|k| k.serialize().to_vec()),
         signed_pre_key_id: u32::from(bundle.signed_pre_key_id().map_err(|_| Error::Corrupt)?),
         signed_pre_key_public: bundle
@@ -173,13 +275,15 @@ pub fn invite_from_bundle(
 pub async fn process_contact_bundle(
     store: &mut InMemSignalProtocolStore,
     local_name: &str,
+    local_device_id: u32,
     remote_name: &str,
+    remote_device_id: u32,
     bundle: &PreKeyBundle,
 ) -> Result<(), Error> {
     use libsignal_protocol::process_prekey_bundle;
 
-    let local = protocol_address(local_name);
-    let remote = protocol_address(remote_name);
+    let local = protocol_address(local_name, local_device_id)?;
+    let remote = protocol_address(remote_name, remote_device_id)?;
     let mut csprng = OsRng.unwrap_err();
     process_prekey_bundle(
         &remote,
@@ -198,13 +302,15 @@ pub async fn process_contact_bundle(
 pub async fn encrypt_message(
     store: &mut InMemSignalProtocolStore,
     local_name: &str,
+    local_device_id: u32,
     remote_name: &str,
+    remote_device_id: u32,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     use libsignal_protocol::message_encrypt;
 
-    let local = protocol_address(local_name);
-    let remote = protocol_address(remote_name);
+    let local = protocol_address(local_name, local_device_id)?;
+    let remote = protocol_address(remote_name, remote_device_id)?;
     let mut csprng = OsRng.unwrap_err();
     let msg = message_encrypt(
         plaintext,
@@ -223,13 +329,15 @@ pub async fn encrypt_message(
 pub async fn decrypt_message(
     store: &mut InMemSignalProtocolStore,
     local_name: &str,
+    local_device_id: u32,
     remote_name: &str,
+    remote_device_id: u32,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     use libsignal_protocol::message_decrypt;
 
-    let local = protocol_address(local_name);
-    let remote = protocol_address(remote_name);
+    let local = protocol_address(local_name, local_device_id)?;
+    let remote = protocol_address(remote_name, remote_device_id)?;
     let mut csprng = OsRng.unwrap_err();
     let msg = parse_ciphertext(ciphertext)?;
     message_decrypt(
