@@ -71,6 +71,10 @@ struct StatusResponse {
     socket: Option<String>,
     /// TCP bind address, when the TCP listener is enabled.
     tcp_addr: Option<String>,
+    /// This member's mail handle (local part only), if set.
+    mail_handle: Option<String>,
+    /// Fixed mail domain suffix, so the UI never hardcodes it.
+    mail_domain: String,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +136,19 @@ struct ReceivedDto {
     file_name: Option<String>,
     file_size: Option<u64>,
     blob_id: Option<String>,
+    /// Mail only: the thread this message belongs to.
+    thread_id: Option<String>,
+    /// Mail only: the subject line, if the sender set one.
+    subject: Option<String>,
+    /// Mail only: attachment references (bytes are fetched via `/api/blob/{id}`).
+    attachments: Vec<MailAttachmentDto>,
+}
+
+#[derive(Serialize)]
+struct MailAttachmentDto {
+    name: String,
+    size: u64,
+    blob_id: String,
 }
 
 #[derive(Serialize)]
@@ -212,6 +229,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/unlock", post(unlock))
         .route("/api/lock", post(lock))
         .route("/api/change-passphrase", post(change_passphrase))
+        .route("/api/mail/handle", post(set_mail_handle))
+        .route("/api/mail/send", post(send_mail))
+        .route("/api/mail", get(mail))
         .route("/api/invite", post(invite))
         .route("/api/contacts", get(contacts))
         .route("/api/contacts/add", post(add_contact))
@@ -437,29 +457,38 @@ fn map_err(result: WorkResult) -> Result<WorkResult, (StatusCode, Json<ApiError>
 
 async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
     let locked = !*state.unlocked.lock().await;
-    let (protocol_name, vault_bytes, contacts, recovery_acknowledged, last_backup_unix, relay) =
-        if locked {
-            (None, 0, 0, true, 0, None)
-        } else {
-            match state.worker.meta().await {
-                WorkResult::Meta {
-                    protocol_name,
-                    vault_bytes,
-                    contacts,
-                    recovery_acknowledged,
-                    last_backup_unix,
-                    relay,
-                } => (
-                    Some(protocol_name),
-                    vault_bytes,
-                    contacts,
-                    recovery_acknowledged,
-                    last_backup_unix,
-                    Some(relay),
-                ),
-                _ => (None, 0, 0, true, 0, None),
-            }
-        };
+    let (
+        protocol_name,
+        vault_bytes,
+        contacts,
+        recovery_acknowledged,
+        last_backup_unix,
+        relay,
+        mail_handle,
+    ) = if locked {
+        (None, 0, 0, true, 0, None, None)
+    } else {
+        match state.worker.meta().await {
+            WorkResult::Meta {
+                protocol_name,
+                vault_bytes,
+                contacts,
+                recovery_acknowledged,
+                last_backup_unix,
+                relay,
+                mail_handle,
+            } => (
+                Some(protocol_name),
+                vault_bytes,
+                contacts,
+                recovery_acknowledged,
+                last_backup_unix,
+                Some(relay),
+                mail_handle,
+            ),
+            _ => (None, 0, 0, true, 0, None, None),
+        }
+    };
     let (relay, relay_source) = match relay {
         Some(stored) => (stored, "vault".to_string()),
         None => {
@@ -480,6 +509,8 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
         relay_source,
         socket: state.socket.as_ref().map(|p| p.display().to_string()),
         tcp_addr: state.tcp_addr.clone(),
+        mail_handle,
+        mail_domain: hush_core::MAIL_DOMAIN.to_string(),
     })
 }
 
@@ -541,6 +572,106 @@ async fn change_passphrase(
         WorkResult::Err(message) => {
             Err((StatusCode::BAD_REQUEST, Json(ApiError { error: message })))
         }
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetMailHandleRequest {
+    handle: String,
+}
+
+async fn set_mail_handle(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SetMailHandleRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.set_mail_handle(&body.handle).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct MailAttachmentInput {
+    name: String,
+    data_base64: String,
+}
+
+#[derive(Deserialize)]
+struct SendMailRequest {
+    to: String,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    subject: Option<String>,
+    body: String,
+    #[serde(default)]
+    attachments: Vec<MailAttachmentInput>,
+}
+
+#[derive(Serialize)]
+struct SendMailResponse {
+    thread_id: String,
+}
+
+async fn send_mail(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SendMailRequest>,
+) -> Result<Json<SendMailResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut attachments = Vec::with_capacity(body.attachments.len());
+    for a in &body.attachments {
+        let data = STANDARD.decode(a.data_base64.trim()).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("invalid base64 for attachment {:?}", a.name),
+                }),
+            )
+        })?;
+        attachments.push((a.name.clone(), data));
+    }
+    // An all-whitespace subject is no subject at all.
+    let subject = body
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let result = map_err(
+        state
+            .worker
+            .send_mail(
+                &body.to,
+                body.thread_id.clone(),
+                subject,
+                &body.body,
+                attachments,
+            )
+            .await,
+    )?;
+    match result {
+        WorkResult::MailSent(thread_id) => Ok(Json(SendMailResponse { thread_id })),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+async fn mail(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<ChatRecord>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.mail_records().await)?;
+    match result {
+        WorkResult::Mail(list) => Ok(Json(list)),
         _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
@@ -698,6 +829,7 @@ async fn recv(
 
 fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
     let from = msg.from_nick;
+    let mail_attachments = msg.mail_attachments;
     match msg.payload {
         MessagePayload::Text { body } => ReceivedDto {
             from,
@@ -706,6 +838,9 @@ fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
             file_name: None,
             file_size: None,
             blob_id: None,
+            thread_id: None,
+            subject: None,
+            attachments: Vec::new(),
         },
         MessagePayload::File { name, data } => ReceivedDto {
             from,
@@ -714,6 +849,32 @@ fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
             file_name: Some(name),
             file_size: Some(data.len() as u64),
             blob_id: msg.file_blob_id.map(|id| hex::encode(id.0)),
+            thread_id: None,
+            subject: None,
+            attachments: Vec::new(),
+        },
+        MessagePayload::Mail {
+            thread_id,
+            subject,
+            body,
+            ..
+        } => ReceivedDto {
+            from,
+            kind: "mail".into(),
+            text: Some(body),
+            file_name: None,
+            file_size: None,
+            blob_id: None,
+            thread_id: Some(thread_id),
+            subject,
+            attachments: mail_attachments
+                .into_iter()
+                .map(|a| MailAttachmentDto {
+                    name: a.name,
+                    size: a.size,
+                    blob_id: hex::encode(a.blob_id.0),
+                })
+                .collect(),
         },
     }
 }

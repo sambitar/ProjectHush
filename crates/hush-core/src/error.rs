@@ -40,6 +40,10 @@ pub enum Error {
     FileTooLarge(usize),
     #[error("invite relay {0} does not match this vault relay {1}")]
     RelayMismatch(String, String),
+    #[error("handle must be 1-64 characters of a-z, 0-9, dot, underscore or dash")]
+    InvalidHandle,
+    #[error("too many attachments (max {0})")]
+    TooManyAttachments(usize),
 }
 
 impl From<argon2::Error> for Error {

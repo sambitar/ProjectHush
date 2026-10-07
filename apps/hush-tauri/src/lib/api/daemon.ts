@@ -138,6 +138,25 @@ export const api = {
     request<null>("/api/presence/heartbeat", { method: "POST" }),
   recv: () => request<RecvResponse>("/api/recv", { method: "POST" }),
   messages: () => request<ChatRecordDto[]>("/api/messages"),
+  mail: () => request<ChatRecordDto[]>("/api/mail"),
+  sendMail: (
+    to: string,
+    body: {
+      thread_id?: string;
+      subject?: string;
+      body: string;
+      attachments: { name: string; data_base64: string }[];
+    },
+  ) =>
+    request<{ thread_id: string }>("/api/mail/send", {
+      method: "POST",
+      body: JSON.stringify({ to, ...body }),
+    }),
+  setMailHandle: (handle: string) =>
+    request<null>("/api/mail/handle", {
+      method: "POST",
+      body: JSON.stringify({ handle }),
+    }),
   blob: (id: string) =>
     request<{ data_base64: string }>(`/api/blob/${encodeURIComponent(id)}`),
   backupExport: () =>

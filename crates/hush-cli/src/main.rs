@@ -129,6 +129,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::fs::write(&out, &data)?;
                         println!("{}: file -> {}", msg.from_nick, out.display());
                     }
+                    MessagePayload::Mail {
+                        thread_id,
+                        subject,
+                        body,
+                        ..
+                    } => {
+                        let subject = subject.as_deref().unwrap_or("(no subject)");
+                        println!(
+                            "{}: mail [{}] {} — {}",
+                            msg.from_nick, thread_id, subject, body
+                        );
+                        for att in &msg.mail_attachments {
+                            let out = if let Some(d) = &save_dir {
+                                std::fs::create_dir_all(d)?;
+                                d.join(&att.name)
+                            } else {
+                                StdPathBuf::from(format!(
+                                    "received-{}-{}",
+                                    msg.from_nick, att.name
+                                ))
+                            };
+                            let bytes = account.read_blob(&att.blob_id)?;
+                            std::fs::write(&out, &bytes)?;
+                            println!("  attachment -> {}", out.display());
+                        }
+                    }
                 }
             }
         }

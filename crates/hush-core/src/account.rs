@@ -4,15 +4,17 @@ use std::path::{Path, PathBuf};
 use libsignal_protocol::IdentityKeyStore;
 use serde::{Deserialize, Serialize};
 
+use uuid::Uuid;
+
 use crate::backup::{export_vault, import_vault};
-use crate::chat_log::ChatLog;
+use crate::chat_log::{ChatLog, MailAttachmentRecord};
 use crate::device::{DeviceKeys, LEGACY_DEVICE_FILE};
 use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_files_exist, unwrap_master_with_recovery};
 use crate::crypto::{decrypt, encrypt};
 use crate::error::Error;
 use crate::invite::InvitePayload;
-use crate::message::{InboxResult, ReceivedMessage};
-use crate::payload::{MessagePayload, MAX_INLINE_FILE_BYTES};
+use crate::message::{InboxResult, ReceivedAttachment, ReceivedMessage};
+use crate::payload::{MailAttachment, MessagePayload, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS};
 use crate::relay_client::{normalize_relay_base, RelayClient};
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
@@ -28,6 +30,10 @@ pub struct Contact {
     pub protocol_name: String,
     pub queue_id: String,
     pub queue_token: String,
+    /// This contact's chosen mail handle (local part only), learned from their
+    /// invite. `None` for contacts added before mail, or who never set one.
+    #[serde(default)]
+    pub mail_handle: Option<String>,
     /// True after we successfully received at least one message from them (they added our invite).
     #[serde(default)]
     pub inbound_ready: bool,
@@ -51,6 +57,10 @@ struct AccountState {
     receive_queue_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receive_queue_token: Option<String>,
+    /// This member's chosen mail handle (local part only). Shared vault state,
+    /// not device material: it is a label, and a restored vault should keep it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mail_handle: Option<String>,
 }
 
 pub struct Account {
@@ -87,6 +97,7 @@ impl Account {
             last_backup_unix: 0,
             receive_queue_id: None,
             receive_queue_token: None,
+            mail_handle: None,
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
@@ -233,6 +244,28 @@ impl Account {
         &self.state.protocol_name
     }
 
+    pub fn mail_handle(&self) -> Option<&str> {
+        self.state.mail_handle.as_deref()
+    }
+
+    pub fn mail_address(&self) -> Option<String> {
+        self.state
+            .mail_handle
+            .as_deref()
+            .map(crate::mail::format_address)
+    }
+
+    /// Set or change this member's mail handle.
+    ///
+    /// The cached invite is dropped so the next `invite()` mints one carrying
+    /// the new handle; otherwise "Copy my invite" would keep advertising the old
+    /// address until the process restarted.
+    pub async fn set_mail_handle(&mut self, handle: &str) -> Result<(), Error> {
+        self.state.mail_handle = Some(crate::mail::normalize_handle(handle)?);
+        self.state.invite_cache = None;
+        self.save().await
+    }
+
     pub fn contacts(&self) -> &[Contact] {
         &self.state.contacts
     }
@@ -251,6 +284,7 @@ impl Account {
             &self.state.protocol_name,
             self.device.queue_id(),
             self.device.queue_token(),
+            self.state.mail_handle.as_deref(),
             &bundle,
         )?;
         let encoded = payload.encode()?;
@@ -285,6 +319,7 @@ impl Account {
             protocol_name: payload.protocol_name.clone(),
             queue_id: payload.queue_id,
             queue_token: payload.queue_token,
+            mail_handle: payload.handle.clone(),
             inbound_ready: false,
         });
         self.save().await?;
@@ -358,6 +393,72 @@ impl Account {
         Ok(blob_id)
     }
 
+    /// Send an internal mail message, returning the thread id.
+    ///
+    /// Mail is async by design: unlike `send_text`, this does not check whether
+    /// the contact is online. Attachments are inlined on the wire (capped) and
+    /// also stored as encrypted vault blobs on our side so the sent message is
+    /// openable after a restart.
+    pub async fn send_mail(
+        &mut self,
+        nickname: &str,
+        thread_id: Option<&str>,
+        subject: Option<&str>,
+        body: &str,
+        attachments: &[(String, Vec<u8>)],
+    ) -> Result<String, Error> {
+        if attachments.len() > MAX_MAIL_ATTACHMENTS {
+            return Err(Error::TooManyAttachments(MAX_MAIL_ATTACHMENTS));
+        }
+        let total: usize = attachments.iter().map(|(_, d)| d.len()).sum();
+        if total > MAX_INLINE_FILE_BYTES {
+            return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
+        }
+        let thread_id = thread_id
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let wire: Vec<MailAttachment> = attachments
+            .iter()
+            .map(|(name, data)| MailAttachment {
+                name: name.clone(),
+                data: data.clone(),
+            })
+            .collect();
+        self.send_payload_inner(
+            nickname,
+            MessagePayload::Mail {
+                thread_id: thread_id.clone(),
+                subject: subject.map(|s| s.to_string()),
+                body: body.to_string(),
+                attachments: wire,
+            },
+            false,
+        )
+        .await?;
+
+        // Store our own copies as blobs, then record the message. `put_blob`
+        // borrows the vault, so the ids are collected before the log is written.
+        let mut records = Vec::with_capacity(attachments.len());
+        for (name, data) in attachments {
+            let id = self.vault.put_blob(data)?;
+            records.push(MailAttachmentRecord {
+                name: name.clone(),
+                blob_id_hex: hex::encode(id.0),
+                size: data.len() as u64,
+            });
+        }
+        let master = *self.vault.master_key();
+        self.chat_log.append_mail(
+            &master, nickname, true, &thread_id, subject, body, &records,
+        )?;
+        Ok(thread_id)
+    }
+
+    pub fn mail_records(&self) -> Vec<crate::chat_log::ChatRecord> {
+        self.chat_log.mail_records().cloned().collect()
+    }
+
     pub async fn heartbeat_presence(&self) -> Result<(), Error> {
         let relay = RelayClient::try_new(&self.state.relay)?;
         relay
@@ -376,11 +477,23 @@ impl Account {
     }
 
     async fn send_payload(&mut self, nickname: &str, payload: MessagePayload) -> Result<(), Error> {
+        self.send_payload_inner(nickname, payload, true).await
+    }
+
+    /// `require_online` is false for mail: mail is delivered into the recipient's
+    /// store-and-forward queue while they are away, which is exactly the
+    /// difference from live-only chat (5h).
+    async fn send_payload_inner(
+        &mut self,
+        nickname: &str,
+        payload: MessagePayload,
+        require_online: bool,
+    ) -> Result<(), Error> {
         let contact = self
             .find_contact(nickname)
             .ok_or(Error::ContactNotFound)?
             .clone();
-        if !self.contact_is_online(nickname).await? {
+        if require_online && !self.contact_is_online(nickname).await? {
             return Err(Error::ContactOffline);
         }
         let plain = payload.encode()?;
@@ -444,31 +557,55 @@ impl Account {
                 },
             };
             let payload = decode_legacy_payload(&plain)?;
-            let file_blob_id = if let MessagePayload::File { data, name } = &payload {
-                let id = self.vault.put_blob(data)?;
-                let master = *self.vault.master_key();
-                let nick = self
-                    .contact_nick_for_protocol(&from_protocol)
-                    .unwrap_or_else(|| short_name(&from_protocol));
-                self.chat_log.append_file(
-                    &master,
-                    &nick,
-                    false,
-                    name,
-                    &id,
-                    data.len() as u64,
-                )?;
-                Some(id)
-            } else {
-                let master = *self.vault.master_key();
-                let nick = self
-                    .contact_nick_for_protocol(&from_protocol)
-                    .unwrap_or_else(|| short_name(&from_protocol));
-                if let MessagePayload::Text { body } = &payload {
+            let nick = self
+                .contact_nick_for_protocol(&from_protocol)
+                .unwrap_or_else(|| short_name(&from_protocol));
+            let (file_blob_id, mail_attachments) = match &payload {
+                MessagePayload::File { data, name } => {
+                    let id = self.vault.put_blob(data)?;
+                    let master = *self.vault.master_key();
                     self.chat_log
-                        .append_text(&master, &nick, false, body)?;
+                        .append_file(&master, &nick, false, name, &id, data.len() as u64)?;
+                    (Some(id), Vec::new())
                 }
-                None
+                MessagePayload::Mail {
+                    thread_id,
+                    subject,
+                    body,
+                    attachments,
+                } => {
+                    let mut blobs = Vec::with_capacity(attachments.len());
+                    let mut records = Vec::with_capacity(attachments.len());
+                    for a in attachments {
+                        let id = self.vault.put_blob(&a.data)?;
+                        records.push(MailAttachmentRecord {
+                            name: a.name.clone(),
+                            blob_id_hex: hex::encode(id.0),
+                            size: a.data.len() as u64,
+                        });
+                        blobs.push(ReceivedAttachment {
+                            name: a.name.clone(),
+                            blob_id: id,
+                            size: a.data.len() as u64,
+                        });
+                    }
+                    let master = *self.vault.master_key();
+                    self.chat_log.append_mail(
+                        &master,
+                        &nick,
+                        false,
+                        thread_id,
+                        subject.as_deref(),
+                        body,
+                        &records,
+                    )?;
+                    (None, blobs)
+                }
+                MessagePayload::Text { body } => {
+                    let master = *self.vault.master_key();
+                    self.chat_log.append_text(&master, &nick, false, body)?;
+                    (None, Vec::new())
+                }
             };
             if let Some(c) = self
                 .state
@@ -478,13 +615,11 @@ impl Account {
             {
                 c.inbound_ready = true;
             }
-            let nick = self
-                .contact_nick_for_protocol(&from_protocol)
-                .unwrap_or_else(|| short_name(&from_protocol));
             out.push(ReceivedMessage {
                 from_nick: nick,
                 payload,
                 file_blob_id,
+                mail_attachments,
             });
             relay
                 .delete(self.device.queue_id(), self.device.queue_token(), &blob_id)
@@ -657,6 +792,7 @@ mod tests {
             last_backup_unix: 0,
             receive_queue_id: Some(queue_id.clone()),
             receive_queue_token: Some(queue_token.clone()),
+            mail_handle: None,
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
         fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();

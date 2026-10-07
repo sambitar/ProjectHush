@@ -21,6 +21,14 @@ import {
   toggleReaction,
 } from "./lib/chatStore";
 import { MAX_FILE_BYTES, RECV_POLL_MS } from "./lib/constants";
+import {
+  clearMailStore,
+  getThread as getMailThread,
+  ingestIncomingMail,
+  listThreads,
+  loadMail,
+  type MailAttachmentRef,
+} from "./lib/mailStore";
 import { getAutoLockMs, getAutoLockMinutes, patchUiPrefs } from "./lib/api/uiPrefs";
 import { displayNick, getMockSettings, setMuted, setNickOverride, clearMockLocal, isMuted, refreshContactPrefs } from "./lib/api/mock";
 import { clearContactUiPrefs } from "./lib/api/uiPrefs";
@@ -37,8 +45,18 @@ import { avatarWithPresence, createAvatarEl } from "./components/ui/Avatar";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
 import QRCode from "qrcode";
 
-type Rail = "chats" | "files" | "vault" | "settings";
-type SettingsSection = "appearance" | "security" | "recovery" | "backup" | "about";
+type Rail = "chats" | "mail" | "files" | "vault" | "settings";
+type SettingsSection =
+  | "appearance"
+  | "profile"
+  | "security"
+  | "recovery"
+  | "backup"
+  | "about";
+
+/** Matches the daemon: at most this many attachments, and this many bytes total. */
+const MAX_MAIL_ATTACHMENTS = 8;
+const MAX_MAIL_BYTES = 256 * 1024;
 
 export class App {
   private root: HTMLElement;
@@ -59,6 +77,10 @@ export class App {
   private recoveryModalCode: string | null = null;
   private linkDevicePayload: string | null = null;
   private unlockLinkMode = false;
+  private mailThreadId: string | null = null;
+  private mailComposeOpen = false;
+  private mailHandle: string | null = null;
+  private mailDomain = "myserver.com";
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -97,15 +119,20 @@ export class App {
 
   private async refreshStatus(): Promise<void> {
     try {
-      this.status = await api.status();
-      if (!this.status?.locked) {
+      const status = await api.status();
+      this.status = status;
+      if (!status || status.locked) {
+        this.stopPoll();
+      } else {
         this.contacts = (await api.contacts()) ?? [];
         if (!this.selectedNick && this.contacts[0]) {
           this.selectedNick = this.contacts[0].nickname;
         }
+        this.mailHandle = status.mail_handle ?? null;
+        this.mailDomain = status.mail_domain ?? "myserver.com";
+        const mail = await api.mail();
+        if (mail) loadMail(mail);
         this.startPoll();
-      } else {
-        this.stopPoll();
       }
     } catch {
       this.status = {
@@ -120,6 +147,8 @@ export class App {
         relay_source: "unknown",
         socket: null,
         tcp_addr: null,
+        mail_handle: null,
+        mail_domain: "myserver.com",
       };
     }
   }
@@ -153,8 +182,12 @@ export class App {
       }
       for (const w of r.warnings) this.announce(w);
       for (const m of r.messages) {
-        ingestIncoming(m.from, m);
-        this.announce(`New message from ${m.from}`);
+        if (m.kind === "mail") {
+          if (ingestIncomingMail(m)) this.announce(`New mail from ${m.from}`);
+        } else {
+          ingestIncoming(m.from, m);
+          this.announce(`New message from ${m.from}`);
+        }
       }
       if (r.messages.length || presenceChanged) this.render();
     } catch {
@@ -165,9 +198,12 @@ export class App {
   private async lock(): Promise<void> {
     await api.lock();
     clearChatStore();
+    clearMailStore();
     clearMockLocal();
     this.selectedNick = null;
     this.filesContactNick = null;
+    this.mailThreadId = null;
+    this.mailComposeOpen = false;
     this.unlockedAt = 0;
     this.stopPoll();
     await this.refreshStatus();
@@ -190,6 +226,8 @@ export class App {
     if (this.rail === "chats") {
       shell.appendChild(this.renderConvList());
       shell.appendChild(this.renderMainChat());
+    } else if (this.rail === "mail") {
+      shell.appendChild(this.renderMail());
     } else if (this.rail === "files") {
       shell.appendChild(this.renderFiles());
     } else if (this.rail === "vault") {
@@ -444,6 +482,7 @@ export class App {
     logo.appendChild(icon("vault"));
     rail.appendChild(logo);
     rail.appendChild(this.railBtn("chats", "Chats", "chats"));
+    rail.appendChild(this.railBtn("mail", "Mail", "mail"));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
     rail.appendChild(spacer);
@@ -706,7 +745,7 @@ export class App {
       const hint = document.createElement("p");
       hint.className = "text-13 muted composer-offline-hint";
       hint.textContent =
-        `${displayNick(nick)} is offline. Live chat works when you're both online — mail (coming soon) will reach them later.`;
+        `${displayNick(nick)} is offline. Chat and files need you both online — use Mail to reach them later.`;
       wrap.appendChild(hint);
     }
     const inner = document.createElement("div");
@@ -758,7 +797,7 @@ export class App {
     if (!text) return;
     const contact = this.contacts.find((c) => c.nickname === nick);
     if (!contact?.online) {
-      this.announce(`${displayNick(nick)} is offline. Live chat only when you're both online.`);
+      this.announce(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`);
       return;
     }
     const msg = addOutgoingText(nick, text);
@@ -777,7 +816,7 @@ export class App {
   private async sendFile(nick: string, file: File): Promise<void> {
     const contact = this.contacts.find((c) => c.nickname === nick);
     if (!contact?.online) {
-      this.announce(`${displayNick(nick)} is offline. Live chat only when you're both online.`);
+      this.announce(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`);
       return;
     }
     if (file.size > MAX_FILE_BYTES) {
@@ -989,6 +1028,318 @@ export class App {
     return pane;
   }
 
+  private mailAddress(): string | null {
+    return this.mailHandle ? `${this.mailHandle}@${this.mailDomain}` : null;
+  }
+
+  private renderMail(): HTMLElement {
+    if (this.mailComposeOpen) return this.renderMailCompose();
+    if (this.mailThreadId) return this.renderMailThread(this.mailThreadId);
+    return this.renderMailList();
+  }
+
+  private renderMailList(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+    pane.style.padding = "var(--space-5)";
+    const head = document.createElement("div");
+    head.style.display = "flex";
+    head.style.alignItems = "center";
+    head.style.justifyContent = "space-between";
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.textContent = "Mail";
+    const newBtn = document.createElement("button");
+    newBtn.type = "button";
+    newBtn.className = "btn-primary pressable";
+    newBtn.textContent = "New mail";
+    newBtn.onclick = () => {
+      this.mailComposeOpen = true;
+      this.render();
+    };
+    head.append(h, newBtn);
+    const hint = document.createElement("p");
+    hint.className = "muted text-13";
+    hint.style.marginTop = "var(--space-2)";
+    hint.textContent = this.mailAddress()
+      ? `Your address is ${this.mailAddress()}`
+      : "Set your address in Settings → Profile so contacts can recognise you.";
+    pane.append(head, hint);
+
+    const threads = listThreads();
+    if (!threads.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.style.marginTop = "var(--space-5)";
+      empty.textContent = "No mail yet — write to a contact.";
+      pane.appendChild(empty);
+      return pane;
+    }
+    const list = document.createElement("div");
+    list.className = "mail-thread-list";
+    list.style.marginTop = "var(--space-4)";
+    for (const t of threads) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "conv-row pressable";
+      row.style.width = "100%";
+      row.style.textAlign = "left";
+      const meta = document.createElement("div");
+      meta.style.flex = "1";
+      meta.style.minWidth = "0";
+      const subject = document.createElement("div");
+      subject.className = "text-15";
+      subject.style.fontWeight = "500";
+      subject.textContent = t.subject;
+      const sub = document.createElement("div");
+      sub.className = "text-13 muted";
+      sub.textContent = `${displayNick(t.contactNick)} · ${t.count} message${t.count === 1 ? "" : "s"}`;
+      meta.append(subject, sub);
+      const time = document.createElement("span");
+      time.className = "text-12 faint";
+      time.textContent = formatRelative(t.lastAt);
+      row.append(meta, time);
+      row.onclick = () => {
+        this.mailThreadId = t.threadId;
+        this.mailComposeOpen = false;
+        this.render();
+      };
+      list.appendChild(row);
+    }
+    pane.appendChild(list);
+    return pane;
+  }
+
+  private renderMailThread(threadId: string): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+    pane.style.padding = "var(--space-5)";
+    const msgs = getMailThread(threadId);
+    const contact = msgs[0]?.contactNick ?? "";
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-secondary text-13 pressable";
+    back.textContent = "← All mail";
+    back.onclick = () => {
+      this.mailThreadId = null;
+      this.render();
+    };
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.style.marginTop = "var(--space-4)";
+    h.textContent = msgs[0]?.subject || "(no subject)";
+    const sub = document.createElement("p");
+    sub.className = "muted text-13";
+    sub.textContent = `With ${displayNick(contact)}`;
+    pane.append(back, h, sub);
+
+    const list = document.createElement("div");
+    list.className = "mail-messages";
+    list.style.marginTop = "var(--space-4)";
+    for (const m of msgs) {
+      const card = document.createElement("div");
+      card.className = `mail-message${m.outgoing ? " outgoing" : ""}`;
+      const meta = document.createElement("div");
+      meta.className = "text-12 faint";
+      meta.textContent = `${m.outgoing ? "You" : displayNick(m.contactNick)} · ${formatRelative(m.createdAt)}`;
+      const body = document.createElement("div");
+      body.className = "text-15";
+      body.style.whiteSpace = "pre-wrap";
+      body.textContent = m.body;
+      card.append(meta, body);
+      for (const a of m.attachments) {
+        card.appendChild(this.mailAttachmentChip(a));
+      }
+      list.appendChild(card);
+    }
+    pane.appendChild(list);
+    pane.appendChild(
+      this.renderMailComposer({
+        to: contact,
+        threadId,
+        subject: msgs[0]?.subject,
+      }),
+    );
+    return pane;
+  }
+
+  private mailAttachmentChip(a: MailAttachmentRef): HTMLElement {
+    const chip = document.createElement("div");
+    chip.className = "mail-attachment";
+    const name = document.createElement("span");
+    name.className = "text-13";
+    name.textContent = a.name;
+    const size = document.createElement("span");
+    size.className = "text-12 faint";
+    size.textContent = formatBytes(a.size);
+    chip.append(name, size);
+    attachFileActions(chip, a.name, async () => {
+      const r = await api.blob(a.blobId);
+      if (!r?.data_base64) throw new Error("Could not load attachment from the vault");
+      const bin = atob(r.data_base64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    });
+    return chip;
+  }
+
+  private renderMailCompose(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+    pane.style.padding = "var(--space-5)";
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-secondary text-13 pressable";
+    back.textContent = "← All mail";
+    back.onclick = () => {
+      this.mailComposeOpen = false;
+      this.render();
+    };
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.style.marginTop = "var(--space-4)";
+    h.textContent = "New mail";
+    pane.append(back, h, this.renderMailComposer({}));
+    return pane;
+  }
+
+  /**
+   * Composer shared by new mail and replies. In a reply the recipient is fixed
+   * to the thread's contact and `thread_id` keeps the conversation together.
+   */
+  private renderMailComposer(opts: {
+    to?: string;
+    threadId?: string;
+    subject?: string;
+  }): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "mail-composer";
+    wrap.style.marginTop = "var(--space-4)";
+    const isReply = !!opts.threadId;
+
+    const toSel = document.createElement("select");
+    toSel.className = "input-field";
+    for (const c of this.contacts) {
+      const o = document.createElement("option");
+      o.value = c.nickname;
+      o.textContent = c.mail_handle
+        ? `${displayNick(c.nickname)} (${c.mail_handle}@${this.mailDomain})`
+        : displayNick(c.nickname);
+      toSel.appendChild(o);
+    }
+    if (opts.to) toSel.value = opts.to;
+    toSel.disabled = isReply;
+
+    const subj = document.createElement("input");
+    subj.className = "input-field";
+    subj.placeholder = "Subject";
+    if (opts.subject) {
+      subj.value = /^re:/i.test(opts.subject)
+        ? opts.subject
+        : `Re: ${opts.subject}`;
+    }
+
+    const body = document.createElement("textarea");
+    body.className = "input-field";
+    body.placeholder = "Write your message";
+    body.rows = 4;
+
+    const files = document.createElement("input");
+    files.type = "file";
+    files.multiple = true;
+    files.className = "mail-file-input";
+
+    const err = document.createElement("p");
+    err.className = "text-13";
+    err.style.color = "var(--danger)";
+    err.hidden = true;
+
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "btn-primary pressable";
+    send.textContent = isReply ? "Reply" : "Send";
+    send.onclick = () => void this.sendMail(send, {
+      to: toSel.value,
+      threadId: opts.threadId,
+      subject: subj.value,
+      body: body.value,
+      files: files.files,
+      err,
+      isReply,
+    });
+
+    wrap.append(toSel, subj, body, files, send, err);
+    return wrap;
+  }
+
+  private async sendMail(
+    btn: HTMLButtonElement,
+    input: {
+      to: string;
+      threadId?: string;
+      subject: string;
+      body: string;
+      files: FileList | null;
+      err: HTMLElement;
+      isReply: boolean;
+    },
+  ): Promise<void> {
+    input.err.hidden = true;
+    if (!input.to) {
+      input.err.hidden = false;
+      input.err.textContent = "Add a contact first.";
+      return;
+    }
+    const picked = Array.from(input.files ?? []);
+    if (picked.length > MAX_MAIL_ATTACHMENTS) {
+      input.err.hidden = false;
+      input.err.textContent = `At most ${MAX_MAIL_ATTACHMENTS} attachments.`;
+      return;
+    }
+    const total = picked.reduce((n, f) => n + f.size, 0);
+    if (total > MAX_MAIL_BYTES) {
+      input.err.hidden = false;
+      input.err.textContent = `Attachments are limited to ${Math.round(MAX_MAIL_BYTES / 1024)} KB in total.`;
+      return;
+    }
+    const subject = input.subject.trim();
+    if (!input.body.trim() && !picked.length) {
+      input.err.hidden = false;
+      input.err.textContent = "Write a message or attach a file.";
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const attachments = await Promise.all(
+        picked.map(async (f) => ({
+          name: f.name,
+          data_base64: await fileToBase64(f),
+        })),
+      );
+      const resp = await api.sendMail(input.to, {
+        thread_id: input.threadId,
+        subject: subject || undefined,
+        body: input.body,
+        attachments,
+      });
+      // Reload from the daemon so the sent copy carries real blob ids for its
+      // attachments (the send response only returns the thread id).
+      const mail = await api.mail();
+      if (mail) loadMail(mail);
+      this.mailThreadId = resp?.thread_id ?? input.threadId ?? null;
+      this.mailComposeOpen = false;
+      this.announce(input.isReply ? "Reply sent" : "Mail sent");
+      this.render();
+    } catch (e) {
+      input.err.hidden = false;
+      input.err.textContent =
+        e instanceof AppError ? e.message : "Couldn't send. Try again.";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   private renderVault(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane";
@@ -1143,6 +1494,7 @@ export class App {
     nav.className = "settings-nav";
     const sections: { id: SettingsSection; label: string }[] = [
       { id: "appearance", label: "Appearance" },
+      { id: "profile", label: "Profile" },
       { id: "security", label: "Security" },
       { id: "recovery", label: "Recovery" },
       { id: "backup", label: "Backup" },
@@ -1174,6 +1526,64 @@ export class App {
         seg.appendChild(b);
       }
       body.appendChild(seg);
+    } else if (this.settingsSection === "profile") {
+      body.innerHTML = `<h2 class="text-22">Profile</h2><p class="muted text-13">Your mail address is a label bound to your keys, shared inside your invite. There is no public directory — contacts learn it only when you add each other.</p>`;
+      const current = document.createElement("p");
+      current.className = "text-15";
+      current.style.marginTop = "var(--space-4)";
+      current.textContent = this.mailAddress()
+        ? `Your address: ${this.mailAddress()}`
+        : "No address yet";
+      const label = document.createElement("p");
+      label.className = "muted";
+      label.style.marginTop = "var(--space-4)";
+      label.textContent = "Address";
+      const input = document.createElement("input");
+      input.className = "input-field";
+      input.placeholder = "sandy";
+      input.value = this.mailHandle ?? "";
+      const suffix = document.createElement("span");
+      suffix.className = "muted text-13";
+      suffix.textContent = `@${this.mailDomain}`;
+      const row = document.createElement("div");
+      row.style.display = "flex";
+      row.style.gap = "var(--space-2)";
+      row.style.alignItems = "center";
+      row.style.marginTop = "var(--space-2)";
+      row.append(input, suffix);
+      const err = document.createElement("p");
+      err.className = "text-13";
+      err.style.color = "var(--danger)";
+      err.hidden = true;
+      const save = document.createElement("button");
+      save.type = "button";
+      save.className = "btn-primary pressable";
+      save.style.marginTop = "var(--space-4)";
+      save.textContent = "Save address";
+      save.onclick = async () => {
+        err.hidden = true;
+        const raw = input.value.trim();
+        if (!/^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/.test(raw.toLowerCase())) {
+          err.hidden = false;
+          err.textContent =
+            "Use 1–64 lowercase letters, digits, dot, dash, or underscore; no leading or trailing separator.";
+          return;
+        }
+        save.disabled = true;
+        try {
+          await api.setMailHandle(raw);
+          await this.refreshStatus();
+          this.announce("Mail address saved");
+          this.render();
+        } catch (e) {
+          err.hidden = false;
+          err.textContent =
+            e instanceof AppError ? e.message : "Couldn't save that address.";
+        } finally {
+          save.disabled = false;
+        }
+      };
+      body.append(current, label, row, err, save);
     } else if (this.settingsSection === "security") {
       body.innerHTML = `<h2 class="text-22">Security</h2><p class="muted text-13">Idle auto-lock is enforced by the daemon. Suspend / sleep also locks the vault on Linux when logind is available.</p>`;
       const label = document.createElement("p");

@@ -7,7 +7,7 @@ The Soft Daylight UI uses real daemon endpoints for unlock, lock, change-passphr
 These features use local mocks in `src/lib/api/mock.ts` and `src/lib/chatStore.ts` until the daemon grows:
 
 - Message history: loaded from **`GET /api/messages`** after unlock (Task **5c.3**); new messages still arrive via **`POST /api/recv`**
-- Live presence: **`POST /api/presence/heartbeat`** + **`online`** on contacts; chat send blocked when contact offline (async mail = Task **5d**)
+- Live presence: **`POST /api/presence/heartbeat`** + **`online`** on contacts; chat send blocked when contact offline. Mail is real (Task **5d**): **`POST /api/mail/send`**, **`GET /api/mail`**, **`POST /api/mail/handle`**, and `kind: "mail"` on **`POST /api/recv`** deliver store-and-forward while the recipient is away.
 - Reactions
 - Mute, block, nickname override (persisted in **`ui-prefs.json`** under data root via **`GET/PUT /api/ui-prefs`**)
 - Report abusive relay slot (local block list exists; no server report API yet)

@@ -16,8 +16,10 @@ Not a crypto paper. We use **Signal protocol (`libsignal`)** for 1:1 sessions. T
 - An **invite** (QR or link) carries, at least:
   - identity public key
   - a receive **queue id** + **queue authorization secret** (so only the invited person can put blobs on that queue)
+  - an optional **mail handle** (local part only, e.g. `sandy`) — a label bound to this identity, carried inside the invite
   - app/version so old clients fail clearly
 - Display names are local only.
+- The mail handle is **not** a relay directory entry. `handle@MAIL_DOMAIN` (`sandy@myserver.com`) is a human label exchanged out-of-band inside the invite; the relay never learns or resolves it, and there is no "look up a person by address" API.
 
 Device link (old device alive): show a QR from the unlocked old device; new device becomes a second Signal device in that identity. Exact linking follows libsignal’s device model; we do not invent a second identity system.
 
@@ -39,6 +41,18 @@ Relay **must not** offer “list all queues for user X.” There is no user X on
 
 - Payload inside Signal: text, or a file reference (content hash + key + size) for an attachment already in the sender’s notion of “encrypt to this recipient.”
 - Fan-out: N independent sessions, N queue puts. No group object.
+
+### Mail
+
+Mail is a payload **kind** on the same Signal session and the same queue — not a second transport. It is the internal member-mail feature (`handle@MAIL_DOMAIN`, members only): an email-like UX (threads, subjects, multiple attachments, address book) without SMTP or federation.
+
+- **Wire payload:** `MessagePayload::Mail { thread_id, subject, body, attachments[] }`. Attachments are inlined on the wire (capped at 8 files / 256 KiB total for v1) rather than referenced out-of-band.
+- **Async by design:** chat and files require the recipient to be **online** (live presence); mail deliberately skips that check, so it is queued on the recipient's relay slot while they are away and delivered on their next drain. This is the one behavioural difference from chat, and the reason mail exists.
+- **Local storage:** mail records reuse the encrypted `chat.enc` log via a `ChatRecordPayload::Mail` variant; attachment bytes live as encrypted vault blobs (`put_blob`) referenced by id. One log, one encryption path, one backup path.
+- **Threads:** `thread_id` groups a conversation; a reply reuses the thread id and keeps its own copy, so both sides hold the full thread.
+- **No directory:** the handle is an invite-carried label (see Identity). There is no handle search, no relay-side address book, and no receiving from non-members in v1.
+
+Relay view of a mail message is unchanged from any other message: an opaque ciphertext blob. Subject, body, and attachment names are inside the Signal envelope and never appear in relay storage.
 
 ## What the relay HTTP API looks like (shape)
 

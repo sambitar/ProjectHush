@@ -128,6 +128,7 @@ pub fn invite_from_bundle(
     protocol_name: &str,
     queue_id: &str,
     queue_token: &str,
+    handle: Option<&str>,
     bundle: &PreKeyBundle,
 ) -> Result<InvitePayload, Error> {
     let pre_key_id = bundle.pre_key_id().map_err(|_| Error::Corrupt)?;
@@ -167,6 +168,7 @@ pub fn invite_from_bundle(
             .kyber_pre_key_signature()
             .map_err(|_| Error::Corrupt)?
             .to_vec(),
+        handle: handle.map(|h| h.to_string()),
     })
 }
 

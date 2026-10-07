@@ -24,6 +24,10 @@ pub struct InvitePayload {
     pub kyber_pre_key_id: u32,
     pub kyber_pre_key_public: Vec<u8>,
     pub kyber_pre_key_signature: Vec<u8>,
+    /// The sender's chosen mail handle (local part only), if they set one.
+    /// Optional so invites minted before mail still decode.
+    #[serde(default)]
+    pub handle: Option<String>,
 }
 
 impl InvitePayload {

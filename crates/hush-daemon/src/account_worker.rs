@@ -83,6 +83,21 @@ enum Work {
         new: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    SetMailHandle {
+        handle: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SendMail {
+        to: String,
+        thread_id: Option<String>,
+        subject: Option<String>,
+        body: String,
+        attachments: Vec<(String, Vec<u8>)>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    MailRecords {
+        reply: oneshot::Sender<WorkResult>,
+    },
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -91,6 +106,9 @@ pub struct ContactDto {
     pub protocol_name: String,
     pub inbound_ready: bool,
     pub online: bool,
+    /// This contact's mail handle (local part only), if they published one in
+    /// their invite. The UI renders `handle@<domain>`.
+    pub mail_handle: Option<String>,
 }
 
 pub enum WorkResult {
@@ -105,10 +123,14 @@ pub enum WorkResult {
         recovery_acknowledged: bool,
         last_backup_unix: u64,
         relay: String,
+        mail_handle: Option<String>,
     },
     Backup(Vec<u8>),
     RecoveryCode(String),
     Messages(Vec<ChatRecord>),
+    /// The thread id the mail was filed under.
+    MailSent(String),
+    Mail(Vec<ChatRecord>),
     Blob(Vec<u8>),
     BlobId(String),
     /// The supplied current passphrase did not match the vault.
@@ -167,6 +189,7 @@ impl AccountWorker {
                                             protocol_name: c.protocol_name.clone(),
                                             inbound_ready: c.inbound_ready,
                                             online,
+                                            mail_handle: c.mail_handle.clone(),
                                         });
                                     }
                                     WorkResult::Contacts(list)
@@ -263,6 +286,7 @@ impl AccountWorker {
                                     recovery_acknowledged: a.recovery_acknowledged(),
                                     last_backup_unix: a.last_backup_unix(),
                                     relay: a.relay().to_string(),
+                                    mail_handle: a.mail_handle().map(|h| h.to_string()),
                                 },
                             };
                             (reply, result)
@@ -331,6 +355,49 @@ impl AccountWorker {
                                     }
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
+                            };
+                            (reply, result)
+                        }
+                        Work::SetMailHandle { handle, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.set_mail_handle(&handle).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendMail {
+                            to,
+                            thread_id,
+                            subject,
+                            body,
+                            attachments,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .send_mail(
+                                        &to,
+                                        thread_id.as_deref(),
+                                        subject.as_deref(),
+                                        &body,
+                                        &attachments,
+                                    )
+                                    .await
+                                {
+                                    Ok(thread) => WorkResult::MailSent(thread),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::MailRecords { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::Mail(a.mail_records()),
                             };
                             (reply, result)
                         }
@@ -499,5 +566,36 @@ impl AccountWorker {
             reply,
         })
         .await
+    }
+
+    pub async fn set_mail_handle(&self, handle: &str) -> WorkResult {
+        self.call(|reply| Work::SetMailHandle {
+            handle: handle.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn send_mail(
+        &self,
+        to: &str,
+        thread_id: Option<String>,
+        subject: Option<String>,
+        body: &str,
+        attachments: Vec<(String, Vec<u8>)>,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendMail {
+            to: to.to_string(),
+            thread_id,
+            subject,
+            body: body.to_string(),
+            attachments,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn mail_records(&self) -> WorkResult {
+        self.call(|reply| Work::MailRecords { reply }).await
     }
 }

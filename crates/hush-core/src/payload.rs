@@ -3,6 +3,18 @@ use serde::{Deserialize, Serialize};
 /// Max file bytes inlined in one Signal message (relay cap is 1 MiB total wire).
 pub const MAX_INLINE_FILE_BYTES: usize = 256 * 1024;
 
+/// Max attachments in one mail message. The total byte cap is
+/// `MAX_INLINE_FILE_BYTES`, shared across all of them.
+pub const MAX_MAIL_ATTACHMENTS: usize = 8;
+
+/// One attachment on the wire: a display name and its bytes, base64 in JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MailAttachment {
+    pub name: String,
+    #[serde(with = "b64_bytes")]
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum MessagePayload {
@@ -11,6 +23,17 @@ pub enum MessagePayload {
         name: String,
         #[serde(with = "b64_bytes")]
         data: Vec<u8>,
+    },
+    /// An internal mail message. Distinct from `Text`/`File` so the Mail rail can
+    /// render threads, subjects and multiple attachments while riding the same
+    /// encrypted session and relay queue.
+    Mail {
+        thread_id: String,
+        #[serde(default)]
+        subject: Option<String>,
+        body: String,
+        #[serde(default)]
+        attachments: Vec<MailAttachment>,
     },
 }
 
@@ -59,5 +82,35 @@ impl MessagePayload {
             }
         }
         serde_json::from_slice(bytes).map_err(|_| crate::error::Error::Corrupt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mail_payload_round_trips_with_attachments() {
+        let p = MessagePayload::Mail {
+            thread_id: "t-1".into(),
+            subject: Some("hi".into()),
+            body: "body".into(),
+            attachments: vec![MailAttachment {
+                name: "a.txt".into(),
+                data: vec![1, 2, 3],
+            }],
+        };
+        assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn a_mail_payload_without_subject_or_attachments_round_trips() {
+        let p = MessagePayload::Mail {
+            thread_id: "t-2".into(),
+            subject: None,
+            body: "body".into(),
+            attachments: vec![],
+        };
+        assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
     }
 }

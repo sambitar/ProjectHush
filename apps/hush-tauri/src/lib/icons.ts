@@ -2,6 +2,7 @@ import {
   createElement,
   Lock,
   MessageCircle,
+  Mail,
   Folder,
   Shield,
   Settings,
@@ -24,6 +25,7 @@ import {
 const ICONS: Record<string, IconNode> = {
   lock: Lock,
   chats: MessageCircle,
+  mail: Mail,
   files: Folder,
   vault: Shield,
   settings: Settings,

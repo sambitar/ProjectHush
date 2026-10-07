@@ -19,7 +19,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **A — Foundation** | First | **1** workspace/vault, **2** relay, **3** two-party CLI, **4** files | ✅ Done |
 | **B — Capsule messaging** | Core product | **5** daemon + Tauri, **5c** opaque relay + encrypted log/blobs, **5b.1–5b.2** files UX, **5h** live presence, **6** recovery/backup | ✅ Mostly done |
 | **C — Messaging polish** | Next dogfood | **5b.3** (optional), remaining `API_GAPS.md` | 🔜 **In progress** (DR-01–09, 14; 5c.4; remove contact; device link; passphrase change done; multi-device **1–3 of 7** done — per-device keys, signed device list, relay device directory + revocation) |
-| **D — Async member mail** | When live chat feels solid | **5d** internal `@myserver.com` mail (replaces “message while offline”) | Planned |
+| **D — Async member mail** | When live chat feels solid | **5d** internal `@myserver.com` mail (replaces “message while offline”) | ✅ Done (threads, compose, multi-attachment, offline delivery; Cc/Bcc + out-of-band attachments deferred) |
 | **E — Outsider delivery** | After 5d | **5e** inbound drop, **5f** outbound to outsiders | Planned |
 | **F — Local notes** | Before public layer | **16** sticky-notes dashboard | Planned |
 | **G — Articles** | After notes or parallel late | **11** Nostr pen names | Planned |
@@ -251,7 +251,7 @@ Work through these while dogfooding; split into PR-sized slices as needed.
 
 ### Task 5d: Internal mail (`@myserver.com`, members only)
 
-**Status:** Planned — **Phase D** (after **Phase C**).
+**Status:** ✅ Done. Plan: [`2026-10-07-internal-mail.md`](2026-10-07-internal-mail.md).
 
 **Goal:** Full **email-like** product for users on Hush keys + vault — threads, compose, **attachments**, contact list — **without** Internet SMTP between members. Addresses like `sandy@myserver.com` are **routing labels** bound to vault identity (protocol name / keys), not a public MX mailbox.
 
@@ -268,6 +268,13 @@ Work through these while dogfooding; split into PR-sized slices as needed.
 | **5d.3 Transport** | Same E2E path as chat: opaque relay blobs (5c.1), payloads in vault; attachment refs as encrypted blobs. | Relay blob scan shows no plaintext subject/body; members decrypt only. |
 
 **Verify:** Two registered `@myserver.com` users exchange multi-attachment “mail” end-to-end; locked vault hides content; relay does not learn member-to-member social graph beyond queue metadata goals in 5c.
+
+**Residual limitations (v1):**
+
+- No **Cc/Bcc** — To only.
+- Attachments are **inlined on the wire**, capped at **8 files / 256 KiB total** (same small-file bound as chat); chunked/out-of-band attachment fetch is deferred to **5e**/**5f**.
+- The handle is an **invite-carried label**; a contact added before a handle change keeps the old handle until the invite is re-added. There is no handle search or relay directory (Threat Model C).
+- Mail reuses the `chat.enc` log via a `ChatRecordPayload::Mail` variant; independent mail retention is deferred until it is needed (Rule of Three).
 
 ---
 

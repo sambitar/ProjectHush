@@ -18,6 +18,15 @@ pub struct ChatRecord {
     pub payload: ChatRecordPayload,
 }
 
+/// One attachment as stored in the log: the bytes live in a vault blob, and the
+/// record keeps only the reference, name and size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailAttachmentRecord {
+    pub name: String,
+    pub blob_id_hex: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ChatRecordPayload {
@@ -26,6 +35,12 @@ pub enum ChatRecordPayload {
         name: String,
         blob_id_hex: String,
         size: u64,
+    },
+    Mail {
+        thread_id: String,
+        subject: Option<String>,
+        body: String,
+        attachments: Vec<MailAttachmentRecord>,
     },
 }
 
@@ -109,9 +124,79 @@ impl ChatLog {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_mail(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        contact_nick: &str,
+        outgoing: bool,
+        thread_id: &str,
+        subject: Option<&str>,
+        body: &str,
+        attachments: &[MailAttachmentRecord],
+    ) -> Result<(), Error> {
+        self.push(
+            master,
+            ChatRecord {
+                id: Uuid::new_v4().to_string(),
+                contact_nick: contact_nick.to_string(),
+                outgoing,
+                ts_ms: now_ms(),
+                payload: ChatRecordPayload::Mail {
+                    thread_id: thread_id.to_string(),
+                    subject: subject.map(|s| s.to_string()),
+                    body: body.to_string(),
+                    attachments: attachments.to_vec(),
+                },
+            },
+        )
+    }
+
+    /// Mail records only, in log order. The Mail rail filters the same encrypted
+    /// log the chat rail reads rather than keeping a second store.
+    pub fn mail_records(&self) -> impl Iterator<Item = &ChatRecord> {
+        self.file
+            .messages
+            .iter()
+            .filter(|r| matches!(r.payload, ChatRecordPayload::Mail { .. }))
+    }
+
     fn push(&mut self, master: &[u8; 32], record: ChatRecord) -> Result<(), Error> {
         self.file.messages.push(record);
         self.save(master)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mail_record_survives_a_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("hush-mail-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        log.append_mail(
+            &master,
+            "alice",
+            true,
+            "t-1",
+            Some("hi"),
+            "body",
+            &[MailAttachmentRecord {
+                name: "a.txt".into(),
+                blob_id_hex: "ab".into(),
+                size: 3,
+            }],
+        )
+        .unwrap();
+
+        let reloaded = ChatLog::load(&dir, &master).unwrap();
+        assert_eq!(reloaded.mail_records().count(), 1);
+        assert_eq!(reloaded.messages().len(), 1);
     }
 }
 

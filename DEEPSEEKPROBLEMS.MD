@@ -12,6 +12,61 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-07 — Internal member mail (Task 5d)
+
+### [WORKED AROUND] `CODE` from a shell helper is lost inside `$(...)`
+
+- **Attempted:** in `scripts/smoke-mail.sh`, captured the response of `api_at` (a helper that sets
+  the global `CODE` and writes `$T/out.json`) with `THREAD=$(api_at ... | sed -n ...)`.
+- **Symptom:** the smoke failed with `mail send returned 400: {"thread_id":"d862..."}` — a 400 that
+  was actually the *previous* request's status. A command substitution runs in a subshell, so the
+  `CODE=...` assignment inside `api_at` never reached the parent shell; the `[[ "$CODE" == "200" ]]`
+  check read a stale value while the body was a genuine 200.
+- **Resolution:** call `api_at` directly (not in `$(...)`) so `CODE` and the new `RESP` global
+  propagate, then parse `$RESP`. Only wrap the pure text transform (`printf | sed`) in `$(...)`.
+- **Lesson:** a shell helper that communicates through globals cannot be called in a command
+  substitution. Either return via stdout and never globals, or call it as a statement.
+
+### [FIXED] New `MessagePayload::Mail` variant broke an exhaustive match in `hush-cli`
+
+- **Attempted:** added `MessagePayload::Mail { .. }` to `hush-core` and built the workspace.
+- **Symptom:** `error[E0004]: non-exhaustive patterns: 'MessagePayload::Mail { .. }' not covered` at
+  `crates/hush-cli/src/main.rs:118`. The daemon's `to_dto` was updated in the same pass, but the
+  CLI's `recv` printer was missed because it lives in a different crate.
+- **Resolution:** added a `Mail` arm to the CLI that prints the thread/subject/body and writes each
+  attachment out via `account.read_blob`.
+- **Lesson:** adding an enum variant to `hush-core` is a workspace-wide change; grep every
+  `match ... payload` across all crates, not just the one being edited.
+
+### [OPEN] UI screenshots are blank in this environment
+
+- **Attempted:** Task 9 browser verification of the Mail rail. Captured the page with both
+  `browser_take_screenshot` and CDP `Page.captureScreenshot` (decoded the base64 to PNG).
+- **Symptom:** both produce a solid white image, while the same page's DOM is fully rendered
+  (`browser_snapshot` shows the rail, thread list, thread view, composer; `Runtime.evaluate` returns
+  the real text). The browser tab runs in the background and is not painting, so no pixels are
+  produced. This is a tooling/environment limitation, not an app defect.
+- **Resolution:** not resolved; visual evidence is unavailable here. Verification was done at the DOM
+  level instead — the Mail rail, thread view, attachment chip, reply composer, Profile section, and
+  New-mail composer were read from the live page, and a reply sent through the UI landed in the other
+  peer's queue under the same thread id. A human should still eyeball the rail once on a machine where
+  the tab paints.
+- **Lesson:** when a screenshot comes back blank but the DOM is populated, suspect a non-painting
+  background tab before suspecting the app.
+
+### [FIXED] Integration test asserted one mail record where two are correct
+
+- **Attempted:** in `a_reply_lands_in_the_same_thread`, asserted each side's `mail_records()` had
+  exactly the one thread id.
+- **Symptom:** the test failed with `left: [<id>, <id>]`, `right: [<id>]`. Each side keeps its own
+  sent copy *and* the received reply, so two records sharing one thread id is the correct outcome.
+- **Resolution:** asserted two records with the same id, which is a stronger statement about thread
+  continuity anyway.
+- **Lesson:** the first green assertion about message counts should be derived from the actual
+  send/receive pairing, not assumed.
+
+---
+
 ## 2026-10-07 — Multi-device Phase 1 (per-device key material)
 
 ### [FIXED] Plan's Task 1 test could not compile as written

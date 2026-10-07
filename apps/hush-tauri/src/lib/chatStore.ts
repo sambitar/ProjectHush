@@ -31,7 +31,7 @@ export function loadHistory(records: ChatRecordDto[]): void {
     };
     if (r.payload.t === "text") {
       push(r.contact_nick, { ...base, kind: "text", text: r.payload.body });
-    } else {
+    } else if (r.payload.t === "file") {
       push(r.contact_nick, {
         ...base,
         kind: "file",
@@ -40,6 +40,7 @@ export function loadHistory(records: ChatRecordDto[]): void {
         blobId: r.payload.blob_id_hex.toLowerCase(),
       });
     }
+    // Mail records belong to the Mail rail; the chat store ignores them.
   }
 }
 
