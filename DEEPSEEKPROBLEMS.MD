@@ -12,6 +12,27 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-07 — Tooling: backgrounded build, and a wrong "it died" call
+
+### [FIXED] A running background build was reported dead, then started a second time
+
+- **Attempted:** warmed the new master worktree's cold Rust build in the background so the two-UI
+  script would start fast, then checked on it.
+- **Symptom:** a `task finished: success` notification arrived for the launcher command (which ends
+  in `&` and returns immediately). I then looked only at the log tail (stalled at
+  `Compiling cairo-sys-rs`) and at the absence of binaries in `target/debug`, and reported that the
+  build had been killed. It had not been: `pgrep -af bin/cargo` showed the original process still
+  running with eight `rustc` children, and the log had grown to 209 lines. My "restart" added a
+  second cargo that blocked on the target-dir lock, which I then had to kill. The build finished on
+  its own in 5m 02s and produced all three binaries.
+- **Resolution:** no repo change needed; the build was healthy throughout. This is a tooling and
+  inference problem, not a code problem.
+- **Lesson:** before calling a background job dead, check the process (`pgrep`), not its side
+  effects. "No output yet" plus "no artifacts yet" is not evidence of death. Also, a `task finished`
+  notification for a command ending in `&` refers to the launcher, not the job it spawned.
+
+---
+
 ## 2026-10-07 — Internal member mail (Task 5d)
 
 ### [FIXED] A stale second browser tab drained the relay queue and looked like UI staleness
@@ -102,6 +123,141 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
   continuity anyway.
 - **Lesson:** the first green assertion about message counts should be derived from the actual
   send/receive pairing, not assumed.
+
+---
+
+## 2026-10-07 — Multi-device Phase 4 landed (queue credential split, fan-out verified)
+
+### [FIXED] `DeviceKeys::load` did not compile: a `u32` const matched against a `u64`
+
+- **Attempted:** ran `cargo test --workspace` to confirm the queue credential split and the v1 device
+  file migration before committing.
+- **Symptom:** `error[E0308]: mismatched types` at `crates/hush-core/src/device.rs:152` —
+  `expected u64, found u32`, with the note `` `DEVICE_FORMAT_VERSION` is interpreted as a constant,
+  not a new binding ``. The match was `match version { 1 => .., DEVICE_FORMAT_VERSION => .. }` where
+  `version` is `u64` and the const is `u32`.
+- **Resolution:** the arm became `v if v == u64::from(DEVICE_FORMAT_VERSION)`. A guard is required
+  because a path pattern cannot compare against a `u64`.
+- **Lesson:** this is the second time a `match` arm meant as a comparison was silently read as a
+  binding. Rust catches it only because the types differ here; with matching types it would have
+  compiled and quietly shadowed. Use a guard when the arm is a comparison.
+
+### [FIXED] Two relay suites presented the published token for read, delete and burn
+
+- **Attempted:** after switching `list_blobs`, `get_blob`, `delete_blob` and `report_queue` to
+  `authorize_read`, ran the workspace suite.
+- **Symptom:** 5 failures across two suites, all `Relay("list failed: 401 Unauthorized")`:
+  `crates/hush-core/tests/two_party_relay.rs` (`relay_blob_has_no_cleartext_sender_json`,
+  `reporting_a_queue_burns_it`) and `crates/hush-relay/tests/relay_queues.rs`
+  (`put_get_delete_roundtrip`, `expire_drops_blob`, `report_burns_queue`). Each test registered a
+  queue with one token and then used that same token to read it back.
+- **Resolution:** the tests now model the two halves of the credential pair. `hush-relay`'s tests
+  derive the delivery token with `hush_core::queue_delivery_token(read)` and use it for `PUT` while
+  presenting the read token for `GET`/`DELETE`/`POST .../report`. `hush-core`'s tests present the
+  device's own read token, exposed as `Account::own_read_token()`. This is a genuine behaviour change
+  and the tests were wrong, not the relay.
+- **Lesson:** the failing tests were the *correct* outcome of the change, not collateral damage. A
+  test that uses one credential for both a write and a read is asserting that those are the same
+  credential, which is exactly the hole being closed.
+
+### [FIXED] `own_read_token()` had to be added, because nothing could read its own inbox
+
+- **Attempted:** fixed the two `two_party_relay.rs` tests to present a read token.
+- **Symptom:** there was no way to get one. `Account` exposes `invite()`, which carries only the
+  delivery token, and `device` is a private field, so an integration test had no access to the read
+  credential at all.
+- **Resolution:** added `Account::own_read_token()`, documented as the private credential for local
+  callers that talk to the relay directly instead of going through `Account::recv`.
+- **Lesson:** splitting a credential in two means every existing caller has to be classified as a
+  reader or a deliverer. Two of them were tests that only worked because the two were the same value.
+
+### [FIXED] The fan-out test could not refresh the contact's device list in time
+
+- **Attempted:** wrote Task 8's test — link a second device of Alice's account, then have Bob send to
+  Alice and assert both of Alice's devices receive it.
+- **Symptom:** `Relay("list failed: 404 Not Found")` from `alice_2.recv()`, and Alice's device 1
+  received the message. Bob had only ever delivered to device 1.
+- **Cause:** `Account::add_contact` already calls `refresh_contact_devices` as a best-effort step, and
+  that call sets `devices_fetched_unix` to now. Bob added Alice *before* she linked her second device,
+  so his cache said "one device, checked just now" and the send inside the 5 minute TTL skipped the
+  refresh. The linked device was invisible for up to the TTL.
+- **Resolution:** the test calls `bob.refresh_contact_devices("alice")` explicitly and asserts it
+  returns 2, standing in for the TTL expiring. This is Q5 working as designed, not a defect — the
+  documented cost of caching the list. A newly linked device is unreachable for up to 5 minutes.
+- **Lesson:** a cache seeded by a successful-but-empty check is indistinguishable from a fresh one.
+  The first test run looked like a fan-out bug and was a caching consequence; the failing assertion
+  named the wrong subsystem.
+
+### [FIXED] `ContactDevice` had no `added_unix`, so a republish redated every device
+
+- **Attempted:** implemented `record_linked_device`, which republishes the signed list via
+  `publish_device_list`.
+- **Symptom:** not a failure but a latent data-loss path. `publish_device_list` mapped carried-over
+  devices with `added_unix: 0` and set its own entry to `now_unix()`, so every republish reset the
+  date on every device. Adding a third device would have redated the second, and adding any device
+  would redate device 1. Nothing read the value yet, so no test caught it.
+- **Resolution:** `ContactDevice` gained `added_unix` with `#[serde(default)]`, projected through both
+  `refresh_own_devices` and `refresh_contact_devices`, and `publish_device_list` now carries the
+  stored value forward. This is also what Task 14's "added date" column needs.
+- **Lesson:** the field was being written to the wire by one function and dropped by the other. A
+  round-trip test over the list would have caught it; the shape tests only covered `Contact`.
+
+### [FIXED] Task 9's core had to land early, because Task 8's test needs it
+
+- **Attempted:** the plan says Task 8's test "cannot be written yet" until Phase 5's linking exists,
+  and the Phase 4 note in `docs/plans/2026-10-06-multi-device.md` said the same.
+- **Symptom:** confirmed by construction. A second device of an account can only be reached if it is
+  in the account's signed list, and only device 1 can sign that, and device 1 can only sign a record
+  it has been given. There is no path around it: the test needs `adopt_linked_vault` and
+  `record_linked_device`.
+- **Resolution:** implemented the two core functions, without the daemon endpoints or CLI wiring that
+  Task 9 also lists. `Account::adopt_linked_vault(dir, passphrase, device_id)` opens a transferred
+  vault, mints fresh device keys, clears the invite cache (which names the *sending* device's inbox)
+  and clears `own_devices`. `Account::record_linked_device(&ContactDevice)` validates the id, stores
+  the record and republishes. `Account::link_request()` is what the new device sends over the link.
+- **Note:** `record_linked_device` takes the new device's own statement of its identity key, inbox and
+  delivery token, and cannot verify it against the list — writing the list is the point. Device 1's
+  signature is the only authority, so it must never be called with a request that did not arrive over
+  an authenticated link channel. The relay enforces the same statement afterwards by refusing prekey
+  records whose identity key is not what the list says.
+- **Still missing for Task 9:** the daemon `link-device/start` and `link-device/complete` endpoints,
+  the CLI, and any authentication on the link channel itself.
+- **Lesson:** "this test cannot be written yet" is worth re-checking once the blocker is named. The
+  blocker here was one function pair, not the whole phase.
+
+### [FIXED] Overclaimed "clippy clean" by grepping away the warnings
+
+- **Attempted:** reported the tree as clippy-clean after
+  `cargo clippy --workspace --all-targets 2>&1 | rg "^(error|warning: unused|warning: this)"`.
+- **Symptom:** the filter matched no warnings, so the report said clean. A later unfiltered run showed
+  7 `redundant_closure` warnings in `crates/hush-core/src/backup.rs`, 4 `ptr_arg` warnings in
+  `hush-cli`/`hush-daemon`, and 1 `unnecessary_to_owned` in the new
+  `crates/hush-relay/tests/prekey_records.rs`.
+- **Resolution:** the new warning is fixed. The other 11 predate this slice — verified with
+  `git show HEAD:...` for the `ptr_arg` ones and by `backup.rs` being unmodified in `git status` — and
+  were deliberately left alone so the Phase 4 commit does not carry an unrelated refactor.
+- **Lesson:** a grep filter that can match nothing is not evidence. Grep for the positive
+  (`warning`) and count, rather than enumerating the warning kinds you expect.
+
+### [OPEN] 11 pre-existing clippy warnings, so "clippy clean" is still not a gate
+
+- 7 `redundant_closure` in `crates/hush-core/src/backup.rs` (`map_err(|e| Error::Io(e))` where
+  `Error::Io` would do), 4 `ptr_arg` in `crates/hush-cli/src/main.rs:208`,
+  `crates/hush-daemon/src/account_worker.rs:402,451,494`.
+- **Needed to close:** a mechanical fix plus a decision on whether to add `-D warnings` to CI. Same
+  shape as the `cargo fmt` entry below: the linter cannot gate while it is not clean.
+- **Tooling note, not a repo problem.**
+
+### [WORKED AROUND] `perl -0pi -e` for a fixture edit silently did nothing
+
+- **Attempted:** added `added_unix: 0` to 5 `ContactDevice` literals in
+  `crates/hush-core/tests/multi_device.rs` with a multi-line `perl -0pi -e` regex.
+- **Symptom:** exit code 1 and empty output. The regex did not match, so no edit was made and the
+  following build failed with the same 5 `missing field` errors as before.
+- **Resolution:** used the edit tool with `replace_all` per literal instead, which is also what the
+  workspace rules require. Cost one build cycle.
+- **Lesson:** bulk regex edits over Rust literals are a false economy; the compiler reports the same
+  errors either way, but only the structured edit is atomic and verifiable.
 
 ---
 
@@ -343,6 +499,137 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 - **Resolution:** no migration needed. Recorded so the check is not repeated.
 - **Lesson:** with an append-only `CREATE TABLE IF NOT EXISTS` schema and no version table, a column
   can only be removed safely while the table is still unreleased. Confirm that before editing DDL.
+
+---
+
+## 2026-10-07 — Multi-device Phase 4 (contacts as device sets, fan-out)
+
+### [FIXED] Nothing publishes a device's prekey bundle, so fan-out has no bundle to build a session from
+
+- **Attempted:** started Task 7/8 and went to fill in `ContactDevice`, which the plan specifies as
+  `{ device_id, identity_key, registration_id, queue_id, queue_token, pre_key_* }`.
+- **Symptom:** there is nothing to populate `pre_key_*` from. The only structure published to the relay
+  is `DeviceRecord` (`crates/hush-core/src/device_list.rs`), and it carries `device_id`, `identity_key`,
+  `registration_id`, `queue_id`, `queue_token`, `added_unix` — **no prekey material at all**. The plan
+  is internally inconsistent: Task 3 defines a `DeviceRecord` with no prekeys, and Task 7 expects a
+  `ContactDevice` with them.
+- **Why it matters:** the invite (`InvitePayload`) carries a full `PreKeyBundle` out of band, and that
+  is the *only* way a bundle has ever been delivered. It works because you exchange an invite with the
+  one device you are adding. It does not scale to a device you have never exchanged an invite with,
+  which is exactly what Task 8's fan-out does — sending to every device of a contact requires a
+  `PreKeyBundle` for each of them, and there is currently no source for it.
+- **Blocked on:** a decision among three models (per-device prekey endpoint; prekeys inside the device
+  list; bundles handed over the established encrypted session). Raised with the user rather than
+  guessed, because the choice has consequences beyond Phase 4 — see the note on one-time prekeys below.
+- **Resolution (same day):** the user chose the **per-device prekey endpoint**. Each device publishes
+  its own record at `PUT /k/{account_id}/{device_id}`, signed by its own identity key, and the relay
+  verifies the record's `identity_key` against that device's entry in the device-1-signed list before
+  storing it. `GET /k/{account_id}/{device_id}` pops exactly one one-time prekey out of the stored
+  pool and returns it, so a peer that fetches a bundle consumes a prekey and nobody else can get the
+  same one. An exhausted pool serves the record with no one-time prekey and libsignal falls back to
+  the signed prekey. Implemented in `crates/hush-core/src/prekey.rs`, `crates/hush-relay/src/store.rs`
+  (`take_prekey_record`) and `crates/hush-relay/src/app.rs`; 9 tests in
+  `crates/hush-relay/tests/prekey_records.rs`.
+- **Note:** the plan's `ContactDevice` still lists `pre_key_*` fields and should not. They are fetched
+  per session, not cached in the contact, or they go stale the moment the device republishes.
+- **Consequence for forward secrecy that drove the decision:** a bundle published in a *static list* can
+  never carry a one-time prekey, because a one-time prekey has to be consumed by exactly one fetch and
+  a list is read by everyone. libsignal accepts a bundle with `pre_key: None`, so this works, but the
+  first message then gets forward secrecy from the signed prekey alone. Only a per-device prekey
+  endpoint that hands out and deletes one prekey per request preserves the full Signal property. That
+  is a real security difference, not a style preference, so it should drive the decision.
+- **Lesson:** "the device list tells peers where to deliver" and "the device list tells peers how to
+  start a session" are different jobs, and the plan conflated them. Membership is signed by device 1;
+  prekey material is per-device and rotates per-device, so signing them with the same key couples
+  every device's session setup to device 1 being online.
+
+---
+
+### [FIXED] Fan-out is written but unreachable, so it has no end-to-end test
+
+> **Closed 2026-10-07.** `Account::adopt_linked_vault` and `Account::record_linked_device` landed as
+> part of the Phase 4 slice (see the newest section), which is the linking pair this entry was blocked
+> on. The test now exists as `a_message_reaches_every_device_of_the_recipient_and_our_own` in
+> `crates/hush-core/tests/multi_device.rs` and passes, asserting both directions: Bob's message lands
+> in both of Alice's inboxes, and Alice's message reaches Bob *and* is filed as outgoing on her second
+> device. It was mutation-checked — disabling the own-device fan-out makes it fail on the
+> "linked device must file what device 1 sent" assertion. The `#[ignore]`d queue-leak test named below
+> was replaced by `crates/hush-relay/tests/queue_credentials.rs`, which asserts the opposite
+> behaviour and passes.
+
+- **Attempted:** finished Task 8 (fan out to every `ContactDevice`, plus an `OwnCopy` to each of our
+  own other devices) and went to write the plan's test,
+  `a_message_reaches_every_device_of_the_recipient_and_our_own`.
+- **Symptom:** no test can build the scenario. A contact's `devices` set is only ever filled from an
+  `InvitePayload`, and an invite describes exactly one device, so every contact in a test has one
+  device and the fan-out loop runs once. `own_devices` is only filled by `refresh_own_devices`, which
+  reads a device list from the relay — and the only way to publish a list containing a second device
+  is to already have one in `own_devices`. There is no `Account` API to add a device, and `state` is
+  private, so a test cannot inject one. The linking flow that would break the cycle is Phase 5
+  (Tasks 9-11).
+- **What is verified instead:** `cargo test --workspace` passes (including the 6 tests in
+  `crates/hush-core/tests/multi_device.rs` for the `Contact` shape and legacy migration, and the 9
+  prekey-endpoint tests), and the fan-out code path compiles and is exercised for the single-device
+  case by the existing `two_party_relay.rs` suite. The multi-device branch itself is **not** covered.
+- **Resolution needed:** Phase 5's device-list fetch must populate `contact.devices` from the relay
+  before Task 8 can be tested as written. Do not mark Task 8 done on the strength of a green suite —
+  the suite passing here means the new branch is untested, not correct.
+- **Lesson:** "it compiles and everything passes" and "the new code ran" are different claims. When a
+  new branch has no reachable entry point, the test suite is silent about it by construction.
+
+---
+
+### [FIXED] The public device list publishes the queue token, which is a full read/write/burn credential
+
+> **Closed 2026-10-07 by the credential split, before Phase 5 continued.** `read_token` is 32 random
+> bytes generated on the device and stored only in `device.enc`; `delivery_token` is
+> `HMAC-SHA256(read_token, "hush-queue-delivery-v1")` and is what goes in the invite and the
+> `DeviceRecord`. The relay stores `sha256(delivery_token)`. `put_blob` and `presence_last_at` check
+> the presented token against that hash; `list_blobs`, `get_blob`, `delete_blob` and `report_queue`
+> instead recompute `HMAC(presented)` and check *that*, so a published delivery token cannot read,
+> drain or burn the inbox it names. No relay schema change was needed — the stored hash simply
+> changed meaning — and there is no second credential to register or rotate. Existing vaults rotate
+> once on load (`device.enc` v1 to v2): the identity and every session are kept, the queue is
+> replaced, and the caller republishes the list. Evidence: `crates/hush-relay/tests/queue_credentials.rs`
+> (3 tests) plus the workspace suite.
+>
+> **What this does not fix:** the delivery token still authorizes `PUT` into that inbox, so a stranger
+> who knows the account id can still flood a device's queue. Burning — the durable denial of service
+> this entry was raised for — is closed. Rate limiting is the existing mitigation for flooding.
+
+- **Attempted:** started Task 9 (device linking) and went to have device 1 record the new device's
+  queue in the signed list, which meant deciding what a `DeviceRecord` may carry.
+- **Symptom:** `DeviceRecord` carries `queue_token`, and `GET /d/{account_id}` is deliberately
+  unauthenticated. But the same token authorizes `PUT /q/{id}` (deliver), `GET /q/{id}` (list),
+  `GET /q/{id}/{blob}` (read), `DELETE /q/{id}/{blob}` (delete) and `POST /q/{id}/report` (burn).
+  So the moment an account publishes a device list, anyone who knows the account id can read,
+  delete and burn that device's inbox. Demonstrated live in
+  `crates/hush-relay/tests/queue_token_leak.rs` (currently `#[ignore]`d, asserting the *required*
+  behaviour): a request with the published token returns `200` on `GET /q/{queue_id}` and lists the
+  owner's queued blobs.
+- **Why it matters:** the account id is not a secret — it is the `protocol_name` in every invite the
+  account has ever handed out, and it is inside the list itself. This is not plaintext disclosure
+  (the relay only holds ciphertext), but it breaks three things the project claims:
+  - `docs/THREAT_MODEL.md` protects "who talks to whom, as seen by our relay, so it is not a
+    social-graph database", and states the relay stores blobs "on random queue IDs, not Alice's
+    inbox". A public `account_id -> queue_id` map plus a readable inbox defeats that.
+  - `docs/THREAT_MODEL.md` lists "Invite/queue tokens" as an asset. This publishes them.
+  - Burning is the worst case, not reading. A stranger can burn a device's queue permanently, and a
+    **device 2 cannot replace a burned queue**: only device 1 can sign a new list, so recovery
+    depends on device 1 being online and unlocked. That is a durable denial of service.
+- **Pre-existing, not introduced here:** the invite already carries the same token
+  (`InvitePayload.queue_token`) and the same relay routes authorize with it, so any contact the
+  account has ever invited can already read, delete and burn its inbox. Multi-device widens the
+  audience from "contacts" to "anyone who knows the account id" and makes it permanent by putting
+  the queue in a list that must be republished.
+- **Fix shape (not applied):** split the credential. The relay keeps a private **read token** that
+  never leaves the device and authorizes list/get/delete/report; a separate **delivery token** is
+  what goes in the invite and the device list and authorizes only `PUT` (deliver) and presence.
+  That is a relay schema change (`queues` gains a second token hash) plus an invite and
+  `DeviceRecord` change, which is why it is raised rather than patched.
+- **Lesson:** a token that gates both reading and writing cannot be handed to anyone who only needs
+  to write. Publishing an address and publishing a credential are different acts; the plan's
+  `DeviceRecord` conflated them.
 
 ---
 

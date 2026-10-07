@@ -35,6 +35,18 @@ pub enum MessagePayload {
         #[serde(default)]
         attachments: Vec<MailAttachment>,
     },
+    /// A copy of a message this account sent, fanned out to its own other
+    /// devices so a linked device shows it in the right conversation.
+    ///
+    /// The recipient's account id travels with it because the receiving device
+    /// cannot recover it from the ciphertext: the session it arrived on names
+    /// *this* account, not the party the message was addressed to. Guessing from
+    /// the chat log would misfile the message whenever two conversations are
+    /// open.
+    OwnCopy {
+        to_account_id: String,
+        inner: Box<MessagePayload>,
+    },
 }
 
 mod b64_bytes {

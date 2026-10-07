@@ -241,6 +241,91 @@ impl RelayClient {
         }
         Ok(())
     }
+
+    /// Publish an account's signed device list.
+    ///
+    /// No credential: the body carries device 1's signature and the relay checks
+    /// it against the account id, which is why revocation needs no rotation step.
+    pub async fn put_device_list(&self, account_id: &str, body: &[u8]) -> Result<(), Error> {
+        let res = self
+            .http
+            .put(format!("{}/d/{}", self.base, account_id))
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("device list put failed: {}", res.status())));
+        }
+        Ok(())
+    }
+
+    /// Fetch an account's signed device list, or `None` if it has none.
+    ///
+    /// Returns the signed bytes; the caller verifies them before trusting the
+    /// contents. A `404` is not a failure: an account that has never linked a
+    /// device has no list (the list is published lazily), and the caller's
+    /// invite already describes that account's one device.
+    pub async fn get_device_list(&self, account_id: &str) -> Result<Option<Vec<u8>>, Error> {
+        let res = self
+            .http
+            .get(format!("{}/d/{}", self.base, account_id))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("device list get failed: {}", res.status())));
+        }
+        res.bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| Error::Relay(e.to_string()))
+    }
+
+    /// Publish this device's prekey record so peers can open a session without an
+    /// invite.
+    pub async fn put_prekey_record(
+        &self,
+        account_id: &str,
+        device_id: u32,
+        body: &[u8],
+    ) -> Result<(), Error> {
+        let res = self
+            .http
+            .put(format!("{}/k/{}/{}", self.base, account_id, device_id))
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("prekey put failed: {}", res.status())));
+        }
+        Ok(())
+    }
+
+    /// Fetch a device's prekey record, consuming one of its one-time prekeys.
+    pub async fn get_prekey_record(
+        &self,
+        account_id: &str,
+        device_id: u32,
+    ) -> Result<Vec<u8>, Error> {
+        let res = self
+            .http
+            .get(format!("{}/k/{}/{}", self.base, account_id, device_id))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("prekey get failed: {}", res.status())));
+        }
+        res.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| Error::Relay(e.to_string()))
+    }
 }
 
 #[cfg(test)]

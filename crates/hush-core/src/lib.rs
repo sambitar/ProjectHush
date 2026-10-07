@@ -12,6 +12,7 @@ mod lockfile;
 mod mail;
 mod message;
 mod payload;
+pub mod prekey;
 mod recovery;
 mod relay_client;
 mod signal;
@@ -19,7 +20,7 @@ mod signal_persist;
 mod vault;
 mod wire;
 
-pub use account::{Account, Contact};
+pub use account::{Account, Contact, ContactDevice};
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{
     ClientConfig, ConfigSource, DEFAULT_DAEMON_ADDR, DEFAULT_RELAY_URL, ENV_DAEMON_ADDR,
@@ -37,5 +38,13 @@ pub use invite::InvitePayload;
 pub use mail::{format_address, normalize_handle, MAIL_DOMAIN, MAX_HANDLE_LEN};
 pub use message::{InboxResult, ReceivedAttachment, ReceivedMessage};
 pub use payload::{MailAttachment, MessagePayload, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS};
+pub use prekey::{OneTimePreKey, PreKeyRecord};
 pub use relay_client::{normalize_relay_base, normalize_relay_base_with, HttpPolicy, RelayClient};
 pub use vault::{BlobId, IdentityPub, Vault};
+
+/// Queue credential derivation, shared by the client and the relay.
+///
+/// The relay has to recognise a read request, so the derivation cannot live on
+/// the client side alone. Exposed as one function rather than the whole module:
+/// the rest of `crypto` handles key material and has no business being public.
+pub use crypto::queue_delivery_token;

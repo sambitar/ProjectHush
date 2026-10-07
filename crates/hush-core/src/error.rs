@@ -44,6 +44,10 @@ pub enum Error {
     InvalidHandle,
     #[error("too many attachments (max {0})")]
     TooManyAttachments(usize),
+    #[error("only device 1 can sign the device list")]
+    NotSigningDevice,
+    #[error("invalid device link request")]
+    InvalidLink,
 }
 
 impl From<argon2::Error> for Error {

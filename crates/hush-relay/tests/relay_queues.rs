@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use hush_core::queue_delivery_token;
 use hush_relay::{RelayConfig, router};
 use http_body_util::BodyExt;
 use tempfile::NamedTempFile;
@@ -41,7 +42,10 @@ async fn unauthorized_put_fails() {
 async fn put_get_delete_roundtrip() {
     let db = temp_db();
     let app = app(RelayConfig::default(), &db).await;
-    let token = "slot-secret-abc";
+    // The owner holds both halves of the credential pair: it publishes the
+    // delivery token and keeps the read token for its own inbox.
+    let read = "slot-secret-abc";
+    let delivery = queue_delivery_token(read);
     let body = b"ciphertext-bytes";
 
     let put = app
@@ -50,7 +54,7 @@ async fn put_get_delete_roundtrip() {
             Request::builder()
                 .method("PUT")
                 .uri("/q/q1")
-                .header(auth(token).0, auth(token).1)
+                .header(auth(&delivery).0, auth(&delivery).1)
                 .body(Body::from(body.to_vec()))
                 .unwrap(),
         )
@@ -66,7 +70,7 @@ async fn put_get_delete_roundtrip() {
         .oneshot(
             Request::builder()
                 .uri("/q/q1")
-                .header(auth(token).0, auth(token).1)
+                .header(auth(read).0, auth(read).1)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -79,7 +83,7 @@ async fn put_get_delete_roundtrip() {
         .oneshot(
             Request::builder()
                 .uri(format!("/q/q1/{}", blob_id))
-                .header(auth(token).0, auth(token).1)
+                .header(auth(read).0, auth(read).1)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -95,7 +99,7 @@ async fn put_get_delete_roundtrip() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/q/q1/{}", blob_id))
-                .header(auth(token).0, auth(token).1)
+                .header(auth(read).0, auth(read).1)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -137,13 +141,14 @@ async fn wrong_token_put_fails_after_queue_minted() {
 async fn expire_drops_blob() {
     let db = temp_db();
     let app = app(RelayConfig::for_tests(), &db).await;
-    let token = "tok";
+    let read = "tok";
+    let delivery = queue_delivery_token(read);
     app.clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
                 .uri("/q/exp")
-                .header(auth(token).0, auth(token).1)
+                .header(auth(&delivery).0, auth(&delivery).1)
                 .body(Body::from(b"old".to_vec()))
                 .unwrap(),
         )
@@ -154,7 +159,7 @@ async fn expire_drops_blob() {
         .oneshot(
             Request::builder()
                 .uri("/q/exp")
-                .header(auth(token).0, auth(token).1)
+                .header(auth(read).0, auth(read).1)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -169,25 +174,28 @@ async fn expire_drops_blob() {
 async fn report_burns_queue() {
     let db = temp_db();
     let app = app(RelayConfig::default(), &db).await;
-    let token = "burn-me";
+    let read = "burn-me";
+    let delivery = queue_delivery_token(read);
     app.clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
                 .uri("/q/burnq")
-                .header(auth(token).0, auth(token).1)
+                .header(auth(&delivery).0, auth(&delivery).1)
                 .body(Body::from(b"x".to_vec()))
                 .unwrap(),
         )
         .await
         .unwrap();
+    // Burning needs the read token; a peer holding only the delivery token
+    // cannot destroy the inbox.
     let rep = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/q/burnq/report")
-                .header(auth(token).0, auth(token).1)
+                .header(auth(read).0, auth(read).1)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -200,7 +208,7 @@ async fn report_burns_queue() {
             Request::builder()
                 .method("PUT")
                 .uri("/q/burnq")
-                .header(auth(token).0, auth(token).1)
+                .header(auth(&delivery).0, auth(&delivery).1)
                 .body(Body::from(b"y".to_vec()))
                 .unwrap(),
         )

@@ -17,16 +17,37 @@ pub const DEVICE_FILE: &str = "device.enc";
 /// the same reason `device.enc` does: it holds the identity private key.
 pub const LEGACY_DEVICE_FILE: &str = "signal.enc";
 
-const DEVICE_FORMAT_VERSION: u32 = 1;
+const DEVICE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct DeviceFile {
     v: u32,
     device_id: u32,
     queue_id: String,
-    queue_token: String,
+    /// The *private* read credential for this device's relay inbox.
+    ///
+    /// Only the delivery token derived from it is ever published, because the
+    /// read token also authorizes burning the queue.
+    read_token: String,
     /// The libsignal store, kept as nested JSON rather than a byte array so the
     /// file stays inspectable without a decoder.
+    signal: serde_json::Value,
+}
+
+/// The pre-split layout: one token doing both jobs, and no read credential.
+///
+/// Kept as its own struct because `read_token` is required in v2, so a v1 file
+/// cannot be deserialized into `DeviceFile` at all.
+#[derive(Deserialize)]
+struct DeviceFileV1 {
+    v: u32,
+    device_id: u32,
+    /// Read only to document the old shape; the queue is replaced on migration,
+    /// so the abandoned id is deliberately not carried forward.
+    #[allow(dead_code)]
+    queue_id: String,
+    #[allow(dead_code)]
+    queue_token: String,
     signal: serde_json::Value,
 }
 
@@ -40,13 +61,21 @@ pub struct DeviceKeys {
     device_id: u32,
     store: InMemSignalProtocolStore,
     queue_id: String,
-    queue_token: String,
+    /// Private. Authorizes reading, deleting and burning this device's own
+    /// inbox, so it must never appear in an invite or a device list.
+    read_token: String,
+    /// Set by [`DeviceKeys::load`] when a pre-split queue had to be replaced.
+    ///
+    /// The caller has to know: the old queue id may already have been handed to
+    /// contacts in an invite, so the cached invite has to be dropped and the
+    /// device list republished for peers to find the new inbox.
+    queue_rotated: bool,
 }
 
 impl std::fmt::Debug for DeviceKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Deliberately omits the store and queue token so a stray `{:?}` in a
-        // log line cannot leak key material.
+        // Deliberately omits the store, the read token and the queue so a stray
+        // `{:?}` in a log line cannot leak key material.
         f.debug_struct("DeviceKeys")
             .field("device_id", &self.device_id)
             .finish_non_exhaustive()
@@ -56,17 +85,18 @@ impl std::fmt::Debug for DeviceKeys {
 impl DeviceKeys {
     /// Wrap a store that already exists (used when migrating a vault that
     /// predates the multi-device model).
-    pub fn from_store(
-        device_id: u32,
-        store: InMemSignalProtocolStore,
-        queue_id: String,
-        queue_token: String,
-    ) -> Self {
+    ///
+    /// The legacy queue is deliberately *not* carried over. Its token was a
+    /// single credential used for both delivery and reading, and it was handed
+    /// out in every invite, so it is already public: keeping it would keep the
+    /// hole. A fresh queue is minted and the caller republishes.
+    pub fn from_store(device_id: u32, store: InMemSignalProtocolStore) -> Self {
         Self {
             device_id,
             store,
-            queue_id,
-            queue_token,
+            queue_id: Uuid::new_v4().to_string(),
+            read_token: hex::encode(random_bytes::<32>()),
+            queue_rotated: true,
         }
     }
 
@@ -80,7 +110,8 @@ impl DeviceKeys {
             device_id,
             store: crate::signal::new_protocol_store()?,
             queue_id: Uuid::new_v4().to_string(),
-            queue_token: hex::encode(random_bytes::<32>()),
+            read_token: hex::encode(random_bytes::<32>()),
+            queue_rotated: false,
         };
         // A fresh device has no sessions yet, so there is nothing to export.
         keys.save(dir, master, &[]).await?;
@@ -94,38 +125,86 @@ impl DeviceKeys {
         }
         let packed = std::fs::read(&path)?;
         let plain = decrypt(master, &packed)?;
-        let file: DeviceFile = serde_json::from_slice(&plain).map_err(|_| Error::Corrupt)?;
-        if file.v != DEVICE_FORMAT_VERSION {
-            return Err(Error::Corrupt);
-        }
-        let signal = serde_json::to_vec(&file.signal).map_err(|_| Error::Corrupt)?;
-        let store = import_store(&signal).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&plain).map_err(|_| Error::Corrupt)?;
+        let version = value.get("v").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        // A v1 file has no read token, and its `queue_token` was published in
+        // invites, so the queue cannot be salvaged by treating that token as the
+        // read credential — the relay would reject it, and accepting it would be
+        // the hole this split exists to close. Replace the queue instead. The
+        // device identity and every session are untouched, so contacts keep
+        // working once they see the new inbox.
+        let (device_id, store, queue_id, read_token, queue_rotated) = match version {
+            1 => {
+                let file: DeviceFileV1 =
+                    serde_json::from_value(value).map_err(|_| Error::Corrupt)?;
+                if file.v != 1 {
+                    return Err(Error::Corrupt);
+                }
+                let signal = serde_json::to_vec(&file.signal).map_err(|_| Error::Corrupt)?;
+                let store = import_store(&signal).await?;
+                (
+                    file.device_id,
+                    store,
+                    Uuid::new_v4().to_string(),
+                    hex::encode(random_bytes::<32>()),
+                    true,
+                )
+            }
+            v if v == u64::from(DEVICE_FORMAT_VERSION) => {
+                let file: DeviceFile =
+                    serde_json::from_value(value).map_err(|_| Error::Corrupt)?;
+                let signal = serde_json::to_vec(&file.signal).map_err(|_| Error::Corrupt)?;
+                let store = import_store(&signal).await?;
+                (
+                    file.device_id,
+                    store,
+                    file.queue_id,
+                    file.read_token,
+                    false,
+                )
+            }
+            _ => return Err(Error::Corrupt),
+        };
+
         Ok(Self {
-            device_id: file.device_id,
+            device_id,
             store,
-            queue_id: file.queue_id,
-            queue_token: file.queue_token,
+            queue_id,
+            read_token,
+            queue_rotated,
         })
+    }
+
+    /// Whether this device's queue was replaced while loading.
+    ///
+    /// True for a v1 file and for a migrated legacy vault. The caller must drop
+    /// any cached invite and republish the device list, or peers keep delivering
+    /// to an inbox this device no longer reads.
+    pub fn queue_rotated(&self) -> bool {
+        self.queue_rotated
     }
 
     /// Persist this device's material.
     ///
-    /// `session_names` is the set of remote addresses whose sessions should be
-    /// carried over; the store cannot enumerate them itself.
+    /// `session_addresses` is the set of remote addresses whose sessions should be
+    /// carried over; the store cannot enumerate them itself, and with
+    /// multi-device an address is an account id *and* a device id.
     pub async fn save(
         &self,
         dir: &Path,
         master: &[u8; MASTER_KEY_LEN],
-        session_names: &[String],
+        session_addresses: &[(String, u32)],
     ) -> Result<(), Error> {
-        let signal = export_store(&self.store, session_names).await?;
+        let signal = export_store(&self.store, session_addresses).await?;
         let signal: serde_json::Value =
             serde_json::from_slice(&signal).map_err(|_| Error::Corrupt)?;
         let file = DeviceFile {
             v: DEVICE_FORMAT_VERSION,
             device_id: self.device_id,
             queue_id: self.queue_id.clone(),
-            queue_token: self.queue_token.clone(),
+            read_token: self.read_token.clone(),
             signal,
         };
         let plain = serde_json::to_vec(&file).map_err(|_| Error::Corrupt)?;
@@ -142,12 +221,46 @@ impl DeviceKeys {
         &self.queue_id
     }
 
-    pub fn queue_token(&self) -> &str {
-        &self.queue_token
+    /// The *public* credential for this device's inbox: what goes in an invite
+    /// and in the device list, and what a peer uses to deliver.
+    pub fn queue_token(&self) -> String {
+        crate::crypto::queue_delivery_token(&self.read_token)
+    }
+
+    /// The private credential for this device's inbox: what authorizes listing,
+    /// reading, deleting and burning it.
+    pub fn read_token(&self) -> &str {
+        &self.read_token
     }
 
     pub fn store_mut(&mut self) -> &mut InMemSignalProtocolStore {
         &mut self.store
+    }
+
+    pub async fn registration_id(&self) -> Result<u32, Error> {
+        self.store
+            .get_local_registration_id()
+            .await
+            .map_err(|_| Error::Corrupt)
+    }
+
+    pub async fn identity_key_pair(&self) -> Result<libsignal_protocol::IdentityKeyPair, Error> {
+        self.store
+            .get_identity_key_pair()
+            .await
+            .map_err(|_| Error::Corrupt)
+    }
+
+    /// Mint a fresh set of publishable prekeys for this device.
+    ///
+    /// The private halves stay in the store; only the returned record goes on the
+    /// wire.
+    pub async fn mint_prekeys(
+        &mut self,
+        one_time_count: usize,
+    ) -> Result<crate::prekey::PreKeyRecord, Error> {
+        crate::signal::mint_publishable_prekeys(&mut self.store, self.device_id, one_time_count)
+            .await
     }
 
     pub async fn identity_public(&self) -> Result<Vec<u8>, Error> {

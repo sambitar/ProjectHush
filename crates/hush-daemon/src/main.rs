@@ -822,16 +822,19 @@ async fn recv(
         }
     };
     Ok(Json(RecvResponse {
-        messages: inbox.messages.into_iter().map(to_dto).collect(),
+        messages: inbox.messages.into_iter().filter_map(to_dto).collect(),
         warnings: inbox.warnings,
     }))
 }
 
-fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
+/// `None` for an own-copy envelope: `recv` files those into the chat log itself
+/// and never surfaces them, so one reaching here would be a bug rather than a
+/// message to show.
+fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
     let from = msg.from_nick;
     let mail_attachments = msg.mail_attachments;
     match msg.payload {
-        MessagePayload::Text { body } => ReceivedDto {
+        MessagePayload::Text { body } => Some(ReceivedDto {
             from,
             kind: "text".into(),
             text: Some(body),
@@ -841,8 +844,8 @@ fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
             thread_id: None,
             subject: None,
             attachments: Vec::new(),
-        },
-        MessagePayload::File { name, data } => ReceivedDto {
+        }),
+        MessagePayload::File { name, data } => Some(ReceivedDto {
             from,
             kind: "file".into(),
             text: None,
@@ -852,13 +855,13 @@ fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
             thread_id: None,
             subject: None,
             attachments: Vec::new(),
-        },
+        }),
         MessagePayload::Mail {
             thread_id,
             subject,
             body,
             ..
-        } => ReceivedDto {
+        } => Some(ReceivedDto {
             from,
             kind: "mail".into(),
             text: Some(body),
@@ -875,7 +878,8 @@ fn to_dto(msg: ReceivedMessage) -> ReceivedDto {
                     blob_id: hex::encode(a.blob_id.0),
                 })
                 .collect(),
-        },
+        }),
+        MessagePayload::OwnCopy { .. } => None,
     }
 }
 

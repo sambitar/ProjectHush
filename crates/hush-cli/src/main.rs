@@ -155,13 +155,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("  attachment -> {}", out.display());
                         }
                     }
+                    // Own copies are filed into the chat log by `recv` itself and
+                    // never surface as inbox items.
+                    MessagePayload::OwnCopy { .. } => {}
                 }
             }
         }
         Commands::Contacts => {
             let account = open(&dir, &passphrase).await?;
             for c in account.contacts() {
-                println!("{} ({})", c.nickname, c.protocol_name);
+                println!(
+                    "{} ({}, {} device{})",
+                    c.nickname,
+                    c.account_id,
+                    c.devices.len(),
+                    if c.devices.len() == 1 { "" } else { "s" }
+                );
             }
         }
         Commands::Config { cmd } => match cmd {
