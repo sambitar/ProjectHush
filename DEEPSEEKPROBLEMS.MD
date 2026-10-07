@@ -171,6 +171,21 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 - **Lesson:** "authorize the write" and "sign the payload" are separate questions. Settling one and
   assuming it settles the other leaves a design that cannot be implemented.
 
+### [FIXED] The plan's tamper-detection test proved nothing about the signature
+
+- **Attempted:** implemented Task 3 including the plan's `signed_list_verifies_and_detects_tampering`,
+  which flips a byte at `len / 2` and asserts that verification fails.
+- **Symptom:** mutation testing — commenting out the `verify_signature` call and re-running — left that
+  test **passing**. Flipping an arbitrary byte in the middle of the blob corrupts the JSON, so
+  `serde_json::from_slice` fails first and the test never reaches the signature check. It was asserting
+  on the parser, not the signature. The wrong-key test *did* catch the mutation, which is what exposed
+  the difference between the two.
+- **Resolution:** the tampering test now rewrites a byte inside a string value (`queue-1` -> `pueue-1`),
+  which keeps the payload valid JSON, and asserts the payload still parses *before* asserting that
+  verification fails. Re-ran the mutation: with `verify_signature` disabled, both tests now fail.
+- **Lesson:** a test named after a security property is not evidence of that property. Disable the check
+  and confirm the test fails, or the assertion may be riding on a completely different code path.
+
 ---
 
 ## 2026-10-06 — Member calls spec (Task 17, P2P WebRTC)

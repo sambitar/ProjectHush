@@ -263,6 +263,21 @@ Run: `cargo test -p hush-core --test backup_recovery`
 
 ## Phase 2 — Device list and account token
 
+> **Status: done 2026-10-07** on `feat/multi-device-phase1`. Deviations from the plan as written:
+>
+> - The signature is taken from the **tail of the blob by its fixed length** (XEd25519 signatures are
+>   always 64 bytes) rather than found by scanning for a newline delimiter. A delimiter that could
+>   appear inside the payload is a parsing bug waiting to happen, and the length is known.
+> - `verify` also rejects an unknown `v` and a blob with no payload, and `AccountToken` gets a
+>   hand-written `Debug` that redacts the secret.
+> - The plan's tamper test asserted on the JSON parser rather than the signature, so it passed even
+>   with `verify_signature` removed. Rewritten to tamper inside a string value so the payload stays
+>   valid JSON. Confirmed by mutation: both signature tests now fail when the check is disabled.
+> - `subtle = "2"` added to `crates/hush-core/Cargo.toml`; it was only present transitively before.
+>
+> Evidence: `cargo test --workspace` (65 tests, 0 failures), including a wrong-key test proving a list
+> signed by anything other than the account root is rejected.
+
 ### Task 3: `DeviceList` with signing and verification
 
 **Files:**
