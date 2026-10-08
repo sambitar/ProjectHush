@@ -35,17 +35,40 @@ pub enum MessagePayload {
         #[serde(default)]
         attachments: Vec<MailAttachment>,
     },
-    /// A copy of a message this account sent, fanned out to its own other
-    /// devices so a linked device shows it in the right conversation.
+    /// A message in a local meeting, fanned out to each member over their own
+    /// 1:1 session.
     ///
-    /// The recipient's account id travels with it because the receiving device
-    /// cannot recover it from the ciphertext: the session it arrived on names
-    /// *this* account, not the party the message was addressed to. Guessing from
-    /// the chat log would misfile the message whenever two conversations are
-    /// open.
-    OwnCopy {
-        to_account_id: String,
-        inner: Box<MessagePayload>,
+    /// There is no relay-side room and no group object: the sender encrypts this
+    /// once per member and puts N blobs. The descriptor (`meeting_id`, `name`,
+    /// `members`) travels with every message so a recipient that has never seen
+    /// the meeting can materialise it locally; once the meeting exists, later
+    /// messages just append. Membership is the sender's local view, so the names
+    /// carried here are the sender's nicknames and may not match the recipient's.
+    Meeting {
+        meeting_id: String,
+        name: String,
+        #[serde(default)]
+        members: Vec<String>,
+        body: String,
+    },
+    /// A grant of the sender's per-contact receive queue.
+    ///
+    /// Delivered into the recipient's inbox (the grant channel) and encrypted by
+    /// the same libsignal session as any other payload, so the relay cannot read
+    /// which account is granting to whom. The signature is what the recipient
+    /// actually trusts: it is verified against the identity key the sender
+    /// pinned in their invite, so an unauthenticated write to the grant channel
+    /// cannot introduce a queue the sender does not own. See
+    /// `Account::apply_queue_grant`.
+    QueueGrant {
+        /// The queue id the recipient should deliver this sender's account into.
+        queue_id: String,
+        /// The delivery token for that queue. Public by design: it authorizes
+        /// putting a message in the queue and nothing else.
+        delivery_token: String,
+        /// Signature over the canonical grant bytes by the granting account's
+        /// identity key.
+        signature: Vec<u8>,
     },
 }
 
@@ -124,5 +147,28 @@ mod tests {
             attachments: vec![],
         };
         assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn a_meeting_payload_round_trips_with_its_descriptor() {
+        let p = MessagePayload::Meeting {
+            meeting_id: "m-1".into(),
+            name: "Standup".into(),
+            members: vec!["bob".into(), "carol".into()],
+            body: "morning".into(),
+        };
+        assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    /// A message from a build that predates the descriptor must still decode, so
+    /// the member list is defaulted rather than required.
+    #[test]
+    fn a_meeting_payload_without_a_member_list_still_decodes() {
+        let json = r#"{"t":"meeting","meeting_id":"m-1","name":"Standup","body":"hi"}"#;
+        let p: MessagePayload = serde_json::from_str(json).unwrap();
+        match p {
+            MessagePayload::Meeting { members, .. } => assert!(members.is_empty()),
+            other => panic!("expected a meeting, got {other:?}"),
+        }
     }
 }

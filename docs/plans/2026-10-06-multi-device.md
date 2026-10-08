@@ -1,5 +1,9 @@
 # Multi-device (per-device keys) Implementation Plan
 
+> **Superseded (2026-10-08).** Multi-device was removed entirely; this plan describes a design the
+> code no longer implements. See `docs/PROTOCOL.md` and `docs/THREAT_MODEL.md` for what the code does
+> now. Kept only as a record of how the removed feature was built.
+
 **Goal:** Give each device its own identity key and relay queue under a shared account id, so a
 linked device can be listed and revoked honestly.
 

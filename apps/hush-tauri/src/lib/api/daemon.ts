@@ -14,13 +14,25 @@ type Transport =
   | { kind: "tcp"; base: string };
 
 /**
+ * `?api=http://127.0.0.1:9877` points one browser tab at one daemon, so a single
+ * Vite dev server can drive both peers during development.
+ */
+function apiFromQuery(): string | null {
+  const v = new URLSearchParams(window.location.search).get("api");
+  return v ? v.replace(/\/+$/, "") : null;
+}
+
+/**
  * How to reach the daemon. The desktop shell injects the real transport
  * (Unix socket by default, DR-02); a plain browser falls back to loopback HTTP.
  */
 function transport(): Transport {
   const t = window.__HUSH_TRANSPORT__;
   if (t && (t.kind === "unix" || t.kind === "tcp")) return t;
-  return { kind: "tcp", base: window.__HUSH_API__ || "http://127.0.0.1:9876" };
+  return {
+    kind: "tcp",
+    base: window.__HUSH_API__ || apiFromQuery() || "http://127.0.0.1:9876",
+  };
 }
 
 export function getApiBase(): string {
@@ -153,6 +165,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ to, ...body }),
     }),
+  /**
+   * Send to an address with no Hush account. The response carries the pickup
+   * link, which the sender passes on themselves — that is the product, not a
+   * fallback for a missing mailer.
+   *
+   * The drop is sealed under exactly one credential: a `pin` the recipient is
+   * told out of band, or the recipient's `public_key`. The union makes giving
+   * both (or neither) a type error here, and the daemon rejects it too.
+   */
+  sendToOutsider: (
+    body: {
+      to: string;
+      subject?: string;
+      body: string;
+      attachments: { name: string; data_base64: string }[];
+    } & ({ pin: string; public_key?: never } | { public_key: string; pin?: never }),
+  ) =>
+    request<{ delivery_id: string; link: string; expires_unix: number }>(
+      "/api/mail/outsider",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   saveDraft: (body: {
     id?: string;
     thread_id?: string;
@@ -197,15 +230,5 @@ export const api = {
     request<null>("/api/ui-prefs", {
       method: "PUT",
       body: JSON.stringify(prefs),
-    }),
-  linkDeviceStart: () =>
-    request<import("./types").LinkDeviceStartResponse>(
-      "/api/link-device/start",
-      { method: "POST" },
-    ),
-  linkDevicePull: (source_api: string, link_id: string) =>
-    request<null>("/api/link-device/pull", {
-      method: "POST",
-      body: JSON.stringify({ source_api, link_id }),
     }),
 };

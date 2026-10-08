@@ -28,12 +28,25 @@ import {
   Reply,
   ChevronLeft,
   X,
+  Bold,
+  Italic,
+  Underline,
+  Strikethrough,
+  List,
+  ListOrdered,
+  Quote,
+  Code,
+  Heading2,
+  RemoveFormatting,
+  Link,
+  Handshake,
   type IconNode,
 } from "lucide";
 
 const ICONS: Record<string, IconNode> = {
   lock: Lock,
   chats: MessageCircle,
+  trusts: Handshake,
   mail: Mail,
   files: Folder,
   vault: Shield,
@@ -60,6 +73,17 @@ const ICONS: Record<string, IconNode> = {
   reply: Reply,
   back: ChevronLeft,
   close: X,
+  bold: Bold,
+  italic: Italic,
+  underline: Underline,
+  strike: Strikethrough,
+  list: List,
+  listOrdered: ListOrdered,
+  quote: Quote,
+  code: Code,
+  heading: Heading2,
+  clearFormat: RemoveFormatting,
+  link: Link,
 };
 
 export type IconName = keyof typeof ICONS;

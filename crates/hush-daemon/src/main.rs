@@ -1,5 +1,4 @@
 mod account_worker;
-mod link_device;
 mod paths;
 mod security;
 mod suspend_lock;
@@ -9,9 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use account_worker::{AccountWorker, ContactDto, WorkResult};
+use account_worker::{AccountWorker, ContactDto, DropSecret, WorkResult};
 use axum::{
-    body::Bytes,
     extract::{Path, State},
     http::{header, Method, StatusCode},
     routing::{delete, get, post},
@@ -19,7 +17,10 @@ use axum::{
 };
 use clap::Parser;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hush_core::{ChatRecord, MessagePayload, ReceivedMessage};
+use hush_core::{
+    notification_body, notification_body_for_key, ChatRecord, FileMailer, Mailer, MessagePayload,
+    NullMailer, ReceivedMessage,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -40,6 +41,35 @@ struct Args {
     /// Skip the Unix socket listener (TCP-only debugging).
     #[arg(long)]
     no_socket: bool,
+    /// Base URL the pickup link is built from. Until a real domain exists this
+    /// points at localhost, so a link only works on this machine.
+    #[arg(long, env = "HUSH_DROP_BASE_URL", default_value = "http://127.0.0.1:8788")]
+    drop_base_url: String,
+    /// How a drop notification is delivered: `null` (the default, meaning the
+    /// sender copies the link by hand) or `file:<dir>`.
+    #[arg(long, env = "HUSH_MAILER", default_value = "null")]
+    mailer: String,
+}
+
+/// Build the notification mailer from its spec.
+///
+/// An unknown spec falls back to `NullMailer` rather than failing: a
+/// misconfigured notification must not stop drops from being sent, because the
+/// link is returned to the sender either way.
+fn build_mailer(spec: &str) -> Arc<dyn Mailer> {
+    match spec.strip_prefix("file:") {
+        Some(dir) => Arc::new(FileMailer::new(dir)),
+        None => Arc::new(NullMailer),
+    }
+}
+
+/// The pickup link. `base` must already be trimmed of trailing slashes.
+///
+/// This is a contract with the pickup page: the path segment is `open`, and the
+/// capability id is the last component. Changing either breaks every link that
+/// has already been emailed.
+fn pickup_link(base: &str, delivery_id: &str) -> String {
+    format!("{base}/open/{delivery_id}")
 }
 
 struct App {
@@ -51,7 +81,11 @@ struct App {
     worker: AccountWorker,
     unlocked: Mutex<bool>,
     unlocked_at: Mutex<Option<Instant>>,
-    link_device: link_device::LinkDeviceStore,
+    /// Base URL the pickup link is composed from.
+    drop_base_url: String,
+    /// How the drop notification goes out. Best-effort: a failure here does not
+    /// fail the send, because the drop is already on the relay.
+    mailer: Arc<dyn Mailer>,
 }
 
 #[derive(Serialize)]
@@ -216,7 +250,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker: AccountWorker::spawn(),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
-        link_device: link_device::LinkDeviceStore::new(),
+        drop_base_url: args.drop_base_url.trim_end_matches('/').to_string(),
+        mailer: build_mailer(&args.mailer),
     };
     let state = Arc::new(app);
 
@@ -232,6 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/change-passphrase", post(change_passphrase))
         .route("/api/mail/handle", post(set_mail_handle))
         .route("/api/mail/send", post(send_mail))
+        .route("/api/mail/outsider", post(send_outsider))
         .route("/api/mail/draft", post(save_draft))
         .route("/api/mail/draft/{id}", delete(delete_draft))
         .route("/api/mail/{id}", delete(delete_mail))
@@ -252,9 +288,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/recovery/pending", get(recovery_pending))
         .route("/api/recovery/acknowledge", post(recovery_acknowledge))
         .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs))
-        .route("/api/link-device/start", post(link_device_start))
-        .route("/api/link-device/pull", post(link_device_pull))
-        .route("/api/link-device/{id}", get(link_device_get))
         .layer(local_ui_cors())
         .with_state(state.clone());
 
@@ -639,6 +672,122 @@ struct SendMailResponse {
     queued: bool,
 }
 
+#[derive(Deserialize)]
+struct SendOutsiderRequest {
+    /// A typed address, not a contact nickname.
+    to: String,
+    #[serde(default)]
+    subject: String,
+    body: String,
+    #[serde(default)]
+    attachments: Vec<MailAttachmentInput>,
+    /// The PIN the recipient will be told out of band. Never emailed. Exactly
+    /// one of `pin` and `public_key` must be given.
+    #[serde(default)]
+    pin: Option<String>,
+    /// The recipient's pasteable drop public key (`hush-drop-pk-v1:...`). Exactly
+    /// one of `pin` and `public_key` must be given.
+    #[serde(default)]
+    public_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SendOutsiderResponse {
+    delivery_id: String,
+    /// The pickup link, composed here because the base URL is daemon config.
+    link: String,
+    expires_unix: u64,
+}
+
+/// Send to an address with no Hush account.
+///
+/// The response carries the link because that is the product: the sender copies
+/// it into whatever channel they already share with the recipient. The
+/// notification email, when a mailer is configured, is a convenience on top and
+/// its failure is swallowed — the drop is already on the relay by then, and
+/// failing the request would leave the sender thinking nothing was sent when a
+/// working link exists.
+async fn send_outsider(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SendOutsiderRequest>,
+) -> Result<Json<SendOutsiderResponse>, ApiErrorResponse> {
+    touch(&state).await;
+
+    // One mode, chosen explicitly. An empty string counts as absent so a client
+    // that always sends both fields with one blank still works, but supplying
+    // two real credentials is a caller bug and is refused rather than guessed at.
+    let pin = body.pin.as_deref().filter(|s| !s.is_empty());
+    let public_key = body.public_key.as_deref().filter(|s| !s.is_empty());
+    let (secret, is_key_mode) = match (pin, public_key) {
+        (Some(pin), None) => (DropSecret::Pin(pin.to_string()), false),
+        (None, Some(key)) => (DropSecret::PublicKey(key.to_string()), true),
+        (Some(_), Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "give either pin or public_key, not both".into(),
+                }),
+            ))
+        }
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "give a pin or a public_key".into(),
+                }),
+            ))
+        }
+    };
+
+    let attachments = decode_attachments(&body.attachments)?;
+    let result = map_err(
+        state
+            .worker
+            .send_to_outsider(
+                &body.to,
+                body.subject.trim(),
+                &body.body,
+                attachments,
+                secret,
+            )
+            .await,
+    )?;
+    let (delivery_id, expires_unix) = match result {
+        WorkResult::OutsiderSent {
+            delivery_id,
+            expires_unix,
+        } => (delivery_id, expires_unix),
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "unexpected worker response".into(),
+                }),
+            ))
+        }
+    };
+    let link = pickup_link(&state.drop_base_url, &delivery_id);
+    // The notification never carries the secret. A key drop tells the recipient
+    // to use their private key rather than sending them looking for a PIN.
+    let notification = if is_key_mode {
+        notification_body_for_key(&link, expires_unix)
+    } else {
+        notification_body(&link, expires_unix)
+    };
+    if let Err(e) = state
+        .mailer
+        .send(&body.to, "An encrypted message is waiting for you", &notification)
+    {
+        // Logged, not surfaced: the link in the response still works.
+        eprintln!("drop notification to {} failed: {e}", body.to);
+    }
+    Ok(Json(SendOutsiderResponse {
+        delivery_id,
+        link,
+        expires_unix,
+    }))
+}
+
 async fn send_mail(
     State(state): State<Arc<App>>,
     Json(body): Json<SendMailRequest>,
@@ -1002,7 +1151,8 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
                 })
                 .collect(),
         }),
-        MessagePayload::OwnCopy { .. } => None,
+        // Queue grants are handled inside `recv` and never surface as inbox items.
+        MessagePayload::QueueGrant { .. } => None,
     }
 }
 
@@ -1113,128 +1263,6 @@ async fn get_ui_prefs(State(state): State<Arc<App>>) -> Json<ui_prefs::UiPrefs> 
     Json(ui_prefs::load(&state.dir))
 }
 
-#[derive(Serialize)]
-struct LinkDeviceStartResponse {
-    link_id: String,
-    expires_unix: u64,
-    /// Paste or scan on the new device together with your daemon URL on the LAN.
-    payload: String,
-}
-
-#[derive(Deserialize)]
-struct LinkDevicePullRequest {
-    source_api: String,
-    link_id: String,
-}
-
-async fn link_device_start(
-    State(state): State<Arc<App>>,
-) -> Result<Json<LinkDeviceStartResponse>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    if !*state.unlocked.lock().await {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ApiError {
-                error: "unlock vault to link a new device".into(),
-            }),
-        ));
-    }
-    let result = map_err(state.worker.backup_export().await)?;
-    match result {
-        WorkResult::Backup(data) => {
-            let Some(tcp) = state.tcp_addr.clone() else {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(ApiError {
-                        error: "device link needs the source daemon reachable over TCP; \
-                                restart it with --addr <lan-ip>:9876"
-                            .into(),
-                    }),
-                ));
-            };
-            let (link_id, expires_unix) = state.link_device.store(data).await;
-            let payload = serde_json::json!({
-                "v": 1,
-                "kind": "hush-link-device",
-                "link_id": link_id,
-                "source_api": format!("http://{}", tcp),
-                "expires_unix": expires_unix,
-            });
-            Ok(Json(LinkDeviceStartResponse {
-                link_id,
-                expires_unix,
-                payload: payload.to_string(),
-            }))
-        }
-        _ => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: "could not export vault for link".into(),
-            }),
-        )),
-    }
-}
-
-async fn link_device_get(
-    State(state): State<Arc<App>>,
-    Path(id): Path<String>,
-) -> Result<Bytes, StatusCode> {
-    let data = state.link_device.take(&id).await.ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Bytes::from(data))
-}
-
-async fn link_device_pull(
-    State(state): State<Arc<App>>,
-    Json(body): Json<LinkDevicePullRequest>,
-) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    if *state.unlocked.lock().await {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiError {
-                error: "lock vault before importing from another device".into(),
-            }),
-        ));
-    }
-    if let Err(msg) = link_device::validate_source_api(&body.source_api) {
-        return Err((StatusCode::BAD_REQUEST, Json(ApiError { error: msg })));
-    }
-    let base = body.source_api.trim().trim_end_matches('/');
-    let url = format!("{}/api/link-device/{}", base, body.link_id.trim());
-    let bytes = reqwest::Client::new()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ApiError {
-                    error: format!("could not reach source device: {}", e),
-                }),
-            )
-        })?
-        .error_for_status()
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ApiError {
-                    error: format!("source device rejected link: {}", e),
-                }),
-            )
-        })?
-        .bytes()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ApiError {
-                    error: format!("download failed: {}", e),
-                }),
-            )
-        })?;
-    map_err(state.worker.backup_import(&state.dir, bytes.to_vec()).await)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn put_ui_prefs(
     State(state): State<Arc<App>>,
     Json(body): Json<ui_prefs::UiPrefs>,
@@ -1287,5 +1315,45 @@ async fn blob(
                 error: "unexpected worker response".into(),
             }),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pickup page is served by the daemon at this path, so the shape is a
+    /// contract, not a detail.
+    #[test]
+    fn the_pickup_link_is_base_open_id() {
+        assert_eq!(
+            pickup_link("https://hush.example", "abc123"),
+            "https://hush.example/open/abc123"
+        );
+        assert_eq!(
+            pickup_link("http://127.0.0.1:8788", "00ff"),
+            "http://127.0.0.1:8788/open/00ff"
+        );
+    }
+
+    #[test]
+    fn the_mailer_spec_selects_a_file_mailer_or_falls_back_to_null() {
+        let dir = std::env::temp_dir().join(format!("hush-mailer-spec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = format!("file:{}", dir.display());
+        let mailer = build_mailer(&spec);
+        mailer.send("bob@gmail.com", "s", "b").unwrap();
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "a file: spec must write"
+        );
+
+        // Anything unrecognised is a no-op rather than an error: a broken
+        // notification must not fail a drop that is already on the relay.
+        for spec in ["null", "", "smtp:host"] {
+            assert!(build_mailer(spec).send("bob@gmail.com", "s", "b").is_ok());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

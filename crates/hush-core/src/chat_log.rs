@@ -43,10 +43,26 @@ pub enum MailState {
     Queued,
 }
 
+/// What an outgoing drop needs to be shown and re-shared.
+///
+/// A drop has no contact and no thread partner, so the address is kept here
+/// rather than inferred from the contact list. `delivery_id` is the relay
+/// capability, and the pickup link is composed from it by whoever knows the
+/// deployment's base URL — deliberately not stored here, because the base URL is
+/// configuration and this record is vault state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalMail {
+    /// The typed recipient address.
+    pub to: String,
+    /// The relay capability id the container was stored under.
+    pub delivery_id: String,
+    /// When the relay will drop it.
+    pub expires_unix: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
-pub enum ChatRecordPayload {
-    Text {
+pub enum ChatRecordPayload {    Text {
         body: String,
     },
     File {
@@ -63,6 +79,11 @@ pub enum ChatRecordPayload {
         /// `Sent`, which is what they are.
         #[serde(default)]
         state: MailState,
+        /// Set when this went to a non-member address instead of a contact. The
+        /// recipient has no keys, so the record carries the capability id rather
+        /// than a session: that is the whole difference between a drop and mail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external: Option<ExternalMail>,
     },
     /// A composed message that has not been sent. Unlike mail this is mutable:
     /// it is edited and deleted in place, which is why the log grew
@@ -85,9 +106,45 @@ pub enum ChatRecordPayload {
     },
 }
 
+/// One message inside a meeting's own log.
+///
+/// Meeting messages do not go through [`ChatRecord`]: a meeting is a local
+/// construct with its own log, and keeping its messages here is what keeps them
+/// out of the chat and mail projections without a filter that could be forgotten.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingMessage {
+    pub id: String,
+    pub outgoing: bool,
+    /// The sender's nickname as this vault knows it; `None` for our own messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    pub body: String,
+    pub ts_ms: u64,
+}
+
+/// A meeting: a local record, not a relay-side room.
+///
+/// It holds the id a descriptor is keyed on, the name, the ordered member list
+/// (nicknames as this vault knows them), when it was created, and its own message
+/// log. Group chat is sender-side fan-out over the members' 1:1 sessions; there is
+/// no group key and no server object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingRecord {
+    pub id: String,
+    pub name: String,
+    pub members: Vec<String>,
+    pub created_ms: u64,
+    #[serde(default)]
+    pub messages: Vec<MeetingMessage>,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct ChatLogFile {
     messages: Vec<ChatRecord>,
+    /// Meetings this vault holds. Defaulted so a log written before meetings
+    /// existed still loads.
+    #[serde(default)]
+    meetings: Vec<MeetingRecord>,
 }
 
 pub struct ChatLog {
@@ -188,6 +245,50 @@ impl ChatLog {
                     body: body.to_string(),
                     attachments: attachments.to_vec(),
                     state,
+                    external: None,
+                },
+            },
+        )?;
+        Ok(id)
+    }
+
+    /// Append an outgoing drop: a message sealed for someone with no account.
+    ///
+    /// `contact_nick` is set to the typed address so the list can render a row
+    /// without unwrapping the payload, and the `external` field carries the
+    /// capability id the link is built from. There is no `MailState`: a drop is
+    /// either on the relay or the send returned an error, so there is nothing to
+    /// retry from an Outbox.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_external_mail(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        to: &str,
+        delivery_id: &str,
+        expires_unix: u64,
+        subject: &str,
+        body: &str,
+        attachments: &[MailAttachmentRecord],
+    ) -> Result<String, Error> {
+        let id = Uuid::new_v4().to_string();
+        self.push(
+            master,
+            ChatRecord {
+                id: id.clone(),
+                contact_nick: to.to_string(),
+                outgoing: true,
+                ts_ms: now_ms(),
+                payload: ChatRecordPayload::Mail {
+                    thread_id: Uuid::new_v4().to_string(),
+                    subject: (!subject.is_empty()).then(|| subject.to_string()),
+                    body: body.to_string(),
+                    attachments: attachments.to_vec(),
+                    state: MailState::Sent,
+                    external: Some(ExternalMail {
+                        to: to.to_string(),
+                        delivery_id: delivery_id.to_string(),
+                        expires_unix,
+                    }),
                 },
             },
         )?;
@@ -253,6 +354,122 @@ impl ChatLog {
         let before = self.file.messages.len();
         self.file.messages.retain(|r| r.id != id);
         if self.file.messages.len() == before {
+            return Ok(false);
+        }
+        self.save(master)?;
+        Ok(true)
+    }
+
+    /// The meetings this vault holds, in creation order.
+    pub fn meetings(&self) -> &[MeetingRecord] {
+        &self.file.meetings
+    }
+
+    pub fn meeting(&self, id: &str) -> Option<&MeetingRecord> {
+        self.file.meetings.iter().find(|m| m.id == id)
+    }
+
+    /// Create a meeting with an empty message log, returning its id.
+    pub fn create_meeting(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        name: &str,
+        members: &[String],
+    ) -> Result<String, Error> {
+        let id = Uuid::new_v4().to_string();
+        self.file.meetings.push(MeetingRecord {
+            id: id.clone(),
+            name: name.to_string(),
+            members: members.to_vec(),
+            created_ms: now_ms(),
+            messages: Vec::new(),
+        });
+        self.save(master)?;
+        Ok(id)
+    }
+
+    /// Materialise a meeting from a received descriptor if this vault does not
+    /// have it yet. Returns whether it was created.
+    ///
+    /// A known meeting is left untouched: a descriptor is how a recipient first
+    /// learns a meeting exists, not an instruction to overwrite local membership.
+    pub fn ensure_meeting(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        id: &str,
+        name: &str,
+        members: &[String],
+    ) -> Result<bool, Error> {
+        if self.file.meetings.iter().any(|m| m.id == id) {
+            return Ok(false);
+        }
+        self.file.meetings.push(MeetingRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            members: members.to_vec(),
+            created_ms: now_ms(),
+            messages: Vec::new(),
+        });
+        self.save(master)?;
+        Ok(true)
+    }
+
+    /// Append one message to a meeting. Returns `false` when the meeting is
+    /// unknown, so a caller can tell "no such meeting" from "written".
+    pub fn append_meeting_message(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        meeting_id: &str,
+        outgoing: bool,
+        from: Option<&str>,
+        body: &str,
+    ) -> Result<bool, Error> {
+        let Some(meeting) = self.file.meetings.iter_mut().find(|m| m.id == meeting_id) else {
+            return Ok(false);
+        };
+        meeting.messages.push(MeetingMessage {
+            id: Uuid::new_v4().to_string(),
+            outgoing,
+            from: from.map(|f| f.to_string()),
+            body: body.to_string(),
+            ts_ms: now_ms(),
+        });
+        self.save(master)?;
+        Ok(true)
+    }
+
+    /// Add a member nickname to a meeting if it is not already there. Returns
+    /// whether anything changed.
+    pub fn add_meeting_member(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        meeting_id: &str,
+        nickname: &str,
+    ) -> Result<bool, Error> {
+        let Some(meeting) = self.file.meetings.iter_mut().find(|m| m.id == meeting_id) else {
+            return Ok(false);
+        };
+        if meeting.members.iter().any(|m| m == nickname) {
+            return Ok(false);
+        }
+        meeting.members.push(nickname.to_string());
+        self.save(master)?;
+        Ok(true)
+    }
+
+    /// Remove a member nickname from a meeting. Returns whether anything changed.
+    pub fn remove_meeting_member(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        meeting_id: &str,
+        nickname: &str,
+    ) -> Result<bool, Error> {
+        let Some(meeting) = self.file.meetings.iter_mut().find(|m| m.id == meeting_id) else {
+            return Ok(false);
+        };
+        let before = meeting.members.len();
+        meeting.members.retain(|m| m != nickname);
+        if meeting.members.len() == before {
             return Ok(false);
         }
         self.save(master)?;

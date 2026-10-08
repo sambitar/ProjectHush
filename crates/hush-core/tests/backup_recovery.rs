@@ -40,8 +40,8 @@ async fn export_vault_contains_lockfile() {
 }
 
 /// A backup is the thing we hand to another device, so it must not carry this
-/// device's identity private key. That is what makes a linked device revocable:
-/// a device holding our identity key could impersonate us forever.
+/// device's identity private key. A device holding our identity key could
+/// impersonate us forever, and the key is what anchors every grant we sign.
 #[tokio::test]
 async fn backup_excludes_device_key_material() {
     let dir = TempDir::new().unwrap();

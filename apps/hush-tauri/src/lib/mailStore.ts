@@ -1,4 +1,5 @@
 import type { ChatRecordDto } from "./api/types";
+import { htmlToText } from "./richText";
 
 /** The Mail sidebar. Order is display order. */
 export type MailFolder =
@@ -27,6 +28,13 @@ export interface MailMessage {
   createdAt: number;
   /** `queued` is mail the relay refused; the daemon retries it from the Outbox. */
   state: "sent" | "queued";
+  /**
+   * Set when this went to an address with no Hush account.
+   *
+   * The delivery id is what the pickup link is rebuilt from, so a sender can
+   * re-share a link they lost without re-sending the message.
+   */
+  external?: { to: string; deliveryId: string; expiresUnix: number };
 }
 
 export interface MailDraft {
@@ -65,9 +73,40 @@ export function emptyFlags(): MailFlags {
 let messages: MailMessage[] = [];
 let drafts: MailDraft[] = [];
 
+/**
+ * Contact nicknames currently in the vault's contact list.
+ *
+ * Mail from someone who is no longer a contact stays in the encrypted log — a
+ * delete keeps history — but it must not surface in the Mail rail, or the
+ * removed person would still appear there. `null` means the list has not been
+ * loaded yet, in which case nothing is hidden.
+ */
+let knownContacts: Set<string> | null = null;
+
+export function setKnownContacts(nicks: string[]): void {
+  knownContacts = new Set(nicks);
+}
+
+/** Whether a message belongs to someone who is still a contact. */
+function fromKnownContact(m: MailMessage): boolean {
+  // A drop goes to a typed address, not a contact, so the contact list must not
+  // hide it.
+  if (m.external) return true;
+  return knownContacts === null || knownContacts.has(m.contactNick);
+}
+
+/** Whether a draft is addressed to someone who is still a contact. */
+function draftToKnownContact(d: MailDraft): boolean {
+  if (knownContacts === null) return true;
+  // A typed external address is not a contact nickname, so it is never hidden.
+  if (d.to.includes("@")) return true;
+  return knownContacts.has(d.to);
+}
+
 export function clearMailStore(): void {
   messages = [];
   drafts = [];
+  knownContacts = null;
 }
 
 function attachmentsOf(
@@ -102,6 +141,13 @@ export function loadMailbox(
       attachments: attachmentsOf(r.payload.attachments),
       createdAt: r.ts_ms,
       state: r.payload.state,
+      external: r.payload.external
+        ? {
+            to: r.payload.external.to,
+            deliveryId: r.payload.external.delivery_id,
+            expiresUnix: r.payload.external.expires_unix,
+          }
+        : undefined,
     });
   }
 
@@ -176,7 +222,7 @@ export function inFolder(
 /** Messages in a folder, newest first. */
 export function listFolder(folder: MailFolder, flags: MailFlags): MailMessage[] {
   return messages
-    .filter((m) => inFolder(m, folder, flags))
+    .filter((m) => inFolder(m, folder, flags) && fromKnownContact(m))
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
@@ -187,14 +233,14 @@ export function searchMessages(rows: MailMessage[], query: string): MailMessage[
     (m) =>
       m.contactNick.toLowerCase().includes(needle) ||
       (m.subject ?? "").toLowerCase().includes(needle) ||
-      m.body.toLowerCase().includes(needle),
+      htmlToText(m.body).toLowerCase().includes(needle),
   );
 }
 
 /** One conversation, oldest first — the order you read it in. */
 export function getThread(threadId: string): MailMessage[] {
   return messages
-    .filter((m) => m.threadId === threadId)
+    .filter((m) => m.threadId === threadId && fromKnownContact(m))
     .sort((a, b) => a.createdAt - b.createdAt);
 }
 
@@ -214,11 +260,17 @@ export function previewText(body: string, attachmentCount = 0): string {
 }
 
 export function preview(m: MailMessage): string {
-  return previewText(m.body, m.attachments.length);
+  return previewText(htmlToText(m.body), m.attachments.length);
+}
+
+export function draftPreview(d: MailDraft): string {
+  return previewText(htmlToText(d.body), d.attachments.length);
 }
 
 export function listDrafts(): MailDraft[] {
-  return [...drafts].sort((a, b) => b.updatedAt - a.updatedAt);
+  return drafts
+    .filter(draftToKnownContact)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 export function draftById(id: string): MailDraft | undefined {
@@ -226,13 +278,13 @@ export function draftById(id: string): MailDraft | undefined {
 }
 
 export function folderCount(folder: MailFolder, flags: MailFlags): number {
-  if (folder === "drafts") return drafts.length;
+  if (folder === "drafts") return listDrafts().length;
   return listFolder(folder, flags).length;
 }
 
 export function unreadCount(flags: MailFlags): number {
   return messages.filter(
-    (m) => inFolder(m, "inbox", flags) && isUnread(m, flags),
+    (m) => inFolder(m, "inbox", flags) && isUnread(m, flags) && fromKnownContact(m),
   ).length;
 }
 

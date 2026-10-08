@@ -31,6 +31,19 @@ export interface MailAttachmentDto {
   blob_id: string;
 }
 
+/**
+ * A drop: a message sent to an address with no Hush account.
+ *
+ * There is no contact and no session, so the record carries the typed address
+ * and the relay capability the pickup link is built from. The link itself is
+ * composed by the daemon, which knows the deployment's base URL.
+ */
+export interface ExternalMailDto {
+  to: string;
+  delivery_id: string;
+  expires_unix: number;
+}
+
 export interface ReceivedDto {
   from: string;
   kind: string;
@@ -62,6 +75,8 @@ export interface ChatRecordDto {
         attachments: { name: string; blob_id_hex: string; size: number }[];
         /** `queued` means the relay refused it and the Outbox is holding it. */
         state: "sent" | "queued";
+        /** Set when this went to a non-member address instead of a contact. */
+        external?: ExternalMailDto | null;
       }
     | {
         t: "draft";
@@ -87,12 +102,6 @@ export interface RecvResponse {
 
 export interface InviteResponse {
   invite: string;
-}
-
-export interface LinkDeviceStartResponse {
-  link_id: string;
-  expires_unix: number;
-  payload: string;
 }
 
 export interface ChatMessage {

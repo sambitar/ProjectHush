@@ -197,6 +197,33 @@ impl RelayClient {
         Ok(parsed.blobs.into_iter().map(|b| b.id).collect())
     }
 
+    /// List a queue, treating a missing or burned queue as empty.
+    ///
+    /// A per-contact queue that a delete has burned reports 403 (`Burned`), not
+    /// 404: the row is kept so the burn cannot be undone by re-creating the
+    /// queue with the same credential. Both mean the same thing to a drain —
+    /// there is nothing to read — so both are handled here rather than surfacing
+    /// as an error. A wrong-token failure is 401 and still errors.
+    pub async fn list_optional(&self, queue_id: &str, token: &str) -> Result<Vec<String>, Error> {
+        let res = self
+            .http
+            .get(format!("{}/q/{}", self.base, queue_id))
+            .header("authorization", Self::auth(token))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND
+            || res.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Ok(Vec::new());
+        }
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("list failed: {}", res.status())));
+        }
+        let parsed: ListResponse = res.json().await.map_err(|e| Error::Relay(e.to_string()))?;
+        Ok(parsed.blobs.into_iter().map(|b| b.id).collect())
+    }
+
     pub async fn get(
         &self,
         queue_id: &str,
@@ -235,9 +262,9 @@ impl RelayClient {
 
     /// Burn a queue so nothing more can be delivered to it.
     ///
-    /// Used on revocation: the revoked device's inbox is destroyed and its token
-    /// stops working, so anything a peer still has queued for it is dropped
-    /// rather than sitting on the relay for a device that should not receive it.
+    /// Used on revocation: the contact's inbox is destroyed and its token stops
+    /// working, so anything that contact still has queued is dropped rather than
+    /// sitting on the relay for someone who should no longer reach us.
     pub async fn report_queue(&self, queue_id: &str, token: &str) -> Result<(), Error> {
         let res = self
             .http
@@ -252,60 +279,77 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Publish an account's signed device list.
+    /// Burn a queue if it exists, treating a missing one as already gone.
     ///
-    /// No credential: the body carries device 1's signature and the relay checks
-    /// it against the account id, which is why revocation needs no rotation step.
-    pub async fn put_device_list(&self, account_id: &str, body: &[u8]) -> Result<(), Error> {
+    /// Revocation burns the queue for every contact, including ones that never
+    /// delivered. A queue that was never created has nothing to burn, and the
+    /// relay cannot distinguish "never created" from "already burned" — both
+    /// refuse — so a refusal here is not a failure the caller should act on.
+    pub async fn burn_if_exists(&self, queue_id: &str, token: &str) -> Result<(), Error> {
         let res = self
             .http
-            .put(format!("{}/d/{}", self.base, account_id))
+            .post(format!("{}/q/{}/report", self.base, queue_id))
+            .header("authorization", Self::auth(token))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND
+            || res.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Ok(());
+        }
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("report failed: {}", res.status())));
+        }
+        Ok(())
+    }
+
+    /// Park an outsider delivery container on the relay.
+    ///
+    /// No credential: the id is a capability the sender chose, and the body is
+    /// already ciphertext under a PIN the relay never sees.
+    pub async fn put_drop(&self, delivery_id: &str, body: &[u8]) -> Result<(), Error> {
+        let res = self
+            .http
+            .put(format!("{}/drop/{}", self.base, delivery_id))
             .body(body.to_vec())
             .send()
             .await
             .map_err(|e| Error::Relay(e.to_string()))?;
         if !res.status().is_success() {
-            return Err(Error::Relay(format!("device list put failed: {}", res.status())));
+            return Err(Error::Relay(format!("drop put failed: {}", res.status())));
         }
         Ok(())
     }
 
-    /// Fetch an account's signed device list, or `None` if it has none.
-    ///
-    /// Returns the signed bytes; the caller verifies them before trusting the
-    /// contents. A `404` is not a failure: an account that has never linked a
-    /// device has no list (the list is published lazily), and the caller's
-    /// invite already describes that account's one device.
-    pub async fn get_device_list(&self, account_id: &str) -> Result<Option<Vec<u8>>, Error> {
+    /// Fetch a delivery container. Used by the pickup page and by tests; the
+    /// member's own client does not read its own outgoing drops back.
+    pub async fn get_drop(&self, delivery_id: &str) -> Result<Vec<u8>, Error> {
         let res = self
             .http
-            .get(format!("{}/d/{}", self.base, account_id))
+            .get(format!("{}/drop/{}", self.base, delivery_id))
             .send()
             .await
             .map_err(|e| Error::Relay(e.to_string()))?;
-        if res.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
         if !res.status().is_success() {
-            return Err(Error::Relay(format!("device list get failed: {}", res.status())));
+            return Err(Error::Relay(format!("drop get failed: {}", res.status())));
         }
         res.bytes()
             .await
-            .map(|b| Some(b.to_vec()))
+            .map(|b| b.to_vec())
             .map_err(|e| Error::Relay(e.to_string()))
     }
 
-    /// Publish this device's prekey record so peers can open a session without an
-    /// invite.
-    pub async fn put_prekey_record(
-        &self,
-        account_id: &str,
-        device_id: u32,
-        body: &[u8],
-    ) -> Result<(), Error> {
+    /// Publish this account's prekey record so peers can open a session without
+    /// an invite.
+    ///
+    /// The record is keyed by account alone. An account has exactly one device,
+    /// so the `device_id` segment that used to distinguish them is gone; the
+    /// relay verifies the record's identity key against the account id instead.
+    pub async fn put_prekey_record(&self, account_id: &str, body: &[u8]) -> Result<(), Error> {
         let res = self
             .http
-            .put(format!("{}/k/{}/{}", self.base, account_id, device_id))
+            .put(format!("{}/k/{}", self.base, account_id))
             .body(body.to_vec())
             .send()
             .await
@@ -316,15 +360,11 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Fetch a device's prekey record, consuming one of its one-time prekeys.
-    pub async fn get_prekey_record(
-        &self,
-        account_id: &str,
-        device_id: u32,
-    ) -> Result<Vec<u8>, Error> {
+    /// Fetch an account's prekey record, consuming one of its one-time prekeys.
+    pub async fn get_prekey_record(&self, account_id: &str) -> Result<Vec<u8>, Error> {
         let res = self
             .http
-            .get(format!("{}/k/{}/{}", self.base, account_id, device_id))
+            .get(format!("{}/k/{}", self.base, account_id))
             .send()
             .await
             .map_err(|e| Error::Relay(e.to_string()))?;

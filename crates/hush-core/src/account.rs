@@ -6,10 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+
 use crate::backup::{export_vault, import_vault};
 use crate::chat_log::{ChatLog, ChatRecordPayload, MailAttachmentRecord, MailState};
-use crate::device::{DeviceKeys, LEGACY_DEVICE_FILE};
-use crate::device_list::{DeviceList, DeviceRecord};
+use crate::crypto::random_bytes;
+use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
+use crate::drop::{
+    decode_public_key, seal as seal_drop, seal_to_key as seal_drop_to_key, DropAttachment,
+    DropPackage,
+};
 use crate::prekey::PreKeyRecord;
 use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_files_exist, unwrap_master_with_recovery};
 use crate::crypto::{decrypt, encrypt};
@@ -20,18 +26,75 @@ use crate::payload::{MailAttachment, MessagePayload, MAX_INLINE_FILE_BYTES, MAX_
 use crate::relay_client::{normalize_relay_base, RelayClient};
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
-    process_contact_bundle, protocol_address, protocol_name_from_identity,
+    process_contact_bundle, protocol_address, protocol_name_from_identity, sign_queue_grant,
+    verify_queue_grant,
 };
 use crate::signal_persist::import_store;
 use crate::vault::{BlobId, Vault};
 use crate::wire::{decode_relay_blob, encode_relay_blob};
 
-/// How long a contact's cached device set is trusted before a send re-fetches it
-/// (Q5).
+/// How long a drop sits on the relay before it is purged.
 ///
-/// The window is what makes revocation eventual rather than instant: a peer may
-/// still encrypt to a device that was revoked inside this window.
-const DEVICE_LIST_TTL_SECS: u64 = 5 * 60;
+/// The recipient is told to open it soon, and the sender is told the expiry so
+/// they can re-share. A drop is not a mailbox: it is a handoff, and the window is
+/// part of the security argument against guessing the PIN offline.
+pub const DROP_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Shortest delivery PIN accepted.
+///
+/// The PIN is not the only lock: the container sits behind a 128-bit random
+/// capability, so brute-forcing it requires the link first. The PIN is what
+/// survives the link leaking — a forwarded email, a shared machine, a screenshot
+/// — and it is sent through a different channel for exactly that reason. Eight
+/// characters is a floor against a PIN so short that the second channel adds
+/// nothing; it is not a claim that a 8-character PIN is strong.
+pub const MIN_DROP_PIN_LEN: usize = 8;
+
+/// What happened to a drop: the relay capability and when it expires. The pickup
+/// link is not here on purpose — the base URL is deployment configuration, which
+/// belongs to the daemon, not to vault state.
+#[derive(Debug, Clone)]
+pub struct OutsiderOutcome {
+    pub delivery_id: String,
+    pub expires_unix: u64,
+}
+
+/// Whether a PIN clears the floor.
+///
+/// Counted in characters, not bytes, so a non-ASCII PIN is measured the way the
+/// person who chose it counts.
+fn pin_is_long_enough(pin: &str) -> bool {
+    pin.chars().count() >= MIN_DROP_PIN_LEN
+}
+
+/// Canonicalize a typed external address, or refuse it.
+///
+/// Deliberately conservative. This is not a full RFC 5322 parser; it rejects the
+/// shapes that are certainly wrong (no `@`, whitespace, no dot in the domain,
+/// two `@`) and returns the address lowercased and trimmed. The domain is not
+/// required to resolve: DNS is the sender's problem, and refusing an unusual but
+/// valid address would be worse than accepting one that bounces.
+fn normalize_external_address(input: &str) -> Result<String, Error> {
+    let addr = input.trim().to_ascii_lowercase();
+    if addr.is_empty() || addr.len() > 320 || addr.contains(char::is_whitespace) {
+        return Err(Error::InvalidAddress);
+    }
+    let mut parts = addr.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(Error::InvalidAddress);
+    };
+    if local.is_empty()
+        || local.len() > 64
+        || domain.len() < 3
+        || !domain.contains('.')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+    {
+        return Err(Error::InvalidAddress);
+    }
+    Ok(addr)
+}
 
 /// What happened to a mail send: which thread it belongs to, and whether the
 /// relay actually took it.
@@ -84,69 +147,44 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// One device belonging to a contact.
+/// A contact: one account, one device.
 ///
-/// This is the routing projection of a device-list entry: enough to deliver to
-/// that device, plus the identity key the account vouched for, so a session is
-/// only ever built against a key that device 1 signed for. Registration ids and
-/// prekey material are deliberately absent — they arrive in the prekey bundle
-/// fetched at session setup, and keeping a second copy here would be state that
-/// can go stale.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContactDevice {
-    pub device_id: u32,
-    /// The device's identity key, from the device-1-signed list (or the invite,
-    /// for the first device).
-    pub identity_key: Vec<u8>,
-    /// That device's relay inbox.
-    pub queue_id: String,
-    pub queue_token: String,
-    /// When the account signed this device into its list.
-    ///
-    /// Carried through a republish rather than recomputed: the date a device
-    /// joined is a fact about that device, and overwriting it on every list
-    /// write would make a device that linked a year ago look like it just did.
-    /// `0` for a device known only from an invite, which has no list entry yet.
-    #[serde(default)]
-    pub added_unix: u64,
-}
-
+/// The routing details the send path needs live here directly. Before
+/// multi-device a contact was a *set* of devices learned from a signed device
+/// list; that dimension is gone, so the device-1 entry of an old set is folded
+/// into these fields on read.
 #[derive(Clone, Debug, Serialize)]
 pub struct Contact {
     pub nickname: String,
-    /// Device 1's identity key hash, which is what the peer pinned when the
-    /// invite was exchanged. Every device of the account shares it.
+    /// The contact's account id: the hash of the identity key they pinned when
+    /// the invite was exchanged. This is the whole routing identity now.
     pub account_id: String,
-    /// Every device we know this contact has.
+    /// The contact's identity public key, learned from their invite.
     ///
-    /// Before multi-device a contact *was* one device with the details stored
-    /// inline; that shape is folded into a one-device set on read, so an
-    /// existing vault upgrades silently.
-    pub devices: Vec<ContactDevice>,
+    /// This is the authority a [`MessagePayload::QueueGrant`] is verified
+    /// against: the invite is what established the relationship, so its key is
+    /// trusted, and the grant signature proves the sender holds the matching
+    /// private key.
+    pub identity_key: Vec<u8>,
+    /// The contact's relay inbox: their **grant channel**, and where messages go
+    /// until they grant us a per-contact queue.
+    pub queue_id: String,
+    pub queue_token: String,
+    /// The per-contact queue this contact granted us, if it has.
+    ///
+    /// Set from a verified [`MessagePayload::QueueGrant`]. When present, a send
+    /// delivers here instead of to the contact's inbox, which is what makes
+    /// deleting the contact able to burn exactly this queue and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_queue_token: Option<String>,
     /// This contact's chosen mail handle (local part only), learned from their
     /// invite. `None` for contacts added before mail, or who never set one.
     #[serde(default)]
     pub mail_handle: Option<String>,
     /// True after we successfully received at least one message from them (they added our invite).
     pub inbound_ready: bool,
-    /// When `devices` was last confirmed against the relay's signed list.
-    ///
-    /// `0` means "never fetched", which is the state every contact starts in:
-    /// an invite describes one device and the rest are learned from the list.
-    /// Peers refresh on a TTL rather than per send (Q5), so this is a cache
-    /// timestamp, not a message ordering value.
-    #[serde(default)]
-    pub devices_fetched_unix: u64,
-}
-
-impl Contact {
-    /// The device we deliver to when we have no reason to prefer another.
-    pub fn primary_device(&self) -> Option<&ContactDevice> {
-        self.devices
-            .iter()
-            .find(|d| d.device_id == 1)
-            .or_else(|| self.devices.first())
-    }
 }
 
 impl<'de> Deserialize<'de> for Contact {
@@ -154,21 +192,52 @@ impl<'de> Deserialize<'de> for Contact {
     where
         D: serde::Deserializer<'de>,
     {
-        /// The stored shapes. `Current` needs `devices`, `Legacy` needs
-        /// `queue_id`, so the two cannot be confused for one another.
+        /// One entry of a pre-single-device contact's `devices` array.
+        #[derive(Deserialize)]
+        struct LegacyDevice {
+            device_id: u32,
+            identity_key: Vec<u8>,
+            queue_id: String,
+            queue_token: String,
+            #[serde(default)]
+            delivery_queue_id: Option<String>,
+            #[serde(default)]
+            delivery_queue_token: Option<String>,
+        }
+
+        /// The stored shapes.
+        ///
+        /// `Flat` is what this build writes. `Devices` is the multi-device
+        /// shape: the device-1 entry becomes the contact. `Legacy` is the
+        /// pre-multi-device inline shape, where `protocol_name` *was* the
+        /// identity key hash, so the key is recovered by decoding it rather than
+        /// being lost.
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Repr {
-            Current {
+            Flat {
                 nickname: String,
                 account_id: String,
-                devices: Vec<ContactDevice>,
+                identity_key: Vec<u8>,
+                queue_id: String,
+                queue_token: String,
+                #[serde(default)]
+                delivery_queue_id: Option<String>,
+                #[serde(default)]
+                delivery_queue_token: Option<String>,
                 #[serde(default)]
                 mail_handle: Option<String>,
                 #[serde(default)]
                 inbound_ready: bool,
+            },
+            Devices {
+                nickname: String,
+                account_id: String,
+                devices: Vec<LegacyDevice>,
                 #[serde(default)]
-                devices_fetched_unix: u64,
+                mail_handle: Option<String>,
+                #[serde(default)]
+                inbound_ready: bool,
             },
             Legacy {
                 nickname: String,
@@ -183,21 +252,52 @@ impl<'de> Deserialize<'de> for Contact {
         }
 
         Ok(match Repr::deserialize(deserializer)? {
-            Repr::Current {
+            Repr::Flat {
                 nickname,
                 account_id,
-                devices,
+                identity_key,
+                queue_id,
+                queue_token,
+                delivery_queue_id,
+                delivery_queue_token,
                 mail_handle,
                 inbound_ready,
-                devices_fetched_unix,
             } => Contact {
                 nickname,
                 account_id,
+                identity_key,
+                queue_id,
+                queue_token,
+                delivery_queue_id,
+                delivery_queue_token,
+                mail_handle,
+                inbound_ready,
+            },
+            Repr::Devices {
+                nickname,
+                account_id,
                 devices,
                 mail_handle,
                 inbound_ready,
-                devices_fetched_unix,
-            },
+            } => {
+                // Keep the entry that used to be device 1 (or the first), so the
+                // queue the contact is actually reachable on is not dropped.
+                let primary = devices
+                    .into_iter()
+                    .find(|d| d.device_id == DEVICE_ID)
+                    .ok_or_else(|| serde::de::Error::custom("contact has no device 1"))?;
+                Contact {
+                    nickname,
+                    account_id,
+                    identity_key: primary.identity_key,
+                    queue_id: primary.queue_id,
+                    queue_token: primary.queue_token,
+                    delivery_queue_id: primary.delivery_queue_id,
+                    delivery_queue_token: primary.delivery_queue_token,
+                    mail_handle,
+                    inbound_ready,
+                }
+            }
             Repr::Legacy {
                 nickname,
                 protocol_name,
@@ -206,26 +306,17 @@ impl<'de> Deserialize<'de> for Contact {
                 mail_handle,
                 inbound_ready,
             } => {
-                // A pre-multi-device contact was exactly one device, and its
-                // `protocol_name` was that device's identity key hash. So the
-                // identity key is recovered by decoding it rather than being
-                // lost, and no re-invite is needed.
                 let identity_key = hex::decode(&protocol_name).unwrap_or_default();
                 Contact {
                     nickname,
                     account_id: protocol_name,
-                    devices: vec![ContactDevice {
-                        device_id: 1,
-                        identity_key,
-                        queue_id,
-                        queue_token,
-                        added_unix: 0,
-                    }],
+                    identity_key,
+                    queue_id,
+                    queue_token,
+                    delivery_queue_id: None,
+                    delivery_queue_token: None,
                     mail_handle,
                     inbound_ready,
-                    // The legacy shape had no list to fetch from, so this is
-                    // "never confirmed" and the next send will refresh it.
-                    devices_fetched_unix: 0,
                 }
             }
         })
@@ -254,17 +345,24 @@ struct AccountState {
     /// not device material: it is a label, and a restored vault should keep it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mail_handle: Option<String>,
-    /// This account's *other* devices, as learned from its own published device
-    /// list. Empty for a single-device account, which is why the own-device copy
-    /// costs nothing when multi-device is not in use.
+    /// Account ids whose contact was deleted.
+    ///
+    /// Deleting a contact burns the one per-contact queue it delivered into, so
+    /// this is not what makes a revocation happen. It stays because a deleted
+    /// contact still holds the invite token for the shared inbox, and a legacy
+    /// blob that names its sender could otherwise be decrypted and surfaced: an
+    /// id here drops those stragglers. It also re-drives the burn if the relay
+    /// was down when the delete ran. Removing the signature check on
+    /// [`Account::apply_queue_grant`] would be the thing that re-opens a
+    /// revocation; removing this list would not.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    own_devices: Vec<ContactDevice>,
+    revoked: Vec<String>,
 }
 
 pub struct Account {
     vault: Vault,
-    /// This device's own keys and relay inbox, kept out of the shared vault so
-    /// it is never handed to another device.
+    /// This account's own keys and relay inbox, kept out of the shared vault so
+    /// an exported backup never carries the identity private key.
     device: DeviceKeys,
     state: AccountState,
     dir: PathBuf,
@@ -277,9 +375,8 @@ impl Account {
         let relay = normalize_relay_base(relay)?;
         let vault = Vault::create(dir, passphrase)?;
         let master = *vault.master_key();
-        let mut device = DeviceKeys::create(dir, &master, 1).await?;
-        let device_id = device.device_id();
-        let _bundle = mint_prekey_bundle(device.store_mut(), device_id).await?;
+        let mut device = DeviceKeys::create(dir, &master).await?;
+        let _bundle = mint_prekey_bundle(device.store_mut(), DEVICE_ID).await?;
         let protocol_name = protocol_name_from_identity(
             &device
                 .store_mut()
@@ -297,7 +394,7 @@ impl Account {
             receive_queue_id: None,
             receive_queue_token: None,
             mail_handle: None,
-            own_devices: Vec::new(),
+            revoked: Vec::new(),
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
@@ -356,7 +453,7 @@ impl Account {
                 // identity private key to another device. Mint a new device
                 // identity so the restored vault is usable.
                 fresh_device = true;
-                DeviceKeys::create(dir, &master, 1).await?
+                DeviceKeys::create(dir, &master).await?
             }
             Err(e) => return Err(e),
         };
@@ -364,9 +461,10 @@ impl Account {
         let chat_log = ChatLog::load(dir, &master)?;
 
         // A rotated queue invalidates any cached invite, which names the old
-        // inbox. The device list also has to be republished for peers to find
-        // the new one; that needs the relay, so it is left to the caller rather
-        // than done here, where open must stay offline-capable.
+        // inbox. There is no device list to republish, so the only way peers
+        // learn the new inbox is a fresh invite: clearing the cache here makes
+        // the next `invite()` mint one. That needs no relay, which keeps open
+        // offline-capable.
         let queue_rotated = device.queue_rotated();
         if queue_rotated {
             state.invite_cache = None;
@@ -523,43 +621,45 @@ impl Account {
         }
         let bundle = payload.to_prekey_bundle()?;
         let local_name = self.state.protocol_name.clone();
-        let local_id = self.device.device_id();
         process_contact_bundle(
             self.device.store_mut(),
             &local_name,
-            local_id,
             &payload.protocol_name,
-            payload.device_id,
             &bundle,
         )
         .await?;
         self.state.contacts.push(Contact {
             nickname: nickname.to_string(),
             account_id: payload.protocol_name.clone(),
-            // An invite is exchanged with exactly one device, so a new contact
-            // starts as a one-device set. Any other devices arrive when we
-            // refresh the list from the relay.
-            devices: vec![ContactDevice {
-                device_id: payload.device_id,
-                identity_key: payload.identity_key.clone(),
-                queue_id: payload.queue_id,
-                queue_token: payload.queue_token,
-                // The invite is not the signed list, so there is no signed
-                // "added" date to carry. The list refresh fills it in.
-                added_unix: 0,
-            }],
+            identity_key: payload.identity_key.clone(),
+            queue_id: payload.queue_id,
+            queue_token: payload.queue_token,
+            // No grant yet: the contact has not told us where it wants our
+            // messages for it, so until it does we deliver to its inbox.
+            delivery_queue_id: None,
+            delivery_queue_token: None,
             mail_handle: payload.handle.clone(),
             inbound_ready: false,
-            devices_fetched_unix: 0,
         });
+        // Adding a contact clears any revocation left from a previous delete, so
+        // a re-added contact is granted a queue again instead of being treated
+        // as still blocked.
+        self.state.revoked.retain(|a| a != &payload.protocol_name);
         self.save().await?;
-        // The invite only describes the one device that minted it. If the
-        // account has linked others, this is where we find out — and if it has
-        // not, the list is absent and the invite was the whole story.
-        let _ = self.refresh_contact_devices(nickname).await;
+        // Hand this account's per-contact queue to the contact, which is what
+        // makes deleting them revocable. Best effort: the next drain re-grants
+        // if the relay was down.
+        if let Err(e) = self.grant_queues_to(nickname).await {
+            eprintln!("hush: could not grant a queue to {nickname}: {e}");
+        }
         Ok(())
     }
 
+    /// Forget a contact without revoking it.
+    ///
+    /// Used where a contact must simply stop being surfaced (and by the older
+    /// callers). [`Account::revoke_contact`] is the one that also burns the
+    /// contact's queues, and is what the Trusts delete flow calls.
     pub async fn remove_contact(&mut self, nickname: &str) -> Result<(), Error> {
         let pos = self
             .state
@@ -569,6 +669,74 @@ impl Account {
             .ok_or(Error::ContactNotFound)?;
         self.state.contacts.remove(pos);
         self.save().await?;
+        Ok(())
+    }
+
+    /// Delete a contact and revoke its ability to deliver to this account.
+    ///
+    /// This burns the per-contact queue the contact was handed, so there is no
+    /// queue left for it to deliver into. The contact's account id is recorded
+    /// so the shared inbox cannot be used as a bypass (see
+    /// [`AccountState::revoked`]).
+    ///
+    /// It does **not** burn this account's inbox. The inbox is shared by every
+    /// contact, so burning it would cut off everyone at once, and a contact that
+    /// has not yet picked up its grant still delivers there. That is the
+    /// migration limit: a contact is fully revoked once it is on its per-contact
+    /// queue.
+    pub async fn revoke_contact(&mut self, nickname: &str) -> Result<(), Error> {
+        let pos = self
+            .state
+            .contacts
+            .iter()
+            .position(|c| c.nickname == nickname)
+            .ok_or(Error::ContactNotFound)?;
+        let account_id = self.state.contacts[pos].account_id.clone();
+        self.state.contacts.remove(pos);
+        if !self.state.revoked.contains(&account_id) {
+            self.state.revoked.push(account_id.clone());
+        }
+        self.save().await?;
+        self.burn_contact_queue(&account_id).await?;
+        Ok(())
+    }
+
+    /// Burn this device's per-contact queue for one account.
+    ///
+    /// Best effort on a queue that was never created: there is nothing to burn,
+    /// and the relay reports that the same way it reports an already-burned
+    /// queue. A relay failure is returned so the caller can decide; the local
+    /// revocation is already recorded, so the next drain re-drives it.
+    async fn burn_contact_queue(&self, account_id: &str) -> Result<(), Error> {
+        let relay = RelayClient::try_new(&self.state.relay)?;
+        relay
+            .burn_if_exists(
+                &self.device.contact_queue_id(account_id),
+                &self.device.contact_queue_read_token(account_id),
+            )
+            .await
+    }
+
+    /// Re-drive the burns for every revoked contact.
+    ///
+    /// A delete burns immediately; if the relay was down the record is already
+    /// saved, so this runs before a drain and burns whatever is still live.
+    /// Burning is idempotent, so a contact whose queue is already gone is a
+    /// no-op. An account id stays in the revoked set afterwards: it is also the
+    /// filter that drops stragglers sent to the shared inbox.
+    async fn burn_revoked_queues(&mut self) -> Result<(), Error> {
+        if self.state.revoked.is_empty() {
+            return Ok(());
+        }
+        let revoked = self.state.revoked.clone();
+        for account_id in revoked {
+            if let Err(e) = self.burn_contact_queue(&account_id).await {
+                eprintln!(
+                    "hush: could not burn revoked queue for {}: {e}",
+                    short_name(&account_id)
+                );
+            }
+        }
         Ok(())
     }
 
@@ -703,9 +871,108 @@ impl Account {
         })
     }
 
-    /// Attempt delivery of every queued message again, marking the ones the
-    /// relay accepts as `Sent`. Returns how many went out.
+    /// Seal a message for someone who has no Hush account and park it on the
+    /// relay.
     ///
+    /// This is not mail. There is no session, no ratchet and no contact: the
+    /// recipient has no keys at all, so the only thing between the relay and the
+    /// plaintext is the PIN the sender shares out of band. That is a weaker bound
+    /// than member-to-member mail, and it is the bound the product chose.
+    ///
+    /// The returned `delivery_id` is the relay capability. The pickup link is
+    /// composed by the caller, which knows the deployment's base URL; keeping it
+    /// out of here keeps configuration out of vault state.
+    pub async fn send_to_outsider(
+        &mut self,
+        to: &str,
+        subject: &str,
+        body: &str,
+        attachments: &[(String, Vec<u8>)],
+        pin: &str,
+    ) -> Result<OutsiderOutcome, Error> {
+        let to = normalize_external_address(to)?;
+        check_drop_attachments(attachments)?;
+        if !pin_is_long_enough(pin) {
+            return Err(Error::WeakPin);
+        }
+        let package = build_drop_package(subject, body, attachments);
+        let container = seal_drop(&package, pin)?;
+        self.upload_drop(&to, subject, body, attachments, container)
+            .await
+    }
+
+    /// Seal a message to the recipient's X25519 public key and park it on the
+    /// relay.
+    ///
+    /// The second drop mode: no PIN is exchanged. The recipient publishes a
+    /// public key out of band (a news channel, a support page), the sender pastes
+    /// it, and only the matching private key opens the container. There is no PIN
+    /// parameter here on purpose — the key is the whole secret, and a caller
+    /// cannot accidentally attach one.
+    ///
+    /// Like the PIN mode this is anonymous: the container carries no sender key
+    /// and no signature, so it says nothing about who sent it.
+    pub async fn send_to_outsider_with_key(
+        &mut self,
+        to: &str,
+        subject: &str,
+        body: &str,
+        attachments: &[(String, Vec<u8>)],
+        public_key: &str,
+    ) -> Result<OutsiderOutcome, Error> {
+        let to = normalize_external_address(to)?;
+        check_drop_attachments(attachments)?;
+        let key = decode_public_key(public_key)?;
+        let package = build_drop_package(subject, body, attachments);
+        let container = seal_drop_to_key(&package, &key)?;
+        self.upload_drop(&to, subject, body, attachments, container)
+            .await
+    }
+
+    /// The plumbing both drop modes share: put the sealed container on the relay
+    /// under a fresh capability, then file the sender's own copy.
+    ///
+    /// Split out so the PIN and public-key paths cannot drift: everything after
+    /// the seal — the capability, the relay upload, the vault copy, the log
+    /// record — is identical for both, and only the container bytes differ.
+    async fn upload_drop(
+        &mut self,
+        to: &str,
+        subject: &str,
+        body: &str,
+        attachments: &[(String, Vec<u8>)],
+        container: Vec<u8>,
+    ) -> Result<OutsiderOutcome, Error> {
+        // A 128-bit random capability. This is the only access control on the
+        // delivery, so it must not be derived from anything guessable.
+        let delivery_id = hex::encode(random_bytes::<16>());
+        let relay = RelayClient::try_new(&self.state.relay)?;
+        relay.put_drop(&delivery_id, &container).await?;
+
+        // Stored as vault blobs as well, so the sender's own Sent copy can show
+        // and re-open what they sent. `put_blob` is content-addressed, so this is
+        // idempotent.
+        let records = self.store_attachments(attachments)?;
+        let expires_unix = now_ms() / 1000 + DROP_TTL_SECS;
+        let master = *self.vault.master_key();
+        self.chat_log.append_external_mail(
+            &master,
+            to,
+            &delivery_id,
+            expires_unix,
+            subject,
+            body,
+            &records,
+        )?;
+
+        Ok(OutsiderOutcome {
+            delivery_id,
+            expires_unix,
+        })
+    }
+
+    /// Attempt delivery of every queued message again, marking the ones the
+    /// relay accepts as `Sent`. Returns how many went out.    ///
     /// The daemon calls this on a timer while the vault is unlocked. A message
     /// that fails again simply stays queued, and one whose attachment blob has
     /// gone missing is left alone rather than silently emptied.
@@ -722,6 +989,9 @@ impl Account {
                     body,
                     attachments,
                     state: MailState::Queued,
+                    // Only internal mail queues. A drop is either on the relay or
+                    // the send failed outright, so it never reaches an Outbox.
+                    external: None,
                 } if r.outgoing => Some(QueuedMail {
                     id: r.id.clone(),
                     contact: r.contact_nick.clone(),
@@ -780,6 +1050,7 @@ impl Account {
                     body: mail.body,
                     attachments: mail.attachments,
                     state: MailState::Sent,
+                    external: None,
                 },
                 now_ms(),
             )?;
@@ -900,13 +1171,10 @@ impl Account {
     }
 
     pub async fn contact_is_online(&self, nickname: &str) -> Result<bool, Error> {
-        let contact = self
-            .find_contact(nickname)
-            .ok_or(Error::ContactNotFound)?;
-        let device = contact.primary_device().ok_or(Error::Corrupt)?;
+        let contact = self.find_contact(nickname).ok_or(Error::ContactNotFound)?;
         let relay = RelayClient::try_new(&self.state.relay)?;
         relay
-            .contact_presence_online(&device.queue_id, &device.queue_token)
+            .contact_presence_online(&contact.queue_id, &contact.queue_token)
             .await
     }
 
@@ -923,9 +1191,6 @@ impl Account {
         payload: MessagePayload,
         require_online: bool,
     ) -> Result<(), Error> {
-        // A linked device that joined since we last looked has to be in the
-        // device set before we encrypt, or it silently misses the message.
-        self.refresh_contact_devices_if_stale(nickname).await?;
         let contact = self
             .find_contact(nickname)
             .ok_or(Error::ContactNotFound)?
@@ -934,79 +1199,116 @@ impl Account {
             return Err(Error::ContactOffline);
         }
 
-        // One independent session per recipient device. libsignal has no group
-        // object, so N devices means N ciphertexts and N queue puts.
         let plain = payload.encode()?;
-        for device in contact.devices.clone() {
-            self.deliver(&contact.account_id, &device, &plain).await?;
-        }
-
-        // A copy to our own other devices, so a linked device shows what this one
-        // sent (Q6). Skipped entirely for a single-device account, which is every
-        // account that has not linked one.
-        let others: Vec<ContactDevice> = self
-            .state
-            .own_devices
-            .iter()
-            .filter(|d| d.device_id != self.device.device_id())
-            .cloned()
-            .collect();
-        if !others.is_empty() {
-            let copy = MessagePayload::OwnCopy {
-                to_account_id: contact.account_id.clone(),
-                inner: Box::new(payload),
-            }
-            .encode()?;
-            let own_account = self.state.protocol_name.clone();
-            for device in others {
-                self.deliver(&own_account, &device, &copy).await?;
-            }
-        }
-
+        self.deliver(&contact, &plain).await?;
         self.save().await?;
         Ok(())
     }
 
-    /// Encrypt to one device and put the ciphertext in its queue, opening a
-    /// session first if there is not one.
-    async fn deliver(
+    /// Encrypt to a contact and put the ciphertext in the right queue.
+    ///
+    /// The queue is the contact's granted per-contact queue when there is one,
+    /// and its inbox otherwise. The inbox fallback is what keeps a contact that
+    /// has not been granted a queue (a pre-existing contact, or one whose grant
+    /// has not arrived) working, at the cost that such a contact cannot be
+    /// revoked without burning the shared inbox.
+    async fn deliver(&mut self, contact: &Contact, plain: &[u8]) -> Result<(), Error> {
+        let (queue_id, queue_token) = match (
+            contact.delivery_queue_id.as_deref(),
+            contact.delivery_queue_token.as_deref(),
+        ) {
+            (Some(id), Some(token)) => (id, token),
+            _ => (contact.queue_id.as_str(), contact.queue_token.as_str()),
+        };
+        self.deliver_to(contact, queue_id, queue_token, plain).await
+    }
+
+    /// Encrypt to a contact and put the ciphertext in a named queue.
+    ///
+    /// Split from [`Account::deliver`] so a queue grant can be sent to the
+    /// contact's *inbox* even when a per-contact delivery queue is already
+    /// known: the grant is what establishes that queue, so it must not be sent
+    /// to it.
+    async fn deliver_to(
         &mut self,
-        account_id: &str,
-        device: &ContactDevice,
+        contact: &Contact,
+        queue_id: &str,
+        queue_token: &str,
         plain: &[u8],
     ) -> Result<(), Error> {
-        self.ensure_session(account_id, device).await?;
+        self.ensure_session(&contact.account_id, &contact.identity_key)
+            .await?;
         let local_name = self.state.protocol_name.clone();
-        let local_id = self.device.device_id();
         let ct = encrypt_message(
             self.device.store_mut(),
             &local_name,
-            local_id,
-            account_id,
-            device.device_id,
+            &contact.account_id,
             plain,
         )
         .await?;
         let body = encode_relay_blob(&ct);
         let relay = RelayClient::try_new(&self.state.relay)?;
-        relay
-            .put(&device.queue_id, &device.queue_token, &body)
-            .await?;
+        relay.put(queue_id, queue_token, &body).await?;
         Ok(())
     }
 
-    /// Make sure a session with one device exists, opening one from its published
+    /// Send this device's per-contact queue grant to a contact.
+    ///
+    /// The grant tells the contact where to deliver this account's messages for
+    /// it, which is what makes deleting the contact able to burn exactly that
+    /// queue. Sent to the contact's **inbox**, which is the grant channel, never
+    /// to a delivery queue.
+    async fn grant_queues_to(&mut self, nickname: &str) -> Result<(), Error> {
+        let contact = self
+            .find_contact(nickname)
+            .ok_or(Error::ContactNotFound)?
+            .clone();
+        // A revoked account is not granted a queue again even if a stale contact
+        // record still names it. This is a shortcut, not the security boundary:
+        // the grant is verified by its signature on the far side anyway (see
+        // `apply_queue_grant`). Not sending it saves a pointless delivery.
+        if self.state.revoked.contains(&contact.account_id) {
+            return Ok(());
+        }
+        let queue_id = self.device.contact_queue_id(&contact.account_id);
+        let delivery_token = self.device.contact_queue_delivery_token(&contact.account_id);
+        let key = self.device.identity_key_pair().await?;
+        let signature = sign_queue_grant(&key, &queue_id, &delivery_token)?;
+        let plain = MessagePayload::QueueGrant {
+            queue_id,
+            delivery_token,
+            signature,
+        }
+        .encode()?;
+
+        // The grant channel is the contact's inbox; the grant must not be sent
+        // to a per-contact queue, which the recipient may not have bound yet.
+        if let Err(e) = self
+            .deliver_to(&contact, &contact.queue_id, &contact.queue_token, &plain)
+            .await
+        {
+            eprintln!(
+                "hush: grant to {} failed: {e}",
+                short_name(&contact.account_id)
+            );
+        }
+        // Encrypting the grant advances the session ratchet. Persist it here:
+        // otherwise a caller that exits right after adding a contact (the CLI)
+        // leaves the ratchet on disk at its pre-grant position, and the next
+        // message is encrypted with a reused chain key that the peer cannot
+        // decrypt. The daemon masks this by saving again on its next send.
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Make sure a session with a contact exists, opening one from its published
     /// prekey record if not.
     ///
-    /// The fetched record is checked against the identity key the account's
-    /// signed device list vouched for. Without that check a relay could serve a
-    /// bundle for a key it controls and read everything sent to that device.
-    async fn ensure_session(
-        &mut self,
-        account_id: &str,
-        device: &ContactDevice,
-    ) -> Result<(), Error> {
-        let remote = protocol_address(account_id, device.device_id)?;
+    /// The fetched record is checked against the identity key the contact pinned
+    /// in their invite. Without that check a relay could serve a bundle for a key
+    /// it controls and read everything sent to that contact.
+    async fn ensure_session(&mut self, account_id: &str, identity_key: &[u8]) -> Result<(), Error> {
+        let remote = protocol_address(account_id)?;
         if self
             .device
             .store_mut()
@@ -1020,422 +1322,117 @@ impl Account {
         }
 
         let relay = RelayClient::try_new(&self.state.relay)?;
-        let bytes = relay
-            .get_prekey_record(account_id, device.device_id)
-            .await?;
+        let bytes = relay.get_prekey_record(account_id).await?;
         let record = PreKeyRecord::decode(&bytes)?;
-        record.verify(&device.identity_key)?;
+        record.verify(identity_key)?;
         let bundle = record.to_prekey_bundle()?;
 
         let local_name = self.state.protocol_name.clone();
-        let local_id = self.device.device_id();
-        process_contact_bundle(
-            self.device.store_mut(),
-            &local_name,
-            local_id,
-            account_id,
-            device.device_id,
-            &bundle,
-        )
-        .await
+        process_contact_bundle(self.device.store_mut(), &local_name, account_id, &bundle).await
     }
 
     /// Publish this device's prekey record, so a peer that has never exchanged an
     /// invite with it can still open a session.
+    ///
+    /// The minted private halves are saved with the device, not just held in
+    /// memory: the record on the relay is useless if the key that decrypts the
+    /// first message is lost on the next unlock.
     pub async fn publish_prekeys(&mut self, one_time_count: usize) -> Result<(), Error> {
         let record = self.device.mint_prekeys(one_time_count).await?;
+        self.save().await?;
         let body = record.encode()?;
         let relay = RelayClient::try_new(&self.state.relay)?;
         relay
-            .put_prekey_record(&self.state.protocol_name, self.device.device_id(), &body)
+            .put_prekey_record(&self.state.protocol_name, &body)
             .await?;
         Ok(())
-    }
-
-    /// Publish this account's device list, signed by device 1.
-    ///
-    /// Only device 1 can sign it (Q11), so this refuses from any other device
-    /// rather than producing a signature no peer would accept. Other devices are
-    /// carried over from what we already know, so republishing does not drop
-    /// them.
-    pub async fn publish_device_list(&mut self) -> Result<(), Error> {
-        if self.device.device_id() != 1 {
-            return Err(Error::NotSigningDevice);
-        }
-        let mut devices: Vec<DeviceRecord> = self
-            .state
-            .own_devices
-            .iter()
-            .filter(|d| d.device_id != self.device.device_id())
-            .map(|d| DeviceRecord {
-                device_id: d.device_id,
-                identity_key: d.identity_key.clone(),
-                registration_id: 0,
-                queue_id: d.queue_id.clone(),
-                queue_token: d.queue_token.clone(),
-                // Kept from the last list rather than reset, or a republish
-                // would redate every device to today.
-                added_unix: d.added_unix,
-            })
-            .collect();
-        // This device's own entry. The date is kept from the last list if we have
-        // already published one, so republishing does not redate device 1 either.
-        let self_added = self
-            .state
-            .own_devices
-            .iter()
-            .find(|d| d.device_id == self.device.device_id())
-            .map(|d| d.added_unix)
-            .filter(|at| *at > 0)
-            .unwrap_or_else(now_unix);
-        devices.push(DeviceRecord {
-            device_id: self.device.device_id(),
-            identity_key: self.device.identity_public().await?,
-            registration_id: self.device.registration_id().await?,
-            queue_id: self.device.queue_id().to_string(),
-            queue_token: self.device.queue_token(),
-            added_unix: self_added,
-        });
-
-        let key_pair = self.device.identity_key_pair().await?;
-        let signed = DeviceList::new(self.state.protocol_name.clone(), devices).sign(&key_pair)?;
-        let relay = RelayClient::try_new(&self.state.relay)?;
-        relay
-            .put_device_list(&self.state.protocol_name, &signed)
-            .await
-    }
-
-    /// Make sure the published device list names this device's current inbox.
-    ///
-    /// A rotated inbox is reachable by peers only through the published list.
-    /// [`DeviceKeys::queue_rotated`] covers the single unlock that performed the
-    /// rotation, and the publish there is best effort: if the relay is down, the
-    /// flag is already spent (the device file is rewritten on that same open), so
-    /// nothing ever retries and peers keep delivering to an inbox this device no
-    /// longer reads. Comparing against what is actually published instead of
-    /// trusting a one-shot flag makes the repair durable, and also heals a vault
-    /// whose publish was lost before this check existed.
-    ///
-    /// Only device 1 can sign the list (Q11); a linked device has no way to
-    /// republish its own inbox, so it is left alone here.
-    ///
-    /// Returns whether a publish was needed. A relay error is the caller's to
-    /// log: the next unlock retries.
-    pub async fn ensure_device_list_published(&mut self) -> Result<bool, Error> {
-        if self.device.device_id() != 1 {
-            return Ok(false);
-        }
-        // Also seeds `own_devices` with the stored `added_unix`, so republishing
-        // does not redate this device.
-        self.refresh_own_devices().await?;
-        if published_list_names_inbox(
-            &self.state.own_devices,
-            self.device.device_id(),
-            self.device.queue_id(),
-        ) {
-            return Ok(false);
-        }
-        self.publish_device_list().await?;
-        Ok(true)
-    }
-
-    /// Learn this account's own device set from the list published to the relay.
-    ///
-    /// The list is signed by device 1, so a relay cannot add a device to it and
-    /// have us deliver a copy of our own messages to a stranger. An absent list
-    /// is not an error: an account that has never linked a device has nothing to
-    /// publish (Q10), and this device is then the whole set.
-    pub async fn refresh_own_devices(&mut self) -> Result<usize, Error> {
-        let relay = RelayClient::try_new(&self.state.relay)?;
-        let Some(body) = relay.get_device_list(&self.state.protocol_name).await? else {
-            self.state.own_devices.clear();
-            self.save().await?;
-            return Ok(1);
-        };
-        let list = DeviceList::verify(&body, &self.state.protocol_name)?;
-        self.state.own_devices = list
-            .devices
-            .iter()
-            .map(|d| ContactDevice {
-                device_id: d.device_id,
-                identity_key: d.identity_key.clone(),
-                queue_id: d.queue_id.clone(),
-                queue_token: d.queue_token.clone(),
-                added_unix: d.added_unix,
-            })
-            .collect();
-        self.save().await?;
-        Ok(self.state.own_devices.len())
-    }
-
-    /// Pull a contact's device set from the relay's signed list.
-    ///
-    /// The list is signed by *their* device 1 and verified against the account
-    /// id we pinned when we exchanged invites, so a relay cannot add a device to
-    /// it and have us deliver to a key it controls. A `404` means they have
-    /// never linked a device: the invite we already hold stays the whole set, and
-    /// we record the check so we do not re-ask on every send.
-    ///
-    /// The queue and identity key of the device we already knew are kept when the
-    /// list agrees with the invite; a device the list *drops* is removed, which is
-    /// what makes a revocation take effect on our side.
-    pub async fn refresh_contact_devices(&mut self, nickname: &str) -> Result<usize, Error> {
-        let account_id = self
-            .find_contact(nickname)
-            .ok_or(Error::ContactNotFound)?
-            .account_id
-            .clone();
-
-        let relay = RelayClient::try_new(&self.state.relay)?;
-        let devices = match relay.get_device_list(&account_id).await? {
-            Some(body) => {
-                let list = DeviceList::verify(&body, &account_id)?;
-                list.devices
-                    .iter()
-                    .map(|d| ContactDevice {
-                        device_id: d.device_id,
-                        identity_key: d.identity_key.clone(),
-                        queue_id: d.queue_id.clone(),
-                        queue_token: d.queue_token.clone(),
-                        added_unix: d.added_unix,
-                    })
-                    .collect::<Vec<_>>()
-            }
-            None => {
-                // Nothing published. Keep what the invite gave us, but mark the
-                // check as done so this is not retried on every send.
-                let count = {
-                    let contact = self
-                        .state
-                        .contacts
-                        .iter_mut()
-                        .find(|c| c.nickname == nickname)
-                        .ok_or(Error::ContactNotFound)?;
-                    contact.devices_fetched_unix = now_unix();
-                    contact.devices.len()
-                };
-                self.save().await?;
-                return Ok(count);
-            }
-        };
-
-        if devices.is_empty() {
-            // A signed list with no devices is not a revocation of everyone —
-            // it is device 1 telling us it revoked itself, which Q11 forbids.
-            // Treat it as a broken list rather than silently dropping the
-            // contact's only way to receive.
-            return Err(Error::Corrupt);
-        }
-
-        let contact = self
-            .state
-            .contacts
-            .iter_mut()
-            .find(|c| c.nickname == nickname)
-            .ok_or(Error::ContactNotFound)?;
-        contact.devices = devices;
-        contact.devices_fetched_unix = now_unix();
-        let count = contact.devices.len();
-        self.save().await?;
-        Ok(count)
-    }
-
-    /// Refresh a contact's device set if the cached one has aged out (Q5).
-    ///
-    /// Called before a send, and by the daemon before it reports presence. Both
-    /// read the cached inbox: a contact whose queue has moved (the credential
-    /// split, or a newly linked device) would otherwise read as offline and stay
-    /// that way, because the UI refuses to send to a contact shown offline — so
-    /// the send that would have refreshed the cache never happens. A failure
-    /// here is deliberately not fatal: a relay hiccup should not stop a message
-    /// the devices we already know can receive.
-    pub async fn refresh_contact_devices_if_stale(&mut self, nickname: &str) -> Result<(), Error> {
-        let fetched = self
-            .find_contact(nickname)
-            .ok_or(Error::ContactNotFound)?
-            .devices_fetched_unix;
-        if now_unix().saturating_sub(fetched) < DEVICE_LIST_TTL_SECS {
-            return Ok(());
-        }
-        self.refresh_contact_devices(nickname).await?;
-        Ok(())
-    }
-
-    /// This account's other devices, if any are known.
-    pub fn own_devices(&self) -> &[ContactDevice] {
-        &self.state.own_devices
     }
 
     /// The private credential for this account's own inbox.
     ///
     /// It authorizes listing, reading, deleting and burning, so it is never
-    /// published — the invite and the device list carry only the derived
-    /// delivery token. Exposed for local callers that talk to the relay directly
-    /// instead of going through [`Account::recv`].
+    /// published — the invite carries only the derived delivery token. Exposed
+    /// for local callers that talk to the relay directly instead of going
+    /// through [`Account::recv`].
     pub fn own_read_token(&self) -> &str {
         self.device.read_token()
+    }
+
+    /// The per-contact queue this device reads for `account_id`, and the read
+    /// credential that authorizes listing, reading and burning it.
+    ///
+    /// Exposed for the same local callers as [`Account::own_read_token`]. Both
+    /// values are per device and must never be published: the read token is what
+    /// makes a per-contact delete revocable.
+    pub fn own_contact_queue(&self, account_id: &str) -> (String, String) {
+        (
+            self.device.contact_queue_id(account_id),
+            self.device.contact_queue_read_token(account_id),
+        )
     }
 
     /// Whether this device's relay inbox was replaced when the vault was opened.
     ///
     /// True once, for a vault written before the read/delivery credential split,
     /// and for a vault migrating off the pre-multi-device layout. The caller must
-    /// republish the device list so peers stop delivering to the abandoned inbox;
-    /// until then this device receives nothing from anyone who has not refreshed.
+    /// drop any cached invite and issue a fresh one, so peers stop delivering to
+    /// the abandoned inbox; until then this device receives nothing from anyone
+    /// who has not seen the new invite.
     pub fn queue_rotated(&self) -> bool {
         self.device.queue_rotated()
     }
 
-    /// The next device id this account has never used.
+    /// Drain every queue this device reads: its inbox, and one per-contact queue
+    /// for each contact.
     ///
-    /// Only device 1 may hand this out, because only device 1 can sign the list
-    /// that records it. The value is derived from the ids we already know about,
-    /// so a device linking while another is offline still gets a fresh id —
-    /// provided we refreshed first, which the caller does.
-    pub fn next_free_device_id(&self) -> u32 {
-        self.state
-            .own_devices
-            .iter()
-            .map(|d| d.device_id)
-            .chain(std::iter::once(self.device.device_id()))
-            .max()
-            .unwrap_or(0)
-            + 1
-    }
-
-    /// Take over a vault another device transferred, as the given device id.
-    ///
-    /// The transfer carries the shared vault — history, contacts, chat log — and
-    /// deliberately not the sender's device key material (Q4). So this device
-    /// mints its own identity, prekeys and relay inbox, and cannot be reached by
-    /// anyone until device 1 signs it into the account's list.
-    ///
-    /// The id is an argument rather than something derived here, because only
-    /// device 1 can sign the list entry that makes an id real, and so only device
-    /// 1 can assign one.
-    pub async fn adopt_linked_vault(
-        dir: &Path,
-        passphrase: &str,
-        device_id: u32,
-    ) -> Result<Self, Error> {
-        if device_id < 2 {
-            // Device 1 is the account. A second vault claiming to be it would
-            // share its identity, which is the thing linking must never do.
-            return Err(Error::InvalidLink);
-        }
-        let vault = Vault::open(dir, passphrase)?;
-        let master = *vault.master_key();
-        let packed = fs::read(dir.join("account.enc")).map_err(|_| Error::NotFound)?;
-        let state_bytes = decrypt(&master, &packed)?;
-        let mut state: AccountState =
-            serde_json::from_slice(&state_bytes).map_err(|_| Error::Corrupt)?;
-
-        // Whatever device file came with the transfer is the sending device's.
-        // Replaced rather than adopted: two devices sharing one identity could
-        // never be told apart, which is exactly what revocation has to do.
-        let mut device = DeviceKeys::create(dir, &master, device_id).await?;
-        mint_prekey_bundle(device.store_mut(), device_id).await?;
-
-        // A cached invite names the *sending* device's inbox, and handing it out
-        // from here would send a contact to a queue this device cannot read.
-        state.invite_cache = None;
-        // The account's device set is learned from the published list, once
-        // device 1 has added us. Until then this device knows only about itself.
-        state.own_devices.clear();
-
-        let chat_log = ChatLog::load(dir, &master)?;
-        let account = Self {
-            vault,
-            device,
-            state,
-            dir: dir.to_path_buf(),
-            chat_log,
-            pending_recovery_code: None,
-        };
-        account.save().await?;
-        Ok(account)
-    }
-
-    /// This device's entry for the account's signed list, for device 1 to sign.
-    ///
-    /// This is what a linking device sends back over the link channel. It carries
-    /// the *delivery* token, never the read token: the list is public, and a
-    /// public credential must not authorize reading or burning the inbox it
-    /// names.
-    pub async fn link_request(&self) -> Result<ContactDevice, Error> {
-        Ok(ContactDevice {
-            device_id: self.device.device_id(),
-            identity_key: self.device.identity_public().await?,
-            queue_id: self.device.queue_id().to_string(),
-            queue_token: self.device.queue_token(),
-            added_unix: now_unix(),
-        })
-    }
-
-    /// Add a linked device to this account's signed list, and republish it.
-    ///
-    /// The request is the new device's own statement of its identity key, inbox
-    /// and delivery token. It cannot be checked against the list, because writing
-    /// the list is the whole point — so device 1's signature on the result is the
-    /// only authority, and this must never be called with a request that did not
-    /// arrive over an authenticated link channel. The relay enforces the same
-    /// statement from the other side: it refuses a prekey record whose identity
-    /// key is not what this list says.
-    ///
-    /// The list is published before this returns, so a failure leaves the device
-    /// recorded locally but not announced. Repeating the call is safe.
-    pub async fn record_linked_device(&mut self, request: &ContactDevice) -> Result<(), Error> {
-        if self.device.device_id() != 1 {
-            return Err(Error::NotSigningDevice);
-        }
-        if request.device_id < 2 || request.device_id == self.device.device_id() {
-            return Err(Error::InvalidLink);
-        }
-        if request.identity_key.is_empty() || request.queue_id.is_empty() {
-            return Err(Error::InvalidLink);
-        }
-        self.state
-            .own_devices
-            .retain(|d| d.device_id != request.device_id);
-        self.state.own_devices.push(request.clone());
-        self.state.own_devices.sort_by_key(|d| d.device_id);
-        self.publish_device_list().await
-    }
-
-    /// Publish this device's prekeys and learn the account's device set.
-    pub async fn announce_linked_device(&mut self, one_time_count: usize) -> Result<(), Error> {
-        self.publish_prekeys(one_time_count).await?;
-        self.refresh_own_devices().await?;
-        Ok(())
-    }
-
+    /// The inbox carries queue grants and messages from contacts that have not
+    /// been granted a per-contact queue yet. Each per-contact queue carries only
+    /// that one contact's messages, which is what makes a queue the unit of
+    /// revocation: deleting the contact burns exactly that queue.
     pub async fn recv(&mut self) -> Result<InboxResult, Error> {
+        // A delete burns the contact's queue immediately; if the relay was down
+        // then, this re-drives it. Burning is idempotent, so a queue that is
+        // already gone is a no-op.
+        self.burn_revoked_queues().await?;
+
         let relay = RelayClient::try_new(&self.state.relay)?;
-        let ids = relay
-            .list(self.device.queue_id(), self.device.read_token())
-            .await?;
+        // (expected sender account, queue id, read token). `None` marks the
+        // inbox, whose sender can be any contact.
+        let mut queues: Vec<(Option<String>, String, String)> = Vec::new();
+        queues.push((
+            None,
+            self.device.queue_id().to_string(),
+            self.device.read_token().to_string(),
+        ));
+        for contact in self.state.contacts.clone() {
+            queues.push((
+                Some(contact.account_id.clone()),
+                self.device.contact_queue_id(&contact.account_id),
+                self.device.contact_queue_read_token(&contact.account_id),
+            ));
+        }
+
         let mut out = Vec::new();
         let mut warnings = Vec::new();
         let mut dirty = false;
-        for blob_id in ids {
-            let body = relay
-                .get(self.device.queue_id(), self.device.read_token(), &blob_id)
-                .await?;
-            let (ct, legacy_from) = decode_relay_blob(&body)?;
-            let (plain, from_account) = match legacy_from {
-                Some(from) => match self.decrypt_from(&from, 1, &ct).await {
-                    Ok(p) => (p, from),
-                    Err(Error::Session) => {
-                        warnings.push(format!(
-                            "Could not read a message from {} — they may not have added your invite yet (use Copy my invite on your side, they paste it under Add contact).",
-                            short_name(&from)
-                        ));
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                },
-                None => match self.try_decrypt_from_any_device(&ct).await {
-                    Ok(pair) => pair,
+        for (expected_contact, queue_id, read_token) in queues {
+            let ids = relay.list_optional(&queue_id, &read_token).await?;
+            for blob_id in ids {
+                let body = relay.get(&queue_id, &read_token, &blob_id).await?;
+                let (ct, legacy_from) = decode_relay_blob(&body)?;
+                let decrypted = match &expected_contact {
+                    // A per-contact queue can only carry that contact's messages.
+                    Some(account_id) => self
+                        .decrypt_from(account_id, &ct)
+                        .await
+                        .map(|plain| (plain, account_id.clone())),
+                    None => match legacy_from {
+                        Some(from) => self.decrypt_from(&from, &ct).await.map(|plain| (plain, from)),
+                        None => self.try_decrypt_from_any_contact(&ct).await,
+                    },
+                };
+                let (plain, from_account) = match decrypted {
+                    Ok(v) => v,
                     Err(Error::Session) => {
                         warnings.push(
                             "Could not decrypt a queued message — unknown sender or session not ready.".into(),
@@ -1443,97 +1440,111 @@ impl Account {
                         continue;
                     }
                     Err(e) => return Err(e),
-                },
-            };
-            let payload = decode_legacy_payload(&plain)?;
-            // A copy of a message we sent from one of our own other devices. It
-            // belongs in the conversation it names, recorded as ours, and must
-            // not be surfaced as an incoming message or the UI would show it
-            // twice.
-            if let MessagePayload::OwnCopy {
-                to_account_id,
-                inner,
-            } = payload
-            {
-                self.file_own_copy(&to_account_id, *inner)?;
-                relay
-                    .delete(self.device.queue_id(), self.device.read_token(), &blob_id)
-                    .await?;
-                dirty = true;
-                continue;
-            }
+                };
 
-            let nick = self
-                .contact_nick_for_protocol(&from_account)
-                .unwrap_or_else(|| short_name(&from_account));
-            let (file_blob_id, mail_attachments) = match &payload {
-                MessagePayload::File { data, name } => {
-                    let id = self.vault.put_blob(data)?;
-                    let master = *self.vault.master_key();
-                    self.chat_log
-                        .append_file(&master, &nick, false, name, &id, data.len() as u64)?;
-                    (Some(id), Vec::new())
+                // A deleted contact must not be able to keep delivering into the
+                // shared inbox and be surfaced. Its session may still be in
+                // memory on the device that did the delete, so the blob can be
+                // decrypted and attributed; drop it instead of filing it.
+                if self.state.revoked.contains(&from_account) {
+                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    dirty = true;
+                    continue;
                 }
-                MessagePayload::Mail {
-                    thread_id,
-                    subject,
-                    body,
-                    attachments,
-                } => {
-                    let mut blobs = Vec::with_capacity(attachments.len());
-                    let mut records = Vec::with_capacity(attachments.len());
-                    for a in attachments {
-                        let id = self.vault.put_blob(&a.data)?;
-                        records.push(MailAttachmentRecord {
-                            name: a.name.clone(),
-                            blob_id_hex: hex::encode(id.0),
-                            size: a.data.len() as u64,
-                        });
-                        blobs.push(ReceivedAttachment {
-                            name: a.name.clone(),
-                            blob_id: id,
-                            size: a.data.len() as u64,
-                        });
+
+                let payload = decode_legacy_payload(&plain)?;
+
+                // A queue grant: the sender tells us where to deliver this
+                // account's messages for it. The signature is verified against
+                // the identity key the sender pinned in their invite, so an
+                // unauthenticated write to the public grant channel cannot name
+                // a queue the sender does not own.
+                if let MessagePayload::QueueGrant {
+                    queue_id: granted_id,
+                    delivery_token,
+                    signature,
+                } = &payload
+                {
+                    if self.apply_queue_grant(&from_account, granted_id, delivery_token, signature)?
+                    {
+                        dirty = true;
                     }
-                    let master = *self.vault.master_key();
-                    self.chat_log.append_mail(
-                        &master,
-                        &nick,
-                        false,
+                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    continue;
+                }
+
+                let nick = self
+                    .contact_nick_for_protocol(&from_account)
+                    .unwrap_or_else(|| short_name(&from_account));
+                let (file_blob_id, mail_attachments) = match &payload {
+                    MessagePayload::File { data, name } => {
+                        let id = self.vault.put_blob(data)?;
+                        let master = *self.vault.master_key();
+                        self.chat_log
+                            .append_file(&master, &nick, false, name, &id, data.len() as u64)?;
+                        (Some(id), Vec::new())
+                    }
+                    MessagePayload::Mail {
                         thread_id,
-                        subject.as_deref(),
+                        subject,
                         body,
-                        &records,
-                        MailState::Sent,
-                    )?;
-                    (None, blobs)
+                        attachments,
+                    } => {
+                        let mut blobs = Vec::with_capacity(attachments.len());
+                        let mut records = Vec::with_capacity(attachments.len());
+                        for a in attachments {
+                            let id = self.vault.put_blob(&a.data)?;
+                            records.push(MailAttachmentRecord {
+                                name: a.name.clone(),
+                                blob_id_hex: hex::encode(id.0),
+                                size: a.data.len() as u64,
+                            });
+                            blobs.push(ReceivedAttachment {
+                                name: a.name.clone(),
+                                blob_id: id,
+                                size: a.data.len() as u64,
+                            });
+                        }
+                        let master = *self.vault.master_key();
+                        self.chat_log.append_mail(
+                            &master,
+                            &nick,
+                            false,
+                            thread_id,
+                            subject.as_deref(),
+                            body,
+                            &records,
+                            MailState::Sent,
+                        )?;
+                        (None, blobs)
+                    }
+                    MessagePayload::Text { body } => {
+                        let master = *self.vault.master_key();
+                        self.chat_log.append_text(&master, &nick, false, body)?;
+                        (None, Vec::new())
+                    }
+                    // Handled above, before this match.
+                    MessagePayload::QueueGrant { .. } => {
+                        unreachable!("control payload handled above")
+                    }
+                };
+                if let Some(c) = self
+                    .state
+                    .contacts
+                    .iter_mut()
+                    .find(|c| c.account_id == from_account)
+                {
+                    c.inbound_ready = true;
                 }
-                MessagePayload::Text { body } => {
-                    let master = *self.vault.master_key();
-                    self.chat_log.append_text(&master, &nick, false, body)?;
-                    (None, Vec::new())
-                }
-                // Own copies are filed into the chat log above, before this match.
-                MessagePayload::OwnCopy { .. } => unreachable!("own copy handled above"),
-            };
-            if let Some(c) = self
-                .state
-                .contacts
-                .iter_mut()
-                .find(|c| c.account_id == from_account)
-            {
-                c.inbound_ready = true;
+                out.push(ReceivedMessage {
+                    from_nick: nick,
+                    payload,
+                    file_blob_id,
+                    mail_attachments,
+                });
+                relay.delete(&queue_id, &read_token, &blob_id).await?;
+                dirty = true;
             }
-            out.push(ReceivedMessage {
-                from_nick: nick,
-                payload,
-                file_blob_id,
-                mail_attachments,
-            });
-            relay
-                .delete(self.device.queue_id(), self.device.read_token(), &blob_id)
-                .await?;
-            dirty = true;
         }
         if dirty {
             self.save().await?;
@@ -1542,6 +1553,43 @@ impl Account {
             messages: out,
             warnings,
         })
+    }
+
+    /// Store a queue grant from the contact that sent it, if it verifies.
+    ///
+    /// Returns whether anything changed. The grant is trusted only when its
+    /// signature checks out under the identity key the contact pinned in their
+    /// invite — the same key that hashes to their account id. That is what keeps
+    /// the public grant channel safe: anyone can write to it, but only the
+    /// holder of the identity private key can name a queue the recipient will
+    /// use.
+    fn apply_queue_grant(
+        &mut self,
+        from_account: &str,
+        queue_id: &str,
+        delivery_token: &str,
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let Some(contact) = self
+            .state
+            .contacts
+            .iter_mut()
+            .find(|c| c.account_id == from_account)
+        else {
+            // Not a contact: a stranger. Nothing to store.
+            return Ok(false);
+        };
+        if !verify_queue_grant(&contact.identity_key, queue_id, delivery_token, signature) {
+            return Ok(false);
+        }
+        if contact.delivery_queue_id.as_deref() == Some(queue_id)
+            && contact.delivery_queue_token.as_deref() == Some(delivery_token)
+        {
+            return Ok(false);
+        }
+        contact.delivery_queue_id = Some(queue_id.to_string());
+        contact.delivery_queue_token = Some(delivery_token.to_string());
+        Ok(true)
     }
 
     fn find_contact(&self, nickname: &str) -> Option<&Contact> {
@@ -1556,99 +1604,27 @@ impl Account {
             .map(|c| c.nickname.clone())
     }
 
-    /// Record a message this account sent from another of its own devices.
-    fn file_own_copy(&mut self, to_account_id: &str, inner: MessagePayload) -> Result<(), Error> {
-        let master = *self.vault.master_key();
-        let nick = self
-            .contact_nick_for_protocol(to_account_id)
-            .unwrap_or_else(|| short_name(to_account_id));
-        match inner {
-            MessagePayload::Text { body } => {
-                self.chat_log.append_text(&master, &nick, true, &body)?;
-            }
-            MessagePayload::File { data, name } => {
-                let id = self.vault.put_blob(&data)?;
-                self.chat_log
-                    .append_file(&master, &nick, true, &name, &id, data.len() as u64)?;
-            }
-            MessagePayload::Mail {
-                thread_id,
-                subject,
-                body,
-                attachments,
-            } => {
-                let mut records = Vec::with_capacity(attachments.len());
-                for a in attachments {
-                    let id = self.vault.put_blob(&a.data)?;
-                    records.push(MailAttachmentRecord {
-                        name: a.name.clone(),
-                        blob_id_hex: hex::encode(id.0),
-                        size: a.data.len() as u64,
-                    });
-                }
-                self.chat_log.append_mail(
-                    &master,
-                    &nick,
-                    true,
-                    &thread_id,
-                    subject.as_deref(),
-                    &body,
-                    &records,
-                    MailState::Sent,
-                )?;
-            }
-            // A copy of a copy is meaningless and would loop if we ever fanned
-            // out from a received copy, so it is dropped rather than filed.
-            MessagePayload::OwnCopy { .. } => {}
-        }
-        Ok(())
-    }
-
-    async fn decrypt_from(
-        &mut self,
-        account_id: &str,
-        device_id: u32,
-        ct: &[u8],
-    ) -> Result<Vec<u8>, Error> {
+    async fn decrypt_from(&mut self, account_id: &str, ct: &[u8]) -> Result<Vec<u8>, Error> {
         let local_name = self.state.protocol_name.clone();
-        let local_id = self.device.device_id();
-        decrypt_message(
-            self.device.store_mut(),
-            &local_name,
-            local_id,
-            account_id,
-            device_id,
-            ct,
-        )
-        .await
+        decrypt_message(self.device.store_mut(), &local_name, account_id, ct).await
     }
 
-    /// Try every device we know of, and our own other devices.
+    /// Try every contact, to recover the sender of a blob on the shared inbox.
     ///
     /// A relay blob carries no sender id — that is the whole point of the queue
-    /// model — so the sender can only be recovered by attempting decryption. The
-    /// candidate set has to include our own other devices, because a copy from one
-    /// of them is indistinguishable from a contact's message until it decrypts.
-    async fn try_decrypt_from_any_device(
+    /// model — so the sender can only be recovered by attempting decryption.
+    async fn try_decrypt_from_any_contact(
         &mut self,
         ct: &[u8],
     ) -> Result<(Vec<u8>, String), Error> {
-        let mut candidates: Vec<(String, u32)> = Vec::new();
-        for contact in &self.state.contacts {
-            for device in &contact.devices {
-                candidates.push((contact.account_id.clone(), device.device_id));
-            }
-        }
-        let own_account = self.state.protocol_name.clone();
-        let own_id = self.device.device_id();
-        for device in &self.state.own_devices {
-            if device.device_id != own_id {
-                candidates.push((own_account.clone(), device.device_id));
-            }
-        }
-
-        for (account_id, device_id) in candidates {
-            if let Ok(plain) = self.decrypt_from(&account_id, device_id, ct).await {
+        let candidates: Vec<String> = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| c.account_id.clone())
+            .collect();
+        for account_id in candidates {
+            if let Ok(plain) = self.decrypt_from(&account_id, ct).await {
                 return Ok((plain, account_id));
             }
         }
@@ -1661,21 +1637,13 @@ impl Account {
         let state_enc = encrypt(master, &state_bytes)?;
         fs::write(self.dir.join("account.enc"), state_enc)?;
 
-        // Every address a session could live under: each device of each contact,
-        // plus our own other devices, whose copies arrive on sessions too.
-        let own_id = self.device.device_id();
-        let mut session_addresses: Vec<(String, u32)> = Vec::new();
-        for contact in &self.state.contacts {
-            for device in &contact.devices {
-                session_addresses.push((contact.account_id.clone(), device.device_id));
-            }
-        }
-        let own_account = self.state.protocol_name.clone();
-        for device in &self.state.own_devices {
-            if device.device_id != own_id {
-                session_addresses.push((own_account.clone(), device.device_id));
-            }
-        }
+        // Every address a session could live under: one per contact.
+        let session_addresses: Vec<(String, u32)> = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| (c.account_id.clone(), DEVICE_ID))
+            .collect();
         self.device.save(&self.dir, master, &session_addresses).await?;
         Ok(())
     }
@@ -1690,8 +1658,8 @@ impl Account {
 /// The legacy **inbox is not** carried over. Before the read/delivery split
 /// there was one token for both jobs and it was handed out in every invite, so
 /// it is already public and the relay would refuse it as a read credential
-/// anyway. `from_store` mints a fresh queue, and the caller republishes so peers
-/// find the new one.
+/// anyway. `from_store` mints a fresh queue, and the caller drops the cached
+/// invite so peers learn the new inbox.
 async fn migrate_legacy_device(
     dir: &Path,
     master: &[u8; crate::crypto::MASTER_KEY_LEN],
@@ -1704,8 +1672,7 @@ async fn migrate_legacy_device(
     // authorizing reads of this device's inbox.
     state.receive_queue_id.take();
     state.receive_queue_token.take();
-    // Device 1 is the identity that already existed, so it keeps its key.
-    Ok(DeviceKeys::from_store(1, store))
+    Ok(DeviceKeys::from_store(store))
 }
 
 fn decode_legacy_payload(plain: &[u8]) -> Result<MessagePayload, Error> {
@@ -1720,34 +1687,43 @@ fn normalize_relay(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
+/// The attachment caps both drop modes share, checked before anything is sealed
+/// or uploaded.
+fn check_drop_attachments(attachments: &[(String, Vec<u8>)]) -> Result<(), Error> {
+    if attachments.len() > MAX_MAIL_ATTACHMENTS {
+        return Err(Error::TooManyAttachments(MAX_MAIL_ATTACHMENTS));
+    }
+    let total: usize = attachments.iter().map(|(_, d)| d.len()).sum();
+    if total > MAX_INLINE_FILE_BYTES {
+        return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
+    }
+    Ok(())
+}
+
+/// Build the plaintext package a drop carries. The same shape for both modes:
+/// the container version, not the package version, is what differs.
+fn build_drop_package(subject: &str, body: &str, attachments: &[(String, Vec<u8>)]) -> DropPackage {
+    DropPackage {
+        v: 1,
+        subject: subject.to_string(),
+        body: body.to_string(),
+        attachments: attachments
+            .iter()
+            .map(|(name, data)| DropAttachment {
+                name: name.clone(),
+                data: BASE64_STANDARD.encode(data),
+            })
+            .collect(),
+        created_unix: now_ms() / 1000,
+    }
+}
+
 fn short_name(protocol_name: &str) -> String {
     if protocol_name.len() > 12 {
         format!("{}…", &protocol_name[..12])
     } else {
         protocol_name.to_string()
     }
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Whether a published device set already names `queue_id` for `device_id`.
-///
-/// Used to decide whether this device's inbox is reachable by peers through the
-/// published list, so a republish happens only when the list has actually fallen
-/// behind — including the case where no list was ever published.
-fn published_list_names_inbox(
-    devices: &[ContactDevice],
-    device_id: u32,
-    queue_id: &str,
-) -> bool {
-    devices
-        .iter()
-        .any(|d| d.device_id == device_id && d.queue_id == queue_id)
 }
 
 fn dir_size(path: &Path) -> u64 {
@@ -1779,14 +1755,58 @@ mod tests {
         path
     }
 
+    /// A typed address is the recipient for someone with no account, so this is
+    /// the only validation between the UI and the relay.
+    #[test]
+    fn an_external_address_is_normalized_or_refused() {
+        assert_eq!(normalize_external_address("  Bob@Gmail.COM ").unwrap(), "bob@gmail.com");
+        assert_eq!(normalize_external_address("a@b.co").unwrap(), "a@b.co");
+        // Dots, plus signs and subdomains are all ordinary.
+        assert_eq!(
+            normalize_external_address("first.last+tag@mail.example.co.uk").unwrap(),
+            "first.last+tag@mail.example.co.uk"
+        );
+
+        for bad in [
+            "",
+            "   ",
+            "bob",
+            "bob@",
+            "@gmail.com",
+            "a b@gmail.com",
+            "bob@gmail",
+            "bob@@x.com",
+            "bob@gmail.",
+            "bob@.gmail.com",
+            "bob@gmail..com",
+        ] {
+            assert!(
+                matches!(normalize_external_address(bad), Err(Error::InvalidAddress)),
+                "{bad:?} should have been refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pin_floor_counts_characters_not_bytes() {
+        assert!(!pin_is_long_enough(""));
+        assert!(!pin_is_long_enough("1234567"));
+        assert!(pin_is_long_enough("12345678"));
+        // 8 characters, 10 bytes: this must pass, or a non-ASCII PIN would be
+        // measured more harshly than the person who chose it would expect.
+        assert_eq!("pässwörd".len(), 10);
+        assert_eq!("pässwörd".chars().count(), 8);
+        assert!(pin_is_long_enough("pässwörd"));
+    }
+
     /// Write the on-disk layout a vault had before the multi-device model: the
     /// device identity in `signal.enc`, and this device's relay inbox in
     /// `account.enc`.
     async fn write_legacy_vault(dir: &Path, passphrase: &str) -> (String, String, Vec<u8>) {
         let vault = Vault::create(dir, passphrase).unwrap();
         let master = *vault.master_key();
-        let mut device = DeviceKeys::create(dir, &master, 1).await.unwrap();
-        let _ = mint_prekey_bundle(device.store_mut(), 1).await.unwrap();
+        let mut device = DeviceKeys::create(dir, &master).await.unwrap();
+        let _ = mint_prekey_bundle(device.store_mut(), DEVICE_ID).await.unwrap();
         let protocol_name = protocol_name_from_identity(
             &device
                 .store_mut()
@@ -1817,7 +1837,7 @@ mod tests {
             receive_queue_id: Some(queue_id.clone()),
             receive_queue_token: Some(queue_token.clone()),
             mail_handle: None,
-            own_devices: Vec::new(),
+            revoked: Vec::new(),
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
         fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();
@@ -1847,10 +1867,10 @@ mod tests {
         );
         assert!(
             account.device.queue_rotated(),
-            "the caller has to know, so it can drop the stale invite and republish"
+            "the caller has to know, so it can drop the stale invite"
         );
         assert!(
-            account.contacts().is_empty() || account.contacts()[0].devices[0].queue_id != old_queue_id,
+            account.contacts().is_empty() || account.contacts()[0].queue_id != old_queue_id,
             "nothing may keep pointing at the abandoned inbox"
         );
         assert!(dir.join(DEVICE_FILE).exists(), "migration must write device.enc");
@@ -1967,15 +1987,13 @@ mod tests {
         let contact = &account.contacts()[0];
         assert_eq!(contact.nickname, "bob");
         assert_eq!(contact.account_id, hex::encode(&remote_identity));
-        assert_eq!(contact.devices.len(), 1);
-        assert_eq!(contact.devices[0].device_id, 1);
         assert_eq!(
-            contact.devices[0].queue_id, "bob-queue",
+            contact.queue_id, "bob-queue",
             "delivery must still go to the inbox the old record named"
         );
-        assert_eq!(contact.devices[0].queue_token, "bob-token");
+        assert_eq!(contact.queue_token, "bob-token");
         assert_eq!(
-            contact.devices[0].identity_key, remote_identity,
+            contact.identity_key, remote_identity,
             "the identity key is recoverable from the old protocol_name"
         );
         assert!(contact.inbound_ready);
@@ -1986,8 +2004,64 @@ mod tests {
         let reopened = Account::open(&dir, "pw").await.unwrap();
         let contact = &reopened.contacts()[0];
         assert_eq!(contact.account_id, hex::encode(&remote_identity));
-        assert_eq!(contact.devices.len(), 1);
-        assert_eq!(contact.devices[0].queue_id, "bob-queue");
+        assert_eq!(contact.queue_id, "bob-queue");
+    }
+
+    /// A contact stored in the multi-device shape must survive the downgrade:
+    /// the device-1 entry (and the per-contact queue it granted us) becomes the
+    /// contact, so an existing relationship does not need re-inviting.
+    #[tokio::test]
+    async fn a_multi_device_contact_folds_to_its_device_one() {
+        let dir = scratch("multi-device-contact");
+        let (_protocol_name, _queue_id, _identity) = write_legacy_vault(&dir, "pw").await;
+
+        let vault = Vault::open(&dir, "pw").unwrap();
+        let master = *vault.master_key();
+        let raw = fs::read(dir.join("account.enc")).unwrap();
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&decrypt(&master, &raw).unwrap()).unwrap();
+
+        let remote_identity = vec![7u8; 33];
+        state["contacts"] = serde_json::json!([{
+            "nickname": "carol",
+            "account_id": hex::encode(&remote_identity),
+            "devices": [
+                {
+                    "device_id": 1,
+                    "identity_key": remote_identity,
+                    "queue_id": "carol-inbox",
+                    "queue_token": "carol-token",
+                    "delivery_queue_id": "carol-granted",
+                    "delivery_queue_token": "carol-granted-token",
+                },
+                {
+                    "device_id": 2,
+                    "identity_key": vec![8u8; 33],
+                    "queue_id": "carol-second",
+                    "queue_token": "carol-second-token",
+                }
+            ],
+            "inbound_ready": true,
+            "devices_fetched_unix": 1234,
+        }]);
+        let bytes = serde_json::to_vec(&state).unwrap();
+        fs::write(dir.join("account.enc"), encrypt(&master, &bytes).unwrap()).unwrap();
+
+        let account = Account::open(&dir, "pw").await.unwrap();
+        let contact = &account.contacts()[0];
+        assert_eq!(contact.nickname, "carol");
+        assert_eq!(contact.queue_id, "carol-inbox");
+        assert_eq!(contact.queue_token, "carol-token");
+        assert_eq!(
+            contact.delivery_queue_id.as_deref(),
+            Some("carol-granted"),
+            "the per-contact queue device 1 granted us must be carried over"
+        );
+        assert_eq!(
+            contact.delivery_queue_token.as_deref(),
+            Some("carol-granted-token")
+        );
+        assert!(contact.inbound_ready);
     }
 
     #[tokio::test]
@@ -2037,31 +2111,4 @@ mod tests {
         );
     }
 
-    /// The decision behind [`Account::ensure_device_list_published`]: a list that
-    /// does not name this device's inbox has to be treated as behind, because
-    /// that is exactly the state a lost publish leaves behind.
-    #[test]
-    fn a_published_list_is_behind_when_it_does_not_name_our_inbox() {
-        let device = |device_id: u32, queue_id: &str| ContactDevice {
-            device_id,
-            identity_key: vec![0u8; 33],
-            queue_id: queue_id.into(),
-            queue_token: "token".into(),
-            added_unix: 0,
-        };
-
-        assert!(published_list_names_inbox(&[device(1, "q1")], 1, "q1"));
-        assert!(
-            !published_list_names_inbox(&[device(1, "abandoned")], 1, "q1"),
-            "a moved inbox means the list is behind, even for a device we know"
-        );
-        assert!(
-            !published_list_names_inbox(&[device(2, "q1")], 1, "q1"),
-            "another device's entry must not stand in for ours"
-        );
-        assert!(
-            !published_list_names_inbox(&[], 1, "q1"),
-            "no list at all is the state a publish that never landed leaves"
-        );
-    }
 }

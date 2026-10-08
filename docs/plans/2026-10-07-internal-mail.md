@@ -1659,3 +1659,68 @@ relay is not lost.
   message you opened, falling back to the newest message in the thread.
 - **The Inbox badge shows unread when there is any, otherwise the total**, so it reads as a count of
   what wants attention. The other folders always show their total.
+
+## Phase 6 — Rich-text compose (2026-10-07)
+
+**Status:** Implemented and verified in a browser against a live two-daemon harness. Compose is now a
+rich-text editor instead of a plain textarea. Formatting survives send, receipt, search, and the draft
+round-trip, and hostile markup in an incoming body is neutralized on render.
+
+**Goal:** A mail body can carry emphasis, lists, headings, quotes, code, and links, without adding an
+editor dependency and without ever rendering untrusted HTML.
+
+### Settled design (continued)
+
+| # | Decision |
+|---|---|
+| M16 | **No editor dependency.** The surface is a plain `contenteditable` div driven by `document.execCommand`, matching the existing dependency-light UI. Bold, italic, underline, strikethrough, H2, bulleted/numbered list, blockquote, code block, link, and clear-formatting are enough; ProseMirror/Tiptap would be a large dependency for that set. |
+| M17 | **The body stays a single string; no `format` field is added.** A body with HTML tags is rich, a body without them is legacy plain text. `bodyToDisplayHtml` decides at render time: tagged bodies are sanitized and rendered, untagged bodies are escaped and their newlines become `<br>`. Adding a format flag would have meant a wire/record migration for a distinction that is already recoverable from the content. |
+| M18 | **Sanitize on read, not only on write.** `sanitizeHtml` runs when a message renders and when the editor serializes, so a body injected through the API by a peer (or a hostile sender) is treated as untrusted. It parses with `DOMParser` into an inert document and rebuilds only an allowlist — `b/strong/i/em/u/s/strike/del/ins`, `p/div/br/span`, `ul/ol/li`, `blockquote/pre/code`, `h1`–`h4`, `a[href][title]` — dropping dangerous subtrees (`script`, `style`, `iframe`, `object`, `svg`, `math`, `form`, `img`, …) and any non-`http(s)`/`mailto` scheme. |
+| M19 | **Compose state lives in the component, not the DOM.** `mailComposeTo`, `mailComposeSubject`, and `mailComposeBody` are tracked in app state and re-applied, so adding an attachment or reloading a draft file no longer discards typed input. Attachment chips update in place for the same reason: a full re-render would collapse the editor selection. |
+| M20 | **Links are intercepted in the reading pane.** A click on an `<a>` in a message body calls `preventDefault()` and copies the URL to the clipboard with a toast, rather than navigating the WebView out of the app. |
+
+### What changed
+
+| File | Change |
+|---|---|
+| `apps/hush-tauri/src/lib/richText.ts` | new — `sanitizeHtml`, `bodyToDisplayHtml`, `htmlToText`, `isBlankHtml`, `escapeHtml`, `hasHtmlTags` |
+| `apps/hush-tauri/src/components/ui/RichTextEditor.ts` | new — `contenteditable` surface + toolbar, paste sanitization, keyboard shortcuts, `getHtml`/`getText`/`isEmpty`/`setHtml` |
+| `apps/hush-tauri/src/lib/icons.ts` | `bold`, `italic`, `underline`, `strikethrough`, `list`, `list-ordered`, `quote`, `code`, `heading-2`, `remove-formatting`, `link` |
+| `apps/hush-tauri/src/lib/mailStore.ts` | `preview` and `searchMessages` strip HTML via `htmlToText`; exported `draftPreview` |
+| `apps/hush-tauri/src/app.ts` | composer uses `RichTextEditor`; compose state tracked and re-applied; attachment chips render in place; message bodies render through `bodyToDisplayHtml`; `guardLinks`; `openCompose` clears the open thread for a new message |
+| `apps/hush-tauri/src/styles/app.css` | editor and toolbar, plus typographic styles for rendered rich bodies |
+
+### Verification (fresh output, this session)
+
+- `cd apps/hush-tauri && npx tsc --noEmit && npm run build` — clean.
+- Browser run against a live harness (daemon `127.0.0.1:9876`, second peer `9877`, relay `8799`):
+  - `execCommand` output read from the DOM: `bold` on a selection produced `<b>hello world</b>`;
+    `insertUnorderedList` produced `<ul><li><b>hello world</b></li></ul>`; headings and blockquote
+    produced the matching tags.
+  - a formatted message sent from Alice rendered as bold text inside a bulleted list in Bob's reading
+    pane, and the same body was persisted in the log as `<ul><li><b>hello world</b></li></ul>`.
+  - a rich-text draft saved, left, and reopened came back into the editor with its formatting intact
+    (the surface's `innerHTML` matched what was saved). Toolbar pressed-state mirroring is
+    implemented through `selectionchange` + `queryCommandState`, but it only updates while the caret
+    is inside the surface, so it was not separately asserted on reopen.
+  - a legacy plain-text body with newlines still rendered as separate lines (escaped, `<br>`-joined).
+  - hostile bodies injected directly through the API — `<img src=x onerror=alert(1)>`, `<script>`,
+    `<b onclick=…>`, `<a href="javascript:…">` — rendered with the script, the event handler, and the
+    `javascript:` href all stripped by `sanitizeHtml`.
+  - search matched on the plain-text form of a rich body (`htmlToText`), and the list preview showed
+    readable text rather than raw tags.
+
+### Known limitations to record, not hide
+
+- **Formatting commands were exercised only in a Chromium WebView.** The desktop shell on Linux runs
+  WebKitGTK, which was not run in this session. `document.execCommand` is deprecated and its behaviour
+  is not guaranteed identical across engines; see the `OPEN` entry in `DEEPSEEKPROBLEMS.MD`. The
+  sanitizer and renderer are engine-independent and were verified.
+- **The allowlist is deliberately small.** Tables, images, horizontal rules, and inline styles are
+  dropped on both write and read. An incoming rich message using them loses that markup rather than
+  being rejected.
+- **No "reply quotes the original" formatting.** Reply opens an empty body; quoting the previous
+  message with its markup is not implemented.
+- **A pasted link becomes plain text unless a selection is made.** The Link button prompts for a URL
+  and applies it to the current selection; there is no automatic link detection while typing.
+

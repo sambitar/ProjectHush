@@ -8,6 +8,7 @@ name = "hush-cli"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 hush-core = { path = "../hush-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

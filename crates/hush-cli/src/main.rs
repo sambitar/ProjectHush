@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf as StdPathBuf;
 
 use hush_core::{
-    Account, MessagePayload, config, resolve_data_dir,
+    config, decode_drop_private_key, encode_drop_private_key, encode_drop_public_key,
+    generate_drop_keypair, open_drop_with_key, resolve_data_dir, Account, MessagePayload,
+    RelayClient,
 };
 
 #[derive(Parser)]
@@ -44,6 +47,32 @@ enum Commands {
         path: StdPathBuf,
     },
     Recv {
+        #[arg(long)]
+        save_dir: Option<StdPathBuf>,
+    },
+    /// Make a keypair for receiving outsider drops sealed to a public key.
+    ///
+    /// Prints the public key to hand out; the private key goes only to a file
+    /// the user controls, created 0600 and never overwritten.
+    DropKeygen {
+        /// Where to write the private key. Refuses to overwrite an existing file.
+        #[arg(long, default_value = "hush-drop-private-key.txt")]
+        out: StdPathBuf,
+    },
+    /// Open an outsider drop sealed to a public key, from a file or a relay.
+    DropOpen {
+        /// The container file. Omit this when using --delivery.
+        file: Option<StdPathBuf>,
+        /// Fetch the container from a relay by its pickup (capability) id.
+        #[arg(long, requires = "relay")]
+        delivery: Option<String>,
+        /// Relay base URL. Required with --delivery.
+        #[arg(long)]
+        relay: Option<String>,
+        /// Private key file written by `drop-keygen`.
+        #[arg(long, default_value = "hush-drop-private-key.txt")]
+        key: StdPathBuf,
+        /// Directory to write attachments into. Defaults to the current directory.
         #[arg(long)]
         save_dir: Option<StdPathBuf>,
     },
@@ -155,22 +184,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("  attachment -> {}", out.display());
                         }
                     }
-                    // Own copies are filed into the chat log by `recv` itself and
-                    // never surface as inbox items.
-                    MessagePayload::OwnCopy { .. } => {}
+                    // Queue grants are handled inside `recv` and never surface as
+                    // inbox items.
+                    MessagePayload::QueueGrant { .. } => {}
                 }
+            }
+        }
+        Commands::DropKeygen { out } => {
+            let keys = generate_drop_keypair();
+            write_private_key(&out, &encode_drop_private_key(&keys.private_key))?;
+            // The public half is the only thing printed: it is meant to be shared.
+            println!("{}", encode_drop_public_key(&keys.public_key));
+            eprintln!(
+                "private key written to {} (mode 0600) — keep it secret; it is never printed",
+                out.display()
+            );
+        }
+        Commands::DropOpen {
+            file,
+            delivery,
+            relay,
+            key,
+            save_dir,
+        } => {
+            let container = read_container(file, delivery, relay).await?;
+            let private = decode_drop_private_key(&std::fs::read_to_string(&key)?)?;
+            let package = open_drop_with_key(&container, &private)?;
+            println!("subject: {}", package.subject);
+            println!("{}", package.body);
+            let dir = save_dir.unwrap_or_else(|| StdPathBuf::from("."));
+            std::fs::create_dir_all(&dir)?;
+            for att in &package.attachments {
+                let bytes = STANDARD
+                    .decode(&att.data)
+                    .map_err(|_| "an attachment in the package is not valid base64")?;
+                let path = dir.join(&att.name);
+                std::fs::write(&path, &bytes)?;
+                println!("attachment -> {}", path.display());
             }
         }
         Commands::Contacts => {
             let account = open(&dir, &passphrase).await?;
             for c in account.contacts() {
-                println!(
-                    "{} ({}, {} device{})",
-                    c.nickname,
-                    c.account_id,
-                    c.devices.len(),
-                    if c.devices.len() == 1 { "" } else { "s" }
-                );
+                println!("{} ({})", c.nickname, c.account_id);
             }
         }
         Commands::Config { cmd } => match cmd {
@@ -236,4 +292,43 @@ async fn open(dir: &PathBuf, passphrase: &Option<String>) -> Result<Account, hus
         .as_deref()
         .ok_or(hush_core::Error::PassphraseRequired)?;
     Account::open(dir, passphrase).await
+}
+
+/// Write a drop private key where the user asked, creating it 0600 and refusing
+/// to overwrite an existing file. The value is never printed.
+fn write_private_key(path: &StdPathBuf, encoded: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| {
+        format!(
+            "cannot create {} ({e}); an existing key is never overwritten",
+            path.display()
+        )
+    })?;
+    use std::io::Write;
+    writeln!(file, "{encoded}")?;
+    Ok(())
+}
+
+/// Get the container bytes from a file or from a relay by pickup id.
+async fn read_container(
+    file: Option<StdPathBuf>,
+    delivery: Option<String>,
+    relay: Option<String>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    match (file, delivery) {
+        (Some(path), None) => Ok(std::fs::read(path)?),
+        (None, Some(id)) => {
+            let relay = relay.ok_or("--relay is required with --delivery")?;
+            let client = RelayClient::try_new(&relay)?;
+            Ok(client.get_drop(&id).await?)
+        }
+        (Some(_), Some(_)) => Err("give either a container file or --delivery, not both".into()),
+        (None, None) => Err("give a container file or --delivery".into()),
+    }
 }

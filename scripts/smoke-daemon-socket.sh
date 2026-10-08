@@ -66,11 +66,6 @@ curl -sf -o /dev/null --unix-socket "$SOCK" http://localhost/api/contacts
 curl -sf -o /dev/null --unix-socket "$SOCK" http://localhost/api/messages
 pass "contacts / messages / ui-prefs over socket"
 
-# --- device link needs TCP and says so ---------------------------------------
-LINK=$(curl -s -o /dev/null -w '%{http_code}' -X POST --unix-socket "$SOCK" http://localhost/api/link-device/start)
-[[ "$LINK" == "400" ]] || fail "link-device/start returned $LINK with TCP off, want 400"
-pass "device link refused with TCP off (clear 400)"
-
 # --- clean exit removes the socket -------------------------------------------
 kill "$DAEMON" 2>/dev/null || true
 wait "$DAEMON" 2>/dev/null || true

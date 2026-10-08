@@ -816,29 +816,152 @@
   padding: var(--space-5);
 }
 
+/*
+ * A conversation is a stack of messages separated by rules, which is how every
+ * classic mail client draws one.
+ *
+ * There are deliberately no cards, bubbles, shadows or rounded boxes here. The
+ * avatar column and the hairline between messages carry all the structure, so
+ * the reading pane stays quiet and the body text is the loudest thing on it.
+ * Alternating alignment would read as a chat between two people; a mail thread
+ * is a stack you read top to bottom.
+ */
+.mail-messages {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  min-height: 0;
+  padding: var(--space-5);
+}
+
 .mail-message {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: var(--space-4);
-  box-shadow: var(--shadow-1);
-  max-width: 680px;
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  gap: var(--space-3);
+  padding: var(--space-4) 0;
+  /* The rule sits between messages, so the first one has none above it. */
+  border-top: 1px solid var(--border);
 }
 
-.mail-message.outgoing {
-  background: var(--accent-soft);
-  align-self: flex-end;
+.mail-message:first-child {
+  border-top: 0;
+  padding-top: 0;
 }
 
-/* The message you clicked, so a thread makes it obvious where you came in. */
-.mail-message.open {
-  border-color: var(--accent);
-  box-shadow: var(--shadow-2);
+.mail-message-content {
+  min-width: 0;
+}
+
+/* The header of a mail message: From/To/Date/Subject, one per line. The labels
+   sit in a max-content column so every value starts on the same x — that left
+   edge is what makes it scan as a mail header rather than a chat line. */
+.mail-message-head {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: var(--space-3);
+  row-gap: 2px;
+  margin: 0;
+}
+
+.mail-message-label {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.mail-message-value {
+  margin: 0;
+  font-size: 13px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The sender is the one field a mail client emphasises. */
+.mail-message-from {
+  font-weight: 600;
+}
+
+/* The rule that separates the envelope from the letter, and the body from the
+   attachments. Same hairline weight as the rule between messages. */
+.mail-message-rule {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: var(--space-3) 0;
 }
 
 .mail-message-body {
-  white-space: pre-wrap;
   margin-top: var(--space-2);
+}
+
+/*
+ * The message you clicked, so a thread shows where you came in. A rule in the
+ * gutter beside the avatar — the same way a mail client marks a quoted or
+ * current message. It is not a highlight box, because a box is a bubble.
+ */
+.mail-message.open .mail-message-content {
+  border-left: 2px solid var(--accent);
+  margin-left: calc(-1 * var(--space-3));
+  padding-left: calc(var(--space-3) - 2px);
+}
+
+/* Rich mail bodies are block HTML, so line breaks come from <br> and blocks
+   rather than from `white-space`. The element styles below mirror the editor's
+   toolbar so a message looks the same after it is sent as while it was typed. */
+.mail-message-body p,
+.mail-message-body div {
+  margin: 0 0 var(--space-2);
+}
+
+.mail-message-body p:last-child,
+.mail-message-body div:last-child {
+  margin-bottom: 0;
+}
+
+.mail-message-body ul,
+.mail-message-body ol {
+  margin: var(--space-2) 0;
+  padding-left: 1.4em;
+}
+
+.mail-message-body blockquote {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-3);
+  border-left: 3px solid var(--border);
+  color: var(--text-dim);
+}
+
+.mail-message-body pre {
+  margin: var(--space-2) 0;
+  padding: var(--space-3);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+.mail-message-body code {
+  padding: 0 0.25em;
+  background: var(--surface-2);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em;
+}
+
+.mail-message-body pre code {
+  padding: 0;
+  background: none;
+}
+
+.mail-message-body h1,
+.mail-message-body h2,
+.mail-message-body h3 {
+  margin: var(--space-3) 0 var(--space-2);
+}
+
+.mail-message-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 .mail-attachment {
@@ -898,11 +1021,239 @@
   min-width: 0;
 }
 
-.mail-compose-body {
-  min-height: 220px;
-  resize: vertical;
+/* ------------------------------------------------- two-mode recipient field */
+
+/*
+ * The To row holds a mode switch and a field. The switch is a segmented control
+ * rather than a checkbox: neither Internal nor External is the "off" state, and
+ * the two behave differently enough that the choice has to be visible before the
+ * recipient is read, not after.
+ */
+.mail-compose-to-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+}
+
+.mail-to-mode,
+/* The credential switch for an external drop — PIN or the recipient's public
+   key. The same segmented control as the To switch, one row below it, because
+   it is the same kind of choice: which of two modes this send is in. */
+.mail-drop-mode {
+  display: inline-flex;
+  align-self: flex-start;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.mail-to-mode-btn {
+  padding: 4px 12px;
+  font: inherit;
+  font-size: 12px;
+  background: transparent;
+  border: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.mail-to-mode-btn + .mail-to-mode-btn {
+  border-left: 1px solid var(--border);
+}
+
+.mail-to-mode-btn[aria-pressed="true"] {
+  background: var(--surface-raised, var(--surface));
+  color: var(--text);
+  font-weight: 600;
+}
+
+.mail-to-mode-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* The PIN hint sits under the field it explains, not beside it. */
+.mail-compose-hint {
+  margin: 0;
+  line-height: 1.45;
+}
+
+/* --------------------------------------- keyboard-typeable contact picker */
+
+/*
+ * The To field is a combobox rather than a native <select>: with many contacts
+ * a native dropdown is a scroll hunt, while this one narrows as you type and
+ * is driven end to end by the keyboard. The popup overlays the rows below
+ * instead of pushing them down, so opening it never reflows the composer.
+ */
+.contact-picker {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.contact-picker-input {
+  cursor: text;
+}
+
+/* A reply's recipient is fixed; read-only keeps it readable and announced. */
+.contact-picker-locked {
+  color: var(--text-dim);
+  cursor: default;
+}
+
+.contact-picker-popup {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  right: 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: var(--space-1);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+}
+
+.contact-picker-option {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The keyboard highlight, mirrored by aria-activedescendant on the input. */
+.contact-picker-option.is-highlighted {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+/* The committed selection. */
+.contact-picker-option[aria-selected="true"] {
+  font-weight: 600;
+}
+
+.contact-picker-empty {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+}
+
+/* ------------------------------------------------------------ drop result */
+
+.mail-drop-result {
+  max-width: 640px;
+}
+
+.mail-drop-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.mail-drop-link-input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono, monospace);
+  font-size: 13px;
+}
+
+/* A hint that is a warning: the expiry and the no-recall are not small print. */
+.mail-drop-result .mail-compose-hint {
+  color: var(--text-dim);
+}
+
+/* ------------------------------------------------------------ rich editor */
+
+.rich-editor {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.rich-editor-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.rich-editor-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.rich-editor-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.rich-editor-btn:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.rich-editor-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.rich-editor-surface {
+  min-height: 200px;
+  padding: var(--space-4);
   font: inherit;
   line-height: 1.5;
+  outline: none;
+  overflow: auto;
+}
+
+.rich-editor-surface:empty::before {
+  content: attr(data-placeholder);
+  color: var(--text-faint);
+}
+
+.rich-editor-surface ul,
+.rich-editor-surface ol {
+  padding-left: 1.4em;
+}
+
+.rich-editor-surface blockquote {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-3);
+  border-left: 3px solid var(--border);
+  color: var(--text-dim);
+}
+
+.rich-editor-surface pre {
+  padding: var(--space-3);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+.rich-editor-surface a {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 .mail-compose-actions {
@@ -931,5 +1282,147 @@
 
 .mail-file-input {
   display: none;
+}
+
+/* ----------------------------------------------------------------- trusts */
+
+/* The pane scrolls as a whole; the grid itself is the same `.bento` used
+   elsewhere, so cards line up with the rest of the app. */
+.trusts-pane {
+  overflow: auto;
+}
+
+.trusts-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.trusts-add {
+  width: auto;
+  flex-shrink: 0;
+}
+
+.trusts-filter {
+  margin: var(--space-4) var(--space-5) 0;
+}
+
+.trusts-grid {
+  align-content: start;
+  padding-top: var(--space-4);
+}
+
+/* `.trust-card` sets its own display, which would otherwise beat [hidden]. */
+.trust-card[hidden] {
+  display: none;
+}
+
+.trusts-filter-empty {
+  padding: 0 var(--space-5) var(--space-5);
+}
+
+.trust-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.trust-card-top {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.trust-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.trust-card-name,
+.trust-card-mail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Actions share the row, but the destructive one is pushed to the far edge so
+   it is never adjacent to a primary action. */
+.trust-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: auto;
+}
+
+.trust-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  width: auto;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.trust-action svg {
+  width: 16px;
+  height: 16px;
+}
+
+.trust-action span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Icon-only, muted, and held apart from the primary actions. */
+.trust-action.icon-only {
+  margin-left: auto;
+  padding: var(--space-2);
+  color: var(--text-faint);
+  background: transparent;
+}
+
+.trust-action.icon-only:hover {
+  color: var(--danger);
+}
+
+/* ----------------------------------------------------------- delete modal */
+
+.trust-delete-modal {
+  width: min(440px, 100%);
+}
+
+.modal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-5);
+}
+
+.modal-actions .btn-primary,
+.modal-actions .btn-secondary {
+  width: auto;
+}
+
+.trust-delete-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+.trust-delete-confirm:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 

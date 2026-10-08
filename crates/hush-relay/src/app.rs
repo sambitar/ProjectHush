@@ -134,54 +134,22 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-/// Store this account's signed device list.
+/// Publish an account's prekey record.
 ///
-/// No bearer credential: the blob must carry a signature by device 1 that
-/// verifies against the account id, and that is what authorizes the write. A
-/// revoked device cannot produce one.
-async fn put_device_dir(
-    State(state): State<Arc<AppState>>,
-    Path(account_id): Path<String>,
-    body: Bytes,
-) -> Result<StatusCode, RelayError> {
-    state.store.put_device_dir(&account_id, &body)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Read an account's device list.
-///
-/// Unauthenticated on purpose: a peer fetching a contact's list holds no
-/// credential for that account and does not need one, because the signature is
-/// what makes the contents trustworthy. Access control here would buy nothing
-/// while making the list unreadable by the only parties that need it. The
-/// account id is an identity key hash, so the directory is not enumerable
-/// without already knowing the account.
-async fn get_device_dir(
-    State(state): State<Arc<AppState>>,
-    Path(account_id): Path<String>,
-) -> Result<Vec<u8>, RelayError> {
-    state.store.get_device_dir(&account_id)
-}
-
-/// Publish a device's prekey record.
-///
-/// No bearer credential, for the same reason the device list has none: the
-/// record is signed by the device's own identity private key, and the relay
-/// checks that signature against the identity key the account's signed device
-/// list carries for this device. That is strictly stronger than a token, because
-/// a revoked device's key is no longer in the list.
+/// No bearer credential: the record is signed by the account's own identity
+/// private key, and the relay checks that signature against the identity key the
+/// account id names. That is strictly stronger than a token, because knowing a
+/// public account id does not let anyone replace that account's prekeys.
 async fn put_prekey_record(
     State(state): State<Arc<AppState>>,
-    Path((account_id, device_id)): Path<(String, u32)>,
+    Path(account_id): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, RelayError> {
-    state
-        .store
-        .put_prekey_record(&account_id, device_id, &body)?;
+    state.store.put_prekey_record(&account_id, &body)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Fetch a device's prekey record, consuming one one-time prekey.
+/// Fetch an account's prekey record, consuming one one-time prekey.
 ///
 /// Unauthenticated on purpose: a peer starting a session holds no credential for
 /// the account, and the record is self-authenticating. The response is the
@@ -189,9 +157,41 @@ async fn put_prekey_record(
 /// discards.
 async fn get_prekey_record(
     State(state): State<Arc<AppState>>,
-    Path((account_id, device_id)): Path<(String, u32)>,
+    Path(account_id): Path<String>,
 ) -> Result<Vec<u8>, RelayError> {
-    state.store.take_prekey_record(&account_id, device_id)
+    state.store.take_prekey_record(&account_id)
+}
+
+/// A delivery id is a 32-character hex capability the sender generates. Rejecting
+/// anything else keeps the table from being usable as arbitrary keyed storage.
+fn validate_delivery_id(id: &str) -> Result<(), RelayError> {
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(RelayError::BadRequest);
+    }
+    Ok(())
+}
+
+/// Accept an outsider delivery.
+///
+/// Unauthenticated by design: the id is the capability, and the body is already
+/// ciphertext under a PIN the relay never sees. There is nothing here to
+/// authorize against, and requiring an account would defeat the point of a drop.
+async fn put_drop(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, RelayError> {
+    validate_delivery_id(&id)?;
+    state.store.put_delivery(&id, &body)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_drop(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Vec<u8>, RelayError> {
+    validate_delivery_id(&id)?;
+    state.store.get_delivery(&id)
 }
 
 pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> {
@@ -199,9 +199,8 @@ pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> 
     let state = Arc::new(AppState { store });
     Ok(Router::new()
         .route("/health", get(health))
-        .route("/d/{account_id}", put(put_device_dir).get(get_device_dir))
         .route(
-            "/k/{account_id}/{device_id}",
+            "/k/{account_id}",
             put(put_prekey_record).get(get_prekey_record),
         )
         .route("/q/{queue_id}", put(put_blob).get(list_blobs))
@@ -211,5 +210,6 @@ pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> 
         )
         .route("/q/{queue_id}/report", post(report_queue))
         .route("/q/{queue_id}/{blob_id}", get(get_blob).delete(delete_blob))
+        .route("/drop/{id}", put(put_drop).get(get_drop))
         .with_state(state))
 }

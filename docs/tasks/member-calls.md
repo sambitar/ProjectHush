@@ -40,6 +40,29 @@ For **1:1** — which is the entire v1 scope ("fan-out only… no group object")
 
 **LiveKit returns as the named option for group calls** (Task 15.3 "private messaging rooms"), where a mesh no longer scales and E2EE (keys fanned out over existing sessions) plus random room IDs and pseudonymous identities become worth the second server. This spec keeps that door open; it does not build it.
 
+### Considered and rejected: Tox / ToxAV (2026-10-08)
+
+[Tox](https://tox.chat/) is a mature, fully distributed P2P messenger with working 1:1 audio/video — the obvious "someone already built P2P voice" candidate. It is **rejected** as both a dependency and a media engine. The reasons reinforce the decisions above rather than overturn them.
+
+| Concern | Tox | Hush requirement |
+|---|---|---|
+| Discovery | Public DHT + volunteer bootstrap nodes; a Tox ID is published so peers can find it | No directory; a public DHT is a queryable social graph ([`THREAT_MODEL.md`](../THREAT_MODEL.md)) |
+| Crypto | Custom NaCl (libsodium) protocol; no per-message double ratchet | `libsignal` only; do not invent a ratchet ([`DESIGN.md`](../DESIGN.md)) |
+| Media | `ToxAV` — its own Opus/VP8 RTP-ish stack over the Tox connection | WebRTC DTLS-SRTP (`webrtcbin`, Section 6) |
+| Identity coupling | Media is bound to `toxcore`'s friend/connection model | Signaling is opaque `MessagePayload` variants inside the existing Signal session; media is a separate plane (Section 3) |
+| Infra | Relies on volunteer bootstrap/TCP relays; still flaky behind symmetric NAT | One self-hosted STUN; direct P2P; no first-party relay (Section 7) |
+
+Adopting Tox would mean running a **second identity and crypto stack** (ToxAV is not separable from `toxcore`'s friend model) alongside `libsignal` — double sessions, double presence, double NAT traversal — while adding a DHT we deliberately refuse to run. That is an architectural regression, not a shortcut.
+
+What Tox is useful for is **evidence and lessons**, all of which the plan already encodes:
+
+- P2P voice is easy; **NAT traversal is the hard part.** A decade of hole punching plus TCP-relay fallback still fails behind symmetric NAT — which is why v1 documents that failure cleanly (Phase 2) instead of promising universal connectivity.
+- **A public DHT is a social-graph database.** Tox's discovery lets anyone harvest IDs and query presence; this is the anti-pattern the queue model exists to avoid.
+- **Bespoke crypto ages badly.** Tox's custom NaCl protocol and its forward-secrecy debates are the case for `libsignal`.
+- **IP hiding needs an overlay that sees the graph.** Tox's onion paths/TCP relays are the same trade already recorded in Section 7 (BYO relay/overlay), reached independently.
+
+No Tox code is adopted. **LiveKit remains the named future group-call path; ToxAV is rejected outright.**
+
 ---
 
 ## 2. Hard constraint: the Tauri webview cannot be the WebRTC client on Linux
@@ -172,6 +195,7 @@ pub enum CallMedia { Audio, AudioVideo }
 | `webrtc-rs` (`webrtc` v0.20) | yes | yes | **no** — RTP-level only; bring your own codecs and capture | none | **Fallback** — pure-Rust transport, but more bespoke media glue |
 | `str0m` | partial | no | no | no | Not a client stack |
 | LiveKit `livekit` (rust-sdks) | via SFU | yes | desktop support in SDK | needs a surface | **Future** group-call path (Section 1) |
+| **ToxAV** (`toxcore`) | via public DHT + volunteer TCP relays | no (Tox relays only) | Opus/VP8, bound to `toxcore` | client-native surface | **Rejected** — not WebRTC; brings a second identity/crypto stack and a public DHT (Section 1) |
 
 **Decision: GStreamer `webrtcbin` for the client media engine.** Rationale, against the project's "no homemade crypto / use audited components / minimize custom security-sensitive code" stance: `webrtcbin` supplies capture, Opus, RTP, ICE, DTLS-SRTP, TURN, jitter buffering and sinks as one **audited, widely deployed** stack, so we write the least security-critical glue. The alternative, `webrtc-rs`, keeps the transport in memory-safe Rust but leaves us assembling capture → resample → Opus → RTP/SRTP and the reverse ourselves — more bespoke, more places to get wrong.
 
@@ -295,3 +319,100 @@ Per [`DISTRO_READINESS.md`](../DISTRO_READINESS.md):
 - **Phase 1** is independent of the media engine and can land as a standalone slice — Section 9's blocking decisions are resolved.
 - **Phase 2** begins with the media-engine spike and self-hosted STUN; it should follow confirmation of the WebKitGTK finding on the target machine.
 - **Group calls** (LiveKit) stay unbuilt; this spec only keeps the door open.
+
+---
+
+## 13. Infrastructure (v1)
+
+**Status:** guidance recorded 2026-10-08. Nothing here is built. This section fixes *where* each piece of infrastructure lives so implementation does not invent a second config, a second server, or a second egress. It restates and sharpens Sections 6, 7, and 11.
+
+### 13.1 Control / signaling plane
+
+- No new server. Signaling is new `MessagePayload` variants inside the existing Signal session (Section 5); the relay stays a dumb store-and-forward.
+- `MessagePayload::decode` must skip unknown tags cleanly (the legacy fallback at [`payload.rs`](../../crates/hush-core/src/payload.rs) is the pattern), so a v1 peer and a call-capable peer interoperate.
+- **Ringing latency** is the one real control-plane question. The UI drains on `RECV_POLL_MS = 4000` ([`constants.ts`](../../apps/hush-tauri/src/lib/constants.ts)), so a ring can take ~4 s. Options, cheapest first:
+  1. Accept it for dogfood (Section 9 #7) — **the v1 default**.
+  2. Daemon→UI push (`GET /api/call/events`, SSE) so the UI updates the instant the daemon has the invite. Local only; does not change relay timing.
+  3. Add a relay **long-poll** (`GET /q/{id}?wait=…`) so a ring lands in <1 s without busy-polling. The relay is deliberately request/response-only today (see [`relay-https-checklist.md`](../ops/relay-https-checklist.md)); this is a conscious relay change, not a client tweak.
+  4. Shorten the idle poll — most relay traffic, least preferred.
+- **Plan:** land Phase 1 with (1); add (2) with the UI call bar; adopt (3) only if dogfood feels slow.
+
+### 13.2 NAT traversal (STUN / TURN / ICE)
+
+- **STUN: self-hosted, one small endpoint.** Run a STUN responder on the relay VPS or a sibling host on **UDP 3478**, plus **TCP 3478** and **TLS 5349** for networks that block UDP; dual-stack A/AAAA. A public STUN server leaks the client IP to a third party for no benefit, so it is never the default.
+- **Implementation:** coturn in **STUN-only mode** (no `user=`, no `lt-cred-mech` — TURN allocations are refused, STUN Binding is answered) is the mature option; a pinned minimal STUN-only responder is an acceptable alternative if coturn's attack surface is judged too large. Deployment runbook: [`voice-stun-checklist.md`](../ops/voice-stun-checklist.md).
+- **Abuse control is mandatory.** STUN is a DDoS amplification/reflection vector: bind to the intended interface, rate-limit, and firewall to expected sources. **Do not log per-request client IPs** — STUN sees IP+port only and no party linkage, but logs would recreate the metadata the relay is built to avoid.
+- **TURN: none first-party (Section 7 stands).** Symmetric-NAT calls fail cleanly with a clear message; media is never silently routed. IP-hiding is an opt-in `iceTransportPolicy: relay` against a **user-supplied** TURN/overlay (BYO TURN, Tailscale/Headscale/Nebula/iroh-style mesh). If a first-party TURN is ever built it is a **separate trust domain and separate host** from `hush-relay` (same rule as the lease server) — but v1 does not build it.
+- **ICE:** trickle (`CallIce`), `host` + `srflx` candidates. Relay-only candidates appear only when BYO TURN is configured.
+
+### 13.3 Media plane (daemon runtime)
+
+- **GStreamer `webrtcbin`** in the daemon (Section 6); it uses **libnice** for ICE, so libnice is a pinned dependency.
+- **Pin the plugin set**: ignore `GST_PLUGIN_PATH`, ship only the plugins the call path needs. Supply-chain control, not just packaging.
+- Audio capture: **PipeWire first**, PulseAudio/ALSA fallback. Video later: PipeWire/v4l2 + VP8/VP9, native surface.
+- Device permission via **`xdg-desktop-portal`** on first call.
+
+### 13.4 Host topology / deployment
+
+Delta on top of the current relay VPS ([`relay-https-checklist.md`](../ops/relay-https-checklist.md)):
+
+- Keep Caddy/nginx TLS 443 → `hush-relay` on `127.0.0.1:8787` (unchanged).
+- Add **STUN as a separate process** (`stun.example.com`), never folded into the relay binary — the relay stays dumb.
+- Firewall opens **3478/udp** (+ 3478/tcp and 5349/tcp if the TCP/TLS fallback is enabled); nothing else new.
+- **No media ports on the VPS.** Media is peer-to-peer; if media ever appears on the server, the design has regressed.
+- One STUN host is enough for v1; a second for redundancy is a later, cheap add.
+
+### 13.5 Config surface (do not create a second one)
+
+Extend the single surface in [`config.rs`](../../crates/hush-core/src/config.rs) (`ClientConfig`), same precedence as everything else (flag/env > file > default):
+
+| Field | Default | Notes |
+|---|---|---|
+| `stun_urls: Vec<String>` | self-hosted STUN | **No public default.** |
+| `turn: Option<{ urls, username, credential }>` | unset | BYO only; unset means direct P2P. |
+| `ice_transport_policy: all \| relay` | `all` | `relay` meaningful only with `turn` set. |
+
+- Env overrides resolved in `config.rs` (`HUSH_STUN_URLS`, `HUSH_TURN_URL`, `HUSH_ICE_POLICY`), so binaries and scripts do not re-implement it (DR-14).
+- STUN/TURN egress must go through the same single outbound abstraction as the relay, so a future firewall/Tor policy still has one place to act.
+
+### 13.6 systemd / sandbox
+
+The current user unit ([`hush-daemon.service`](../../packaging/systemd/user/hush-daemon.service)) is deliberately strict and blocks parts of the call path. Changes to make in Phase 2, not before:
+
+| Directive | Today | Call-path need |
+|---|---|---|
+| `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` | allows IPv4/IPv6 | **No change** — STUN/ICE sockets work |
+| `PrivateDevices=true` | blocks `/dev/snd`, `/dev/video*` | Keep if **PipeWire-only**; relax to `DeviceAllow=` for direct ALSA/V4L2 fallback |
+| `ReadWritePaths=` | data root only | **Add the PipeWire socket** (`%t/pipewire-0`, or its dir) or capture fails under `ProtectSystem=strict` |
+| `RestrictRealtime=true` | blocks RT scheduling | Likely fine (PipeWire owns RT on its side); **verify in the spike** |
+| `MemoryDenyWriteExecute=true` | W^X | Likely fine (plugins are file-backed `dlopen`, no JIT); **verify in the spike** |
+| `SystemCallFilter=@system-service` | — | Should cover `socket/bind/connect/sendto/recvfrom`; confirm |
+
+Record the outcome as the "daemon permissions / syscall inventory" doc that [`DISTRO_READINESS.md`](../DISTRO_READINESS.md) already calls for.
+
+### 13.7 Packaging / dependencies
+
+GStreamer core + a **pinned plugin subset** (`webrtcbin`, `opus`, `vpx`, PipeWire/ALSA sources/sinks), `libnice`, `gstreamer-rs`, `xdg-desktop-portal`; `cargo-deny`/`cargo-audit` cover the Rust side. Extends Section 11.
+
+### 13.8 Ops, abuse, privacy
+
+- **Local-only diagnostics.** ICE failure codes logged locally with clear user-facing copy; no telemetry, no phone-home.
+- **No call metadata on the relay** (ciphertext, size, time, queue id, IP only) — the reason there is no first-party TURN.
+- **No plaintext media on disk, ever** — no recording, no temp files (Section 4).
+- Second STUN host only if availability is a real complaint; TURN capacity planning is deliberately avoided.
+
+### 13.9 What not to build
+
+- First-party TURN (sees the call graph, eats the bandwidth).
+- A DHT/public discovery layer (see the Tox assessment in Section 1).
+- WebRTC in the webview on Linux (WebKitGTK limitation, Section 2).
+- A second config system for ICE/STUN — it goes in `config.rs`.
+
+### 13.10 Acceptance checklist (Phase 2)
+
+- [ ] Self-hosted STUN reachable over UDP 3478 (and TCP/TLS if enabled); no request logging; rate-limited.
+- [ ] `ClientConfig` carries `stun_urls` / `turn` / `ice_transport_policy` with env overrides; no public STUN default.
+- [ ] Daemon reaches the PipeWire socket under the shipped unit (or the unit is relaxed with a documented reason).
+- [ ] Two peers complete a direct call on a LAN and across networks where hole-punching succeeds.
+- [ ] Symmetric-NAT case fails cleanly; `relay.db` and `strings` scans show no media or call plaintext.
+- [ ] No media ports exposed on the VPS.

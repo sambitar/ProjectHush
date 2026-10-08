@@ -21,26 +21,92 @@ Not a crypto paper. We use **Signal protocol (`libsignal`)** for 1:1 sessions. T
 - Display names are local only.
 - The mail handle is **not** a relay directory entry. `handle@MAIL_DOMAIN` (`sandy@myserver.com`) is a human label exchanged out-of-band inside the invite; the relay never learns or resolves it, and there is no "look up a person by address" API.
 
-Device link (old device alive): show a QR from the unlocked old device; new device becomes a second Signal device in that identity. Exact linking follows libsignal’s device model; we do not invent a second identity system.
+**One device per account.** An account is a single identity with a single device. There is no device
+list, no per-device fan-out, and no way to add a second device: `DEVICE_ID` is the constant `1`
+everywhere a libsignal address needs one, and the on-disk device file keeps a `device_id` field only
+so files written under the old model still read back. This was removed deliberately on 2026-10-08 —
+the multi-device machinery (signed device lists published at `PUT /d/{account_id}`, per-device
+queues, cross-device `Revoked` reconciliation, and the `POST /api/link-device/*` transfer) no longer
+exists, and neither do the endpoints.
 
-**v1 implementation (one-time transfer, not yet a live second device):** the unlocked old device exports its encrypted backup once and publishes it under a short-lived, single-use **link id** (`POST /api/link-device/start`). The new device, while **locked**, fetches and imports it (`POST /api/link-device/pull` with the pairing payload's `source_api` + `link_id`) and then unlocks with the same passphrase. The pairing payload is JSON (`kind: "hush-link-device"`, `source_api`, `link_id`, `expires_unix`); QR and clipboard carry the same bytes. TTL is ~10 minutes and the link id is consumed on first read. Treat the link id as a bearer secret: the payload it returns is the passphrase-encrypted vault, and anyone who can reach the source daemon and guess the id could download it (so keep the source on a trusted network, and prefer a LAN address only for the brief window). This is an identity/vault copy, **not** concurrent multi-device: both devices hold the same keys and do not ratchet with each other. Real multi-device (per-device sessions, libsignal device model) is a later slice.
+An account's identity key is its **account id**: `account_id = hex(identity_public_key)`. That is what
+a peer addresses it by and what the relay checks a prekey record against.
 
 ## Queues
 
-- Creating a contact mints (or rotates) a queue the *other* party can send into.
-- Sender uploads: `PUT /q/{queue_id}` with **opaque ciphertext bytes** (Signal message only; no cleartext sender id in the relay blob) + proof they know the slot secret (exact auth: spec during implementation; must not require a global user id).
+Each **account** owns one **inbox** and mints one **per-contact queue** for every contact it
+receives from. A contact's messages are delivered into the queue minted for them, so a queue is the
+unit of revocation: deleting a contact burns that contact's queue and touches no one else's.
+
+- **Inbox:** the account's own queue, named in its invite. It carries the account's queue grants and
+  — for a contact that has not yet received a per-contact queue — that contact's messages.
+- **Per-contact queue:** derived, not stored. The id is `HMAC(read_token,
+  "hush-contact-queue-id-v1" || contact_account_id)` and the read token is `HMAC(read_token,
+  "hush-contact-queue-read-v1" || contact_account_id)`. The account recomputes both from its own read
+  token, so it stores no per-contact secret and neither value ever leaves the device.
+- **Grant channel:** the inbox is where a queue **grant** is sent. A grant is
+  `MessagePayload::QueueGrant { queue_id, delivery_token, signature }`, carried inside the same
+  libsignal session as any other payload. The signature is over the canonical grant bytes
+  (`hush-queue-grant-v1\n{queue_id}\n{delivery_token}`) by the granting account's identity key, and
+  the recipient verifies it against the identity key the sender **pinned in their invite** — the same
+  key that hashes to the sender's account id, and the key that established the relationship in the
+  first place. The delivery token is public by design (it authorizes putting a blob in the queue and
+  nothing else), so the signature — not a blocklist, and not a device list — is what makes a grant
+  trustworthy on a channel anyone can write to.
+- **Delivery:** a send is one ciphertext to one queue: the recipient's per-contact queue for this
+  account when a grant has arrived, and its inbox until then.
+- **Revocation:** deleting a contact burns the per-contact queue for them and records the account id
+  in a local blocklist. The blocklist is not what makes the revocation happen — the burn is — but it
+  still drops a revoked contact's stragglers from the shared inbox (the only shape it can attribute
+  is the legacy JSON envelope, which names its sender) and re-drives a burn that failed while the
+  relay was down. Re-adding the contact clears the entry.
+- **Read vs delivery:** the **read** token (never published) authorizes listing, reading, deleting and
+  burning this account's queues. The **delivery** token (published in the invite, derived from the
+  read token) authorizes only putting a blob in the queue.
+- Sender uploads: `PUT /q/{queue_id}` with **opaque ciphertext bytes** (Signal message only; no
+  cleartext sender id in the relay blob) + proof they know the slot secret (exact auth: spec during
+  implementation; must not require a global user id).
 - Recipient lists/drains their queues; then deletes blobs.
 - TTL: **7 days**, then the relay drops the blob.
 - Max blob: **1 MiB** for v1 messages; larger files: encrypt in the vault, send a pointer + chunks as multiple blobs or a follow-up (keep v1 files small if needed rather than inventing a CDN).
 - Rotate queue IDs inside the encrypted session so the relay cannot staple one ID to a person forever.
-- Block = drop local session + tell relay to burn that queue + stop fetching it.
+- Block = burn the contact's per-contact queue + drop local session + stop fetching them.
 
 Relay **must not** offer “list all queues for user X.” There is no user X on the relay.
+
+### Prekeys
+
+`PUT /k/{account_id}` publishes this account's prekey record so a peer can open a session without an
+invite; `GET /k/{account_id}` takes it, consuming one one-time prekey. There is no bearer credential:
+the record carries the account's identity key and signs its signed prekey and kyber prekey with the
+matching private key, and the relay checks both against the identity key that `account_id` decodes
+to (`account_id` *is* the hex of that key). Knowing a public account id therefore does not let anyone
+replace an account's prekeys. The route is per account rather than per `(account, device)` because
+there is only one device.
+
+This is not a multi-device feature: an invite already carries a prekey bundle inline, and the relay
+record is the same thing for a peer that has an account id but no invite. In the normal flow a
+session is established from the invite and the relay record is never fetched.
+
+### Migration limit (2026-10-08)
+
+Contacts created before per-contact queues existed keep delivering to the account's shared-inbox
+queue, and that queue is **not** burned — burning it would cut off every pre-existing contact at
+once. Such a contact therefore keeps working and is **not revocable** until it receives a per-contact
+queue, which it acquires the next time this account sends to it and it drains its inbox and applies
+the grant. Until then, deleting the contact removes it locally and drops its messages on drain, but
+its device still has a working queue to write to. New contacts are revocable from the moment the
+grant lands.
+
+Removing the device list also removed the only way a peer learned a *changed* inbox, so a rotated
+inbox (a vault migrating off the pre-delivery/read-split or pre-multi-device layout) now requires a
+fresh invite: the cached one is dropped on open and the next `invite()` mints one naming the new
+queue.
 
 ## Messages
 
 - Payload inside Signal: text, or a file reference (content hash + key + size) for an attachment already in the sender’s notion of “encrypt to this recipient.”
-- Fan-out: N independent sessions, N queue puts. No group object.
+- One session, one queue put. No group object.
 
 ### Mail
 
@@ -60,7 +126,15 @@ Relay view of a mail message is unchanged from any other message: an opaque ciph
 - `GET /q/{id}` — list or fetch pending blobs (authz for the owner of the queue)
 - `DELETE /q/{id}/…` — ack
 - `POST /q/{id}/report` — mark slot abusive (rate-limit / burn)
-- No search, no profiles, no public keys directory
+- `PUT /k/{account_id}` — publish this account's prekey record (authz: the record's own signature)
+- `GET /k/{account_id}` — take the record, consuming one one-time prekey
+- `PUT /drop/{id}`, `GET /drop/{id}` — outsider delivery containers, keyed by a random capability id
+- No search, no profiles, no public keys directory, and no device directory (`/d/…` is gone)
+
+A drop container is `HSHD`-magic and one of two versions (2026-10-08): **v1** is sealed under a PIN
+(PBKDF2-HMAC-SHA256 → XChaCha20-Poly1305), **v2** is sealed to the recipient's X25519 public key (an
+ephemeral-key ECDH → HKDF-SHA256 → XChaCha20-Poly1305 sealed box). The relay only ever stores the
+opaque container and cannot tell which version it holds or open either.
 
 TLS for transport privacy in transit to the VPS; that does **not** replace E2E.
 

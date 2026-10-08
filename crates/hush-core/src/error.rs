@@ -44,10 +44,24 @@ pub enum Error {
     InvalidHandle,
     #[error("too many attachments (max {0})")]
     TooManyAttachments(usize),
-    #[error("only device 1 can sign the device list")]
-    NotSigningDevice,
-    #[error("invalid device link request")]
-    InvalidLink,
+    #[error("delivery PIN must not be empty")]
+    EmptyPin,
+    #[error("unsupported drop container version")]
+    UnsupportedDrop,
+    #[error("malformed drop container")]
+    BadDrop,
+    #[error("that does not look like an email address")]
+    InvalidAddress,
+    #[error("the delivery PIN is too short")]
+    WeakPin,
+    #[error("that does not look like a Hush drop public key")]
+    InvalidDropPublicKey,
+    #[error("that does not look like a Hush drop private key")]
+    InvalidDropPrivateKey,
+    #[error("this drop was sealed to a public key; open it with the private key, not a PIN")]
+    DropNeedsKey,
+    #[error("this drop was sealed under a PIN; open it with the PIN, not a private key")]
+    DropNeedsPin,
 }
 
 impl From<argon2::Error> for Error {

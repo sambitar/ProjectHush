@@ -92,27 +92,30 @@ async fn relay_blob_has_no_cleartext_sender_json() {
     let alice_inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
     let client = RelayClient::new(&relay);
     // Reading our own inbox needs the private read credential; the invite carries
-    // only the delivery token, which must not authorize a read.
+    // only the delivery token, which must not authorize a read. Bob's add-contact
+    // grant and his message are both queued here, so both ciphertexts are checked.
     let ids = client
         .list(&alice_inv.queue_id, alice.own_read_token())
         .await
         .unwrap();
-    assert_eq!(ids.len(), 1);
-    let body = client
-        .get(&alice_inv.queue_id, alice.own_read_token(), &ids[0])
-        .await
-        .unwrap();
-    assert!(
-        !body.windows(7).any(|w| w == b"\"from\""),
-        "relay blob must not be legacy JSON envelope"
-    );
+    assert_eq!(ids.len(), 2, "one queue grant and one message");
     let bob_id = bob.protocol_name();
-    assert!(
-        !body
-            .windows(bob_id.len())
-            .any(|w| w == bob_id.as_bytes()),
-        "relay blob must not contain sender protocol name"
-    );
+    for id in &ids {
+        let body = client
+            .get(&alice_inv.queue_id, alice.own_read_token(), id)
+            .await
+            .unwrap();
+        assert!(
+            !body.windows(7).any(|w| w == b"\"from\""),
+            "relay blob must not be legacy JSON envelope"
+        );
+        assert!(
+            !body
+                .windows(bob_id.len())
+                .any(|w| w == bob_id.as_bytes()),
+            "relay blob must not contain sender protocol name"
+        );
+    }
 
     let inbox = alice.recv().await.unwrap();
     assert_eq!(inbox.messages.len(), 1);
@@ -229,11 +232,12 @@ async fn reporting_a_queue_burns_it() {
     let inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
     let client = RelayClient::new(&relay);
 
-    // The device is live and its inbox holds the pending message. Only the
-    // private read credential can see it — the published delivery token cannot.
+    // The device is live and its inbox holds the pending message plus bob's
+    // queue grant. Only the private read credential can see them — the published
+    // delivery token cannot.
     let read_token = alice.own_read_token().to_string();
     let ids = client.list(&inv.queue_id, &read_token).await.unwrap();
-    assert_eq!(ids.len(), 1);
+    assert_eq!(ids.len(), 2, "one queue grant and one message");
 
     client
         .report_queue(&inv.queue_id, &read_token)

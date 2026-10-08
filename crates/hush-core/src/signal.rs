@@ -18,14 +18,57 @@ pub fn protocol_name_from_identity(pair: &IdentityKeyPair) -> String {
     hex::encode(pair.identity_key().serialize())
 }
 
-/// Build the address of one device of an account.
+/// The bytes a queue-grant signature covers.
 ///
-/// `name` is the *account* id, not the device's own identity hash: every device
-/// of an account shares it and the device id distinguishes them. That is exactly
-/// what libsignal's `ProtocolAddress` models, and it is why a peer holds one
-/// session per device under a single contact instead of a session per key.
-pub fn protocol_address(name: &str, device_id: u32) -> Result<ProtocolAddress, Error> {
-    let device_id = DeviceId::try_from(device_id).map_err(|_| Error::Corrupt)?;
+/// A newline separator is unambiguous because both fields are hex. The version
+/// tag keeps a future grant shape from verifying under this one.
+pub fn queue_grant_signing_bytes(queue_id: &str, delivery_token: &str) -> Vec<u8> {
+    format!("hush-queue-grant-v1\n{queue_id}\n{delivery_token}").into_bytes()
+}
+
+/// Sign a queue grant with the granting account's identity key.
+///
+/// The signature is what makes a grant trustworthy on a channel anyone can
+/// write to: the recipient verifies it against the identity key the sender
+/// pinned in their invite, so a forged grant cannot name a queue the forger
+/// controls.
+pub fn sign_queue_grant(
+    key: &IdentityKeyPair,
+    queue_id: &str,
+    delivery_token: &str,
+) -> Result<Vec<u8>, Error> {
+    let mut csprng = OsRng.unwrap_err();
+    key.private_key()
+        .calculate_signature(&queue_grant_signing_bytes(queue_id, delivery_token), &mut csprng)
+        .map(|sig| sig.into_vec())
+        .map_err(|_| Error::Corrupt)
+}
+
+/// Whether `signature` is a valid grant signature under `identity_key`.
+///
+/// `identity_key` is the serialized key the contact pinned in their invite, the
+/// same key that hashes to their account id. That is the authority the grant is
+/// anchored on now that there is no device list.
+pub fn verify_queue_grant(
+    identity_key: &[u8],
+    queue_id: &str,
+    delivery_token: &str,
+    signature: &[u8],
+) -> bool {
+    let Ok(key) = libsignal_protocol::IdentityKey::try_from(identity_key) else {
+        return false;
+    };
+    key.public_key()
+        .verify_signature(&queue_grant_signing_bytes(queue_id, delivery_token), signature)
+}
+
+/// Build the address of an account's one device.
+///
+/// `name` is the *account* id, not the device's own identity hash. The device id
+/// is the constant [`crate::device::DEVICE_ID`], because an account now has
+/// exactly one device.
+pub fn protocol_address(name: &str) -> Result<ProtocolAddress, Error> {
+    let device_id = DeviceId::try_from(crate::device::DEVICE_ID).map_err(|_| Error::Corrupt)?;
     Ok(ProtocolAddress::new(name.to_string(), device_id))
 }
 
@@ -277,15 +320,13 @@ pub fn invite_from_bundle(
 pub async fn process_contact_bundle(
     store: &mut InMemSignalProtocolStore,
     local_name: &str,
-    local_device_id: u32,
     remote_name: &str,
-    remote_device_id: u32,
     bundle: &PreKeyBundle,
 ) -> Result<(), Error> {
     use libsignal_protocol::process_prekey_bundle;
 
-    let local = protocol_address(local_name, local_device_id)?;
-    let remote = protocol_address(remote_name, remote_device_id)?;
+    let local = protocol_address(local_name)?;
+    let remote = protocol_address(remote_name)?;
     let mut csprng = OsRng.unwrap_err();
     process_prekey_bundle(
         &remote,
@@ -304,15 +345,13 @@ pub async fn process_contact_bundle(
 pub async fn encrypt_message(
     store: &mut InMemSignalProtocolStore,
     local_name: &str,
-    local_device_id: u32,
     remote_name: &str,
-    remote_device_id: u32,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     use libsignal_protocol::message_encrypt;
 
-    let local = protocol_address(local_name, local_device_id)?;
-    let remote = protocol_address(remote_name, remote_device_id)?;
+    let local = protocol_address(local_name)?;
+    let remote = protocol_address(remote_name)?;
     let mut csprng = OsRng.unwrap_err();
     let msg = message_encrypt(
         plaintext,
@@ -331,15 +370,13 @@ pub async fn encrypt_message(
 pub async fn decrypt_message(
     store: &mut InMemSignalProtocolStore,
     local_name: &str,
-    local_device_id: u32,
     remote_name: &str,
-    remote_device_id: u32,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     use libsignal_protocol::message_decrypt;
 
-    let local = protocol_address(local_name, local_device_id)?;
-    let remote = protocol_address(remote_name, remote_device_id)?;
+    let local = protocol_address(local_name)?;
+    let remote = protocol_address(remote_name)?;
     let mut csprng = OsRng.unwrap_err();
     let msg = parse_ciphertext(ciphertext)?;
     message_decrypt(

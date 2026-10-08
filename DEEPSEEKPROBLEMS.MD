@@ -8,7 +8,630 @@ slice. Newest section first. One entry per problem, with what was attempted, the
 resolution, and the status.
 
 Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fixed),
-`OPEN` (unresolved, needs a different environment or a later task).
+`OPEN` (unresolved, needs a different environment or a later task), `NO LONGER APPLICABLE`
+(the configuration it described cannot occur any more).
+
+---
+
+## 2026-10-08 — Internal-mail keyboard contact picker (the composer To field)
+
+Replaced the composer's native `<select>` recipient list with a typeable, keyboard-driven
+combobox (`ContactPicker.ts`). Problems hit while wiring and verifying it:
+
+### [FIXED] Escape in the picker re-rendered the whole shell and dropped focus
+
+- **Attempted:** press Escape to close the picker's list, expecting only the list to close.
+- **Symptom:** the list closed, but focus fell to `<body>` and the composer was rebuilt from
+  scratch. A marker set on the input node (`input.dataset.marker`) was gone afterwards, proving
+  the node had been replaced. Cause: `App` installs a document-level `keydown` handler that
+  calls `this.render()` on every Escape (app.ts, near line 273). The picker called
+  `e.preventDefault()` but the event still bubbled to that handler.
+- **Resolution:** added `e.stopPropagation()` in the picker's Escape branch when it actually
+  handles the key. Re-verified in the browser: the marker survived, `document.activeElement`
+  stayed on the input, and the value was restored.
+- **Lesson:** a control that handles a key the app also handles globally must stop propagation,
+  not just prevent the default; otherwise a local action triggers a global re-render.
+
+### [WORKED AROUND] `browser_type` inserts text without firing keydown, so it did not exercise the replace-on-type path
+
+- **Attempted:** type `zz` into a picker already showing the selected label `bob`.
+- **Symptom:** the value became `bobzz`, not `zz`. `browser_type` uses `Input.insertText`, which
+  fires only `input`, while the picker's "the first keystroke replaces the selected label" logic
+  lives in `keydown`.
+- **Resolution:** verified the replace path with real key events (`browser_press_key`): pressing
+  `c` on a field showing `bob` cleared it to `c`. Verified the filter path separately with an
+  `input` event.
+- **Lesson:** `browser_type` is not a faithful keyboard for keydown-dependent behavior; use
+  `browser_press_key` when the logic branches on key events.
+
+### [OPEN] Native click-to-open could not be verified in the automation browser (tooling, not the repo)
+
+- **Attempted:** click the To field to open the list, the way a mouse user would.
+- **Symptom:** the input received focus (`document.activeElement` was the input) but
+  `aria-expanded` stayed `false` and the popup stayed hidden. `document.hasFocus()` returned
+  `false` for the whole session: the Cursor browser tab was never the OS-focused window, and a
+  click in that state did not dispatch a `focus` event. Dispatching `new FocusEvent("focus")`
+  and pressing ArrowDown both opened the list, so the handler itself is correct.
+- **Resolution:** none required in the repo. Closing this needs a click-to-open check in a
+  focused window (the Tauri window, or a manually focused browser).
+- **Lesson:** in this environment, a missing native focus event after a programmatic click is an
+  automation artifact, not an app bug. Do not "fix" the component for it.
+
+### [WORKED AROUND] The no-contacts state could not be reached in the dev vaults
+
+- **Attempted:** verify the "no contacts at all" empty state against a running composer.
+- **Symptom:** both dev vaults (`peer-a`, `peer-b`) each hold exactly one contact, so the
+  no-contacts branch is unreachable there, and the multi-match/accent filtering could not be
+  exercised with one contact either.
+- **Resolution:** imported the real `ContactPicker` module into the running page and mounted it
+  with synthetic items (including an accented `Álvaro` and an empty list) to exercise the same
+  code in the same browser. Verified: `alv` matches `Álvaro` (accent- and substring-insensitive),
+  two matches highlight and move with ArrowDown, and the empty list shows its own message.
+- **Lesson:** a one-contact dev vault is not enough to verify a picker; mount the real module
+  with representative data rather than claiming the edge states work.
+
+---
+
+## 2026-10-08 — Public-key outsider drop (second drop mode, alongside the PIN mode)
+
+Added `hush-drop-v2`, an X25519 sealed box for outsider drops, and a `hush-cli drop-keygen` /
+`drop-open` pair so an outsider can make a key and open one. The PIN path (`hush-drop-v1`) is
+untouched and verified unchanged. Problems hit while wiring and verifying it:
+
+### [WORKED AROUND] A dev relay I started for a UI check shared port 8787 with a live two-peer session
+
+- **Attempted:** to exercise the composer end to end I started `hush-relay` on the default
+  `127.0.0.1:8787` with a throwaway DB (`HUSH_RELAY_DB=.tmp-ui-check/relay.db`) and a private daemon.
+- **Symptom:** the two-peer dev environment (`scripts/run-two-ui.sh`, daemons on 9876/9877, Vite on
+  5173) was already up and reuses a relay that answers on 8787. It therefore adopted my relay. When
+  I then `rm -rf .tmp-ui-check` to tidy up, the running relay's SQLite database file was unlinked
+  out from under it; new deliveries would fail because SQLite cannot recreate its journal at a path
+  whose directory is gone.
+- **Resolution:** killed my relay and restarted one at 8787 with the canonical
+  `instances/relay/relay.db`, which is what `run-two-ui.sh` would have used. Any blob stored in the
+  deleted DB is unrecoverable, but nothing in that window was under test. Re-ran the UI check against
+  a private daemon on a free port (19876) instead of 9876, leaving the two-peer session alone.
+- **Lesson:** check for a running dev relay before starting another, and never point a relay at a
+  throwaway DB on a port a dev script may reuse. `ss -ltnp` before starting is cheaper than repairing
+  a shared session.
+
+### [FIXED] The UI check nearly used a daemon that was not mine (the stale-process trap)
+
+- **Attempted:** `curl http://127.0.0.1:9876/api/status` to see whether my freshly started daemon was
+  up.
+- **Symptom:** it returned `200`, which looked like success — but `ss -ltnp` showed 9876 was already
+  held by the two-peer session's `peer-a` daemon (started earlier, different vault, different
+  passphrase), and my daemon had failed to bind.
+- **Resolution:** checked `ps -eo pid,lstart,cmd` and `ss -ltnp` before trusting the status code, then
+  ran my daemon on 19876. The user's warning about a stale daemon is exactly right: a `200` on the
+  default port says nothing about which process answered.
+- **Lesson:** never treat "the port answers" as "my process is up". Compare the process start time and
+  the port owner first.
+
+### [FIXED] The key smoke script wrote an attachment into the repository root
+
+- **Attempted:** ran `scripts/smoke-drop-key.sh`, which opens the drop a second time with
+  `drop-open --delivery <id> --relay <url>`.
+- **Symptom:** `git status` showed an untracked `q3.txt` in the repo root. That invocation had no
+  `--save-dir`, so the package attachment was written to the process working directory (the repo root,
+  since the script was run from there).
+- **Resolution:** added `--save-dir "$T/open-relay"` (and an `mkdir -p`) to that call; re-ran the
+  script and confirmed `git status` is clean of stray files. This is the intended default of
+  `drop-open` — write attachments where the user is — the script just had to contain it.
+- **Lesson:** any script that drives a tool which writes to the CWD must pin the output directory.
+
+### [FIXED] `pkill -f` matched the shell running it and killed the cleanup mid-way
+
+- **Attempted:** `pkill -f 'hush-daemon --dir /home/sam/ProjectHush/.tmp-ui-check'` followed by
+  `rm -rf .tmp-ui-check` in the same command.
+- **Symptom:** the command produced empty output and the temp vault was still present. The `pkill`
+  pattern appeared in the shell's own command line, so `pkill` killed the shell before the `rm` ran.
+- **Resolution:** re-checked with `ps -eo pid,cmd | grep -F hush-daemon` (which does not match itself
+  the same way) and removed the directory in a separate command.
+- **Lesson:** `pkill -f` can match the invoking shell; scope it to a PID or a pattern that cannot
+  appear in the shell's own argv. Tooling-related, not a repo problem.
+
+### [FIXED] `cargo test` takes only one filter, and the build lock waited 2m34s behind the other agent
+
+- **Attempted:** `cargo test -p hush-core --lib drop:: crypto::`.
+- **Symptom:** `error: unexpected argument 'crypto::' found` — `cargo test` accepts a single test-name
+  filter. Separately, `cargo test -p hush-core --lib drop::` reported `Blocking waiting for file lock
+  on build directory` for 2m34s, because the concurrent multi-device agent was building in the same
+  target directory.
+- **Resolution:** ran the two filters as separate commands. The lock cleared on its own; no failure.
+- **Lesson:** budget for the shared `target/` lock when another agent is building the same tree. This
+  is a collision cost, not a defect.
+
+---
+
+## 2026-10-08 — Multi-device removed entirely (one device per account)
+
+The user asked for multi-device support to be removed outright, not hidden behind a disabled entry
+point. Removed: the signed device list (`DeviceList`/`DeviceRecord`, `PUT`/`GET /d/{account_id}`),
+the relay `device_dirs` table, per-device fan-out, cross-device `Revoked` reconciliation and
+`revoke_sweep`, device linking (`POST /api/link-device/*`), `ContactDevice`/`contact.devices`, the
+device-list TTL refresh, and the tests that existed only for multi-device. Kept: per-contact queues,
+per-contact revocation, the `revoked` blocklist, prekeys, and the on-disk device file (which still
+reads `device_id`, now a constant `1`). `DEVICE_ID = 1` everywhere a libsignal address needs one.
+
+**Grant authentication is unchanged in strength.** The device list used to be the authority a
+`hush-queue-grant-v1` signature was verified against. With it gone, `apply_queue_grant` verifies the
+signature directly against the contact's `identity_key` — the key pinned in the invite that
+established the relationship, and the key that hashes to the contact's account id. The signature
+check itself is untouched; only the device-list lookup was dropped, and there is no path that accepts
+a grant verified against a sender-supplied key. The `revoked` blocklist is kept: it is what drops a
+deleted contact's already-queued blobs on drain, a job the per-contact burn cannot do for a blob that
+is already in the shared inbox.
+
+### [FIXED] A grant send advanced the session ratchet without persisting it
+
+- **Attempted:** verified the post-removal wire end to end by exchanging invites with the CLI
+  (`hush-cli add-contact`) and then sending from the daemon that opened the same vault. The first
+  message the recipient drained reported `Could not decrypt a queued message — unknown sender or
+  session not ready.` and the blob stayed undecryptable on every later drain; later sends worked.
+- **Cause:** `Account::grant_queues_to` calls `deliver_to`, which runs `encrypt_message` and advances
+  the session ratchet, but never saves. `add_contact` saves *before* the grant, so a process that
+  exits right after adding a contact (the CLI) left the ratchet on disk at its pre-grant position.
+  The next process then encrypted with a reused chain key and the peer could not decrypt. The daemon
+  masks this because it keeps the store in memory and saves again on its next send.
+- **Resolution:** `grant_queues_to` now calls `self.save().await?` after the grant attempt. Re-ran
+  the exact CLI-add/daemon-send flow: first message delivered, no warning. Full workspace suite still
+  green.
+- **Lesson:** any path that mutates the session store must persist it before it can be the last thing
+  a process does. "The caller will save" is false when the caller is a one-shot CLI command.
+
+### [FIXED] Mutation check on the revocation burn still fails when the burn is stubbed
+
+- **Attempted:** stubbed `burn_contact_queue` to return `Ok(())` and ran
+  `cargo test -p hush-core --test revocation`.
+- **Symptom:** `deleting_one_contact_burns_only_its_queue` FAILED with "the deleted contact's queue
+  must be burned immediately" — the assertion is real. `a_revoked_contact_cannot_deliver_into_the_shared_inbox`
+  still passed, which is expected: it exercises the `revoked` blocklist dropping decrypted blobs, a
+  separate mechanism from the burn, so it is not a mutation target for this stub.
+- **Resolution:** restored the burn; both tests pass. Live check against the dev relay: a throwaway
+  pair delivered into the recipient's per-contact queue, the recipient deleted the contact, and the
+  relay's burned-queue count went 2 -> 3 (`select count(*) from queues where burned=1`).
+- **Lesson:** a mutation check only proves the test that targets the mutated function. Record which
+  assertions a stub is expected to break, or a passing bystander test looks like a hole.
+
+---
+
+## 2026-10-08 — Per-contact queue revocation implemented (option 2)
+
+### [FIXED] A live delete did not burn, because the running daemon predated the wiring it was testing
+
+- **Attempted:** ran the throwaway delete flow end to end against the dev daemon on
+  `127.0.0.1:9876`: add a throwaway contact, deliver once, delete it, check the relay's burned count
+  and whether the throwaway could still send.
+- **Symptom:** `remove:204` and the contact was gone from `/api/contacts`, but `burned queues after
+  delete: 0` and `SEND AFTER DELETE: UNEXPECTEDLY SUCCEEDED`. Rebuilding and restarting the daemon
+  made the identical script pass: `burned queues before delete: 1` to `after delete: 2`, and
+  `SEND AFTER DELETE: failed as expected -> Error: Relay("put failed: 403 Forbidden")`.
+- **Cause:** the running process was started on 2026-10-07, before this slice. `target/debug/hush-daemon`
+  was rebuilt at 06:36:31, but the daemon-side wiring it needed landed later:
+  `crates/hush-daemon/src/account_worker.rs` (`RemoveContact -> revoke_contact`) was last written at
+  06:44:02 and `crates/hush-core/src/payload.rs` (`QueueGrant` / `Revoked`) at 06:43:06. So the process
+  image was a build in which removing a contact did not revoke. A `strings` check that the *binary on
+  disk* contained the burn code was true and irrelevant — the process was running an older image.
+- **Resolution:** killed the stale process, restarted `target/debug/hush-daemon`, and re-ran; the burn
+  and the 403 then appeared. A temporary `eprintln!` in `burn_contact_queue` / `grant_queues_to`
+  confirmed the granted and burned queue ids were identical, then was removed.
+- **Lesson:** a long-running daemon is a build artifact with its own start time; verifying the file on
+  disk proves nothing about the process image. Compare the process start time against the source and
+  binary mtimes before trusting any live result, and restart the process after every rebuild.
+
+### [FIXED] A burned queue reported 403, so a device's own reconciliation broke its next drain
+
+- **Attempted:** after wiring `Account::recv` to drain the inbox plus every per-contact queue, and to
+  burn a queue on an own-device revocation notice, ran the new integration test.
+- **Symptom:** `Relay("list failed: 403 Forbidden")` from `alice_2.recv()`. The notice is processed
+  during the inbox pass and burns device 2's queue for the deleted contact; the same `recv` then lists
+  that queue, and `RelayClient::list_optional` only treated 404 as empty.
+- **Cause:** the relay maps a burned queue to `403` (`RelayError::Burned -> FORBIDDEN`) and a wrong
+  token to `401` (`Unauthorized`). `list_optional` was written for a queue that may not exist (404) and
+  did not know a burned queue is also "nothing to read".
+- **Resolution:** `list_optional` now returns an empty list on 403 as well as 404. A 401 (wrong token)
+  still errors, so the relaxation cannot hide a credential bug. Evidence:
+  `crates/hush-core/tests/revocation.rs` passes.
+- **Lesson:** "the queue is gone" has two relay encodings — never created (404) and burned (403) — and
+  a drain has to treat both the same. Enumerate the status codes a check must absorb, not just the one
+  the happy path produces.
+
+### [NO LONGER APPLICABLE] A linked device cannot open a session with a single-device contact that never published prekeys
+
+- **Attempted:** the multi-device revocation test has Alice's second device grant its per-contact queues
+  to Bob and Carol, who are single-device accounts.
+- **Symptom:** `hush: grant to <bob> device 1 failed: relay error: prekey get failed: 404 Not Found`.
+  A linked device holds none of the original device's sessions (the device store is not transferred), so
+  `ensure_session` fetches the peer's prekey record; a single-device account only ever publishes prekeys
+  inside `announce_linked_device`, so there is no record to fetch.
+- **Impact:** in production a linked device's grant to such a contact silently fails, so that contact
+  keeps delivering to the linked device's shared inbox. Revocation on the linked device then relies on
+  the `revoked` blocklist dropping the messages rather than on burning a per-contact queue. Revocation
+  still hides the messages, but the queue-burn guarantee does not hold for that pair until the contact
+  publishes prekeys.
+- **Worked around in the test** by calling `publish_prekeys(5)` on Bob and Carol, which models a contact
+  that has published. Not fixed in the daemon: `ensure_device_list_published` runs on unlock but nothing
+  calls `publish_prekeys` outside linking. Publishing prekeys on unlock would close it.
+- **Status:** NO LONGER APPLICABLE (2026-10-08). Multi-device and device linking were removed, so the
+  configuration this describes — a *linked* second device granting to a single-device contact — cannot
+  occur. The entry is kept rather than deleted, per this log's rule. The underlying observation (a
+  one-time `ensure_session` fetch against a peer that never published prekeys) is not exercised by any
+  surviving code path, because a grant now always rides the session the invite established.
+
+### [FIXED] Existing queue-count assertions in `two_party_relay.rs` assumed one blob per inbox
+
+- **Attempted:** ran the workspace suite after adding queue grants.
+- **Symptom:** `relay_blob_has_no_cleartext_sender_json` and `reporting_a_queue_burns_it` failed with
+  `left: 2, right: 1`: the inbox now also holds the sender's queue grant alongside the message.
+- **Resolution:** the tests assert two blobs (one grant, one message) and check the opacity of both.
+  This is the intended new state, not a regression.
+- **Lesson:** a test that counts queue blobs encodes the set of payload kinds that can land there.
+  Adding a control payload is a change to that set.
+
+---
+
+## 2026-10-07 — Per-contact queue revocation (multi-device)
+
+### [FIXED] Per-contact revocation is blocked on how a contact's *other* devices learn the queue
+
+> **Closed 2026-10-08.** The user chose **option 2** and it is implemented. Each device derives a
+> per-contact queue and its read token from its own read token (`crypto::contact_queue_id` /
+> `contact_queue_read_token`), so the read token stays per device and out of the vault. The device
+> list's queue is now a **grant channel**: each device sends a signed `MessagePayload::QueueGrant`
+> (`queue_id`, `delivery_token`, `signature`) into the contact's inbox over the libsignal session, and
+> the recipient verifies the signature against the identity key the signed device list vouches for that
+> device — the same authority `DeviceList::verify` uses for the account id, so an unauthenticated write
+> to the public grant channel cannot name a queue the writer owns. The blocklist (`AccountState.revoked`)
+> remains only as defence in depth. Cross-device reconciliation is the `MessagePayload::Revoked` notice
+> a device sends to its own siblings' inboxes (authenticated by the own-device session), which makes each
+> sibling burn its own queue and drop the contact; `revoke_sweep` retries any burn that failed. Evidence:
+> `crates/hush-core/tests/revocation.rs` (`deleting_one_contact_burns_only_its_queues_on_every_device`,
+> `a_single_device_delete_burns_its_queue`), which fail when `burn_contact_queue` is disabled (verified
+> again 2026-10-08 by stubbing `burn_contact_queue` to `Ok(())`: both tests fail, at the "device 1 must
+> burn its queue" and the "must not be able to deliver" assertions).
+>
+> **Not fully closed.** One multi-device path is still broken and tracked separately as `OPEN`:
+> a *linked* device's grant to a *single-device* contact that never published prekeys fails
+> (`prekey get failed: 404`), so for that pair revocation falls back to dropping on drain rather than
+> burning the queue. See "[OPEN] A linked device cannot open a session with a single-device contact
+> that never published prekeys". The design is implemented; that pair's burn guarantee is not.
+
+
+- **Attempted:** implement the fix the user chose — mint a per-contact queue at add time so deleting
+  a contact burns only that contact's queue — by first designing it against the real send/recv path.
+- **What is settled by the code and docs:** the relay needs no new endpoint. `Store::authorize`
+  (`crates/hush-relay/src/store.rs`) mints a queue on first `PUT`, `Store::report_queue`
+  (`store.rs:294`) burns it, and `POST /q/{id}/report` exists (`crates/hush-relay/src/app.rs:244`).
+  `docs/DESIGN.md` already chose "invite-minted rotating receive queues"; `docs/PROTOCOL.md` says
+  "recipient lists/drains their queues" (plural) and "rotate queue IDs inside the encrypted session".
+  So a per-contact queue on the recipient, handed out in the invite, is the intended shape.
+- **The blocking finding — multi-device.** A peer fans out one ciphertext per recipient device
+  (`Account::send_payload_inner`, `account.rs:1084`), and the recipient learns those devices from the
+  signed device list, which carries each device's `queue_id`/`queue_token`
+  (`Account::publish_device_list`, `account.rs:1239`; `refresh_contact_devices`, `account.rs:1339`).
+  For deleting a contact to cut off **every** device of the account, the contact must be unable to
+  deliver to *any* of them, so the queues are necessarily **per (contact, device)**. But a queue's
+  delivery token can only reach the contact privately — the device list is public and unauthenticated
+  (`GET /d/{account_id}`, `app.rs:159`), which is the exact leak that makes the current rotation
+  impossible. So the per-device queues must be granted in-session (a new payload), not published.
+- **Why the invite alone cannot carry them:** the invite is generated by one device (whichever calls
+  `invite()`), so it can only name that device's queue. The account's other devices' queues have no
+  channel to the contact unless the *other* device grants them — and that device may have no session
+  with the contact yet, and the contact may not even be a contact of that device (contacts are
+  one-sided; a peer can add you without you adding them). A grant channel therefore has to be
+  introduced (a per-device "control"/bootstrap queue in the device list that only accepts grants and
+  own-copies), plus a blocklist so a revoked account's grants are ignored, plus cross-device
+  reconciliation so each of the deleter's devices burns its own per-contact queues.
+- **Second blocking finding — where the read token lives.** If per-contact queues are read by all of
+  the account's devices (one queue per contact, simplest fan-out), the read token must be shared
+  across devices, which today it explicitly is not: `DeviceKeys.read_token` is per device and kept out
+  of the vault and out of backups (`device.rs:55-71`), and `docs/THREAT_MODEL.md` lists queue read
+  tokens as "per device, never published". Sharing them is a threat-model change, and it weakens
+  *device* revocation (a revoked device's vault copy could still read pre-existing per-contact
+  queues unless every per-contact queue is also rotated). Keeping them per device avoids that but
+  forces per-(contact, device) queues plus the cross-device burn described above.
+- **Symptom:** neither branch is a patch. Both change the invite model (per-handout queues, so
+  `AccountState.invite_cache` stops being a single blob and becomes a set of issued handout queues),
+  the device-list semantics (its queue becomes a grant channel, not a delivery target), and the
+  send/recv paths (poll N queues, route grants vs messages, drop a blocklisted sender). Each is
+  security-critical, and the wrong pick produces a change that *looks* like revocation while leaving a
+  device reachable — which the task says is worse than the current honest state.
+- **Resolution needed (a user decision, then a slice):** pick one and I will implement it end to end:
+  1. **Per contact, shared read token in the vault.** One queue per contact, all the account's
+     devices read it, the sender fans out N ciphertexts into it. Smallest change; requires accepting
+     that read tokens live in the vault (and rotating every per-contact queue when a *device* is
+     revoked).
+  2. **Per (contact, device), read token stays per device.** Sounder for device revocation; needs a
+     per-device grant/control queue, a blocklist, and cross-device burn reconciliation. Largest
+     change.
+  Either way the invite becomes per-handout and the device list's queue becomes a grant channel.
+- **Lesson:** "mint a queue per contact" is one sentence, but the recipient having more than one
+  device turns it into a credential-distribution problem, and the only private channel is the session.
+  Before committing to a revocation design, count the credential holders (every device of both
+  parties) and ask how each one learns and loses the credential — not just the inviting device.
+
+---
+
+## 2026-10-07 — Trusts: typed-DELETE confirmation, copy sweep, card ordering
+
+### [FIXED] The delete dialog cannot say "they lose the ability to message you", because they do not
+
+> **Closed 2026-10-08.** The protocol change landed (see the newest section): deleting a contact now
+> burns the per-contact queues its devices deliver into. The Trusts delete modal in
+> `apps/hush-tauri/src/app.ts` now says the person is removed, history stays in the vault, and they can
+> no longer message you. It states the one remaining limit accurately: a contact added before
+> per-contact queues existed is still on the shared inbox (not burned, or every old contact would be cut
+> off at once) and becomes revocable once it receives its own queue. The typed-`DELETE` gate is
+> unchanged. `npx tsc --noEmit` passes.
+
+- **Attempted:** built the requested typed-`DELETE` confirmation and wrote its copy to the spec:
+  removed from Trusts, history stays in the vault, they lose the ability to message you, cannot be
+  undone, plus a sentence about re-issuing the invite to the remaining contacts.
+- **Symptom:** the revocation those two sentences describe does not exist. The entry below
+  ("Rotating the invite cannot revoke a contact") is still `OPEN`, and no rotate-and-re-issue flow
+  was built, so a deleted contact can still deliver to the relay inbox. The typed gate itself is
+  real and was verified in the running app (disabled until the field matches, input focused, Enter
+  guarded, Escape and backdrop dismiss, state reset on reopen); only the claim was not shippable.
+- **Resolution:** shipped honest copy. The dialog says the person is removed from Trusts, that
+  history stays, that they disappear from Chats/Mail/Trusts and the session is dropped, that this
+  cannot be undone, and it states the limit plainly: they can still write to the relay inbox,
+  because the invite cannot be rotated without cutting off the remaining contacts too. The
+  "re-issued invite" sentence is omitted because no invite is re-issued.
+- **What is still needed:** the protocol change named in the entry below. When it lands, the copy
+  can be upgraded to the wording the requirement asked for. Until then, saying it would be a lie
+  in the product.
+- **Lesson:** a UI requirement can be downstream of a protocol decision. Write the copy against
+  what the system actually does and record the gap, rather than letting a modal assert a security
+  property that nothing enforces.
+
+### [OPEN] WebKitGTK still has not run this pane, so the dialog is verified only in Chromium
+
+- **Attempted:** verify the Trusts pane, the typed confirmation, the ordering and the filter in a
+  running app rather than by reading code.
+- **Symptom:** no failure. Everything above was exercised against the Vite dev server at
+  `localhost:5173` in the Cursor IDE browser (Chromium) and against the live daemon on
+  `127.0.0.1:9876`: the card order `ámbar, bob, Zed` from an API order of `bob, Zed, ámbar`, the
+  filter narrowing with real `input` events, and both delete paths (Enter and the button) end to
+  end. But the shipped desktop shell is WebKitGTK, and no Tauri CLI is installed here, so that
+  engine was never run.
+- **Resolution:** not resolved. Same constraint as the composer's `execCommand` entry: browser
+  evidence, not shell evidence.
+- **Lesson:** say which engine the evidence came from. "Verified in the app" is ambiguous when the
+  dev server and the desktop shell are different engines.
+
+---
+
+## 2026-10-07 — Mail reading pane (header, rules, absolute time)
+
+### [FIXED] A concurrent edit to `app.ts` turned `tsc` red in code this slice does not own
+
+- **Attempted:** re-run `npx tsc --noEmit` as the final check after finishing the mail-pane edits.
+- **Symptom:** `src/app.ts(1231,7): error TS2304: Cannot find name 'setKnownContacts'` (exit 2).
+  The name is imported at `app.ts:38` from `./lib/mailStore` and called at lines 258, 317, 1234 and
+  3225, but at that moment no module exported or defined it — a repo-wide grep found it only at
+  those call sites. The failing code is the Trusts/contact-revocation slice, which belongs to the
+  other agent and is off-limits here. The first `tsc` run in this session, taken before that edit
+  landed, passed with exit 0.
+- **Resolution:** not touched in this slice, deliberately — repairing it would have meant editing
+  another agent's in-flight code and colliding with it. The other agent then landed the export
+  (`setKnownContacts` now defined at `mailStore.ts:86`), and a fresh `npx tsc --noEmit` in this
+  session returned exit 0 with no output. That run is the evidence that closed this entry.
+- **Lesson:** on a shared working tree a clean check can go red between two commands. Record the
+  exact error and which slice owns it; do not repair another agent's half-finished edit. Re-running
+  the check later is enough when the owner is still working.
+
+### [OPEN] A concurrent agent edits the same two source files, so the verified UI state is not final
+
+- **Attempted:** implement the mail header/rules/absolute-timestamp slice in
+  `apps/hush-tauri/src/app.ts` and `apps/hush-tauri/src/styles/app.css` while another agent was
+  building the Trusts rail in the same two files.
+- **Symptom:** `git diff` for `app.ts` is 637 lines and mixes several pre-existing uncommitted
+  slices (rich-text compose, outsider mail) with the Trusts work, so this slice's diff cannot be
+  read in isolation. The other agent also appended its own section to this log
+  (`## 2026-10-07 — Trusts rail and contact revocation`) between two of my reads of this file,
+  so the race is live, not hypothetical.
+- **Resolution:** re-read each region immediately before editing and used small anchored
+  replacements; every edit applied cleanly and `npx tsc --noEmit` stayed clean, so no collision
+  occurred in this slice. The header block, the rules and the absolute timestamp were then
+  verified in the running dev server.
+- **What is still needed:** the UI was verified against a tree another agent is still writing, so
+  the reading pane must be re-checked once the Trusts work lands. This is a workflow risk, not a
+  code defect in the mail pane.
+- **Lesson:** on a shared working tree, "it type-checks" certifies the tree only at the instant it
+  was read. Anchor edits to exact text and re-read before every write; do not treat a whole-file
+  diff as proof that a change is yours.
+
+### [WORKED AROUND] `browser_snapshot` collapses the mail header, so the DOM had to be read over CDP
+
+- **Attempted:** verify the new From/To/Date/Subject block using the browser tool's accessibility
+  snapshot of the open thread.
+- **Symptom:** the snapshot listed the heading and the action buttons but not the `<dl>` fields,
+  so it could not show whether the header rendered at all.
+- **Resolution:** read the rendered text and computed styles with `browser_cdp`
+  (`Runtime.evaluate`), which confirmed the four fields, the 1px `--border` rules and the aligned
+  label column. The accessibility snapshot is not a substitute for reading the DOM for
+  layout-only changes.
+- **Lesson:** assert on computed style and geometry, not just the accessibility tree.
+
+---
+
+## 2026-10-07 — Trusts rail and contact revocation
+
+### [FIXED] Rotating the invite cannot revoke a contact: the public device list republishes the delivery token
+
+> **Closed 2026-10-08.** Revocation no longer depends on rotating the invite. Contacts deliver into a
+> per-contact queue that each device mints and reads with a per-device credential; the device list's
+> queue is a grant channel and no longer a delivery target once a grant has landed. Deleting a contact
+> burns those queues on every device of the deleter, so the published device list does not resurrect a
+> delivery path. The delivery token is still public by design, but it now authorizes only putting a blob
+> in a queue that the deleter can burn, and the grant that names a queue is signed by the granting
+> device's identity key and verified against the signed device list. Migration limit (old contacts on
+> the shared inbox) is documented in `docs/PROTOCOL.md` and in the modal copy. Evidence:
+> `crates/hush-core/tests/revocation.rs`.
+
+- **Attempted:** built the Trusts rail and, before wiring Delete to a
+  rotate-and-re-issue flow, traced what actually authorizes a delivery into an
+  account's inbox.
+- **Evidence from the code:**
+  - `Account::invite()` (`crates/hush-core/src/account.rs`) mints and caches one
+    invite carrying the account's single inbox `queue_id` and its delivery token.
+    Every contact of an account receives that same invite, so they all hold the
+    same delivery token. `DeviceKeys::queue_token()` (`crates/hush-core/src/device.rs`)
+    is `queue_delivery_token(read_token)`, one value for the whole account.
+  - `Store::authorize` (`crates/hush-relay/src/store.rs`) binds a queue to
+    `sha256(delivery_token)` on first write and rejects a non-matching token.
+    There is no path to rebind an existing queue, so a rotation means a new queue
+    id and a new token.
+  - The decisive leak: `Account::publish_device_list()` writes
+    `queue_token: self.device.queue_token()` for device 1 into the signed list,
+    and `GET /d/{account_id}` is deliberately unauthenticated
+    (`crates/hush-relay/src/app.rs`). `Account::refresh_contact_devices()` reads
+    that list and overwrites the contact's `queue_id`/`queue_token`
+    (`crates/hush-core/src/account.rs`). A contact learns the owner's
+    `account_id` from the invite it was given (`InvitePayload.protocol_name`).
+- **Symptom:** any rotate-and-republish revocation is undone by the revoked
+  contact's next send. `refresh_contact_devices_if_stale` (5-minute TTL, and it
+  also runs from the daemon's `/api/contacts`) fetches the public device list and
+  picks up the new delivery token. Burning the old queue does not help, because
+  the new queue is the one the list advertises. This contradicts
+  `docs/THREAT_MODEL.md`, which names "a contact who was blocked (they should not
+  keep delivering to a live slot)" as an attacker, and `docs/PROTOCOL.md`, which
+  describes a queue "the other party can send into" per contact
+  ("Block = drop local session + tell relay to burn that queue"). The
+  implementation collapsed that per-contact slot into one shared account inbox.
+- **Resolution needed:** a protocol change, not a patch. Options, none
+  slice-sized: (a) per-contact inboxes minted when a contact is added, with
+  revoke = burn that contact's inbox (matches PROTOCOL.md; needs a way to hand the
+  dedicated inbox to the contact and keep it out of the public device list);
+  (b) authenticate `GET /d/{account_id}` behind a directory capability rotated on
+  revocation and re-issued to remaining contacts; or (c) rotate the account
+  identity, which breaks every session. Until one is chosen, Delete removes the
+  contact, keeps history, and drops their sessions, but does **not** stop them
+  writing to the inbox.
+- **Lesson:** a credential published at a stable, unauthenticated rendezvous
+  cannot be rotated away from someone who already knows the rendezvous key. The
+  question is not "can I mint a new token" but "who can discover it".
+
+---
+
+## 2026-10-07 — Outsider mail (delivery + drop)
+
+### [FIXED] The drop container's production KDF cost was paid in every test, taking the suite from seconds to 85
+
+- **Attempted:** wrote the `hush-drop-v1` container tests against the public `seal`/`open`, which
+  stretch the PIN with PBKDF2 at 600,000 iterations.
+- **Symptom:** `cargo test -p hush-core --lib` went from ~13s to **84.9s**, with four tests each
+  reporting `has been running for over 60 seconds`. The tests were correct and passed; the cost was
+  the production iteration count multiplied by every seal and open in the tests, on an unoptimized
+  build.
+- **Resolution:** split `seal` into a public entry point that passes `DROP_ITERATIONS` and a private
+  `seal_with_iterations`. The count is recorded in the container header either way, so `open` needs
+  no hint and the tests exercise the same code path with 1,000 iterations. The drop tests now run in
+  **0.07s** and the production count is unchanged and pinned by a compile-time assertion
+  (`const _: () = assert!(DROP_ITERATIONS >= 600_000)`).
+- **Lesson:** a deliberately expensive primitive has to be injectable, or the cost lands on the test
+  suite and people quietly lower it. Pin the production value at compile time so parameterizing it
+  for tests cannot become a way to weaken it.
+- **Still true after the fix:** the *integration* test in `crates/hush-core/tests/outsider_mail.rs`
+  deliberately pays the real 600k cost, because it is the only place the shipped path is exercised
+  end to end. It is the slowest test in the suite (~40s in a debug build). That is a cost, not a
+  defect, but it should not grow: keep the number of real-iteration seals and opens in integration
+  tests to the minimum that still proves the shipped path.
+
+### [FIXED] A wrong KDF test-vector reference was written into the plan before the code existed
+
+- **Attempted:** specified the PBKDF2 test as "RFC 6070, case 2" with a 20-byte output.
+- **Symptom:** RFC 6070 is the **PBKDF2-HMAC-SHA1** vector set. Using it to check a
+  PBKDF2-HMAC-SHA256 implementation would have asserted the wrong digest, or the test would have
+  been "fixed" by weakening the implementation to match a SHA-1 result.
+- **Resolution:** the implementation and its test use the standard PBKDF2-HMAC-SHA256 vectors
+  (including a 40-byte case that spans two output blocks), and the plan text was corrected to say
+  why RFC 6070 does not apply. Verified: `pbkdf2_matches_the_published_sha256_vectors` passes.
+- **Lesson:** a test vector quoted from memory is a claim. Name the exact document and hash, and
+  prefer a vector whose digest length forces the multi-block path.
+
+---
+
+## 2026-10-07 — Rich-text mail compose
+
+### [WORKED AROUND] The browser-automation text tool does not carry the editor's typing style, so formatted typing looked broken
+
+- **Attempted:** verified the new compose editor by clicking Bold, then using the browser tool's
+  "type" action to enter text, then reading the editor DOM.
+- **Symptom:** the toolbar reported `Bold: pressed` but the surface's `innerHTML` was the bare string
+  `bold text and a bullet` — no `<b>`, no `<ul>`. It looked like `execCommand` was a no-op in the
+  WebView, which would have meant the feature did not work.
+- **Resolution:** the same `document.execCommand("bold")` run directly through `Runtime.evaluate`
+  against selected text produced `<b>hello world</b>`, and `insertUnorderedList` produced
+  `<ul><li><b>hello world</b></li></ul>`. The automation's type action inserts text by a path that
+  does not apply the browser's pending typing style, so the formatting was never going to appear.
+  This is a tooling artifact, not a repo problem. The editor was then verified end to end (send,
+  recipient, draft round-trip) by driving the formatting commands through CDP and reading the DOM.
+- **Lesson:** `queryCommandState` reporting a toolbar button as active says nothing about the DOM.
+  Confirm formatting by reading `innerHTML`, not the pressed state — the same trap the Phase 5 note
+  records for toolbar clicks.
+
+### [FIXED] Saving a draft opened from a thread left the reading pane on the old thread
+
+- **Attempted:** tested the rich composer from the Compose button while a conversation was open, then
+  saved a draft.
+- **Symptom:** the folder switched to Drafts (badge updated, list correct) but the main pane still
+  rendered the conversation that had been open, because `openCompose` never cleared `mailThreadId`
+  and `renderMailMain` prefers the thread over the list. Pre-existing, but only reachable by opening
+  compose while a thread was displayed, which the new test flow did.
+- **Resolution:** `openCompose` now clears `mailThreadId`/`mailOpenId` for a brand-new message (no
+  draft and no reply thread), so leaving compose returns to the folder list. Replies and draft edits
+  keep their thread. Verified: Save draft from an open thread now lands on the Drafts list.
+- **Lesson:** "the folder changed" and "the pane changed" are separate assertions. Checking only the
+  badge would have missed this.
+
+### [OPEN] The composer formats with `document.execCommand`, which is deprecated and untested on WebKitGTK
+
+- **Attempted:** chose a formatting API for the contenteditable surface without adding an editor
+  dependency (ProseMirror/Tiptap/Quill would be a large new dependency for bold/italic/lists).
+- **Symptom:** no failure yet. `execCommand` is deprecated and its behaviour is not guaranteed
+  identical across engines. It was exercised only in the Cursor IDE browser (Chromium) during this
+  slice; the real desktop shell on Linux runs WebKitGTK, which was not run here (no Tauri CLI — see
+  the entry above about the unreferenced dev config).
+- **Resolution needed:** confirm bold/lists/headings in a packaged `hush-tauri` window on WebKitGTK
+  before relying on it. If it misbehaves, the fallback is a small Range/Selection formatter over the
+  same allowlisted subset; the sanitizer and renderer would not change.
+- **Lesson:** an untested-by-construction choice should be written down as such, not presented as
+  done. The rendering and sanitization paths are engine-independent and were verified; the editing
+  commands are not.
+
+---
+
+## 2026-10-07 — Live UI development without rebuilding the desktop binary
+
+### [FIXED] `run-two-ui.sh --dev` left the Vite dev server running after Ctrl+C
+
+- **Attempted:** added a `--dev` mode that starts the relay, both daemons with a TCP listener, and
+  `npm run dev`, then checked that stopping the script releases everything.
+- **Symptom:** the relay and both daemons died, and `node .../node_modules/.bin/vite` stayed alive with
+  port 5173 still bound, so the next `--dev` run failed its port check. The dev server is started as
+  `npm run dev`, which runs the script through `sh -c`; `npm` did not forward the `SIGTERM` that
+  `cleanup()` sent to its pid, and the `sh` wrapper died while its child did not.
+- **Resolution:** the dev server is now started with `setsid` and stopped as a process group
+  (`kill -TERM -- "-$VITE_PGID"`), which takes `npm`, `sh`, and `vite` together. Verified by starting a
+  run, sending `SIGINT` to the script only, and confirming no leftover process and no listener on 5173,
+  8787, 9876, or 9877.
+- **Lesson:** `npm run <script>` is two processes, not one. Anything that has to be killed later must
+  either be exec'd directly or started in its own process group.
+
+### [OPEN] The repo carries a Tauri dev config that nothing references, and no Tauri CLI is installed
+
+- **Attempted:** looked for a way to run the desktop window against the Vite dev server (hot reload
+  inside the real shell instead of a browser tab).
+- **Symptom:** `apps/hush-tauri/src-tauri/tauri.dev.conf.json` sets `devUrl` and `beforeDevCommand` as
+  Tauri's dev mode requires, but nothing in the repo passes `--config` to it: no script, no doc, no
+  mention outside the file itself. `cargo-tauri` is not installed and `@tauri-apps/cli` is not in
+  `node_modules`, so `tauri dev` cannot run here at all.
+- **Resolution needed:** either wire the config up (add `@tauri-apps/cli` and a `dev:app` script that
+  runs `tauri dev --config src-tauri/tauri.dev.conf.json`) or delete the file. Until then, live
+  development is browser-only, which is what `--dev` provides. Not verified either way in this
+  environment: no Tauri CLI to try it with.
 
 ---
 
@@ -66,6 +689,20 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
   in the signature.
 - **Lesson:** a warning count is only meaningful against a baseline. Check the offending file against
   `HEAD` before deciding whether a warning is yours.
+
+### [FIXED] `run-two-ui.sh` could not be re-run while a harness was live, and tore itself down instead of saying so
+
+- **Attempted:** re-ran `scripts/run-two-ui.sh` to pick up a rebuilt UI while the previous run's relay and daemons were still up.
+- **Symptom:** the script printed its usual "Opening two UI windows" block and then immediately exited with "A process exited; shutting down…", taking the windows with it. Two daemons had been started on sockets that were already live; `bind_socket` refuses to unlink a live socket (correctly), so both new daemons exited at once, and `wait -n` returned on the first of them. The readiness loop had not noticed because the *old* daemon answered `/api/status` on that path, so every check looked healthy.
+- **Resolution:** the script now probes each socket first and reuses a daemon that answers, the same way it already reused a running relay. Starting a daemon is followed by a readiness check that also watches for the process dying, and a failure prints the daemon's log and exits non-zero instead of continuing. Per-process logs moved into `$RUN_DIR/logs/`. Reuse is refused when a TCP listener was requested and is not open, since a running daemon cannot grow one.
+- **Lesson:** "already running" and "just started" have to be told apart before starting anything, or the second run silently fights the first. A readiness check that only asks "does something answer here?" cannot see its own process die.
+
+### [FIXED] A bad `HUSH_RUNTIME_DIR` surfaced as a raw `mkdir` error and skipped the script's own diagnostics
+
+- **Attempted:** tested the new daemon-startup failure path by pointing `HUSH_RUNTIME_DIR` at an unwritable path.
+- **Symptom:** the script exited 1 before reaching any of it, with `mkdir: cannot create directory '/proc/nope': No such file or directory` and no mention of which variable to fix.
+- **Resolution:** the `mkdir` is now guarded and names `HUSH_RUNTIME_DIR` in its message. The daemon-death path was then verified separately by pointing `HUSH_DAEMON_A_SOCKET` at an unwritable path, which produced `alice daemon did not come up on /usr/peer-a.sock:` followed by the daemon's `PermissionDenied`.
+- **Lesson:** `set -e` plus an unguarded setup command means the first failure the user sees is the least informative one.
 
 ### [WORKED AROUND] A toolbar click that reports `[active, focused]` has not necessarily done anything
 

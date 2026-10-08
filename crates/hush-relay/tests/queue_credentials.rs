@@ -1,14 +1,12 @@
 //! The queue credential split: what a peer is given to *deliver* must not also
 //! let it read, delete or burn.
 //!
-//! An invite and the signed device list both carry a device's delivery token, so
-//! that token is public to anyone who knows the account id — which is the
-//! `protocol_name` in every invite the account has ever handed out. If that one
-//! token also authorized reads, a stranger could list the owner's inbox (message
-//! timing and volume, the "who talks to whom" property the relay is explicitly
-//! meant not to expose) and, worse, burn it: `report_queue` is destructive, and a
-//! linked device cannot replace a burned queue because only device 1 can sign a
-//! new device list.
+//! An invite carries the delivery token, so that token is public to anyone who
+//! has been handed the invite — the same people who are meant to deliver. If
+//! that one token also authorized reads, a peer could list the owner's inbox
+//! (message timing and volume, the "who talks to whom" property the relay is
+//! explicitly meant not to expose) and, worse, burn it: `report_queue` is
+//! destructive.
 //!
 //! The read token never leaves the device. It authorizes list/read/delete/burn;
 //! the delivery token is derived from it as `HMAC(read_token, context)`, so the
@@ -17,12 +15,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use hush_core::device_list::{DeviceList, DeviceRecord};
 use hush_core::queue_delivery_token;
 use hush_relay::{router, RelayConfig};
-use libsignal_protocol::IdentityKeyPair;
-use rand::rngs::OsRng;
-use rand::TryRngCore;
 use tempfile::NamedTempFile;
 use tower::ServiceExt;
 
@@ -32,13 +26,6 @@ fn temp_db() -> NamedTempFile {
 
 fn app(db: &NamedTempFile) -> axum::Router {
     router(db.path().to_str().unwrap(), RelayConfig::default()).unwrap()
-}
-
-fn account() -> (IdentityKeyPair, String) {
-    let mut csprng = OsRng.unwrap_err();
-    let pair = IdentityKeyPair::generate(&mut csprng);
-    let id = hex::encode(pair.identity_key().serialize());
-    (pair, id)
 }
 
 async fn request(
@@ -63,12 +50,11 @@ async fn request(
 }
 
 /// The whole point, in one test: the owner can do everything with its read
-/// token, and the token that appears in the public device list can only deliver.
+/// token, and the token that appears in the invite can only deliver.
 #[tokio::test]
 async fn the_published_delivery_token_cannot_read_delete_or_burn_an_inbox() {
     let db = temp_db();
     let app = app(&db);
-    let (key, account_id) = account();
 
     let queue_id = "b7c1f2a4-0000-4000-8000-000000000001".to_string();
     let read_token = "9f2d3e4a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60";
@@ -91,7 +77,7 @@ async fn the_published_delivery_token_cannot_read_delete_or_burn_an_inbox() {
     .await;
     assert!(status.is_success(), "the owner must be able to bind its queue");
 
-    // A peer delivers using the token it was given.
+    // A peer delivers using the token it was handed in the invite.
     let (status, _) = request(
         &app,
         "PUT",
@@ -103,14 +89,8 @@ async fn the_published_delivery_token_cannot_read_delete_or_burn_an_inbox() {
     assert!(status.is_success(), "delivery with the delivery token");
 
     // The owner drains with the read token.
-    let (status, listed) = request(
-        &app,
-        "GET",
-        &format!("/q/{queue_id}"),
-        read_token,
-        Vec::new(),
-    )
-    .await;
+    let (status, listed) = request(&app, "GET", &format!("/q/{queue_id}"), read_token, Vec::new())
+        .await;
     assert_eq!(status, StatusCode::OK, "the owner must be able to list");
     let blobs: serde_json::Value = serde_json::from_slice(&listed).unwrap();
     let blob_id = blobs["blobs"][0]["id"].as_str().unwrap().to_string();
@@ -126,43 +106,16 @@ async fn the_published_delivery_token_cannot_read_delete_or_burn_an_inbox() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"sealed for the owner");
 
-    // Now the attack. The account publishes its device list, so anyone who knows
-    // the account id can read the delivery token out of it.
-    let list = DeviceList::new(
-        account_id.clone(),
-        vec![DeviceRecord {
-            device_id: 1,
-            identity_key: vec![1u8; 33],
-            registration_id: 1,
-            queue_id: queue_id.clone(),
-            queue_token: delivery_token.clone(),
-            added_unix: 1_700_000_000,
-        }],
-    );
-    let signed = list.sign(&key).unwrap();
-    let (status, _) = request(
-        &app,
-        "PUT",
-        &format!("/d/{account_id}"),
-        "",
-        signed,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    let (status, published) = request(&app, "GET", &format!("/d/{account_id}"), "", Vec::new()).await;
-    assert_eq!(status, StatusCode::OK);
-    let parsed = DeviceList::verify(&published, &account_id).unwrap();
-    let leaked = parsed.devices[0].queue_token.clone();
-    let leaked_queue = parsed.devices[0].queue_id.clone();
-    assert_eq!(leaked, delivery_token, "the list publishes the delivery token");
+    // Now the attack, using the token the peer already holds.
+    let leaked = delivery_token;
+    let leaked_queue = queue_id.clone();
 
     // Listing is refused.
     let (status, _) = request(&app, "GET", &format!("/q/{leaked_queue}"), &leaked, Vec::new()).await;
     assert_ne!(
         status,
         StatusCode::OK,
-        "a token from the public list must not list the owner's inbox"
+        "the delivery token must not list the owner's inbox"
     );
 
     // Reading a specific blob is refused.
@@ -188,8 +141,8 @@ async fn the_published_delivery_token_cannot_read_delete_or_burn_an_inbox() {
     assert_ne!(status, StatusCode::OK, "and must not delete a message");
 
     // And burning is refused. This is the one that mattered most: it is
-    // destructive, and a linked device cannot replace a burned queue without
-    // device 1.
+    // destructive and it is what a contact's delete relies on being the owner's
+    // alone.
     let (status, _) = request(
         &app,
         "POST",
@@ -201,19 +154,13 @@ async fn the_published_delivery_token_cannot_read_delete_or_burn_an_inbox() {
     assert_ne!(
         status,
         StatusCode::OK,
-        "a token from the public list must not burn the owner's inbox"
+        "the delivery token must not burn the owner's inbox"
     );
 
     // The message is still there and still readable by the owner, which is the
     // property the whole split exists to preserve.
-    let (status, listed) = request(
-        &app,
-        "GET",
-        &format!("/q/{queue_id}"),
-        read_token,
-        Vec::new(),
-    )
-    .await;
+    let (status, listed) = request(&app, "GET", &format!("/q/{queue_id}"), read_token, Vec::new())
+        .await;
     assert_eq!(status, StatusCode::OK);
     let blobs: serde_json::Value = serde_json::from_slice(&listed).unwrap();
     assert_eq!(
@@ -245,14 +192,8 @@ async fn a_peer_may_deliver_before_the_owner_binds_its_queue() {
     .await;
     assert!(status.is_success(), "a peer delivers first");
 
-    let (status, listed) = request(
-        &app,
-        "GET",
-        &format!("/q/{queue_id}"),
-        read_token,
-        Vec::new(),
-    )
-    .await;
+    let (status, listed) = request(&app, "GET", &format!("/q/{queue_id}"), read_token, Vec::new())
+        .await;
     assert_eq!(
         status,
         StatusCode::OK,

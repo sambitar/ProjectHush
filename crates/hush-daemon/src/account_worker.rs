@@ -8,6 +8,18 @@ pub struct AccountWorker {
     tx: mpsc::Sender<Work>,
 }
 
+/// The one credential a drop is sealed under.
+///
+/// An enum rather than two `Option`s so a caller cannot pass both, and so the
+/// worker has to say which mode it means. The HTTP layer builds this after
+/// rejecting a request that gave both or neither.
+pub enum DropSecret {
+    /// A PIN the recipient is told out of band.
+    Pin(String),
+    /// The recipient's pasteable drop public key.
+    PublicKey(String),
+}
+
 enum Work {
     Unlock {
         dir: PathBuf,
@@ -95,6 +107,15 @@ enum Work {
         attachments: Vec<(String, Vec<u8>)>,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Seal a message for someone with no Hush account.
+    SendToOutsider {
+        to: String,
+        subject: String,
+        body: String,
+        attachments: Vec<(String, Vec<u8>)>,
+        secret: DropSecret,
+        reply: oneshot::Sender<WorkResult>,
+    },
     MailRecords {
         reply: oneshot::Sender<WorkResult>,
     },
@@ -159,6 +180,8 @@ pub enum WorkResult {
     Messages(Vec<ChatRecord>),
     /// The thread the mail was filed under, and whether the relay took it.
     MailSent { thread_id: String, queued: bool },
+    /// A drop is on the relay: its capability id, and when it expires.
+    OutsiderSent { delivery_id: String, expires_unix: u64 },
     Mail(Vec<ChatRecord>),
     Drafts(Vec<ChatRecord>),
     /// The record id of the saved draft.
@@ -184,18 +207,13 @@ impl AccountWorker {
                     let (reply, result) = match work {
                         Work::Unlock { dir, passphrase, reply } => {
                             let result = match Account::open(&dir, &passphrase).await {
-                                Ok(mut a) => {
-                                    // Peers reach this device only through the
-                                    // published device list, so a rotated inbox
-                                    // has to be republished or this device goes
-                                    // silent. Best effort: a relay that is down
-                                    // must not block an unlock, and the next
-                                    // unlock retries.
-                                    if let Err(e) = a.ensure_device_list_published().await {
-                                        eprintln!(
-                                            "hush: could not publish device list: {e}"
-                                        );
-                                    }
+                                Ok(a) => {
+                                    // Nothing to publish on unlock: peers learn
+                                    // this account's inbox from its invite, and
+                                    // there is no device list to refresh. A
+                                    // rotated inbox cleared the cached invite in
+                                    // `finish_open`, so the next invite mints a
+                                    // fresh one.
                                     account = Some(a);
                                     WorkResult::Ok
                                 }
@@ -221,26 +239,9 @@ impl AccountWorker {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => {
-                                    // Presence reads the cached inbox, and the UI
-                                    // will not send to a contact it shows offline.
-                                    // A contact whose queue has moved would then be
-                                    // stuck offline forever, so pick up a moved
-                                    // inbox here rather than only on send. Bounded
-                                    // by the same TTL the send path uses.
-                                    let nicknames: Vec<String> = a
-                                        .contacts()
-                                        .iter()
-                                        .map(|c| c.nickname.clone())
-                                        .collect();
-                                    for nick in &nicknames {
-                                        if let Err(e) =
-                                            a.refresh_contact_devices_if_stale(nick).await
-                                        {
-                                            eprintln!(
-                                                "hush: could not refresh devices for {nick}: {e}"
-                                            );
-                                        }
-                                    }
+                                    // Presence reads the cached per-contact queue,
+                                    // which only changes when a grant arrives, so
+                                    // there is nothing to refresh here.
                                     let mut list = Vec::new();
                                     for c in a.contacts() {
                                         let online = a
@@ -287,7 +288,7 @@ impl AccountWorker {
                         Work::RemoveContact { nickname, reply } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
-                                Some(a) => match a.remove_contact(&nickname).await {
+                                Some(a) => match a.revoke_contact(&nickname).await {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
@@ -460,8 +461,51 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
-                        Work::MailRecords { reply } => {
-                            let result = match account.as_ref() {
+                        Work::SendToOutsider {
+                            to,
+                            subject,
+                            body,
+                            attachments,
+                            secret,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    let sent = match &secret {
+                                        DropSecret::Pin(pin) => {
+                                            a.send_to_outsider(
+                                                &to,
+                                                &subject,
+                                                &body,
+                                                &attachments,
+                                                pin,
+                                            )
+                                            .await
+                                        }
+                                        DropSecret::PublicKey(key) => {
+                                            a.send_to_outsider_with_key(
+                                                &to,
+                                                &subject,
+                                                &body,
+                                                &attachments,
+                                                key,
+                                            )
+                                            .await
+                                        }
+                                    };
+                                    match sent {
+                                        Ok(outcome) => WorkResult::OutsiderSent {
+                                            delivery_id: outcome.delivery_id,
+                                            expires_unix: outcome.expires_unix,
+                                        },
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::MailRecords { reply } => {                            let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => WorkResult::Mail(a.mail_records()),
                             };
@@ -732,6 +776,27 @@ impl AccountWorker {
         self.call(|reply| Work::MailRecords { reply }).await
     }
 
+    /// Seal a message for an address with no Hush account and park it on the
+    /// relay. Returns the capability id and expiry, not a link: the base URL is
+    /// daemon configuration. `secret` selects the PIN or public-key mode.
+    pub async fn send_to_outsider(
+        &self,
+        to: &str,
+        subject: &str,
+        body: &str,
+        attachments: Vec<(String, Vec<u8>)>,
+        secret: DropSecret,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendToOutsider {
+            to: to.to_string(),
+            subject: subject.to_string(),
+            body: body.to_string(),
+            attachments,
+            secret,
+            reply,
+        })
+        .await
+    }
     pub async fn draft_records(&self) -> WorkResult {
         self.call(|reply| Work::DraftRecords { reply }).await
     }

@@ -1,16 +1,15 @@
-//! The per-device prekey endpoint.
+//! The per-account prekey endpoint.
 //!
-//! Authorization here is the device's own signature, checked against the
-//! identity key its entry carries in the account's signed device list. These
-//! tests are mostly about what must *not* be accepted, because the happy path is
-//! the easy part and the failure to reject is what would let a revoked or
-//! unrelated device hijack another device's prekeys.
+//! Authorization is the publisher's own signature, checked against the identity
+//! key the account id *is* the hex of. These tests are mostly about what must
+//! *not* be accepted, because the happy path is the easy part and a failure to
+//! reject is what would let anyone who knows a public account id replace that
+//! account's prekeys.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use hush_core::prekey::PREKEY_RECORD_VERSION;
-use hush_core::device_list::{DeviceList, DeviceRecord};
-use hush_core::{OneTimePreKey, PreKeyRecord};
+use hush_core::{OneTimePreKey, PreKeyRecord, DEVICE_ID};
 use hush_relay::{router, RelayConfig};
 use http_body_util::BodyExt;
 use libsignal_protocol::{kem, IdentityKeyPair, KeyPair};
@@ -27,6 +26,8 @@ fn app(db: &NamedTempFile) -> axum::Router {
     router(db.path().to_str().unwrap(), RelayConfig::default()).unwrap()
 }
 
+/// A fresh account: its identity key pair, and the account id peers address it
+/// by, which is the hex of its identity public key.
 fn account() -> (IdentityKeyPair, String) {
     let mut csprng = OsRng.unwrap_err();
     let pair = IdentityKeyPair::generate(&mut csprng);
@@ -34,7 +35,7 @@ fn account() -> (IdentityKeyPair, String) {
     (pair, id)
 }
 
-/// A genuinely signed prekey record for `device_id`, as the device itself would
+/// A genuinely signed prekey record for `device_id`, as the account itself would
 /// publish it.
 fn make_record(keys: &IdentityKeyPair, device_id: u32, one_time_count: usize) -> PreKeyRecord {
     let mut csprng = OsRng.unwrap_err();
@@ -78,49 +79,12 @@ fn make_record(keys: &IdentityKeyPair, device_id: u32, one_time_count: usize) ->
     }
 }
 
-/// Publish a device list naming `devices` (as `(device_id, identity_key)`),
-/// signed by device 1.
-async fn publish_list(app: &axum::Router, signer: &IdentityKeyPair, account_id: &str, devices: Vec<(u32, Vec<u8>)>) {
-    let records = devices
-        .into_iter()
-        .map(|(device_id, identity_key)| DeviceRecord {
-            device_id,
-            identity_key,
-            registration_id: 7,
-            queue_id: format!("queue-{device_id}"),
-            queue_token: format!("token-{device_id}"),
-            added_unix: 1_700_000_000,
-        })
-        .collect();
-    let signed = DeviceList::new(account_id.to_string(), records)
-        .sign(signer)
-        .unwrap();
-    let status = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/d/{account_id}"))
-                .body(Body::from(signed))
-                .unwrap(),
-        )
-        .await
-        .unwrap()
-        .status();
-    assert_eq!(status, StatusCode::NO_CONTENT, "device list must publish");
-}
-
-async fn put_record(
-    app: &axum::Router,
-    account_id: &str,
-    device_id: u32,
-    record: &PreKeyRecord,
-) -> StatusCode {
+async fn put_record(app: &axum::Router, account_id: &str, record: &PreKeyRecord) -> StatusCode {
     app.clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/k/{account_id}/{device_id}"))
+                .uri(format!("/k/{account_id}"))
                 .body(Body::from(record.encode().unwrap()))
                 .unwrap(),
         )
@@ -129,16 +93,12 @@ async fn put_record(
         .status()
 }
 
-async fn get_record(
-    app: &axum::Router,
-    account_id: &str,
-    device_id: u32,
-) -> (StatusCode, Vec<u8>) {
+async fn get_record(app: &axum::Router, account_id: &str) -> (StatusCode, Vec<u8>) {
     let res = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/k/{account_id}/{device_id}"))
+                .uri(format!("/k/{account_id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -154,16 +114,14 @@ async fn a_published_record_round_trips() {
     let db = temp_db();
     let app = app(&db);
     let (keys, account_id) = account();
-    let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity)]).await;
 
-    let record = make_record(&keys, 1, 3);
+    let record = make_record(&keys, DEVICE_ID, 3);
     assert_eq!(
-        put_record(&app, &account_id, 1, &record).await,
+        put_record(&app, &account_id, &record).await,
         StatusCode::NO_CONTENT
     );
 
-    let (status, body) = get_record(&app, &account_id, 1).await;
+    let (status, body) = get_record(&app, &account_id).await;
     assert_eq!(status, StatusCode::OK);
     let fetched = PreKeyRecord::decode(&body).unwrap();
     let expected_identity = keys.identity_key().serialize();
@@ -179,12 +137,10 @@ async fn each_fetch_consumes_a_different_one_time_prekey() {
     let db = temp_db();
     let app = app(&db);
     let (keys, account_id) = account();
-    let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity)]).await;
-    put_record(&app, &account_id, 1, &make_record(&keys, 1, 2)).await;
+    put_record(&app, &account_id, &make_record(&keys, DEVICE_ID, 2)).await;
 
-    let (_, first) = get_record(&app, &account_id, 1).await;
-    let (_, second) = get_record(&app, &account_id, 1).await;
+    let (_, first) = get_record(&app, &account_id).await;
+    let (_, second) = get_record(&app, &account_id).await;
     let first = PreKeyRecord::decode(&first).unwrap();
     let second = PreKeyRecord::decode(&second).unwrap();
 
@@ -204,14 +160,15 @@ async fn an_exhausted_pool_still_serves_a_bundle() {
     let db = temp_db();
     let app = app(&db);
     let (keys, account_id) = account();
-    let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity)]).await;
-    put_record(&app, &account_id, 1, &make_record(&keys, 1, 1)).await;
+    put_record(&app, &account_id, &make_record(&keys, DEVICE_ID, 1)).await;
 
-    let (_, first) = get_record(&app, &account_id, 1).await;
-    assert_eq!(PreKeyRecord::decode(&first).unwrap().one_time_prekeys.len(), 1);
+    let (_, first) = get_record(&app, &account_id).await;
+    assert_eq!(
+        PreKeyRecord::decode(&first).unwrap().one_time_prekeys.len(),
+        1
+    );
 
-    let (status, drained) = get_record(&app, &account_id, 1).await;
+    let (status, drained) = get_record(&app, &account_id).await;
     assert_eq!(status, StatusCode::OK, "a dry pool is not an error");
     let drained = PreKeyRecord::decode(&drained).unwrap();
     assert!(drained.one_time_prekeys.is_empty());
@@ -222,95 +179,71 @@ async fn an_exhausted_pool_still_serves_a_bundle() {
     );
 }
 
-/// Only a listed device may publish, and only under its own identity key. This is
-/// what a revoked device loses: once it is gone from the list there is no
-/// identity key to check against, so it cannot republish itself.
-#[tokio::test]
-async fn a_record_for_an_unlisted_device_is_rejected() {
-    let db = temp_db();
-    let app = app(&db);
-    let (keys, account_id) = account();
-    let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity)]).await;
-
-    // Device 2 is not in the list.
-    let record = make_record(&keys, 2, 1);
-    assert_eq!(
-        put_record(&app, &account_id, 2, &record).await,
-        StatusCode::UNAUTHORIZED
-    );
-}
-
+/// A record signed by a key that is not the account's must be rejected. This is
+/// the whole authorization: the account id is the identity key, so a publisher
+/// that cannot sign with the matching private key cannot claim the account.
 #[tokio::test]
 async fn a_record_with_the_wrong_identity_key_is_rejected() {
     let db = temp_db();
     let app = app(&db);
-    let (keys, account_id) = account();
+    let (_keys, account_id) = account();
     let (other, _) = account();
-    let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity)]).await;
 
-    // Correctly signed, but by a key the list does not vouch for.
-    let record = make_record(&other, 1, 1);
+    // Correctly signed, but by a key that is not the one the account id names.
+    let record = make_record(&other, DEVICE_ID, 1);
     assert_eq!(
-        put_record(&app, &account_id, 1, &record).await,
+        put_record(&app, &account_id, &record).await,
         StatusCode::UNAUTHORIZED
     );
 }
 
 /// The signature check is what proves the publisher holds the identity private
-/// key. Without it, reading the public device list would be enough to replace a
-/// device's prekeys with ones the reader controls.
+/// key. Without it, knowing a public account id would be enough to replace its
+/// prekeys with ones the writer controls.
 #[tokio::test]
 async fn a_record_with_a_forged_prekey_signature_is_rejected() {
     let db = temp_db();
     let app = app(&db);
     let (keys, account_id) = account();
-    let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity)]).await;
 
-    let mut record = make_record(&keys, 1, 1);
+    let mut record = make_record(&keys, DEVICE_ID, 1);
     record.signed_pre_key_signature = vec![0u8; 64];
     assert_eq!(
-        put_record(&app, &account_id, 1, &record).await,
+        put_record(&app, &account_id, &record).await,
         StatusCode::UNAUTHORIZED
     );
 
-    let mut record = make_record(&keys, 1, 1);
+    let mut record = make_record(&keys, DEVICE_ID, 1);
     record.kyber_pre_key_signature = vec![0u8; 64];
     assert_eq!(
-        put_record(&app, &account_id, 1, &record).await,
+        put_record(&app, &account_id, &record).await,
         StatusCode::UNAUTHORIZED,
         "the kyber signature is checked too, not just the signed prekey"
     );
 }
 
+/// An account id that is not a hex identity key cannot be checked against
+/// anything, so it is refused rather than stored unverified.
 #[tokio::test]
-async fn a_record_claiming_another_device_id_is_rejected() {
+async fn a_non_hex_account_id_is_rejected() {
     let db = temp_db();
     let app = app(&db);
-    let (keys, account_id) = account();
-    let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity)]).await;
+    let (keys, _) = account();
 
-    // Signed for device 1 but posted to device 1's slot while claiming to be
-    // device 2. The path and the body must agree.
-    let record = make_record(&keys, 2, 1);
+    let record = make_record(&keys, DEVICE_ID, 1);
     assert_eq!(
-        put_record(&app, &account_id, 1, &record).await,
+        put_record(&app, "not-hex", &record).await,
         StatusCode::BAD_REQUEST
     );
 }
 
 #[tokio::test]
-async fn a_device_that_never_published_has_no_record() {
+async fn an_account_that_never_published_has_no_record() {
     let db = temp_db();
     let app = app(&db);
-    let (keys, account_id) = account();
-    let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity)]).await;
+    let (_keys, account_id) = account();
 
-    let (status, _) = get_record(&app, &account_id, 1).await;
+    let (status, _) = get_record(&app, &account_id).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -323,12 +256,13 @@ async fn a_fetched_record_verifies_for_the_peer() {
     let app = app(&db);
     let (keys, account_id) = account();
     let identity = keys.identity_key().serialize().to_vec();
-    publish_list(&app, &keys, &account_id, vec![(1, identity.clone())]).await;
-    put_record(&app, &account_id, 1, &make_record(&keys, 1, 1)).await;
+    put_record(&app, &account_id, &make_record(&keys, DEVICE_ID, 1)).await;
 
-    let (_, body) = get_record(&app, &account_id, 1).await;
+    let (_, body) = get_record(&app, &account_id).await;
     let fetched = PreKeyRecord::decode(&body).unwrap();
     fetched.verify(&identity).unwrap();
-    // And it converts into something libsignal will accept.
-    assert!(fetched.to_prekey_bundle().is_ok());
+    // And it converts into something libsignal will accept, addressed to the
+    // account's one device.
+    let bundle = fetched.to_prekey_bundle().unwrap();
+    assert_eq!(u32::from(bundle.device_id().unwrap()), DEVICE_ID);
 }
