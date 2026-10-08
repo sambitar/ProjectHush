@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::thread;
 
-use hush_core::{Account, ChatRecord, InboxResult, MeetingRecord};
+use hush_core::{Account, ChatRecord, ConclaveRecord, InboxResult, PendingInvite};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct AccountWorker {
@@ -142,27 +142,46 @@ enum Work {
     RetryOutbox {
         reply: oneshot::Sender<WorkResult>,
     },
-    Meetings {
+    Conclaves {
         reply: oneshot::Sender<WorkResult>,
     },
-    CreateMeeting {
+    CreateConclave {
         name: String,
-        members: Vec<String>,
+        trustees: Vec<String>,
         reply: oneshot::Sender<WorkResult>,
     },
-    SendMeetingMessage {
-        meeting_id: String,
+    SendConclaveMessage {
+        conclave_id: String,
         body: String,
         reply: oneshot::Sender<WorkResult>,
     },
-    AddMeetingMember {
-        meeting_id: String,
+    InviteConclaveTrustee {
+        conclave_id: String,
         nickname: String,
         reply: oneshot::Sender<WorkResult>,
     },
-    RemoveMeetingMember {
-        meeting_id: String,
+    KickConclaveTrustee {
+        conclave_id: String,
         nickname: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    AcceptConclaveInvite {
+        conclave_id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    DeclineConclaveInvite {
+        conclave_id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    LeaveConclave {
+        conclave_id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    PendingInvites {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    EndConclave {
+        conclave_id: String,
         reply: oneshot::Sender<WorkResult>,
     },
 }
@@ -211,10 +230,14 @@ pub enum WorkResult {
     DraftSaved(String),
     Blob(Vec<u8>),
     BlobId(String),
-    /// Every meeting this vault holds, with its message log.
-    Meetings(Vec<MeetingRecord>),
-    /// The meeting that was just created.
-    MeetingCreated(MeetingRecord),
+    /// Every conclave this vault holds, with its message log.
+    Conclaves(Vec<ConclaveRecord>),
+    /// The conclave that was just created.
+    ConclaveCreated(ConclaveRecord),
+    /// The conclave that was just joined by accepting an invite.
+    ConclaveAccepted(ConclaveRecord),
+    /// Conclave invitations received but not yet accepted or declined.
+    PendingInvites(Vec<PendingInvite>),
     /// The supplied current passphrase did not match the vault.
     WrongPassphrase,
     Err(String),
@@ -605,69 +628,117 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
-                        Work::Meetings { reply } => {
+                        Work::Conclaves { reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
-                                Some(a) => WorkResult::Meetings(a.meetings()),
+                                Some(a) => WorkResult::Conclaves(a.conclaves()),
                             };
                             (reply, result)
                         }
-                        Work::CreateMeeting {
+                        Work::CreateConclave {
                             name,
-                            members,
+                            trustees,
                             reply,
                         } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
-                                Some(a) => match a.create_meeting(&name, &members).await {
-                                    Ok(meeting) => WorkResult::MeetingCreated(meeting),
+                                Some(a) => match a.create_conclave(&name, &trustees).await {
+                                    Ok(conclave) => WorkResult::ConclaveCreated(conclave),
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
                             (reply, result)
                         }
-                        Work::SendMeetingMessage {
-                            meeting_id,
+                        Work::SendConclaveMessage {
+                            conclave_id,
                             body,
                             reply,
                         } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
-                                Some(a) => match a.send_meeting_message(&meeting_id, &body).await {
+                                Some(a) => match a.send_conclave_message(&conclave_id, &body).await {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
                             (reply, result)
                         }
-                        Work::AddMeetingMember {
-                            meeting_id,
-                            nickname,
-                            reply,
-                        } => {
-                            let result = match account.as_mut() {
-                                None => WorkResult::Err("locked".into()),
-                                Some(a) => match a.add_meeting_member(&meeting_id, &nickname).await
-                                {
-                                    Ok(()) => WorkResult::Ok,
-                                    Err(e) => WorkResult::Err(e.to_string()),
-                                },
-                            };
-                            (reply, result)
-                        }
-                        Work::RemoveMeetingMember {
-                            meeting_id,
+                        Work::InviteConclaveTrustee {
+                            conclave_id,
                             nickname,
                             reply,
                         } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => {
-                                    match a.remove_meeting_member(&meeting_id, &nickname).await {
+                                    match a.invite_conclave_trustee(&conclave_id, &nickname).await {
                                         Ok(()) => WorkResult::Ok,
                                         Err(e) => WorkResult::Err(e.to_string()),
                                     }
                                 }
+                            };
+                            (reply, result)
+                        }
+                        Work::KickConclaveTrustee {
+                            conclave_id,
+                            nickname,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a.kick_conclave_trustee(&conclave_id, &nickname).await {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::AcceptConclaveInvite { conclave_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.accept_conclave_invite(&conclave_id).await {
+                                    Ok(conclave) => WorkResult::ConclaveAccepted(conclave),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::DeclineConclaveInvite { conclave_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.decline_conclave_invite(&conclave_id).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::LeaveConclave { conclave_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.leave_conclave(&conclave_id).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::PendingInvites { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::PendingInvites(a.pending_invites()),
+                            };
+                            (reply, result)
+                        }
+                        Work::EndConclave { conclave_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.end_conclave(&conclave_id).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
                             };
                             (reply, result)
                         }
@@ -937,41 +1008,77 @@ impl AccountWorker {
         self.call(|reply| Work::RetryOutbox { reply }).await
     }
 
-    pub async fn meetings(&self) -> WorkResult {
-        self.call(|reply| Work::Meetings { reply }).await
+    pub async fn conclaves(&self) -> WorkResult {
+        self.call(|reply| Work::Conclaves { reply }).await
     }
 
-    pub async fn create_meeting(&self, name: &str, members: Vec<String>) -> WorkResult {
-        self.call(|reply| Work::CreateMeeting {
+    pub async fn create_conclave(&self, name: &str, trustees: Vec<String>) -> WorkResult {
+        self.call(|reply| Work::CreateConclave {
             name: name.to_string(),
-            members,
+            trustees,
             reply,
         })
         .await
     }
 
-    pub async fn send_meeting_message(&self, meeting_id: &str, body: &str) -> WorkResult {
-        self.call(|reply| Work::SendMeetingMessage {
-            meeting_id: meeting_id.to_string(),
+    pub async fn send_conclave_message(&self, conclave_id: &str, body: &str) -> WorkResult {
+        self.call(|reply| Work::SendConclaveMessage {
+            conclave_id: conclave_id.to_string(),
             body: body.to_string(),
             reply,
         })
         .await
     }
 
-    pub async fn add_meeting_member(&self, meeting_id: &str, nickname: &str) -> WorkResult {
-        self.call(|reply| Work::AddMeetingMember {
-            meeting_id: meeting_id.to_string(),
+    pub async fn invite_conclave_trustee(&self, conclave_id: &str, nickname: &str) -> WorkResult {
+        self.call(|reply| Work::InviteConclaveTrustee {
+            conclave_id: conclave_id.to_string(),
             nickname: nickname.to_string(),
             reply,
         })
         .await
     }
 
-    pub async fn remove_meeting_member(&self, meeting_id: &str, nickname: &str) -> WorkResult {
-        self.call(|reply| Work::RemoveMeetingMember {
-            meeting_id: meeting_id.to_string(),
+    pub async fn kick_conclave_trustee(&self, conclave_id: &str, nickname: &str) -> WorkResult {
+        self.call(|reply| Work::KickConclaveTrustee {
+            conclave_id: conclave_id.to_string(),
             nickname: nickname.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn accept_conclave_invite(&self, conclave_id: &str) -> WorkResult {
+        self.call(|reply| Work::AcceptConclaveInvite {
+            conclave_id: conclave_id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn decline_conclave_invite(&self, conclave_id: &str) -> WorkResult {
+        self.call(|reply| Work::DeclineConclaveInvite {
+            conclave_id: conclave_id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn leave_conclave(&self, conclave_id: &str) -> WorkResult {
+        self.call(|reply| Work::LeaveConclave {
+            conclave_id: conclave_id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn pending_invites(&self) -> WorkResult {
+        self.call(|reply| Work::PendingInvites { reply }).await
+    }
+
+    pub async fn end_conclave(&self, conclave_id: &str) -> WorkResult {
+        self.call(|reply| Work::EndConclave {
+            conclave_id: conclave_id.to_string(),
             reply,
         })
         .await

@@ -49,7 +49,7 @@ const ICONS: Record<string, IconNode> = {
   lock: Lock,
   chats: MessageCircle,
   trusts: Handshake,
-  meetings: Users,
+  conclaves: Users,
   addMember: UserPlus,
   mail: Mail,
   files: Folder,

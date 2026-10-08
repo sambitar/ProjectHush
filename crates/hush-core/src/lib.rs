@@ -21,7 +21,9 @@ mod signal_persist;
 mod vault;
 mod wire;
 
-pub use account::{Account, Contact, MailOutcome, OutsiderOutcome, DROP_TTL_SECS, MIN_DROP_PIN_LEN};
+pub use account::{
+    Account, Contact, MailOutcome, OutsiderOutcome, PendingInvite, DROP_TTL_SECS, MIN_DROP_PIN_LEN,
+};
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{
     ClientConfig, ConfigSource, DEFAULT_DAEMON_ADDR, DEFAULT_RELAY_URL, ENV_DAEMON_ADDR,
@@ -41,15 +43,18 @@ pub use drop::{
 };
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
 pub use chat_log::{
-    ChatRecord, ChatRecordPayload, ExternalMail, MailAttachmentRecord, MailState, MeetingMessage,
-    MeetingRecord,
+    ChatRecord, ChatRecordPayload, ConclaveMessage, ConclaveRecord, ExternalMail,
+    MailAttachmentRecord, MailState,
 };
 pub use error::Error;
 pub use invite::InvitePayload;
 pub use mail::{format_address, normalize_handle, MAIL_DOMAIN, MAX_HANDLE_LEN};
 pub use mailer::{notification_body, notification_body_for_key, FileMailer, Mailer, NullMailer};
 pub use message::{InboxResult, ReceivedAttachment, ReceivedMessage};
-pub use payload::{MailAttachment, MessagePayload, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS};
+pub use payload::{
+    ConclaveDescriptor, ConclaveTrustee, MessagePayload, TrusteeState, MailAttachment,
+    MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS,
+};
 pub use prekey::{OneTimePreKey, PreKeyRecord};
 pub use relay_client::{normalize_relay_base, normalize_relay_base_with, HttpPolicy, RelayClient};
 pub use vault::{BlobId, IdentityPub, Vault};

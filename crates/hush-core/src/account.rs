@@ -9,9 +9,8 @@ use uuid::Uuid;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 
 use crate::backup::{export_vault, import_vault};
-use crate::chat_log::{
-    ChatLog, ChatRecordPayload, MailAttachmentRecord, MailState, MeetingRecord,
-};
+use crate::chat_log::{ChatLog, ChatRecordPayload, ConclaveRecord, MailAttachmentRecord, MailState};
+use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeState};
 use crate::crypto::random_bytes;
 use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
 use crate::drop::{
@@ -325,6 +324,29 @@ impl<'de> Deserialize<'de> for Contact {
     }
 }
 
+/// An invitation this vault has received but not yet accepted or declined.
+///
+/// It is not a conclave: nothing is materialised and no message is filed until
+/// the invitee accepts. This is the record that replaces the old silent
+/// materialisation of an unknown conclave.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingInvite {
+    pub conclave_id: String,
+    pub name: String,
+    /// The convener's account id. `alias` reads the pre-rename field name.
+    #[serde(alias = "creator")]
+    pub convener: String,
+    /// The account id of whoever sent the invite.
+    pub from_account: String,
+    /// The sender's nickname as this vault knows it.
+    pub from_nick: String,
+    /// The trustees the invite carried, so the invitee can render who else is
+    /// in. `alias` reads the pre-rename field name.
+    #[serde(alias = "roster")]
+    pub trustees: Vec<ConclaveTrustee>,
+    pub received_ms: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 struct AccountState {
     relay: String,
@@ -359,6 +381,9 @@ struct AccountState {
     /// revocation; removing this list would not.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     revoked: Vec<String>,
+    /// Conclave invitations received but not yet accepted or declined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_invites: Vec<PendingInvite>,
 }
 
 pub struct Account {
@@ -397,6 +422,7 @@ impl Account {
             receive_queue_token: None,
             mail_handle: None,
             revoked: Vec::new(),
+            pending_invites: Vec::new(),
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
@@ -482,7 +508,7 @@ impl Account {
 
         let needs_save =
             migrated || fresh_device || queue_rotated || pending_recovery_code.is_some();
-        let account = Self {
+        let mut account = Self {
             vault,
             device,
             state,
@@ -493,6 +519,10 @@ impl Account {
         if needs_save {
             account.save().await?;
         }
+        // Fill legacy records before anything can read them: a conclave written
+        // before consent and governance has nicknames only and no convener, so it
+        // gets trustees and a convener here. Saves the log itself when it changes.
+        account.hydrate_conclaves()?;
         if migrated {
             // Safe only now that `device.enc` holds the same identity: the
             // legacy file carries the identity private key and would otherwise
@@ -1165,103 +1195,658 @@ impl Account {
         self.chat_log.draft_records().cloned().collect()
     }
 
-    /// The meetings this vault holds, in creation order.
-    pub fn meetings(&self) -> Vec<MeetingRecord> {
-        self.chat_log.meetings().to_vec()
+    /// The active conclaves this vault holds, in creation order.
+    ///
+    /// An ended conclave is filtered out here but kept in the encrypted log, so
+    /// its message history is not lost and a restart still shows it gone.
+    pub fn conclaves(&self) -> Vec<ConclaveRecord> {
+        // Ended conclaves are returned too: they are read-only rather than
+        // hidden, so a peer that received the creator's end broadcast still sees
+        // the record and its history.
+        self.chat_log.conclaves().to_vec()
     }
 
-    /// Create a meeting and return its record.
+    /// Conclave invitations received but not yet accepted or declined.
+    pub fn pending_invites(&self) -> Vec<PendingInvite> {
+        self.state.pending_invites.clone()
+    }
+
+    /// Create a conclave and return its record.
     ///
-    /// A meeting needs a name and at least one member: an empty meeting has no
-    /// one to fan out to, so it would be a record the user can never use.
-    pub async fn create_meeting(
+    /// The convener is the local account. Every named trustee is added as
+    /// `Invited` and sent an invite; nobody is joined until they accept. A
+    /// conclave needs a name and at least one other trustee: an empty conclave has
+    /// no one to fan out to.
+    pub async fn create_conclave(
         &mut self,
         name: &str,
-        members: &[String],
-    ) -> Result<MeetingRecord, Error> {
+        trustees: &[String],
+    ) -> Result<ConclaveRecord, Error> {
         let name = name.trim();
-        if name.is_empty() || members.is_empty() {
-            return Err(Error::InvalidMeeting);
+        if name.is_empty() || trustees.is_empty() {
+            return Err(Error::InvalidConclave);
         }
-        // Fail fast on an unknown member: fan-out cannot conjure a contact, and a
-        // half-delivered meeting is worse than a refused one.
-        for nickname in members {
-            if self.find_contact(nickname).is_none() {
-                return Err(Error::ContactNotFound);
+        let me = self.state.protocol_name.clone();
+        let mut roster = vec![ConclaveTrustee {
+            account_id: me.clone(),
+            nick: String::new(),
+            state: TrusteeState::Joined,
+        }];
+        for nickname in trustees {
+            let contact = self.find_contact(nickname).ok_or(Error::ContactNotFound)?;
+            if contact.account_id == me {
+                continue;
+            }
+            if roster.iter().any(|m| m.account_id == contact.account_id) {
+                continue;
+            }
+            roster.push(ConclaveTrustee {
+                account_id: contact.account_id.clone(),
+                nick: nickname.clone(),
+                state: TrusteeState::Invited,
+            });
+        }
+        if roster.len() < 2 {
+            return Err(Error::InvalidConclave);
+        }
+        let master = *self.vault.master_key();
+        let id = self.chat_log.create_conclave(&master, name, &me, &roster)?;
+        let record = self
+            .chat_log
+            .conclave(&id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        let descriptor = descriptor_of(&record);
+        // Invite each invitee. Store-and-forward, so an offline invitee still
+        // receives it on their next drain.
+        for trustee in record.trustees.iter().filter(|m| m.state == TrusteeState::Invited) {
+            if self.find_contact(&trustee.nick).is_some() {
+                self.send_payload_inner(
+                    &trustee.nick,
+                    MessagePayload::ConclaveInvite {
+                        descriptor: descriptor.clone(),
+                    },
+                    false,
+                )
+                .await?;
             }
         }
-        let master = *self.vault.master_key();
-        let id = self.chat_log.create_meeting(&master, name, members)?;
-        self.chat_log
-            .meeting(&id)
-            .cloned()
-            .ok_or(Error::MeetingNotFound)
+        Ok(record)
     }
 
-    /// Send a message to every member of a meeting over their own 1:1 session.
+    /// Send a message to every joined trustee of a conclave over their own 1:1
+    /// session.
     ///
     /// This is the whole of "group chat": N independent encryptions and N queue
-    /// puts. Each blob carries the meeting descriptor, so a recipient that has
-    /// never seen this meeting materialises it on receipt. Delivery is
-    /// store-and-forward, so a member who is away still gets the message; there
-    /// is no delivery receipt and no server-side room.
-    pub async fn send_meeting_message(
+    /// puts. Fan-out targets the joined set only; an invitee who has not
+    /// accepted receives the invite and nothing else. An ended conclave is
+    /// read-only, so sending in it is refused.
+    pub async fn send_conclave_message(
         &mut self,
-        meeting_id: &str,
+        conclave_id: &str,
         body: &str,
     ) -> Result<(), Error> {
-        let meeting = self
+        let me = self.state.protocol_name.clone();
+        let conclave = self
             .chat_log
-            .meeting(meeting_id)
+            .conclave(conclave_id)
             .cloned()
-            .ok_or(Error::MeetingNotFound)?;
-        // Send first, then log: a member list can legitimately include a contact
-        // deleted since the meeting was created, and a partial fan-out must not
-        // leave a message the sender cannot see was only partly delivered.
-        for member in &meeting.members {
-            let payload = MessagePayload::Meeting {
-                meeting_id: meeting.id.clone(),
-                name: meeting.name.clone(),
-                members: meeting.members.clone(),
-                body: body.to_string(),
-            };
-            self.send_payload_inner(member, payload, false).await?;
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended {
+            return Err(Error::ConclaveEnded);
+        }
+        if !conclave.is_joined(&me) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        let payload = MessagePayload::Conclave {
+            conclave_id: conclave.id.clone(),
+            name: conclave.name.clone(),
+            trustees: conclave
+                .joined()
+                .map(|t| t.nick.clone())
+                .filter(|n| !n.is_empty())
+                .collect(),
+            body: body.to_string(),
+        };
+        let targets: Vec<String> = conclave
+            .joined()
+            .filter(|m| m.account_id != me)
+            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
+            .collect();
+        for nick in targets {
+            self.send_payload_inner(&nick, payload.clone(), false).await?;
         }
         let master = *self.vault.master_key();
         self.chat_log
-            .append_meeting_message(&master, meeting_id, true, None, body)?;
+            .append_conclave_message(&master, conclave_id, true, None, body)?;
         Ok(())
     }
 
-    pub async fn add_meeting_member(
+    /// Invite a contact to a conclave. Convener only.
+    ///
+    /// The invitee is added as `Invited` and receives an invite; the joined
+    /// trustees receive the convener's roster update so the invited count
+    /// converges. The daemon rejects this at the API boundary for a non-convener,
+    /// so the rule is not merely a hidden button.
+    pub async fn invite_conclave_trustee(
         &mut self,
-        meeting_id: &str,
+        conclave_id: &str,
         nickname: &str,
     ) -> Result<(), Error> {
-        if self.chat_log.meeting(meeting_id).is_none() {
-            return Err(Error::MeetingNotFound);
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended {
+            return Err(Error::ConclaveEnded);
         }
-        if self.find_contact(nickname).is_none() {
-            return Err(Error::ContactNotFound);
+        if !conclave.convener.is_empty() && conclave.convener != me {
+            return Err(Error::NotConclaveConvener);
+        }
+        let contact = self
+            .find_contact(nickname)
+            .ok_or(Error::ContactNotFound)?
+            .clone();
+        if conclave.trustee(&contact.account_id).is_some() {
+            return Err(Error::AlreadyConclaveTrustee);
         }
         let master = *self.vault.master_key();
+        let invited = ConclaveTrustee {
+            account_id: contact.account_id.clone(),
+            nick: nickname.to_string(),
+            state: TrusteeState::Invited,
+        };
         self.chat_log
-            .add_meeting_member(&master, meeting_id, nickname)?;
+            .update_conclave(&master, conclave_id, |c| {
+                c.upsert_trustee(&invited);
+            })?;
+        let record = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        let descriptor = descriptor_of(&record);
+        self.send_payload_inner(
+            nickname,
+            MessagePayload::ConclaveInvite {
+                descriptor: descriptor.clone(),
+            },
+            false,
+        )
+        .await?;
+        self.broadcast_update(&record).await?;
+        self.save().await?;
         Ok(())
     }
 
-    pub async fn remove_meeting_member(
+    /// Accept an invite: materialise the conclave and tell the convener.
+    ///
+    /// This is the only path that creates a conclave from a received message. It
+    /// moves the trustee from invited to joined and sends an acknowledgement to
+    /// the convener, who re-broadcasts the authoritative roster to everyone.
+    pub async fn accept_conclave_invite(
         &mut self,
-        meeting_id: &str,
-        nickname: &str,
-    ) -> Result<(), Error> {
-        if self.chat_log.meeting(meeting_id).is_none() {
-            return Err(Error::MeetingNotFound);
+        conclave_id: &str,
+    ) -> Result<ConclaveRecord, Error> {
+        let me = self.state.protocol_name.clone();
+        let invite = self
+            .state
+            .pending_invites
+            .iter()
+            .find(|i| i.conclave_id == conclave_id)
+            .cloned()
+            .ok_or(Error::InviteNotFound)?;
+        let master = *self.vault.master_key();
+        let mut roster = self.localise_roster(&invite.trustees);
+        match roster.iter_mut().find(|m| m.account_id == me) {
+            Some(self_entry) => {
+                self_entry.state = TrusteeState::Joined;
+                self_entry.nick = String::new();
+            }
+            None => roster.push(ConclaveTrustee {
+                account_id: me.clone(),
+                nick: String::new(),
+                state: TrusteeState::Joined,
+            }),
+        }
+        if self.chat_log.conclave(conclave_id).is_none() {
+            self.chat_log.create_conclave_with_id(
+                &master,
+                conclave_id,
+                &invite.name,
+                &invite.convener,
+                &roster,
+            )?;
+        } else {
+            self.chat_log
+                .update_conclave(&master, conclave_id, |c| {
+                    if c.convener.is_empty() {
+                        c.convener = invite.convener.clone();
+                    }
+                    for m in &roster {
+                        c.upsert_trustee(m);
+                    }
+                })?;
+        }
+        self.state
+            .pending_invites
+            .retain(|i| i.conclave_id != conclave_id);
+        let record = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        let descriptor = descriptor_of(&record);
+        if let Some(nick) = self.contact_nick_for_protocol(&invite.from_account) {
+            self.send_payload_inner(
+                &nick,
+                MessagePayload::ConclaveAccept { descriptor },
+                false,
+            )
+            .await?;
+        }
+        self.save().await?;
+        Ok(record)
+    }
+
+    /// Decline an invite. Silent to the inviter beyond the state change: only the
+    /// convener is told, and no roster update is broadcast.
+    pub async fn decline_conclave_invite(&mut self, conclave_id: &str) -> Result<(), Error> {
+        let invite = self
+            .state
+            .pending_invites
+            .iter()
+            .find(|i| i.conclave_id == conclave_id)
+            .cloned()
+            .ok_or(Error::InviteNotFound)?;
+        self.state
+            .pending_invites
+            .retain(|i| i.conclave_id != conclave_id);
+        if let Some(nick) = self.contact_nick_for_protocol(&invite.from_account) {
+            self.send_payload_inner(
+                &nick,
+                MessagePayload::ConclaveDecline {
+                    conclave_id: conclave_id.to_string(),
+                    member: self.state.protocol_name.clone(),
+                },
+                false,
+            )
+            .await?;
+        }
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Leave a conclave. Any joined trustee may leave.
+    ///
+    /// If the convener leaves, the conclave ends for everyone (decision a): the
+    /// convener is the only trustee who can administer or close it, so a departed
+    /// convener would leave a conclave nobody can govern. Otherwise the trustee is
+    /// marked `Left` and the convener is told, so the roster converges from the
+    /// convener's broadcast.
+    pub async fn leave_conclave(&mut self, conclave_id: &str) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if !conclave.is_joined(&me) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        if conclave.convener == me {
+            return self.end_conclave(conclave_id).await;
         }
         let master = *self.vault.master_key();
+        let left = ConclaveTrustee {
+            account_id: me.clone(),
+            nick: String::new(),
+            state: TrusteeState::Left,
+        };
         self.chat_log
-            .remove_meeting_member(&master, meeting_id, nickname)?;
+            .update_conclave(&master, conclave_id, |c| {
+                c.upsert_trustee(&left);
+            })?;
+        let record = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        let descriptor = descriptor_of(&record);
+        if let Some(nick) = self.contact_nick_for_protocol(&conclave.convener) {
+            self.send_payload_inner(&nick, MessagePayload::ConclaveLeave { descriptor }, false)
+                .await?;
+        }
+        self.save().await?;
         Ok(())
+    }
+
+    /// Remove a trustee. Convener only.
+    ///
+    /// The trustee is marked `Kicked` and the convener broadcasts the
+    /// authoritative roster to every joined trustee, so the kick converges
+    /// everywhere.
+    pub async fn kick_conclave_trustee(
+        &mut self,
+        conclave_id: &str,
+        nickname: &str,
+    ) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended {
+            return Err(Error::ConclaveEnded);
+        }
+        if !conclave.convener.is_empty() && conclave.convener != me {
+            return Err(Error::NotConclaveConvener);
+        }
+        let target = self
+            .find_contact(nickname)
+            .ok_or(Error::ContactNotFound)?
+            .clone();
+        let Some(existing) = conclave.trustee(&target.account_id) else {
+            return Err(Error::NotConclaveTrustee);
+        };
+        if matches!(existing.state, TrusteeState::Left | TrusteeState::Kicked) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        let master = *self.vault.master_key();
+        let kicked = ConclaveTrustee {
+            account_id: target.account_id.clone(),
+            nick: nickname.to_string(),
+            state: TrusteeState::Kicked,
+        };
+        self.chat_log
+            .update_conclave(&master, conclave_id, |c| {
+                c.upsert_trustee(&kicked);
+            })?;
+        let record = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        self.broadcast_update(&record).await?;
+        self.save().await?;
+        Ok(())
+    }
+
+    /// End a conclave for everyone. Convener only.
+    ///
+    /// The record and its message log stay in every vault; the `ended` flag makes
+    /// the conclave read-only on every peer, not only on the convener's. This is a
+    /// broadcast, not the local hide it used to be.
+    pub async fn end_conclave(&mut self, conclave_id: &str) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if !conclave.convener.is_empty() && conclave.convener != me {
+            return Err(Error::NotConclaveConvener);
+        }
+        let master = *self.vault.master_key();
+        if !self.chat_log.end_conclave(&master, conclave_id)? {
+            return Ok(());
+        }
+        let record = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        let descriptor = descriptor_of(&record);
+        let targets: Vec<String> = record
+            .joined()
+            .filter(|m| m.account_id != me)
+            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
+            .collect();
+        for nick in targets {
+            self.send_payload_inner(
+                &nick,
+                MessagePayload::ConclaveEnd {
+                    descriptor: descriptor.clone(),
+                },
+                false,
+            )
+            .await?;
+        }
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Send the convener's authoritative roster to every joined trustee.
+    async fn broadcast_update(&mut self, record: &ConclaveRecord) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let descriptor = descriptor_of(record);
+        let targets: Vec<String> = record
+            .joined()
+            .filter(|m| m.account_id != me)
+            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
+            .collect();
+        for nick in targets {
+            self.send_payload_inner(
+                &nick,
+                MessagePayload::ConclaveUpdate {
+                    descriptor: descriptor.clone(),
+                },
+                false,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Map a wire roster onto this vault's nicknames.
+    ///
+    /// The account id is stable across peers; the nickname is local. A trustee
+    /// this vault knows is renamed to the local nickname, and our own entry gets
+    /// an empty nickname so the UI can render it as "you".
+    fn localise_roster(&self, trustees: &[ConclaveTrustee]) -> Vec<ConclaveTrustee> {
+        trustees
+            .iter()
+            .map(|m| {
+                let nick = if m.account_id == self.state.protocol_name {
+                    String::new()
+                } else if let Some(contact) = self.contact_by_account(&m.account_id) {
+                    contact.nickname.clone()
+                } else {
+                    m.nick.clone()
+                };
+                ConclaveTrustee {
+                    account_id: m.account_id.clone(),
+                    nick,
+                    state: m.state,
+                }
+            })
+            .collect()
+    }
+
+    /// Apply a convener-originated descriptor to a conclave this vault already
+    /// holds. Returns `false` when the conclave is unknown, so a stray update is
+    /// ignored rather than inventing a conclave.
+    fn apply_descriptor(&mut self, descriptor: &ConclaveDescriptor) -> Result<bool, Error> {
+        if self.chat_log.conclave(&descriptor.conclave_id).is_none() {
+            return Ok(false);
+        }
+        let localised = self.localise_roster(&descriptor.trustees);
+        let name = descriptor.name.clone();
+        let convener = descriptor.convener.clone();
+        let ended = descriptor.ended;
+        let master = *self.vault.master_key();
+        self.chat_log
+            .update_conclave(&master, &descriptor.conclave_id, |c| {
+                if !name.is_empty() {
+                    c.name = name.clone();
+                }
+                if !convener.is_empty() {
+                    c.convener = convener.clone();
+                }
+                if ended {
+                    c.ended = true;
+                }
+                for m in &localised {
+                    c.upsert_trustee(m);
+                }
+            })?;
+        Ok(true)
+    }
+
+    /// Fill every legacy conclave's trustees from its nickname list, and give a
+    /// record with no convener the local account as convener.
+    ///
+    /// A record written before consent and governance existed has nicknames only
+    /// and no convener. Without this it would have no trustees and no one
+    /// could administer it; assigning the local account is the only sensible
+    /// default for a record that predates the concept.
+    fn hydrate_conclaves(&mut self) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let ids: Vec<String> = self.chat_log.conclaves().iter().map(|c| c.id.clone()).collect();
+        let master = *self.vault.master_key();
+        for id in ids {
+            let contacts: Vec<(String, String)> = self
+                .state
+                .contacts
+                .iter()
+                .map(|c| (c.nickname.clone(), c.account_id.clone()))
+                .collect();
+            self.chat_log
+                .hydrate_trustees(&master, &id, &me, |nick| {
+                    contacts
+                        .iter()
+                        .find(|(n, _)| n == nick)
+                        .map(|(_, id)| id.clone())
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Store a received invite as a pending record. Returns whether anything
+    /// changed.
+    ///
+    /// Nothing is materialised: the conclave does not exist locally until the
+    /// invitee accepts. A repeat invite refreshes the pending record; an invite
+    /// for a conclave already joined or ended is ignored.
+    fn receive_conclave_invite(
+        &mut self,
+        descriptor: &ConclaveDescriptor,
+        from_account: &str,
+        from_nick: &str,
+    ) -> Result<bool, Error> {
+        if let Some(existing) = self.chat_log.conclave(&descriptor.conclave_id) {
+            if existing.ended || existing.is_joined(&self.state.protocol_name) {
+                return Ok(false);
+            }
+        }
+        let invite = PendingInvite {
+            conclave_id: descriptor.conclave_id.clone(),
+            name: descriptor.name.clone(),
+            convener: descriptor.convener.clone(),
+            from_account: from_account.to_string(),
+            from_nick: from_nick.to_string(),
+            trustees: descriptor.trustees.clone(),
+            received_ms: now_ms(),
+        };
+        match self
+            .state
+            .pending_invites
+            .iter_mut()
+            .find(|i| i.conclave_id == descriptor.conclave_id)
+        {
+            Some(existing) => {
+                *existing = invite;
+                Ok(true)
+            }
+            None => {
+                self.state.pending_invites.push(invite);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Apply a received acceptance. Convener only.
+    ///
+    /// The trustee moves from invited to joined in the convener's record, which
+    /// the convener then re-broadcasts so the joined count converges everywhere.
+    async fn receive_conclave_accept(
+        &mut self,
+        descriptor: &ConclaveDescriptor,
+    ) -> Result<bool, Error> {
+        if descriptor.convener != self.state.protocol_name {
+            return Ok(false);
+        }
+        if !self.apply_descriptor(descriptor)? {
+            return Ok(false);
+        }
+        let record = self
+            .chat_log
+            .conclave(&descriptor.conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        self.broadcast_update(&record).await?;
+        Ok(true)
+    }
+
+    /// Apply a received decline. Convener only.
+    ///
+    /// The declined trustee is dropped from the convener's record so the invited
+    /// count is honest; nothing is broadcast, because no one else needs to know.
+    fn receive_conclave_decline(
+        &mut self,
+        conclave_id: &str,
+        trustee_account: &str,
+    ) -> Result<bool, Error> {
+        if self.chat_log.conclave(conclave_id).is_none() {
+            return Ok(false);
+        }
+        let master = *self.vault.master_key();
+        self.chat_log.update_conclave(&master, conclave_id, |c| {
+            c.trustees.retain(|t| t.account_id != trustee_account);
+        })?;
+        Ok(true)
+    }
+
+    /// Apply a received leave. Convener only.
+    ///
+    /// The leaver is marked `Left` and the convener re-broadcasts, so every
+    /// joined trustee converges from one authority rather than a peer-to-peer
+    /// flood.
+    async fn receive_conclave_leave(
+        &mut self,
+        descriptor: &ConclaveDescriptor,
+    ) -> Result<bool, Error> {
+        if descriptor.convener != self.state.protocol_name {
+            return Ok(false);
+        }
+        if !self.apply_descriptor(descriptor)? {
+            return Ok(false);
+        }
+        let record = self
+            .chat_log
+            .conclave(&descriptor.conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        self.broadcast_update(&record).await?;
+        Ok(true)
+    }
+
+    /// Apply a convener-originated roster snapshot, or an end.
+    ///
+    /// Accepted only when the sender is the convener named in the descriptor, so
+    /// a trustee cannot forge membership changes.
+    fn receive_conclave_update(
+        &mut self,
+        descriptor: &ConclaveDescriptor,
+        from_account: &str,
+    ) -> Result<bool, Error> {
+        if descriptor.convener.is_empty() || descriptor.convener != from_account {
+            return Ok(false);
+        }
+        self.apply_descriptor(descriptor)
     }
 
     pub async fn heartbeat_presence(&self) -> Result<(), Error> {
@@ -1577,6 +2162,51 @@ impl Account {
                 let nick = self
                     .contact_nick_for_protocol(&from_account)
                     .unwrap_or_else(|| short_name(&from_account));
+
+                // Conclave control payloads. Membership is consensual, so an
+                // invite, accept, decline, leave, update or end changes local
+                // state and is never surfaced as a chat message. Only an
+                // explicit accept ever materialises a conclave.
+                match &payload {
+                    MessagePayload::ConclaveInvite { descriptor } => {
+                        if self.receive_conclave_invite(descriptor, &from_account, &nick)? {
+                            dirty = true;
+                        }
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        continue;
+                    }
+                    MessagePayload::ConclaveAccept { descriptor } => {
+                        if self.receive_conclave_accept(descriptor).await? {
+                            dirty = true;
+                        }
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        continue;
+                    }
+                    MessagePayload::ConclaveDecline { conclave_id, member } => {
+                        if self.receive_conclave_decline(conclave_id, member)? {
+                            dirty = true;
+                        }
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        continue;
+                    }
+                    MessagePayload::ConclaveLeave { descriptor } => {
+                        if self.receive_conclave_leave(descriptor).await? {
+                            dirty = true;
+                        }
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        continue;
+                    }
+                    MessagePayload::ConclaveUpdate { descriptor }
+                    | MessagePayload::ConclaveEnd { descriptor } => {
+                        if self.receive_conclave_update(descriptor, &from_account)? {
+                            dirty = true;
+                        }
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        continue;
+                    }
+                    _ => {}
+                }
+
                 let (file_blob_id, mail_attachments) = match &payload {
                     MessagePayload::File { data, name } => {
                         let id = self.vault.put_blob(data)?;
@@ -1624,22 +2254,24 @@ impl Account {
                         self.chat_log.append_text(&master, &nick, false, body)?;
                         (None, Vec::new())
                     }
-                    // A meeting message: materialise the meeting if this vault
-                    // has never seen it, then file the message in it. The
-                    // descriptor is the only way a recipient learns a meeting
-                    // exists; there is no server-side room to join.
-                    MessagePayload::Meeting {
-                        meeting_id,
-                        name,
-                        members,
-                        body,
-                    } => {
+                    // A conclave message. The conclave must already exist and
+                    // the sender must be a joined trustee: a message never
+                    // materialises a conclave, so a stray fan-out cannot invent
+                    // one. The invite handled above must be accepted first.
+                    MessagePayload::Conclave { conclave_id, body, .. } => {
+                        let known = self
+                            .chat_log
+                            .conclave(conclave_id)
+                            .is_some_and(|c| c.is_joined(&from_account));
+                        if !known {
+                            relay.delete(&queue_id, &read_token, &blob_id).await?;
+                            dirty = true;
+                            continue;
+                        }
                         let master = *self.vault.master_key();
-                        self.chat_log
-                            .ensure_meeting(&master, meeting_id, name, members)?;
-                        self.chat_log.append_meeting_message(
+                        self.chat_log.append_conclave_message(
                             &master,
-                            meeting_id,
+                            conclave_id,
                             false,
                             Some(&nick),
                             body,
@@ -1647,7 +2279,13 @@ impl Account {
                         (None, Vec::new())
                     }
                     // Handled above, before this match.
-                    MessagePayload::QueueGrant { .. } => {
+                    MessagePayload::QueueGrant { .. }
+                    | MessagePayload::ConclaveInvite { .. }
+                    | MessagePayload::ConclaveAccept { .. }
+                    | MessagePayload::ConclaveDecline { .. }
+                    | MessagePayload::ConclaveLeave { .. }
+                    | MessagePayload::ConclaveUpdate { .. }
+                    | MessagePayload::ConclaveEnd { .. } => {
                         unreachable!("control payload handled above")
                     }
                 };
@@ -1717,6 +2355,10 @@ impl Account {
 
     fn find_contact(&self, nickname: &str) -> Option<&Contact> {
         self.state.contacts.iter().find(|c| c.nickname == nickname)
+    }
+
+    fn contact_by_account(&self, account_id: &str) -> Option<&Contact> {
+        self.state.contacts.iter().find(|c| c.account_id == account_id)
     }
 
     fn contact_nick_for_protocol(&self, account_id: &str) -> Option<String> {
@@ -1849,6 +2491,20 @@ fn short_name(protocol_name: &str) -> String {
     }
 }
 
+/// The wire snapshot of a conclave.
+///
+/// An invite, accept, leave, update or end all carry this, so every peer
+/// converges on the convener's view of the trustee list without a server object.
+fn descriptor_of(record: &ConclaveRecord) -> ConclaveDescriptor {
+    ConclaveDescriptor {
+        conclave_id: record.id.clone(),
+        name: record.name.clone(),
+        convener: record.convener.clone(),
+        trustees: record.trustees.clone(),
+        ended: record.ended,
+    }
+}
+
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = fs::read_dir(path) {
@@ -1961,6 +2617,7 @@ mod tests {
             receive_queue_token: Some(queue_token.clone()),
             mail_handle: None,
             revoked: Vec::new(),
+            pending_invites: Vec::new(),
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
         fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();

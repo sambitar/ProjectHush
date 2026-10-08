@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::crypto::{decrypt, encrypt, MASTER_KEY_LEN};
 use crate::error::Error;
+use crate::payload::{ConclaveTrustee, TrusteeState};
 use crate::vault::BlobId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,13 +107,13 @@ pub enum ChatRecordPayload {    Text {
     },
 }
 
-/// One message inside a meeting's own log.
+/// One message inside a conclave's own log.
 ///
-/// Meeting messages do not go through [`ChatRecord`]: a meeting is a local
+/// Conclave messages do not go through [`ChatRecord`]: a conclave is a local
 /// construct with its own log, and keeping its messages here is what keeps them
 /// out of the chat and mail projections without a filter that could be forgotten.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MeetingMessage {
+pub struct ConclaveMessage {
     pub id: String,
     pub outgoing: bool,
     /// The sender's nickname as this vault knows it; `None` for our own messages.
@@ -122,29 +123,111 @@ pub struct MeetingMessage {
     pub ts_ms: u64,
 }
 
-/// A meeting: a local record, not a relay-side room.
+/// A conclave: a local record, not a relay-side room.
 ///
-/// It holds the id a descriptor is keyed on, the name, the ordered member list
-/// (nicknames as this vault knows them), when it was created, and its own message
-/// log. Group chat is sender-side fan-out over the members' 1:1 sessions; there is
-/// no group key and no server object.
+/// It holds the id a descriptor is keyed on, the name, the trustees (with their
+/// per-member state), when it was created, its convener, and its own message
+/// log. Group chat is sender-side fan-out over the trustees' 1:1 sessions; there
+/// is no group key and no server object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MeetingRecord {
+pub struct ConclaveRecord {
     pub id: String,
     pub name: String,
-    pub members: Vec<String>,
+    /// The trustees, keyed on the stable account id.
+    ///
+    /// `alias` reads the pre-rename `members` key, whose entries were bare
+    /// nickname strings (still accepted by [`ConclaveTrustee`]'s custom
+    /// `Deserialize`), so an existing vault loads. New records write `trustees`.
+    #[serde(default, alias = "members")]
+    pub trustees: Vec<ConclaveTrustee>,
     pub created_ms: u64,
     #[serde(default)]
-    pub messages: Vec<MeetingMessage>,
+    pub messages: Vec<ConclaveMessage>,
+    /// Set when the conclave ends. The record and its message log stay in the
+    /// vault; an ended conclave is read-only on every peer. Defaulted so a
+    /// record written before ending existed loads as still active.
+    #[serde(default)]
+    pub ended: bool,
+    /// The convener's account id. The convener is the only trustee who may
+    /// invite, kick, or end. Empty for a record written before governance
+    /// existed; hydration fills it with the local account.
+    #[serde(default, alias = "creator")]
+    pub convener: String,
+}
+
+impl ConclaveRecord {
+    /// Every joined trustee, in order.
+    pub fn joined(&self) -> impl Iterator<Item = &ConclaveTrustee> {
+        self.trustees
+            .iter()
+            .filter(|m| m.state == TrusteeState::Joined)
+    }
+
+    /// Every invited (not yet accepted) trustee.
+    pub fn invited(&self) -> impl Iterator<Item = &ConclaveTrustee> {
+        self.trustees
+            .iter()
+            .filter(|m| m.state == TrusteeState::Invited)
+    }
+
+    pub fn trustee(&self, account_id: &str) -> Option<&ConclaveTrustee> {
+        self.trustees.iter().find(|m| m.account_id == account_id)
+    }
+
+    pub fn is_joined(&self, account_id: &str) -> bool {
+        self.trustee(account_id)
+            .is_some_and(|m| m.state == TrusteeState::Joined)
+    }
+
+    /// Insert or update one trustee's state.
+    ///
+    /// The merge is monotonic, so a stale snapshot cannot undo a newer fact:
+    /// a terminal state (left or kicked) is never revived by a live one, and a
+    /// joined trustee is never downgraded back to invited by a peer that had not
+    /// yet heard they joined. Returns whether anything changed.
+    pub fn upsert_trustee(&mut self, incoming: &ConclaveTrustee) -> bool {
+        match self
+            .trustees
+            .iter_mut()
+            .find(|m| m.account_id == incoming.account_id)
+        {
+            Some(existing) => {
+                let terminal = matches!(existing.state, TrusteeState::Left | TrusteeState::Kicked);
+                let incoming_live =
+                    matches!(incoming.state, TrusteeState::Invited | TrusteeState::Joined);
+                let downgrade =
+                    existing.state == TrusteeState::Joined && incoming.state == TrusteeState::Invited;
+                let mut changed = false;
+                if !(terminal && incoming_live) && !downgrade && existing.state != incoming.state {
+                    existing.state = incoming.state;
+                    changed = true;
+                }
+                if existing.nick.is_empty() && !incoming.nick.is_empty() {
+                    existing.nick = incoming.nick.clone();
+                    changed = true;
+                }
+                changed
+            }
+            None => {
+                self.trustees.push(incoming.clone());
+                true
+            }
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct ChatLogFile {
     messages: Vec<ChatRecord>,
-    /// Meetings this vault holds. Defaulted so a log written before meetings
+    /// Conclaves this vault holds. Defaulted so a log written before conclaves
     /// existed still loads.
-    #[serde(default)]
-    meetings: Vec<MeetingRecord>,
+    ///
+    /// The on-disk key stays `meetings`: every existing `chat.enc` writes it that
+    /// way, and pinning it means an older build can still read a log this build
+    /// writes (a rollback must not lose records). `alias` accepts the renamed key
+    /// if one is ever written.
+    #[serde(default, rename = "meetings", alias = "conclaves")]
+    conclaves: Vec<ConclaveRecord>,
 }
 
 pub struct ChatLog {
@@ -360,74 +443,153 @@ impl ChatLog {
         Ok(true)
     }
 
-    /// The meetings this vault holds, in creation order.
-    pub fn meetings(&self) -> &[MeetingRecord] {
-        &self.file.meetings
+    /// The conclaves this vault holds, in creation order.
+    pub fn conclaves(&self) -> &[ConclaveRecord] {
+        &self.file.conclaves
     }
 
-    pub fn meeting(&self, id: &str) -> Option<&MeetingRecord> {
-        self.file.meetings.iter().find(|m| m.id == id)
+    pub fn conclave(&self, id: &str) -> Option<&ConclaveRecord> {
+        self.file.conclaves.iter().find(|m| m.id == id)
     }
 
-    /// Create a meeting with an empty message log, returning its id.
-    pub fn create_meeting(
+    /// Create a conclave with an empty message log, returning its id.
+    ///
+    /// `convener` is the convener's account id and `trustees` is the initial
+    /// roster (the convener as joined, each invitee as invited).
+    pub fn create_conclave(
         &mut self,
         master: &[u8; MASTER_KEY_LEN],
         name: &str,
-        members: &[String],
+        convener: &str,
+        trustees: &[ConclaveTrustee],
     ) -> Result<String, Error> {
         let id = Uuid::new_v4().to_string();
-        self.file.meetings.push(MeetingRecord {
+        let record = ConclaveRecord {
             id: id.clone(),
             name: name.to_string(),
-            members: members.to_vec(),
+            trustees: trustees.to_vec(),
             created_ms: now_ms(),
             messages: Vec::new(),
-        });
+            ended: false,
+            convener: convener.to_string(),
+        };
+        self.file.conclaves.push(record);
         self.save(master)?;
         Ok(id)
     }
 
-    /// Materialise a meeting from a received descriptor if this vault does not
-    /// have it yet. Returns whether it was created.
-    ///
-    /// A known meeting is left untouched: a descriptor is how a recipient first
-    /// learns a meeting exists, not an instruction to overwrite local membership.
-    pub fn ensure_meeting(
+    /// Create a conclave under an id chosen elsewhere (the id an invite carried),
+    /// returning whether it was created. Used when accepting an invite, so both
+    /// peers key the same conclave.
+    pub fn create_conclave_with_id(
         &mut self,
         master: &[u8; MASTER_KEY_LEN],
         id: &str,
         name: &str,
-        members: &[String],
+        convener: &str,
+        trustees: &[ConclaveTrustee],
     ) -> Result<bool, Error> {
-        if self.file.meetings.iter().any(|m| m.id == id) {
+        if self.file.conclaves.iter().any(|m| m.id == id) {
             return Ok(false);
         }
-        self.file.meetings.push(MeetingRecord {
+        let record = ConclaveRecord {
             id: id.to_string(),
             name: name.to_string(),
-            members: members.to_vec(),
+            trustees: trustees.to_vec(),
             created_ms: now_ms(),
             messages: Vec::new(),
-        });
+            ended: false,
+            convener: convener.to_string(),
+        };
+        self.file.conclaves.push(record);
         self.save(master)?;
         Ok(true)
     }
 
-    /// Append one message to a meeting. Returns `false` when the meeting is
-    /// unknown, so a caller can tell "no such meeting" from "written".
-    pub fn append_meeting_message(
+    /// Apply a change to one conclave in place, then persist it. Returns `false`
+    /// when the id is unknown, so a caller can tell "no such conclave" from
+    /// "written".
+    pub fn update_conclave<F>(
         &mut self,
         master: &[u8; MASTER_KEY_LEN],
-        meeting_id: &str,
+        id: &str,
+        f: F,
+    ) -> Result<bool, Error>
+    where
+        F: FnOnce(&mut ConclaveRecord),
+    {
+        let Some(record) = self.file.conclaves.iter_mut().find(|m| m.id == id) else {
+            return Ok(false);
+        };
+        f(record);
+        self.save(master)?;
+        Ok(true)
+    }
+
+    /// Fill a legacy record's trustees from its nickname list, resolving each
+    /// nickname to an account id with `resolve`. Returns whether anything
+    /// changed.
+    ///
+    /// A record written before consent existed has nicknames only; without this
+    /// it would have no trustees and every membership operation would see an
+    /// empty set. A nickname that cannot be resolved keeps its nickname as the
+    /// id, so it is still one stable entry. The convener is recorded as joined.
+    pub fn hydrate_trustees<F>(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        id: &str,
+        convener: &str,
+        mut resolve: F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let Some(record) = self.file.conclaves.iter_mut().find(|m| m.id == id) else {
+            return Ok(false);
+        };
+        if record.trustees.is_empty() || record.trustees.iter().all(|t| !t.account_id.is_empty()) {
+            return Ok(false);
+        }
+        let trustees: Vec<ConclaveTrustee> = record
+            .trustees
+            .iter()
+            .map(|t| {
+                // A pre-rename record stored a bare nickname, which decodes with
+                // an empty account id; resolve it through contacts. A structured
+                // entry already carries its account id.
+                if t.account_id.is_empty() {
+                    ConclaveTrustee {
+                        account_id: resolve(&t.nick).unwrap_or_else(|| t.nick.clone()),
+                        nick: t.nick.clone(),
+                        state: TrusteeState::Joined,
+                    }
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+        record.trustees = trustees;
+        if record.convener.is_empty() {
+            record.convener = convener.to_string();
+        }
+        self.save(master)?;
+        Ok(true)
+    }
+
+    /// Append one message to a conclave. Returns `false` when the conclave is
+    /// unknown, so a caller can tell "no such conclave" from "written".
+    pub fn append_conclave_message(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        conclave_id: &str,
         outgoing: bool,
         from: Option<&str>,
         body: &str,
     ) -> Result<bool, Error> {
-        let Some(meeting) = self.file.meetings.iter_mut().find(|m| m.id == meeting_id) else {
+        let Some(conclave) = self.file.conclaves.iter_mut().find(|m| m.id == conclave_id) else {
             return Ok(false);
         };
-        meeting.messages.push(MeetingMessage {
+        conclave.messages.push(ConclaveMessage {
             id: Uuid::new_v4().to_string(),
             outgoing,
             from: from.map(|f| f.to_string()),
@@ -438,40 +600,23 @@ impl ChatLog {
         Ok(true)
     }
 
-    /// Add a member nickname to a meeting if it is not already there. Returns
-    /// whether anything changed.
-    pub fn add_meeting_member(
+    /// Mark a conclave as ended. Returns `false` when the id is unknown or it was
+    /// already ended.
+    ///
+    /// The record and its message log stay in the encrypted log; the flag makes
+    /// the conclave read-only on every peer it is broadcast to.
+    pub fn end_conclave(
         &mut self,
         master: &[u8; MASTER_KEY_LEN],
-        meeting_id: &str,
-        nickname: &str,
+        conclave_id: &str,
     ) -> Result<bool, Error> {
-        let Some(meeting) = self.file.meetings.iter_mut().find(|m| m.id == meeting_id) else {
+        let Some(conclave) = self.file.conclaves.iter_mut().find(|m| m.id == conclave_id) else {
             return Ok(false);
         };
-        if meeting.members.iter().any(|m| m == nickname) {
+        if conclave.ended {
             return Ok(false);
         }
-        meeting.members.push(nickname.to_string());
-        self.save(master)?;
-        Ok(true)
-    }
-
-    /// Remove a member nickname from a meeting. Returns whether anything changed.
-    pub fn remove_meeting_member(
-        &mut self,
-        master: &[u8; MASTER_KEY_LEN],
-        meeting_id: &str,
-        nickname: &str,
-    ) -> Result<bool, Error> {
-        let Some(meeting) = self.file.meetings.iter_mut().find(|m| m.id == meeting_id) else {
-            return Ok(false);
-        };
-        let before = meeting.members.len();
-        meeting.members.retain(|m| m != nickname);
-        if meeting.members.len() == before {
-            return Ok(false);
-        }
+        conclave.ended = true;
         self.save(master)?;
         Ok(true)
     }
@@ -642,80 +787,214 @@ mod tests {
         assert_eq!(log.chat_records().count() + log.draft_records().count(), 2);
     }
 
+    fn trustee(account_id: &str, nick: &str, state: TrusteeState) -> ConclaveTrustee {
+        ConclaveTrustee {
+            account_id: account_id.to_string(),
+            nick: nick.to_string(),
+            state,
+        }
+    }
+
     #[test]
-    fn a_meeting_and_its_messages_survive_a_save_and_load() {
-        let dir = std::env::temp_dir().join(format!("hush-meeting-log-{}", std::process::id()));
+    fn a_conclave_and_its_messages_survive_a_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("hush-conclave-log-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
         let id = log
-            .create_meeting(&master, "Standup", &["bob".into(), "carol".into()])
+            .create_conclave(
+                &master,
+                "Standup",
+                "self",
+                &[
+                    trustee("self", "", TrusteeState::Joined),
+                    trustee("bob-id", "bob", TrusteeState::Invited),
+                    trustee("carol-id", "carol", TrusteeState::Invited),
+                ],
+            )
             .unwrap();
-        log.append_meeting_message(&master, &id, true, None, "morning")
+        log.append_conclave_message(&master, &id, true, None, "morning")
             .unwrap();
 
         let reloaded = ChatLog::load(&dir, &master).unwrap();
-        let meeting = reloaded.meeting(&id).expect("the meeting survives a reload");
-        assert_eq!(meeting.name, "Standup");
-        assert_eq!(meeting.members, vec!["bob".to_string(), "carol".to_string()]);
-        assert_eq!(meeting.messages.len(), 1);
-        assert_eq!(meeting.messages[0].body, "morning");
-        assert!(meeting.messages[0].outgoing);
-        // A meeting is not chat history, so the chat rail cannot show it twice.
+        let conclave = reloaded.conclave(&id).expect("the conclave survives a reload");
+        assert_eq!(conclave.name, "Standup");
+        assert_eq!(conclave.convener, "self");
+        assert_eq!(conclave.trustees.len(), 3);
+        assert_eq!(conclave.invited().count(), 2);
+        assert_eq!(conclave.messages.len(), 1);
+        assert_eq!(conclave.messages[0].body, "morning");
+        assert!(conclave.messages[0].outgoing);
+        // A conclave is not chat history, so the chat rail cannot show it twice.
         assert_eq!(reloaded.chat_records().count(), 0);
     }
 
     #[test]
-    fn a_meeting_materialises_once_from_a_descriptor_and_then_only_appends() {
-        let dir = std::env::temp_dir().join(format!("hush-meeting-desc-{}", std::process::id()));
+    fn a_conclave_created_under_an_invite_id_keeps_that_id() {
+        let dir = std::env::temp_dir().join(format!("hush-conclave-id-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
         assert!(
-            log.ensure_meeting(&master, "m-1", "Standup", &["bob".into()])
-                .unwrap(),
-            "an unknown meeting is created"
+            log.create_conclave_with_id(
+                &master,
+                "c-1",
+                "Trip",
+                "convener",
+                &[trustee("convener", "alice", TrusteeState::Joined)]
+            )
+            .unwrap()
         );
         assert!(
-            !log.ensure_meeting(&master, "m-1", "Renamed", &["bob".into(), "carol".into()])
-                .unwrap(),
-            "a descriptor for a known meeting must not overwrite local state"
+            !log.create_conclave_with_id(&master, "c-1", "Again", "convener", &[]).unwrap(),
+            "the same id is not created twice"
         );
-        assert_eq!(log.meeting("m-1").unwrap().name, "Standup");
-        assert_eq!(log.meeting("m-1").unwrap().members.len(), 1);
-
-        log.append_meeting_message(&master, "m-1", false, Some("bob"), "hi")
-            .unwrap();
-        assert_eq!(log.meeting("m-1").unwrap().messages[0].from.as_deref(), Some("bob"));
-
-        // Appending to an unknown meeting reports "nothing to do" rather than
-        // inventing a meeting with no name or members.
-        assert!(!log
-            .append_meeting_message(&master, "missing", false, None, "x")
-            .unwrap());
+        assert_eq!(log.conclave("c-1").unwrap().name, "Trip");
     }
 
     #[test]
-    fn meeting_membership_can_be_changed() {
-        let dir = std::env::temp_dir().join(format!("hush-meeting-mem-{}", std::process::id()));
+    fn conclave_trustee_updates_converge_and_never_revive_a_terminal_state() {
+        let dir = std::env::temp_dir().join(format!("hush-conclave-mem-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
-        let id = log.create_meeting(&master, "Trip", &["bob".into()]).unwrap();
-        assert!(log.add_meeting_member(&master, &id, "carol").unwrap());
-        assert!(
-            !log.add_meeting_member(&master, &id, "carol").unwrap(),
-            "adding the same member twice is a no-op"
+        let id = log
+            .create_conclave(
+                &master,
+                "Trip",
+                "alice",
+                &[
+                    trustee("alice", "alice", TrusteeState::Joined),
+                    trustee("bob", "bob", TrusteeState::Invited),
+                ],
+            )
+            .unwrap();
+
+        log.update_conclave(&master, &id, |c| {
+            c.upsert_trustee(&trustee("bob", "bob", TrusteeState::Joined));
+        })
+        .unwrap();
+        assert_eq!(log.conclave(&id).unwrap().joined().count(), 2);
+        assert_eq!(log.conclave(&id).unwrap().invited().count(), 0);
+
+        // A stale snapshot that still says invited must not downgrade a joined
+        // trustee: a peer that had not yet heard bob joined is not authoritative.
+        log.update_conclave(&master, &id, |c| {
+            c.upsert_trustee(&trustee("bob", "bob", TrusteeState::Invited));
+        })
+        .unwrap();
+        assert_eq!(
+            log.conclave(&id).unwrap().trustee("bob").unwrap().state,
+            TrusteeState::Joined
         );
-        assert!(log.remove_meeting_member(&master, &id, "bob").unwrap());
-        assert_eq!(log.meeting(&id).unwrap().members, vec!["carol".to_string()]);
-        assert!(!log.remove_meeting_member(&master, &id, "nobody").unwrap());
+
+        // A kick is terminal: a stale snapshot that still says joined must not
+        // revive the trustee.
+        log.update_conclave(&master, &id, |c| {
+            c.upsert_trustee(&trustee("bob", "bob", TrusteeState::Kicked));
+        })
+        .unwrap();
+        log.update_conclave(&master, &id, |c| {
+            c.upsert_trustee(&trustee("bob", "bob", TrusteeState::Joined));
+        })
+        .unwrap();
+        assert_eq!(
+            log.conclave(&id).unwrap().trustee("bob").unwrap().state,
+            TrusteeState::Kicked
+        );
+        assert!(!log.conclave(&id).unwrap().is_joined("bob"));
+    }
+
+    #[test]
+    fn a_legacy_record_hydrates_its_trustees_from_its_nickname_list() {
+        let dir = std::env::temp_dir().join(format!("hush-conclave-hydrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        // A record written before consent existed: a bare nickname, which decodes
+        // with an empty account id.
+        assert!(
+            log.create_conclave_with_id(&master, "m-1", "Standup", "", &[])
+                .unwrap()
+        );
+        log.update_conclave(&master, "m-1", |c| {
+            c.trustees = vec![trustee("", "bob", TrusteeState::Joined)];
+        })
+        .unwrap();
+
+        let hydrated = log
+            .hydrate_trustees(&master, "m-1", "self", |nick| {
+                (nick == "bob").then(|| "bob-id".to_string())
+            })
+            .unwrap();
+        assert!(hydrated);
+        let c = log.conclave("m-1").unwrap();
+        assert_eq!(c.trustees.len(), 1);
+        assert_eq!(c.trustees[0].account_id, "bob-id");
+        assert_eq!(c.trustees[0].state, TrusteeState::Joined);
+        assert_eq!(c.convener, "self");
+        // A second hydration is a no-op.
+        assert!(!log.hydrate_trustees(&master, "m-1", "self", |_| None).unwrap());
+    }
+
+    #[test]
+    fn ending_a_conclave_keeps_its_record_and_log() {
+        let dir = std::env::temp_dir().join(format!("hush-conclave-end-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        let id = log
+            .create_conclave(
+                &master,
+                "Trip",
+                "alice",
+                &[
+                    trustee("alice", "alice", TrusteeState::Joined),
+                    trustee("bob", "bob", TrusteeState::Joined),
+                ],
+            )
+            .unwrap();
+        log.append_conclave_message(&master, &id, true, None, "we leave at six")
+            .unwrap();
+
+        assert!(log.end_conclave(&master, &id).unwrap());
+        assert!(
+            !log.end_conclave(&master, &id).unwrap(),
+            "ending the same conclave twice is a no-op"
+        );
+
+        // A flag, not a delete: the record and its log survive a reload.
+        let reloaded = ChatLog::load(&dir, &master).unwrap();
+        let record = reloaded.conclave(&id).expect("the record stays in the log");
+        assert!(record.ended, "the record is marked ended");
+        assert_eq!(record.messages.len(), 1, "the message log is kept");
+        assert_eq!(record.messages[0].body, "we leave at six");
+    }
+
+    /// A log written by the build that keyed the list as `meetings` must still
+    /// load, so the rename cannot make an existing vault look empty or corrupt.
+    #[test]
+    fn a_log_written_before_the_rename_still_loads() {
+        let json = r#"{"messages":[],"meetings":[{"id":"m-1","name":"Standup","members":["bob"],"created_ms":1,"messages":[]}]}"#;
+        let file: ChatLogFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.conclaves.len(), 1, "the old `meetings` key still loads");
+        assert_eq!(file.conclaves[0].id, "m-1");
+        assert!(!file.conclaves[0].ended, "an old record loads as active");
+        // The bare nickname decodes into a trustee with an unknown account id,
+        // which hydration resolves on first open.
+        assert_eq!(file.conclaves[0].trustees.len(), 1);
+        assert_eq!(file.conclaves[0].trustees[0].nick, "bob");
+        assert_eq!(file.conclaves[0].trustees[0].account_id, "");
     }
 }
 

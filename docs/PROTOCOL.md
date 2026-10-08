@@ -120,32 +120,48 @@ Mail is a payload **kind** on the same Signal session and the same queue — not
 
 Relay view of a mail message is unchanged from any other message: an opaque ciphertext blob. Subject, body, and attachment names are inside the Signal envelope and never appear in relay storage.
 
-### Meetings
+### Conclaves
 
-A meeting is **not** a relay-side room and there is no group object in the protocol. Group chat is
-sender-side fan-out: the sender encrypts the message once per member over that member's existing 1:1
-session and puts N blobs (N puts for N members) — exactly the same primitive as two-party chat, just
-repeated. Nothing on the relay or in the wire format changes.
+A conclave is **not** a relay-side room and there is no group object in the protocol. Group chat is
+sender-side fan-out: the sender encrypts the message once per joined trustee over that trustee's
+existing 1:1 session and puts N blobs (N puts for N joined trustees) — exactly the same primitive as
+two-party chat, just repeated. Nothing on the relay changes.
 
-- **Wire payload:** `MessagePayload::Meeting { meeting_id, name, members[], body }`. The descriptor
-  (`meeting_id`, `name`, `members`) rides on **every** message, so a recipient that has never seen the
-  meeting can materialise it locally from the first message it receives; once the meeting exists, later
-  messages simply append.
+- **Roles.** The **convener** is the creator: the sole authority for inviting a trustee, kicking one,
+  and ending the conclave. A **trustee** is anyone else in it. Any joined trustee may leave; the
+  convener leaving ends the conclave instead.
+- **Membership is consensual.** Naming someone sends an **invite**; they join only by accepting. A
+  message never materialises a conclave on a vault that has never seen it — only an accepted invite
+  does. An invitee who has not accepted is not a fan-out target.
+- **Trustee states:** `invited` (asked, not answered), `joined` (receives the fan-out), and the
+  terminal `left` / `kicked`. State transitions are monotonic: a terminal state is never revived, and a
+  joined trustee is never downgraded back to invited by a stale peer snapshot.
+- **Single authority.** The convener broadcasts the authoritative roster as a descriptor
+  (`conclave_id`, `name`, `convener`, `trustees[]`, `ended`); peers apply it only when the sender is the
+  convener named in it. This replaces the older per-message member list, which drifted.
+- **Wire payloads:** `MessagePayload::Conclave { conclave_id, name, trustees[], body }` for a message,
+  plus the control variants `ConclaveInvite`, `ConclaveAccept`, `ConclaveDecline`, `ConclaveLeave`,
+  `ConclaveUpdate`, and `ConclaveEnd`, each carrying the descriptor. Control payloads change local state
+  and are never surfaced as chat messages. The message variant and the id field were renamed from
+  `Meeting` / `meeting_id`; `#[serde(alias = "meeting")]` and `#[serde(alias = "meeting_id")]` keep a
+  message written under the old names decodable.
 - **Delivery:** store-and-forward, like mail (the fan-out uses the same `require_online: false` path), so
-  an away member still receives the message on their next drain. There is no delivery receipt and no
+  an away trustee still receives the message on their next drain. There is no delivery receipt and no
   server-side membership to read.
-- **Local storage:** meetings reuse the encrypted `chat.enc` log via a `MeetingRecord` (`id`, `name`,
-  `members`, `created_ms`, `messages: MeetingMessage[]`). A meeting's messages are kept in the meeting's
-  own log, not in the 1:1 `ChatRecord` projection. One log, one encryption path, one backup path.
-- **Membership is local.** Adding or removing a member changes only the actor's own member list and
-  therefore only who they fan out to next; it is not announced to anyone and does not rewrite history for
-  others. A descriptor for a meeting a client already holds is ignored for membership purposes. This is a
-  deliberate first-cut limitation, not a shared-invitation protocol.
-- **Not a directory:** `members` holds the sender's local nicknames. They need not match the recipient's
-  names for the same people, and the relay never sees them.
+- **Local storage:** conclaves reuse the encrypted `chat.enc` log via a `ConclaveRecord` (`id`, `name`,
+  `convener`, `trustees[]`, `created_ms`, `messages: ConclaveMessage[]`, `ended`). A conclave's messages
+  are kept in the conclave's own log, not in the 1:1 `ChatRecord` projection. One log, one encryption
+  path, one backup path. A pre-rename record stored `members` as bare nickname strings and no convener;
+  `#[serde(alias = "members")]` plus a load-time hydration step (resolve the nicknames to account ids,
+  and make the local account the convener) keep an existing vault working. The on-disk key for the list
+  stays `meetings` (`#[serde(rename = "meetings", alias = "conclaves")]`).
+- **Ending is shared.** The convener broadcasts a `ConclaveEnd` descriptor; every peer marks the record
+  `ended` and renders it read-only. The record and its message log stay in every vault.
+- **Not a directory:** `trustees[].nick` is the sender's local nickname; `trustees[].account_id` is the
+  stable identity. The relay never sees either.
 
-Relay view of a meeting message is unchanged from any other message: an opaque ciphertext blob. The
-meeting name, member list, and body are inside the Signal envelope and never appear in relay storage.
+Relay view of a conclave message is unchanged from any other message: an opaque ciphertext blob. The
+conclave name, trustee list, and body are inside the Signal envelope and never appear in relay storage.
 
 ## What the relay HTTP API looks like (shape)
 

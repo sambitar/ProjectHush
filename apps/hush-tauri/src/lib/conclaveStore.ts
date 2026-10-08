@@ -1,0 +1,173 @@
+import type {
+  ConclaveDto,
+  ConclaveMessageDto,
+  ConclaveTrusteeDto,
+  PendingInviteDto,
+  TrusteeStateDto,
+} from "./api/types";
+
+/**
+ * The Conclaves rail's view of a conclave.
+ *
+ * A conclave is a local record in the vault, not a relay-side room: the daemon
+ * owns the record and its message log, and this store only mirrors what it last
+ * returned. Nothing is persisted here — the record lives in the encrypted log,
+ * which is what makes it survive a restart.
+ */
+export interface ConclaveMessage {
+  id: string;
+  outgoing: boolean;
+  /** The sender's nickname as this vault knows it; absent for our own messages. */
+  from?: string;
+  body: string;
+  createdAt: number;
+}
+
+/** A person in a conclave, and where they are in the consensual join flow. */
+export interface ConclaveTrustee {
+  /** The trustee's stable account id. */
+  accountId: string;
+  /** The local nickname for this trustee; a display hint only. */
+  nick: string;
+  state: TrusteeStateDto;
+}
+
+export interface Conclave {
+  id: string;
+  name: string;
+  /** The convener's account id: the only authority for invite, kick and end. */
+  convener: string;
+  trustees: ConclaveTrustee[];
+  createdAt: number;
+  messages: ConclaveMessage[];
+  /** True once ended: read-only on every peer. */
+  ended: boolean;
+}
+
+/** An invitation received but not yet accepted or declined. */
+export interface PendingInvite {
+  conclaveId: string;
+  name: string;
+  convener: string;
+  fromAccount: string;
+  fromNick: string;
+  trustees: ConclaveTrustee[];
+  receivedAt: number;
+}
+
+let conclaves: Conclave[] = [];
+let pendingInvites: PendingInvite[] = [];
+
+export function clearConclaveStore(): void {
+  conclaves = [];
+  pendingInvites = [];
+}
+
+function toMessage(m: ConclaveMessageDto): ConclaveMessage {
+  return {
+    id: m.id,
+    outgoing: m.outgoing,
+    from: m.from ?? undefined,
+    body: m.body,
+    createdAt: m.ts_ms,
+  };
+}
+
+function toTrustee(t: ConclaveTrusteeDto): ConclaveTrustee {
+  return { accountId: t.account_id, nick: t.nick, state: t.state };
+}
+
+function toConclave(dto: ConclaveDto): Conclave {
+  return {
+    id: dto.id,
+    name: dto.name,
+    convener: dto.convener,
+    trustees: dto.trustees.map(toTrustee),
+    createdAt: dto.created_ms,
+    messages: dto.messages.map(toMessage),
+    ended: dto.ended,
+  };
+}
+
+function toInvite(dto: PendingInviteDto): PendingInvite {
+  return {
+    conclaveId: dto.conclave_id,
+    name: dto.name,
+    convener: dto.convener,
+    fromAccount: dto.from_account,
+    fromNick: dto.from_nick,
+    trustees: dto.trustees.map(toTrustee),
+    receivedAt: dto.received_ms,
+  };
+}
+
+/**
+ * Everything the Conclaves rail renders, reduced to a comparable string, so the
+ * poll can skip a repaint that would steal the caret for nothing.
+ */
+function signature(list: Conclave[]): string {
+  return list
+    .map((m) => {
+      const last = m.messages[m.messages.length - 1];
+      const roster = m.trustees.map((t) => `${t.accountId}:${t.state}`).join(",");
+      return `${m.id}:${m.name}:${m.convener}:${roster}:${m.ended}:${m.messages.length}:${
+        last?.id ?? ""
+      }`;
+    })
+    .join("|");
+}
+
+/** Rebuild the conclave list from the daemon. Returns whether anything changed. */
+export function loadConclaves(dtos: ConclaveDto[]): boolean {
+  const next = dtos.map(toConclave);
+  const before = signature(conclaves);
+  conclaves = next;
+  return before !== signature(next);
+}
+
+/** Replace the pending-invite list. Returns whether anything changed. */
+export function loadPendingInvites(dtos: PendingInviteDto[]): boolean {
+  const next = dtos.map(toInvite);
+  const before = pendingInvites.map((i) => `${i.conclaveId}:${i.name}`).join("|");
+  pendingInvites = next;
+  const after = pendingInvites.map((i) => `${i.conclaveId}:${i.name}`).join("|");
+  return before !== after;
+}
+
+/** Invitations awaiting an accept or decline, newest first. */
+export function listPendingInvites(): PendingInvite[] {
+  return [...pendingInvites].sort((a, b) => b.receivedAt - a.receivedAt);
+}
+
+/** Conclaves, newest first. Ended conclaves are included: they are read-only. */
+export function listConclaves(): Conclave[] {
+  return [...conclaves].sort((a, b) => b.createdAt - a.createdAt);
+}
+
+export function conclaveById(id: string): Conclave | undefined {
+  return conclaves.find((m) => m.id === id);
+}
+
+/** The joined trustees: the fan-out set. */
+export function joinedTrustees(m: Conclave): ConclaveTrustee[] {
+  return m.trustees.filter((t) => t.state === "joined");
+}
+
+/** The invited trustees: asked but not yet answered. */
+export function invitedTrustees(m: Conclave): ConclaveTrustee[] {
+  return m.trustees.filter((t) => t.state === "invited");
+}
+
+/** The one-line summary under a conclave's name in the list. */
+export function conclavePreview(m: Conclave): string {
+  const last = m.messages[m.messages.length - 1];
+  if (!last) return "No messages yet";
+  const who = last.outgoing ? "You" : last.from ?? "Someone";
+  return `${who}: ${last.body.replace(/\s+/g, " ").trim()}`;
+}
+
+/** Contacts not already a trustee (invited or joined), for the invite picker. */
+export function candidatesToInvite(conclave: Conclave, contactNicks: string[]): string[] {
+  const present = new Set(conclave.trustees.map((t) => t.nick));
+  return contactNicks.filter((n) => !present.has(n));
+}

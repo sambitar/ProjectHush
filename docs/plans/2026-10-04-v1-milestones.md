@@ -27,6 +27,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **I — Confidential** | Heavy; spec early, code late | **10** TPM + lease rail | Planning only |
 | **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | **Deferred** |
 | **K — Member calls** | After **C** stabilizes | **17** P2P audio/video between contacts | Planning only |
+| **L — Shared surface** | After **17** Phase 4 (video) | **18** live screen share / co-browse in a conclave | Planning only |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
 
 **Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce.
@@ -490,6 +491,24 @@ Full design, build order, and acceptance criteria:
 **Depends on:** Task **5h** (presence), **5c** (opaque transport + encrypted log), **5** (daemon). **Independent of** **5d** / **16** / **11** / **10**.
 
 **Distro-readiness:** new runtime deps (GStreamer + plugins, `xdg-desktop-portal`); second egress (self-hosted STUN; optional user-supplied TURN); daemon capture-device/systemd exceptions — see the task doc.
+
+---
+
+### Task 18: Conclave shared surface — live screen share / co-browse (planning only)
+
+**Status:** **Phase L** — planning only. Spec decisions resolved (2026-10-08); no code until a phase is approved.
+
+**Goal:** A conclave trustee starts a **live shared surface** (screen, window, or app); the other joined trustees see it live, **end-to-end encrypted** and **peer-to-peer**, with the **host's own daemon as the hub**. The host may **grant input control** per viewer (view-only by default) — neko's multi-participant control without a server. No Hush server carries media; nothing is recorded; a locked host ends the session.
+
+→ **[`docs/tasks/conclave-shared-surface.md`](../tasks/conclave-shared-surface.md)**
+
+**Key constraint:** this is a **video** feature, so it is **gated on Task 17 Phase 4 (video)** — it is the strongest reason to do that phase, and Phase 4 should be designed for a **low-latency interactive** surface. The WebKitGTK finding from Task 17 applies: the peer connection and pipeline live in **`hush-daemon`**, not the webview. Signaling rides the existing Signal sessions (fanned out per member, no group object); **live input rides a WebRTC DataChannel**, not the Signal session.
+
+**Why not self-host neko:** neko's hub is a **container on a server** and its control is **free-for-all**; both conflict with the threat model (no first-party media relay; explicit consent). The primitive is adopted, the architecture is not.
+
+**Depends on:** Task **17** Phase 4 (video), Task **17** Phase 1 (tolerant decode + signaling plumbing, shared), **5h** presence, conclave fan-out, **5c** opaque transport. **Independent of** **5d** / **16** / **11** / **10**.
+
+**Distro-readiness:** new runtime deps (`xdg-desktop-portal` ScreenCast/RemoteDesktop, PipeWire, GStreamer encode plugins, an input-injection backend); second egress (self-hosted STUN); daemon portal/input/systemd exceptions; no frames on disk — see the task doc.
 
 ---
 

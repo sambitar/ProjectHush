@@ -62,10 +62,20 @@ pub enum Error {
     DropNeedsKey,
     #[error("this drop was sealed under a PIN; open it with the PIN, not a private key")]
     DropNeedsPin,
-    #[error("meeting not found")]
-    MeetingNotFound,
-    #[error("a meeting needs a name and at least one member")]
-    InvalidMeeting,
+    #[error("conclave not found")]
+    ConclaveNotFound,
+    #[error("a conclave needs a name and at least one trustee")]
+    InvalidConclave,
+    #[error("only the conclave's convener can do that")]
+    NotConclaveConvener,
+    #[error("this conclave has ended")]
+    ConclaveEnded,
+    #[error("you are not a trustee of this conclave")]
+    NotConclaveTrustee,
+    #[error("no pending invite for that conclave")]
+    InviteNotFound,
+    #[error("that person is already a trustee of this conclave")]
+    AlreadyConclaveTrustee,
 }
 
 impl From<argon2::Error> for Error {

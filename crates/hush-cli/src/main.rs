@@ -184,22 +184,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("  attachment -> {}", out.display());
                         }
                     }
-                    // A meeting message; the meeting itself is materialised in
-                    // the vault during `recv`.
-                    MessagePayload::Meeting {
-                        meeting_id,
+                    // A conclave message. The conclave itself is only ever
+                    // materialised by an accepted invite; a message for an
+                    // unknown conclave is dropped during `recv`.
+                    MessagePayload::Conclave {
+                        conclave_id,
                         name,
                         body,
                         ..
                     } => {
                         println!(
-                            "{}: meeting [{}] {} — {}",
-                            msg.from_nick, meeting_id, name, body
+                            "{}: conclave [{}] {} — {}",
+                            msg.from_nick, conclave_id, name, body
                         );
                     }
-                    // Queue grants are handled inside `recv` and never surface as
-                    // inbox items.
-                    MessagePayload::QueueGrant { .. } => {}
+                    // Control payloads are handled inside `recv` and never
+                    // surface as inbox items.
+                    MessagePayload::QueueGrant { .. }
+                    | MessagePayload::ConclaveInvite { .. }
+                    | MessagePayload::ConclaveAccept { .. }
+                    | MessagePayload::ConclaveDecline { .. }
+                    | MessagePayload::ConclaveLeave { .. }
+                    | MessagePayload::ConclaveUpdate { .. }
+                    | MessagePayload::ConclaveEnd { .. } => {}
                 }
             }
         }

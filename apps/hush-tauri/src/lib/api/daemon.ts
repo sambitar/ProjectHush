@@ -5,7 +5,8 @@ import type {
   ContactDto,
   InviteResponse,
   MailboxDto,
-  MeetingDto,
+  ConclaveDto,
+  PendingInviteDto,
   RecvResponse,
   StatusResponse,
 } from "./types";
@@ -211,32 +212,62 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ handle }),
     }),
-  /** Every meeting this vault holds, each with its own message log. */
-  meetings: () => request<MeetingDto[]>("/api/meetings"),
-  createMeeting: (name: string, members: string[]) =>
-    request<MeetingDto>("/api/meetings", {
+  /** Every conclave this vault holds, each with its own message log. */
+  conclaves: () => request<ConclaveDto[]>("/api/conclaves"),
+  createConclave: (name: string, trustees: string[]) =>
+    request<ConclaveDto>("/api/conclaves", {
       method: "POST",
-      body: JSON.stringify({ name, members }),
+      body: JSON.stringify({ name, trustees }),
     }),
   /**
-   * Send in a meeting. The daemon fans this out to every member over their own
-   * 1:1 session, so the response says nothing about per-member delivery.
+   * Send in a conclave. The daemon fans this out to every joined trustee over
+   * their own 1:1 session, so the response says nothing about per-trustee
+   * delivery.
    */
-  sendMeetingMessage: (meetingId: string, body: string) =>
-    request<null>("/api/meetings/message", {
+  sendConclaveMessage: (conclaveId: string, body: string) =>
+    request<null>("/api/conclaves/message", {
       method: "POST",
-      body: JSON.stringify({ meeting_id: meetingId, body }),
+      body: JSON.stringify({ conclave_id: conclaveId, body }),
     }),
-  /** Membership changes are local to this vault. */
-  addMeetingMember: (meetingId: string, nickname: string) =>
-    request<null>("/api/meetings/members/add", {
+  /** Invite a contact. Convener only; the invitee must accept. */
+  inviteConclaveTrustee: (conclaveId: string, nickname: string) =>
+    request<null>("/api/conclaves/trustees/invite", {
       method: "POST",
-      body: JSON.stringify({ meeting_id: meetingId, nickname }),
+      body: JSON.stringify({ conclave_id: conclaveId, nickname }),
     }),
-  removeMeetingMember: (meetingId: string, nickname: string) =>
-    request<null>("/api/meetings/members/remove", {
+  /** Remove a trustee. Convener only; converges to the joined trustees. */
+  kickConclaveTrustee: (conclaveId: string, nickname: string) =>
+    request<null>("/api/conclaves/trustees/kick", {
       method: "POST",
-      body: JSON.stringify({ meeting_id: meetingId, nickname }),
+      body: JSON.stringify({ conclave_id: conclaveId, nickname }),
+    }),
+  /** Accept an invite: the only path that materialises a conclave locally. */
+  acceptConclaveInvite: (conclaveId: string) =>
+    request<ConclaveDto>("/api/conclaves/trustees/accept", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId }),
+    }),
+  declineConclaveInvite: (conclaveId: string) =>
+    request<null>("/api/conclaves/trustees/decline", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId }),
+    }),
+  /** Leave a conclave. Any joined trustee may; the convener leaving ends it. */
+  leaveConclave: (conclaveId: string) =>
+    request<null>("/api/conclaves/trustees/leave", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId }),
+    }),
+  /** Invitations received but not yet accepted or declined. */
+  pendingInvites: () => request<PendingInviteDto[]>("/api/conclaves/invites"),
+  /**
+   * End a conclave for everyone: the convener broadcasts an `ended` descriptor
+   * so it becomes read-only on every peer. The log is kept on every vault.
+   */
+  endConclave: (conclaveId: string) =>
+    request<null>("/api/conclaves/end", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId }),
     }),
   blob: (id: string) =>
     request<{ data_base64: string }>(`/api/blob/${encodeURIComponent(id)}`),

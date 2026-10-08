@@ -13,6 +13,247 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-08 — Lab VPS relay provisioning (hush-relay + SMTP)
+
+Provisioned the lab VPS `137.184.129.205` as a public plain-HTTP hush relay with an SMTP submission
+server. New files only: `packaging/systemd/system/hush-relay.service.d/10-lab-public.conf`,
+`scripts/smoke-relay-lab.sh`, `docs/ops/relay-lab-vps.md`. Problems hit:
+
+### [OPEN] The daemon has no SMTP client, so there is no SMTP setting to wire
+
+- **Attempted:** read the repo to find "exactly which SMTP settings the daemon expects" so the
+  installed OpenSMTPD could be wired to the outsider-mail notification egress.
+- **Symptom:** there is no SMTP code at all. `hush-core/src/mailer.rs` ships only `NullMailer` and
+  `FileMailer`; `build_mailer` in `hush-daemon/src/main.rs` maps `file:<dir>` and everything else —
+  including `smtp:host` — to `NullMailer`. The unit test
+  `the_mailer_spec_selects_a_file_mailer_or_falls_back_to_null` asserts exactly that, so a `smtp:`
+  spec is silently a no-op, not an error.
+- **Resolution:** none in this slice. OpenSMTPD is installed and verified, but the daemon cannot use
+  it until an SMTP `Mailer` implementation exists. That means editing `crates/hush-core` and
+  `crates/hush-daemon`, which are outside this task's scope and are being edited concurrently.
+  Proposed contract (not implemented): `HUSH_MAILER=smtp://<host>:<port>` selecting a new
+  `SmtpMailer`.
+- **Lesson:** confirm the configuration surface exists before provisioning the thing it is meant to
+  configure. The premise "the SMTP settings the daemon expects" did not hold.
+
+### [OPEN] External mail egress is impossible from this droplet (port 25 blocked)
+
+- **Attempted:** verify the SMTP path by relaying a message to an external recipient
+  (`hushlab.test@gmail.com`).
+- **Symptom:** accepted by smtpd (`250`), then the MTA failed:
+  `mta error reason=Connection failed: Network is unreachable` connecting to the Gmail MX on
+  `smtp://142.251.16.26:25`. Outbound TCP 25 is blocked from the box and 587 to `smtp.gmail.com`
+  also failed, while TCP 443 works. This is a DigitalOcean egress policy, not a repo or OpenSMTPD
+  problem.
+- **Resolution:** none available without a smarthost/provider relay or a DO support exception. Local
+  delivery is verified; real external notification egress is not. Documented in
+  `docs/ops/relay-lab-vps.md`.
+- **Lesson:** a lab box with a public IP still cannot send internet mail; provider egress policy, not
+  configuration, is the limit.
+
+### [FIXED] Port 8787 was already listening — but it is not a hush relay
+
+- **Attempted:** the brief flagged `0.0.0.0:8787` (the relay's default port) as possibly an
+  already-installed hush relay.
+- **Symptom:** `ss -ltnp` shows the listener is `node`, pid 83639, cwd `/opt/mcp-ironlink`,
+  `MCP_HTTP_PORT=8787`, cgroup `/system.slice/mcp-ironlink.service`. It is the IronLine MCP HTTP
+  server, unrelated to hush.
+- **Resolution:** left it untouched and moved the relay to `0.0.0.0:8790` via a systemd drop-in. No
+  second relay was started on 8787.
+- **Lesson:** identify the owning unit from the cgroup before assuming a port collision means the
+  service you want is already running.
+
+### [FIXED] OpenSMTPD accepted the test message but refused to deliver it to root
+
+- **Attempted:** verify the SMTP server by sending to `root@localhost`.
+- **Symptom:** submission returned `250 2.0.0 Ok` / `Message accepted for delivery`, but the queue log
+  showed `mda delivery ... result=PermFail stat=Error (permission denied: not allowed to deliver to:
+  root)`. No file appeared in `/root/Maildir`.
+- **Resolution:** created a dedicated unprivileged `hushmail` user and delivered to
+  `hushmail@localhost`; the log then showed `result=Ok stat=Delivered` and the message file was
+  present. "Accepted" is not "delivered"; the verification was only valid after the mailbox check.
+- **Lesson:** for an MTA, assert on the delivery result line, not the SMTP `250`.
+
+### [WORKED AROUND] The cross-machine test cannot use release binaries over plain HTTP
+
+- **Attempted:** point a local daemon at `http://137.184.129.205:8790` with release binaries.
+- **Symptom:** `hush-cli config set --relay http://137.184.129.205:8790` fails with
+  `relay error: insecure relay URL: use HTTPS except for localhost`. `HttpPolicy::LoopbackOnly`
+  refuses any non-loopback `http://` in a release build by design.
+- **Resolution:** ran the cross-machine test with **debug** binaries (`HttpPolicy::Allow`), the only
+  way to test a plain-HTTP lab relay without TLS. Documented in `docs/ops/relay-lab-vps.md`. The
+  production answer remains "terminate TLS in front of the relay".
+- **Lesson:** the lab's plain-HTTP choice is incompatible with shipped clients; the harness must say
+  so rather than appearing to prove a release path.
+
+### [OPEN] Full reboot of the VPS was not performed
+
+- **Attempted:** verify the relay comes up at boot.
+- **Symptom:** `systemctl restart hush-relay` was verified (active, listening on 8790, `/health`
+  200, DB intact) and the unit is `enabled` (symlinked into `multi-user.target.wants`). A real reboot
+  was not run because the box hosts unrelated services (nginx, the alhakim app, BGP) and a boot
+  failure would take them down with no console access.
+- **Resolution:** none needed for the lab, but boot persistence rests on `is-enabled` plus the
+  restart test, not on an observed reboot.
+- **Lesson:** say "enabled and survives a restart", not "survives a reboot", when the reboot was
+  deliberately not run.
+
+---
+
+## 2026-10-08 — Consensual conclave membership and convener governance
+
+Replaced silent materialisation and local-only membership with an invite/accept protocol governed by
+a single authority (the convener), renamed `creator`/`member` to `convener`/`trustee`, and kept every
+existing vault readable. Problems hit while doing it:
+
+### [FIXED] A large block replacement duplicated two `ChatLog` methods
+
+- **Attempted:** rewrite `create_conclave`/`update_conclave`/`hydrate_*` in `chat_log.rs` with one
+  `StrReplace`, re-emitting the neighbouring `append_conclave_message` and `end_conclave` in the new
+  text.
+- **Symptom:** `cargo build -p hush-core` failed with
+  `error[E0592]: duplicate definitions with name `append_conclave_message`` and the same for
+  `end_conclave`. The old copies still sat below the replaced region.
+- **Resolution:** deleted the two leftover copies. Caught immediately because the build was run right
+  after the edit, not at the end of the slice.
+- **Lesson:** when a replacement re-emits methods that already exist elsewhere in the file, the
+  originals are not removed. Build after every large structural edit.
+
+### [FIXED] A stale peer snapshot downgraded a joined trustee back to invited
+
+- **Attempted:** the three-party fan-out test (`a_conclave_message_reaches_every_joined_trustee_exactly_once`).
+- **Symptom:** `assertion left == right failed: bob gets exactly his one copy / left: 0 / right: 1`.
+  A debug dump of Alice's record showed `bob … state: Invited` after both Bob and Carol had accepted.
+- **Cause:** Carol accepted from an invite that still listed Bob as invited, so Carol's accept
+  descriptor carried `bob: invited`. `upsert_trustee` only protected *terminal* states, so that stale
+  snapshot overwrote Bob's `joined` with `invited`, and Alice's later fan-out skipped him.
+- **Resolution:** made `upsert_trustee` monotonic in both directions: a terminal state is never
+  revived, and a joined trustee is never downgraded to invited. Added an assertion to the chat-log
+  unit test for the downgrade case.
+- **Lesson:** single-authority convergence still has to survive out-of-order snapshots from peers who
+  had not yet heard the latest fact. Guard the merge, not just the sender.
+
+### [FIXED] `hydrate_trustees` skipped the exact legacy shape it existed for
+
+- **Attempted:** the load-time migration for a pre-rename record.
+- **Symptom:** `assertion failed: hydrated` in `a_legacy_record_hydrates_its_trustees_from_its_nickname_list`.
+- **Cause:** the guard was `if !record.trustees.is_empty() { return Ok(false) }`. A pre-rename record
+  decodes `members: ["bob"]` into a *non-empty* trustees vec whose entry has an empty `account_id`, so
+  the guard treated it as already hydrated.
+- **Resolution:** the guard is now "skip only when every trustee already has a non-empty account id";
+  entries with an empty id are resolved through contacts (falling back to the nickname).
+- **Lesson:** "already migrated" must be tested per item, not by whether the collection is non-empty.
+
+### [FIXED] `#[serde(rename = "members")]` leaked the old key into the daemon's JSON API
+
+- **Attempted:** keep old vaults loading by renaming the new `trustees` field to the on-disk name
+  `members`.
+- **Symptom:** found by inspection before the frontend was wired: `ConclaveRecord` is serialised
+  directly as the daemon's API DTO, so the JSON key would have been `members` even for new records,
+  contradicting the `trustees` vocabulary the UI and tests use.
+- **Resolution:** dropped `rename`, kept `#[serde(alias = "members")]`. New records write `trustees`;
+  old records still read. The frontend DTO uses `trustees`/`convener`/`ended`.
+- **Lesson:** a serde `rename` for on-disk compatibility also renames the wire DTO when the same type
+  is serialised to the API. Use `alias` for read-compat and leave the canonical name alone.
+
+### [OPEN] A kicked trustee is not told, so their local record still shows them joined
+
+- **Attempted:** verify the kick converges to the removed trustee.
+- **Reality:** `broadcast_update` targets the *joined* set only, and the kick marks the trustee
+  `Kicked` before broadcasting, so the kicked peer is excluded from the fan-out. The remaining joined
+  trustees converge (covered by `a_kick_converges_and_cuts_off_delivery`), and the kicked peer stops
+  receiving, but its own record is never updated.
+- **Consequence:** the kicked peer's UI still shows them in the conclave; they only discover it when
+  messages stop. Enforcing "kicked" client-side would need either a targeted notification to the
+  kicked account (they are no longer a fan-out target) or an explicit end-of-membership message.
+- **Needed to close:** a decision on whether to notify the kicked peer, and a delivery path that does
+  not depend on them being in the joined set. This supersedes the older "[NO LONGER APPLICABLE]
+  Membership changes are local only" entry; that limitation is gone, this one remains.
+
+### [OPEN] The consensual conclave UI was not driven in a running app
+
+- **Attempted:** verify the invite banner, invite/kick/leave/end actions, the read-only ended view,
+  and the convener-only button gating in a real window.
+- **Symptom / limit:** no display is available in this environment, so the UI could not be driven. The
+  protocol is verified at the integration layer with two and three live daemons plus a relay
+  (`crates/hush-core/tests/conclaves.rs`, 10 tests: invite/pending/accept/decline, fan-out exactly
+  once, convener-only invite and kick, kick convergence, leave, convener-leave-ends, backward
+  compatibility of the record shape) and the frontend is verified with `npx tsc --noEmit` (exit 0).
+- **Needed to close:** a manual pass in `scripts/run-two-ui.sh --dev` with two or three tabs.
+
+---
+
+## 2026-10-08 — Conclave rebrand, Add-members fix, End-conclave (scope reversal: rename the internals)
+
+Renamed the whole group-chat feature from Meeting to Conclave across Rust, the daemon, the
+frontend, the tests, and the docs, fixed the "Add members" button, and added an End-conclave
+action with a typed gate. The rename had to keep every existing vault readable. Problems hit:
+
+### [FIXED] "Add members" did nothing: the picker popup covered the dialog's action buttons
+
+- **Attempted:** reproduce against the live dev stack with the members picker open in the create dialog.
+- **Symptom:** clicking Create/Add did nothing. A hit-test at the button's coordinates returned the
+  `.contact-picker-popup` (z-index 30) as the top element, not the button. In multiple mode the popup
+  stays open after a selection, and it drops downwards over `.modal-actions`, which sits directly below
+  the picker — so the popup swallowed the click.
+- **First fix attempt (wrong):** gave `.modal-actions` `position: relative; z-index: 31` and
+  `pointer-events: none` with `> * { pointer-events: auto }`. That fixed the button but broke the
+  reverse direction: the transparent row still intercepted clicks aimed at the option list behind it
+  (`hitChain: BUTTON.btn-secondary pressable`), so a member could no longer be selected.
+- **Resolution:** added a `dropUp` option to `ContactPicker`. Inside a dialog the picker adds
+  `contact-picker-drop-up`, which opens the popup above the field (`bottom: 100%`) so it never
+  overlaps the action row in either direction. Reverted the z-index/pointer-events hack. Verified in
+  the browser: with the popup open, the option click registers, the button enables, and the button
+  click lands (`popupOverlapsActions: false`, `popupCoversAdd: false`).
+- **Lesson:** a stacking-order fix trades one blocked click for another. Move the colliding element
+  out of the way instead.
+
+### [WORKED AROUND] A synthetic `focus` event was needed to open the picker during browser automation
+
+- **Attempted:** click the members combobox with the browser tool, then click an option.
+- **Symptom:** the input received `document.activeElement` but no `focus` event fired, so
+  `ContactPicker`'s focus handler never ran and the popup stayed `hidden` (`aria-expanded="false"`).
+  `input.focus()` and `blur()`/`focus()` from CDP did not help. The browser tab is not OS-focused in
+  this environment, so real focus events do not fire.
+- **Resolution:** opened the picker with `dispatchEvent(new FocusEvent("focus"))` over CDP for the
+  automation step only, then used real clicks for the option and the action buttons. This is a
+  harness limitation, not a repo problem; a real user clicking the field fires `focus` normally.
+- **Lesson:** a control that opens on `focus` cannot be driven by a click in a non-focused tab.
+
+### [WORKED AROUND] The add-member picker had no candidate contact to select
+
+- **Attempted:** exercise "Add member" end to end, as the brief requires.
+- **Symptom:** Alice's vault trusts only `bob`, and `bob` is already in the test conclave, so the
+  add-member list was empty and its Add button stayed disabled — the click-through could not be tested.
+- **Resolution:** created a throwaway third identity (`hush-cli init` in `/tmp/hush-carol`), added its
+  invite to Alice via `POST /api/contacts/add`, then selected `carol` in the add-member dialog. This
+  adds a `carol` contact to `instances/peer-a`; it is test residue in a dev vault, not a code change.
+
+### [WORKED AROUND] A backgrounded `cargo test` produced an empty log
+
+- **Attempted:** `cargo build --workspace; cargo test --workspace` in a `( ... ) &` subshell.
+- **Symptom:** the build log was written and `BUILD_EXIT=0`, but `/tmp/hush-test-final.log` stayed at
+  0 bytes and no `cargo` process remained. The subshell was killed with the shell session that spawned it.
+- **Resolution:** re-ran the tests with `setsid nohup bash -c '...' &` so they survive the shell.
+- **Lesson:** detach long jobs with `setsid`/`nohup` rather than a bare `&`.
+
+### [FIXED] Backward compatibility for vaults and queued messages written under the old names
+
+- **Attempted:** rename `MeetingRecord`/`MeetingMessage`, `MessagePayload::Meeting`, the payload fields,
+  and the `ChatLogFile` list key without breaking `instances/peer-a` and `instances/peer-b`.
+- **Symptom:** the list key, the enum tag, and the id field are all serde-written names; a plain rename
+  makes an existing `chat.enc` and any already-queued payload undecodable, which surfaces to the user
+  as a wrong password.
+- **Resolution:** pinned the old names with `alias`/`rename` — `ChatLogFile` keeps
+  `#[serde(rename = "meetings", alias = "conclaves")]`; the `Conclave` variant keeps
+  `#[serde(alias = "meeting")]`; its id field keeps `#[serde(alias = "meeting_id")]`. Covered by the
+  unit tests `a_log_written_before_the_rename_still_loads` and `a_legacy_meeting_payload_still_decodes`.
+- **Evidence:** a fresh daemon process (built from the renamed source) opened a copy of `instances/peer-a`,
+  unlocked with `peer-a-pass` (`HTTP 204`), and listed the pre-existing `Daily sync` conclave with its
+  `bob: hello` message intact.
+
+---
+
 ## 2026-10-08 — Meetings rail (local record, sender-side fan-out)
 
 Built the Meetings feature: a vault-held `MeetingRecord` with its own message log, a
@@ -67,15 +308,16 @@ descriptor, daemon routes, and a Meetings rail in the UI. Problems hit:
   mail composer path is untouched and still typechecks, but it was not re-driven either.
 - **Needed to close:** a manual pass in `scripts/run-two-ui.sh --dev` with two tabs.
 
-### [OPEN] Membership changes are local only, and the UI says so
+### [NO LONGER APPLICABLE] Membership changes are local only, and the UI says so
 
 - **Attempted:** add/remove meeting members.
-- **Reality:** a membership change edits only the actor's own `MeetingRecord.members`; it is not sent
-  to anyone and does not change another client's member list or history. A recipient that receives a
-  descriptor for a meeting it already holds ignores the descriptor's member list.
-- **Consequence:** after A removes B, B still sees the meeting and A's *earlier* messages; B simply
-  stops receiving new fan-out from A. This is the agreed first-cut scope, not a bug, but it is a real
-  limitation and is stated in `docs/PROTOCOL.md` and in the add-member dialog copy rather than hidden.
+- **Reality (then):** a membership change edited only the actor's own `MeetingRecord.members`; it was
+  not sent to anyone and did not change another client's member list or history. A recipient that
+  received a descriptor for a meeting it already held ignored the descriptor's member list.
+- **Superseded (2026-10-08, consensual-membership slice):** membership is now a convener-broadcast
+  protocol. Invites are sent and must be accepted; the convener's descriptor is authoritative and
+  peers apply it. The old "local only" limitation no longer describes the code, so this entry is kept
+  only as history. See the new section at the top of this file.
 
 ---
 
@@ -106,16 +348,18 @@ mismatch, not a code defect, but the failure mode was silent and misleading.
   will fail against a daemon started before that endpoint existed. Restart the dev stack after
   landing daemon-side changes.
 
-### [OPEN] `refreshStatus` treats any auxiliary-load error as "vault locked"
+### [FIXED] `refreshStatus` treats any auxiliary-load error as "vault locked"
 
 - **Attempted:** nothing yet; found while diagnosing the above.
-- **Symptom:** a failure to load an *optional* resource (the mailbox or the meeting list) forces the
-  whole app into the locked state, hides the real error, and makes a healthy, unlocked daemon look
-  like a failed login. The user sees wrong-passphrase behaviour for a problem that has nothing to
-  do with the passphrase.
-- **Resolution:** not fixed. The fix is to scope the `try` so that mailbox/meeting load failures
-  cannot flip `status.locked`, and ideally to surface the real error instead of swallowing it.
-  Deferred so as not to edit `app.ts` while another agent's commit was in flight.
+- **Symptom:** a failure to load an *optional* resource (the mailbox or the conclave list) forced the
+  whole app into the locked state, hid the real error, and made a healthy, unlocked daemon look like a
+  failed login. The user saw wrong-passphrase behaviour for a problem that had nothing to do with the
+  passphrase.
+- **Resolution (2026-10-08, consensual-membership slice):** `refreshStatus` now wraps only the
+  `api.status()` call in the "locked" path. A failure there sets `status = null` (unlock screen, as
+  before); the contacts/mailbox/conclave loads run in their own `try` whose failure announces a retry
+  message and leaves `status` untouched. Verified with `npx tsc --noEmit` (exit 0); the runtime path
+  is not re-driven here (no display), see the UI-verification entry above.
 - **Lesson:** a catch-all that maps every error onto a user-visible state will misattribute
   unrelated failures; scope error handling to the operation that can actually fail.
 
@@ -126,7 +370,7 @@ mismatch, not a code defect, but the failure mode was silent and misleading.
 Committed the whole working tree to `master` as `350d2d1` while a Meetings worker was
 mid-implementation. The commit does not compile.
 
-### [OPEN] `350d2d1` on master fails to build: `MessagePayload::Meeting` has no match arm
+### [FIXED] `350d2d1` on master fails to build: `MessagePayload::Meeting` has no match arm
 
 - **Attempted:** commit the accumulated work (multi-device removal, outsider mail, Trusts, the
   mail pane rework) to `master` as a single checkpoint, after first trying to confirm that no
@@ -152,9 +396,12 @@ mid-implementation. The commit does not compile.
   `find . -newermt '-4 minutes'` window. Neither proves a concurrent agent is idle: the worker had
   written `payload.rs` just outside that window, and the probe never looked at `payload.rs` or
   `chat_log.rs` at all. No build was run before committing.
-- **Resolution:** not yet. The worker is still editing the same files, so the working tree is left
-  alone rather than raced. When it lands, the completed feature will be built and committed, which
-  restores a compiling `master`. The tip of `master` is broken until then.
+- **Resolution:** fixed in `6419be1` ("Add Meetings: named group conversations over 1:1 fan-out"),
+  committed on top of `350d2d1` with no amend and no history rewrite. The completed Meetings work
+  adds the missing match arm in `account.rs`, so `master` builds again. Verified before committing:
+  `cargo build --workspace` exit 0; `cargo test --workspace` 136 passed / 0 failed / 0 ignored
+  (including the 5-test `meetings` suite); `npx tsc --noEmit` exit 0; no lint errors. The tip of
+  `master` was broken from 11:24 until this commit landed.
 - **Lesson:** a build is the only evidence that a tree is committable. Run `cargo check` before
   committing, not after, and do not treat an mtime probe as proof that a concurrent writer is done.
 

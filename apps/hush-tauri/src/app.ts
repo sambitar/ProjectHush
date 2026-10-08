@@ -61,14 +61,18 @@ import {
 } from "./lib/fileBytes";
 import { groupMessages, dayLabel } from "./lib/messageGroups";
 import {
-  candidatesToAdd,
-  clearMeetingStore,
-  listMeetings,
-  loadMeetings,
-  meetingById,
-  meetingPreview,
-  type Meeting,
-} from "./lib/meetingStore";
+  candidatesToInvite,
+  clearConclaveStore,
+  conclaveById,
+  conclavePreview,
+  invitedTrustees,
+  joinedTrustees,
+  listConclaves,
+  listPendingInvites,
+  loadConclaves,
+  loadPendingInvites,
+  type Conclave,
+} from "./lib/conclaveStore";
 import { icon, type IconName } from "./lib/icons";
 import { avatarWithPresence, createAvatarEl } from "./components/ui/Avatar";
 import { RichTextEditor } from "./components/ui/RichTextEditor";
@@ -77,7 +81,7 @@ import { bodyToDisplayHtml, isBlankHtml } from "./lib/richText";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
 import QRCode from "qrcode";
 
-type Rail = "chats" | "trusts" | "meetings" | "mail" | "files" | "vault" | "settings";
+type Rail = "chats" | "trusts" | "conclaves" | "mail" | "files" | "vault" | "settings";
 type SettingsSection =
   | "appearance"
   | "profile"
@@ -252,24 +256,35 @@ export class App {
   private trustDeleteConfirm = "";
 
   /**
-   * The meeting open in the Meetings rail, if any.
+   * The conclave open in the Conclaves rail, if any.
    *
    * Like the mail reading pane, the selection is held outside the DOM so a
    * background re-render cannot lose it.
    */
-  private meetingId: string | null = null;
-  private meetingCreateOpen = false;
+  private conclaveId: string | null = null;
+  private conclaveCreateOpen = false;
   /**
-   * The in-progress create-meeting form.
+   * The in-progress create-conclave form.
    *
    * Held here rather than read back out of the DOM because the picker re-renders
    * on every selection; a rebuilt field would forget what was typed.
    */
-  private meetingCreateName = "";
-  private meetingCreateMembers: string[] = [];
-  /** The add-member dialog's pending selection. */
-  private meetingAddOpen = false;
-  private meetingAddMembers: string[] = [];
+  private conclaveCreateName = "";
+  private conclaveCreateTrustees: string[] = [];
+  /** The invite dialog's pending selection. */
+  private conclaveInviteOpen = false;
+  private conclaveInviteTrustees: string[] = [];
+
+  /**
+   * The conclave the end dialog is open for, and what the user has typed into
+   * its confirmation field.
+   *
+   * Held here so a background re-render cannot wipe the typing mid-entry, and
+   * cleared every time the dialog opens so a previous confirmation can never
+   * carry over to the next conclave.
+   */
+  private conclaveEndId: string | null = null;
+  private conclaveEndConfirm = "";
 
   /** Read/star/archive/trash, straight from `ui-prefs.json`. */
   private mailPrefs(): MailFlags {
@@ -304,8 +319,9 @@ export class App {
         this.addFriendOpen = false;
         this.profileNick = null;
         this.closeTrustDelete();
-        this.meetingCreateOpen = false;
-        this.meetingAddOpen = false;
+        this.conclaveCreateOpen = false;
+        this.conclaveInviteOpen = false;
+        this.closeConclaveEnd();
         if (this.filesContactNick) this.filesContactNick = null;
         this.render();
       }
@@ -319,40 +335,36 @@ export class App {
   }
 
   private async refreshStatus(): Promise<void> {
+    // Only the status call itself can mean "locked". A failure to load an
+    // auxiliary resource (contacts, mailbox, conclaves) is a partial refresh,
+    // not a failed login, and must not flip the app to the unlock screen.
+    let status: StatusResponse | null = null;
     try {
-      const status = await api.status();
-      this.status = status;
-      if (!status || status.locked) {
-        this.stopPoll();
-      } else {
-        this.contacts = (await api.contacts()) ?? [];
-        setKnownContacts(this.contacts.map((c) => c.nickname));
-        if (!this.selectedNick && this.contacts[0]) {
-          this.selectedNick = this.contacts[0].nickname;
-        }
-        this.mailHandle = status.mail_handle ?? null;
-        this.mailDomain = status.mail_domain ?? "myserver.com";
-        await this.reloadMailbox();
-        await this.reloadMeetings();
-        this.startPoll();
-      }
+      status = await api.status();
     } catch {
-      this.status = {
-        locked: true,
-        vault_dir: "",
-        protocol_name: null,
-        vault_bytes: 0,
-        contacts: 0,
-        recovery_acknowledged: true,
-        last_backup_unix: 0,
-        relay: getApiBase(),
-        relay_source: "unknown",
-        socket: null,
-        tcp_addr: null,
-        mail_handle: null,
-        mail_domain: "myserver.com",
-      };
+      status = null;
     }
+    this.status = status;
+    if (!status || status.locked) {
+      this.stopPoll();
+      return;
+    }
+    try {
+      this.contacts = (await api.contacts()) ?? [];
+      setKnownContacts(this.contacts.map((c) => c.nickname));
+      if (!this.selectedNick && this.contacts[0]) {
+        this.selectedNick = this.contacts[0].nickname;
+      }
+      this.mailHandle = status.mail_handle ?? null;
+      this.mailDomain = status.mail_domain ?? "myserver.com";
+      await this.reloadMailbox();
+      await this.reloadConclaves();
+    } catch {
+      this.announce(
+        "Some data could not be loaded. It will be retried on the next sync.",
+      );
+    }
+    this.startPoll();
   }
 
   private startPoll(): void {
@@ -368,12 +380,15 @@ export class App {
     return loadMailbox(box.mail ?? [], box.drafts ?? []);
   }
 
-  /** Re-read the meeting list. Returns whether it changed, so the poll can
-   *  skip a repaint that would steal the caret out of the meeting composer. */
-  private async reloadMeetings(): Promise<boolean> {
-    const list = await api.meetings();
+  /** Re-read the conclave list. Returns whether it changed, so the poll can
+   *  skip a repaint that would steal the caret out of the conclave composer. */
+  private async reloadConclaves(): Promise<boolean> {
+    const list = await api.conclaves();
+    const invites = await api.pendingInvites();
     if (!list) return false;
-    return loadMeetings(list);
+    const changed = loadConclaves(list);
+    const invitesChanged = invites ? loadPendingInvites(invites) : false;
+    return changed || invitesChanged;
   }
 
   private stopPoll(): void {
@@ -401,19 +416,19 @@ export class App {
       }
       for (const w of r.warnings) this.announce(w);
       let mailArrived = false;
-      let meetingArrived = false;
+      let conclaveArrived = false;
       for (const m of r.messages) {
         if (m.kind === "mail") {
           // Reloaded from the daemon rather than appended here, so the message
           // carries the record id the read/unread flags are keyed on.
           mailArrived = true;
           this.announce(`New mail from ${m.from}`);
-        } else if (m.kind === "meeting") {
-          // The daemon already filed it into the meeting (materialising the
-          // meeting first if it was unknown), so re-read rather than guess at
+        } else if (m.kind === "conclave") {
+          // The daemon already filed it into the conclave (materialising the
+          // conclave first if it was unknown), so re-read rather than guess at
           // the record id here.
-          meetingArrived = true;
-          this.announce(`New meeting message from ${m.from}`);
+          conclaveArrived = true;
+          this.announce(`New conclave message from ${m.from}`);
         } else {
           ingestIncoming(m.from, m);
           this.announce(`New message from ${m.from}`);
@@ -427,14 +442,14 @@ export class App {
       if (mailArrived || this.rail === "mail") {
         mailboxChanged = await this.reloadMailbox();
       }
-      let meetingsChanged = false;
-      if (meetingArrived || this.rail === "meetings") {
-        meetingsChanged = await this.reloadMeetings();
+      let conclavesChanged = false;
+      if (conclaveArrived || this.rail === "conclaves") {
+        conclavesChanged = await this.reloadConclaves();
       }
       // Never repaint over a half-written message.
-      const composing = this.mailComposeOpen || this.meetingCreateOpen || this.meetingAddOpen;
+      const composing = this.mailComposeOpen || this.conclaveCreateOpen || this.conclaveInviteOpen;
       if (
-        (r.messages.length || presenceChanged || mailboxChanged || meetingsChanged) &&
+        (r.messages.length || presenceChanged || mailboxChanged || conclavesChanged) &&
         !composing
       ) {
         this.render();
@@ -448,7 +463,7 @@ export class App {
     await api.lock();
     clearChatStore();
     clearMailStore();
-    clearMeetingStore();
+    clearConclaveStore();
     clearMockLocal();
     this.selectedNick = null;
     this.filesContactNick = null;
@@ -459,12 +474,14 @@ export class App {
     this.mailReplyTo = null;
     this.mailReplyThread = null;
     this.mailSearch = "";
-    this.meetingId = null;
-    this.meetingCreateOpen = false;
-    this.meetingCreateName = "";
-    this.meetingCreateMembers = [];
-    this.meetingAddOpen = false;
-    this.meetingAddMembers = [];
+    this.conclaveId = null;
+    this.conclaveCreateOpen = false;
+    this.conclaveCreateName = "";
+    this.conclaveCreateTrustees = [];
+    this.conclaveInviteOpen = false;
+    this.conclaveInviteTrustees = [];
+    this.conclaveEndId = null;
+    this.conclaveEndConfirm = "";
     this.unlockedAt = 0;
     this.stopPoll();
     await this.refreshStatus();
@@ -485,8 +502,8 @@ export class App {
       shell.appendChild(this.renderMainChat());
     } else if (this.rail === "trusts") {
       shell.appendChild(this.renderTrusts());
-    } else if (this.rail === "meetings") {
-      shell.appendChild(this.renderMeetings());
+    } else if (this.rail === "conclaves") {
+      shell.appendChild(this.renderConclaves());
     } else if (this.rail === "mail") {
       shell.appendChild(this.renderMailFolders());
       shell.appendChild(this.renderMailMain());
@@ -503,8 +520,9 @@ export class App {
     if (this.profileNick) this.root.appendChild(this.renderProfile());
     if (this.recoveryModalCode) this.root.appendChild(this.renderRecoveryModal());
     if (this.trustDeleteNick) this.root.appendChild(this.renderTrustDeleteModal());
-    if (this.meetingCreateOpen) this.root.appendChild(this.renderMeetingCreateModal());
-    if (this.meetingAddOpen) this.root.appendChild(this.renderMeetingAddMemberModal());
+    if (this.conclaveCreateOpen) this.root.appendChild(this.renderConclaveCreateModal());
+    if (this.conclaveInviteOpen) this.root.appendChild(this.renderConclaveInviteModal());
+    if (this.conclaveEndId) this.root.appendChild(this.renderConclaveEndModal());
   }
 
   private async maybeShowRecoveryCode(): Promise<void> {
@@ -643,9 +661,9 @@ export class App {
           if (changed && this.rail === "mail" && !this.mailComposeOpen) this.render();
         });
       }
-      if (id === "meetings") {
-        void this.reloadMeetings().then((changed) => {
-          if (changed && this.rail === "meetings" && !this.meetingCreateOpen) this.render();
+      if (id === "conclaves") {
+        void this.reloadConclaves().then((changed) => {
+          if (changed && this.rail === "conclaves" && !this.conclaveCreateOpen) this.render();
         });
       }
     };
@@ -664,7 +682,7 @@ export class App {
     rail.appendChild(logo);
     rail.appendChild(this.railBtn("chats", "Chats", "chats"));
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
-    rail.appendChild(this.railBtn("meetings", "Meetings", "meetings"));
+    rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
     rail.appendChild(this.railBtn("mail", "Mail", "mail", hasUnreadMail(this.mailPrefs())));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
@@ -1050,8 +1068,10 @@ export class App {
     sub.className = "muted text-13";
     sub.style.marginTop = "var(--space-2)";
     sub.textContent = this.contacts.length
-      ? `${this.contacts.length} ${this.contacts.length === 1 ? "person" : "people"} in your circle.`
-      : "People you have exchanged invites with.";
+      ? `${this.contacts.length} ${
+          this.contacts.length === 1 ? "trustee" : "trustees"
+        } in your circle.`
+      : "No trustees in your circle.";
     titles.append(h, sub);
     const add = document.createElement("button");
     add.type = "button";
@@ -1222,62 +1242,63 @@ export class App {
   }
 
   // ---------------------------------------------------------------------
-  // Meetings
+  // Conclaves
   //
-  // A meeting is a local record in the vault, not a relay-side room: sending in
+  // A conclave is a local record in the vault, not a relay-side room: sending in
   // one fans the message out to each member over their own 1:1 session. The
   // daemon owns the record and the fan-out; this rail renders the daemon's view
   // and drives create, send, and the local membership changes.
   // ---------------------------------------------------------------------
 
-  private renderMeetings(): HTMLElement {
+  private renderConclaves(): HTMLElement {
     const pane = document.createElement("div");
-    pane.className = "meetings-pane";
-    pane.appendChild(this.renderMeetingsList());
-    pane.appendChild(this.renderMeetingDetail());
+    pane.className = "conclaves-pane";
+    pane.appendChild(this.renderConclavesList());
+    pane.appendChild(this.renderConclaveDetail());
     return pane;
   }
 
-  /** The left column: a filter over meeting cards, newest first. */
-  private renderMeetingsList(): HTMLElement {
+  /** The left column: a filter over conclave cards, newest first. */
+  private renderConclavesList(): HTMLElement {
     const col = document.createElement("div");
-    col.className = "meetings-list";
+    col.className = "conclaves-list";
 
     const head = document.createElement("div");
-    head.className = "meetings-list-head";
+    head.className = "conclaves-list-head";
     const h = document.createElement("h1");
     h.className = "text-22";
-    h.textContent = "Meetings";
+    h.textContent = "Conclaves";
     const add = document.createElement("button");
     add.type = "button";
-    add.className = "btn-primary pressable meetings-new";
-    add.textContent = "New meeting";
+    add.className = "btn-primary pressable conclaves-new";
+    add.textContent = "New conclave";
     add.disabled = this.contacts.length === 0;
     add.title = this.contacts.length
-      ? "Create a meeting"
+      ? "Create a conclave"
       : "Add a trust before you can meet with anyone";
-    add.onclick = () => this.openMeetingCreate();
+    add.onclick = () => this.openConclaveCreate();
     head.append(h, add);
     col.appendChild(head);
 
-    const meetings = listMeetings();
-    if (!meetings.length) {
+    const conclaves = listConclaves();
+    const invites = listPendingInvites();
+    if (!conclaves.length && !invites.length) {
       const empty = document.createElement("div");
-      empty.className = "empty-state meetings-empty";
+      empty.className = "empty-state conclaves-empty";
       const t = document.createElement("h2");
       t.className = "text-22";
-      t.textContent = "No meetings yet";
+      t.textContent = "No conclaves yet";
       const p = document.createElement("p");
       p.className = "muted";
       p.textContent = this.contacts.length
-        ? "Start a meeting and bring a few people in."
+        ? "Start a conclave and bring a few people in."
         : "Add a trust, then you can meet with them.";
       empty.append(t, p);
       if (this.contacts.length) {
         const b = document.createElement("button");
         b.className = "btn-primary pressable";
-        b.textContent = "New meeting";
-        b.onclick = () => this.openMeetingCreate();
+        b.textContent = "New conclave";
+        b.onclick = () => this.openConclaveCreate();
         empty.appendChild(b);
       }
       col.appendChild(empty);
@@ -1285,28 +1306,62 @@ export class App {
     }
 
     const filter = document.createElement("div");
-    filter.className = "search-pill meetings-filter";
+    filter.className = "search-pill conclaves-filter";
     const filterInput = document.createElement("input");
     filterInput.type = "search";
-    filterInput.placeholder = "Filter meetings";
-    filterInput.setAttribute("aria-label", "Filter meetings");
+    filterInput.placeholder = "Filter conclaves";
+    filterInput.setAttribute("aria-label", "Filter conclaves");
     filter.append(icon("search"), filterInput);
     col.appendChild(filter);
 
+    // Invitations waiting on an accept or decline, above the conclave cards. A
+    // pending invite is not a conclave yet: nothing is materialised until it is
+    // accepted.
+    if (invites.length) {
+      const box = document.createElement("div");
+      box.className = "conclave-invites";
+      for (const invite of invites) {
+        const card = document.createElement("div");
+        card.className = "conclave-invite-card";
+        const title = document.createElement("div");
+        title.className = "text-15";
+        title.textContent = invite.name;
+        const from = document.createElement("div");
+        from.className = "muted text-12";
+        from.textContent = `${displayNick(invite.fromNick)} invited you`;
+        const row = document.createElement("div");
+        row.className = "conclave-invite-actions";
+        const accept = document.createElement("button");
+        accept.type = "button";
+        accept.className = "btn-primary pressable";
+        accept.textContent = "Accept";
+        accept.onclick = () => void this.acceptConclaveInvite(invite.conclaveId);
+        const decline = document.createElement("button");
+        decline.type = "button";
+        decline.className = "btn-secondary pressable";
+        decline.textContent = "Decline";
+        decline.onclick = () => void this.declineConclaveInvite(invite.conclaveId);
+        row.append(accept, decline);
+        card.append(title, from, row);
+        box.appendChild(card);
+      }
+      col.appendChild(box);
+    }
+
     const cards = document.createElement("div");
-    cards.className = "meetings-cards";
-    for (const m of meetings) cards.appendChild(this.meetingCard(m));
+    cards.className = "conclaves-cards";
+    for (const m of conclaves) cards.appendChild(this.conclaveCard(m));
 
     const noMatch = document.createElement("p");
-    noMatch.className = "muted text-13 meetings-filter-empty";
+    noMatch.className = "muted text-13 conclaves-filter-empty";
     noMatch.hidden = true;
-    noMatch.textContent = "No meetings match that filter.";
+    noMatch.textContent = "No conclaves match that filter.";
     filterInput.oninput = () => {
       const q = filterInput.value.trim().toLocaleLowerCase();
       let shown = 0;
       for (const el of Array.from(cards.children) as HTMLElement[]) {
         const match =
-          !q || (el.dataset.meetingName ?? "").toLocaleLowerCase().includes(q);
+          !q || (el.dataset.conclaveName ?? "").toLocaleLowerCase().includes(q);
         el.hidden = !match;
         if (match) shown++;
       }
@@ -1317,135 +1372,203 @@ export class App {
     return col;
   }
 
-  /** One meeting card: name, member count, and a preview of the last message. */
-  private meetingCard(m: Meeting): HTMLElement {
+  /** One conclave card: name, member count, and a preview of the last message. */
+  private conclaveCard(m: Conclave): HTMLElement {
     const card = document.createElement("button");
     card.type = "button";
-    card.className = `tile meeting-card pressable${
-      this.meetingId === m.id ? " selected" : ""
+    card.className = `tile conclave-card pressable${
+      this.conclaveId === m.id ? " selected" : ""
     }`;
-    card.dataset.meetingName = m.name;
+    card.dataset.conclaveName = m.name;
 
     const top = document.createElement("div");
-    top.className = "meeting-card-top";
+    top.className = "conclave-card-top";
     const badge = document.createElement("span");
-    badge.className = "meeting-card-icon";
-    badge.appendChild(icon("meetings"));
+    badge.className = "conclave-card-icon";
+    badge.appendChild(icon("conclaves"));
     const meta = document.createElement("div");
-    meta.className = "meeting-card-meta";
+    meta.className = "conclave-card-meta";
     const name = document.createElement("div");
-    name.className = "text-17 meeting-card-name";
+    name.className = "text-17 conclave-card-name";
     name.textContent = m.name;
     const sub = document.createElement("div");
     sub.className = "muted text-12";
-    sub.textContent = `${m.members.length} ${
-      m.members.length === 1 ? "member" : "members"
-    }`;
+    const joined = joinedTrustees(m).length;
+    sub.textContent = m.ended
+      ? "Ended"
+      : `${joined} ${joined === 1 ? "trustee" : "trustees"}`;
     meta.append(name, sub);
     top.append(badge, meta);
     card.appendChild(top);
 
     const preview = document.createElement("div");
-    preview.className = "meeting-card-preview muted text-13";
-    preview.textContent = meetingPreview(m);
+    preview.className = "conclave-card-preview muted text-13";
+    preview.textContent = conclavePreview(m);
     card.appendChild(preview);
 
     card.onclick = () => {
-      this.meetingId = m.id;
+      this.conclaveId = m.id;
       this.render();
     };
     return card;
   }
 
-  /** The right column: the selected meeting's members and group chat. */
-  private renderMeetingDetail(): HTMLElement {
+  /** The right column: the selected conclave's members and group chat. */
+  private renderConclaveDetail(): HTMLElement {
     const pane = document.createElement("div");
-    pane.className = "meetings-detail";
-    const meeting = this.meetingId ? meetingById(this.meetingId) : undefined;
-    if (!meeting) {
+    pane.className = "conclaves-detail";
+    const conclave = this.conclaveId ? conclaveById(this.conclaveId) : undefined;
+    if (!conclave) {
       const empty = document.createElement("div");
       empty.className = "empty-state";
       const t = document.createElement("h2");
       t.className = "text-22";
-      t.textContent = "Pick a meeting";
+      t.textContent = "Pick a conclave";
       const p = document.createElement("p");
       p.className = "muted";
-      p.textContent = "Choose a meeting on the left, or start a new one.";
+      p.textContent = "Choose a conclave on the left, or start a new one.";
       empty.append(t, p);
       pane.appendChild(empty);
       return pane;
     }
 
+    const me = this.status?.protocol_name ?? "";
+    const isConvener = conclave.convener === me;
+    const joinedCount = joinedTrustees(conclave).length;
+    const invitedCount = invitedTrustees(conclave).length;
+
     const header = document.createElement("div");
-    header.className = "meeting-header";
+    header.className = "conclave-header";
     const titles = document.createElement("div");
     const n = document.createElement("div");
     n.className = "text-17";
     n.style.fontWeight = "500";
-    n.textContent = meeting.name;
+    n.textContent = conclave.name;
     const sub = document.createElement("div");
     sub.className = "text-13 muted";
-    sub.textContent = `${meeting.members.length} ${
-      meeting.members.length === 1 ? "member" : "members"
-    }`;
+    sub.textContent = conclave.ended
+      ? "Ended — read only"
+      : `${joinedCount} ${joinedCount === 1 ? "trustee" : "trustees"}${
+          invitedCount ? ` · ${invitedCount} invited` : ""
+        }`;
     titles.append(n, sub);
 
-    const addBtn = document.createElement("button");
-    addBtn.type = "button";
-    addBtn.className = "btn-secondary pressable meeting-add-member";
-    addBtn.appendChild(icon("addMember"));
-    const addLabel = document.createElement("span");
-    addLabel.textContent = "Add member";
-    addBtn.appendChild(addLabel);
-    const remaining = candidatesToAdd(
-      meeting,
-      this.contacts.map((c) => c.nickname),
-    );
-    addBtn.disabled = remaining.length === 0;
-    addBtn.title = remaining.length
-      ? "Add a member"
-      : "Everyone you know is already in this meeting";
-    addBtn.onclick = () => {
-      this.meetingAddOpen = true;
-      this.meetingAddMembers = [];
-      this.render();
-    };
-    header.append(titles, addBtn);
+    const actions = document.createElement("div");
+    actions.className = "conclave-header-actions";
+    if (conclave.ended) {
+      // Read-only everywhere: no invite, no leave, no send.
+    } else if (isConvener) {
+      // The convener is the only authority for inviting and ending.
+      const inviteBtn = document.createElement("button");
+      inviteBtn.type = "button";
+      inviteBtn.className = "btn-secondary pressable conclave-invite";
+      inviteBtn.appendChild(icon("addMember"));
+      const inviteLabel = document.createElement("span");
+      inviteLabel.textContent = "Invite";
+      inviteBtn.appendChild(inviteLabel);
+      const remaining = candidatesToInvite(
+        conclave,
+        this.contacts.map((c) => c.nickname),
+      );
+      inviteBtn.disabled = remaining.length === 0;
+      inviteBtn.title = remaining.length
+        ? "Invite a trustee"
+        : "Everyone you know is already in this conclave";
+      inviteBtn.onclick = () => {
+        this.conclaveInviteOpen = true;
+        this.conclaveInviteTrustees = [];
+        this.render();
+      };
 
-    // Member chips. Removing is local: it changes this vault's member list and
-    // stops future fan-out to them; it is not a shared change.
+      const endBtn = document.createElement("button");
+      endBtn.type = "button";
+      endBtn.className = "btn-secondary pressable conclave-end";
+      endBtn.textContent = "End conclave";
+      endBtn.title = "End this conclave for everyone";
+      endBtn.onclick = () => this.openConclaveEnd(conclave.id);
+
+      actions.append(inviteBtn, endBtn);
+    } else {
+      // Any joined trustee may leave; the convener leaving ends it instead.
+      const leaveBtn = document.createElement("button");
+      leaveBtn.type = "button";
+      leaveBtn.className = "btn-secondary pressable conclave-leave";
+      leaveBtn.textContent = "Leave conclave";
+      leaveBtn.title = "Leave this conclave";
+      leaveBtn.onclick = () => void this.leaveConclave(conclave.id);
+      actions.appendChild(leaveBtn);
+    }
+    header.append(titles, actions);
+
+    // Trustee chips. Every trustee is shown with their state. Only the convener
+    // may kick, and the convener cannot be removed here: leaving as the convener
+    // ends the conclave.
     const members = document.createElement("div");
-    members.className = "meeting-members";
-    for (const nick of meeting.members) {
+    members.className = "conclave-members";
+    for (const trustee of conclave.trustees) {
       const chip = document.createElement("span");
-      chip.className = "member-chip";
+      chip.className = `member-chip member-chip-${trustee.state}`;
       const label = document.createElement("span");
       label.className = "member-chip-label";
-      label.textContent = displayNick(nick);
+      label.textContent =
+        trustee.accountId === me ? "You" : displayNick(trustee.nick);
       chip.appendChild(label);
-      if (meeting.members.length > 1) {
+
+      if (trustee.accountId === conclave.convener) {
+        chip.classList.add("member-chip-convener");
+        const tag = document.createElement("span");
+        tag.className = "member-chip-tag";
+        tag.textContent = "convener";
+        chip.appendChild(tag);
+      } else if (trustee.state === "invited") {
+        const tag = document.createElement("span");
+        tag.className = "member-chip-tag";
+        tag.textContent = "invited";
+        chip.appendChild(tag);
+      } else if (trustee.state === "left") {
+        const tag = document.createElement("span");
+        tag.className = "member-chip-tag";
+        tag.textContent = "left";
+        chip.appendChild(tag);
+      } else if (trustee.state === "kicked") {
+        const tag = document.createElement("span");
+        tag.className = "member-chip-tag";
+        tag.textContent = "removed";
+        chip.appendChild(tag);
+      }
+
+      const canKick =
+        !conclave.ended &&
+        isConvener &&
+        trustee.accountId !== me &&
+        (trustee.state === "joined" || trustee.state === "invited");
+      if (canKick) {
         const rm = document.createElement("button");
         rm.type = "button";
         rm.className = "member-chip-remove";
-        rm.setAttribute("aria-label", `Remove ${displayNick(nick)} from ${meeting.name}`);
-        rm.title = "Remove from meeting";
+        rm.setAttribute(
+          "aria-label",
+          `Remove ${displayNick(trustee.nick)} from ${conclave.name}`,
+        );
+        rm.title = "Remove from conclave";
         rm.textContent = "×";
-        rm.onclick = () => void this.removeMeetingMember(meeting.id, nick);
+        rm.onclick = () =>
+          void this.kickConclaveTrustee(conclave.id, trustee.nick);
         chip.appendChild(rm);
       }
       members.appendChild(chip);
     }
 
     const scroll = document.createElement("div");
-    scroll.className = "meeting-messages";
-    if (!meeting.messages.length) {
+    scroll.className = "conclave-messages";
+    if (!conclave.messages.length) {
       const hint = document.createElement("p");
-      hint.className = "muted text-13 meeting-no-messages";
+      hint.className = "muted text-13 conclave-no-messages";
       hint.textContent = "No messages yet. Say hello.";
       scroll.appendChild(hint);
     }
     let lastDay = "";
-    for (const msg of meeting.messages) {
+    for (const msg of conclave.messages) {
       const day = dayLabel(msg.createdAt);
       if (day !== lastDay) {
         lastDay = day;
@@ -1457,9 +1580,9 @@ export class App {
       const group = document.createElement("div");
       group.className = `bubble-group ${msg.outgoing ? "out" : "in"}`;
       if (!msg.outgoing) {
-        // A meeting is several people, so the sender has to be named.
+        // A conclave is several people, so the sender has to be named.
         const who = document.createElement("div");
-        who.className = "meeting-sender text-12 muted";
+        who.className = "conclave-sender text-12 muted";
         who.textContent = msg.from ? displayNick(msg.from) : "Unknown";
         group.appendChild(who);
       }
@@ -1471,15 +1594,26 @@ export class App {
     }
     scroll.scrollTop = scroll.scrollHeight;
 
-    // No offline gate here: a meeting message is store-and-forward, so a member
-    // who is away still gets it when they next sync.
+    // An ended conclave is read-only: the history is shown, but there is no
+    // composer.
+    if (conclave.ended) {
+      const note = document.createElement("div");
+      note.className = "conclave-ended-note muted text-13";
+      note.textContent =
+        "This conclave has ended. Its history stays here, and no one can send in it.";
+      pane.append(header, members, scroll, note);
+      return pane;
+    }
+
+    // No offline gate here: a conclave message is store-and-forward, so a
+    // trustee who is away still gets it when they next sync.
     const composer = document.createElement("div");
     composer.className = "composer";
     const inner = document.createElement("div");
     inner.className = "composer-inner";
     const ta = document.createElement("textarea");
     ta.rows = 1;
-    ta.placeholder = `Message ${meeting.name}`;
+    ta.placeholder = "Message conclave";
     const send = document.createElement("button");
     send.className = "send-fab btn-icon-round pressable";
     send.appendChild(icon("send"));
@@ -1493,11 +1627,11 @@ export class App {
     ta.onkeydown = (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        void this.sendMeetingMessage(meeting.id, ta.value.trim(), ta, send);
+        void this.sendConclaveMessage(conclave.id, ta.value.trim(), ta, send);
       }
     };
     send.onclick = () =>
-      void this.sendMeetingMessage(meeting.id, ta.value.trim(), ta, send);
+      void this.sendConclaveMessage(conclave.id, ta.value.trim(), ta, send);
     inner.append(ta, send);
     composer.appendChild(inner);
     syncSend();
@@ -1506,32 +1640,33 @@ export class App {
     return pane;
   }
 
-  private openMeetingCreate(): void {
-    this.meetingCreateOpen = true;
-    this.meetingCreateName = "";
-    this.meetingCreateMembers = [];
+  private openConclaveCreate(): void {
+    this.conclaveCreateOpen = true;
+    this.conclaveCreateName = "";
+    this.conclaveCreateTrustees = [];
     this.render();
   }
 
-  private renderMeetingCreateModal(): HTMLElement {
+  private renderConclaveCreateModal(): HTMLElement {
     const back = document.createElement("div");
     back.className = "modal-backdrop";
     const modal = document.createElement("div");
-    modal.className = "modal meeting-create-modal";
+    modal.className = "modal conclave-create-modal";
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
-    modal.setAttribute("aria-label", "New meeting");
+    modal.setAttribute("aria-label", "New conclave");
 
     const h = document.createElement("h2");
     h.className = "text-22";
-    h.textContent = "New meeting";
+    h.textContent = "New conclave";
     const p = document.createElement("p");
     p.className = "muted text-13";
     p.style.marginTop = "var(--space-2)";
-    p.textContent = "Give it a name and choose who is in it.";
+    p.textContent =
+      "Give it a name and choose who to invite. They join once they accept.";
 
     const nameLabel = document.createElement("label");
-    nameLabel.className = "meeting-field";
+    nameLabel.className = "conclave-field";
     const nameText = document.createElement("span");
     nameText.className = "text-13";
     nameText.textContent = "Name";
@@ -1540,14 +1675,14 @@ export class App {
     nameInput.className = "input-field";
     nameInput.placeholder = "e.g. Weekly sync";
     nameInput.autocomplete = "off";
-    nameInput.value = this.meetingCreateName;
+    nameInput.value = this.conclaveCreateName;
     nameLabel.append(nameText, nameInput);
 
     const membersField = document.createElement("div");
-    membersField.className = "meeting-field";
+    membersField.className = "conclave-field";
     const membersText = document.createElement("span");
     membersText.className = "text-13";
-    membersText.textContent = "Members";
+    membersText.textContent = "Trustees";
     membersField.appendChild(membersText);
 
     const row = document.createElement("div");
@@ -1557,19 +1692,19 @@ export class App {
     cancel.className = "btn-secondary pressable";
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
-      this.meetingCreateOpen = false;
+      this.conclaveCreateOpen = false;
       this.render();
     };
     const create = document.createElement("button");
     create.type = "button";
     create.className = "btn-primary pressable";
-    create.textContent = "Create meeting";
+    create.textContent = "Create conclave";
     // Declared before the picker so its change callback can reach it without a
     // temporal-dead-zone reference.
     const syncCreate = () => {
       create.disabled =
-        this.meetingCreateName.trim().length === 0 ||
-        this.meetingCreateMembers.length === 0;
+        this.conclaveCreateName.trim().length === 0 ||
+        this.conclaveCreateTrustees.length === 0;
     };
 
     const picker = new ContactPicker({
@@ -1581,23 +1716,25 @@ export class App {
         keywords: c.nickname,
       })),
       multiple: true,
-      values: this.meetingCreateMembers,
-      label: "Members",
+      values: this.conclaveCreateTrustees,
+      // Opens above the field so the list cannot cover the Create button below.
+      dropUp: true,
+      label: "Trustees",
       placeholder: "Type a name…",
       emptyMessage: "No contacts yet. Add someone in Trusts first.",
       noMatchMessage: "No contacts match that name.",
       onChangeMulti: (nicks) => {
-        this.meetingCreateMembers = nicks;
+        this.conclaveCreateTrustees = nicks;
         syncCreate();
       },
     });
     membersField.appendChild(picker.element);
 
     nameInput.oninput = () => {
-      this.meetingCreateName = nameInput.value;
+      this.conclaveCreateName = nameInput.value;
       syncCreate();
     };
-    create.onclick = () => void this.createMeeting();
+    create.onclick = () => void this.createConclave();
     syncCreate();
 
     row.append(cancel, create);
@@ -1605,7 +1742,7 @@ export class App {
     back.appendChild(modal);
     back.onclick = (e) => {
       if (e.target === back) {
-        this.meetingCreateOpen = false;
+        this.conclaveCreateOpen = false;
         this.render();
       }
     };
@@ -1613,25 +1750,25 @@ export class App {
     return back;
   }
 
-  private renderMeetingAddMemberModal(): HTMLElement {
+  private renderConclaveInviteModal(): HTMLElement {
     const back = document.createElement("div");
     back.className = "modal-backdrop";
     const modal = document.createElement("div");
-    modal.className = "modal meeting-add-modal";
+    modal.className = "modal conclave-invite-modal";
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
-    const meeting = this.meetingId ? meetingById(this.meetingId) : undefined;
-    modal.setAttribute("aria-label", "Add a member");
+    const conclave = this.conclaveId ? conclaveById(this.conclaveId) : undefined;
+    modal.setAttribute("aria-label", "Invite a trustee");
 
     const h = document.createElement("h2");
     h.className = "text-22";
-    h.textContent = "Add a member";
+    h.textContent = "Invite a trustee";
     const p = document.createElement("p");
     p.className = "muted text-13";
     p.style.marginTop = "var(--space-2)";
-    p.textContent = meeting
-      ? `Add someone to ${meeting.name}. Membership changes are local to you for now — they are not announced to the others.`
-      : "Add someone to this meeting.";
+    p.textContent = conclave
+      ? `Invite someone to ${conclave.name}. They join once they accept the invite.`
+      : "Invite someone to this conclave.";
 
     const row = document.createElement("div");
     row.className = "modal-actions";
@@ -1640,19 +1777,19 @@ export class App {
     cancel.className = "btn-secondary pressable";
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
-      this.meetingAddOpen = false;
+      this.conclaveInviteOpen = false;
       this.render();
     };
-    const add = document.createElement("button");
-    add.type = "button";
-    add.className = "btn-primary pressable";
-    add.textContent = "Add";
-    const syncAdd = () => {
-      add.disabled = this.meetingAddMembers.length === 0;
+    const invite = document.createElement("button");
+    invite.type = "button";
+    invite.className = "btn-primary pressable";
+    invite.textContent = "Invite";
+    const syncInvite = () => {
+      invite.disabled = this.conclaveInviteTrustees.length === 0;
     };
 
-    const remaining = meeting
-      ? candidatesToAdd(meeting, this.contacts.map((c) => c.nickname))
+    const remaining = conclave
+      ? candidatesToInvite(conclave, this.contacts.map((c) => c.nickname))
       : [];
     const picker = new ContactPicker({
       items: remaining.map((nick) => {
@@ -1666,102 +1803,271 @@ export class App {
         };
       }),
       multiple: true,
-      values: this.meetingAddMembers,
-      label: "Members to add",
+      values: this.conclaveInviteTrustees,
+      // Opens above the field so the list cannot cover the Invite button below.
+      dropUp: true,
+      label: "Trustees to invite",
       placeholder: "Type a name…",
-      emptyMessage: "Everyone you know is already in this meeting.",
+      emptyMessage: "Everyone you know is already in this conclave.",
       noMatchMessage: "No contacts match that name.",
       onChangeMulti: (nicks) => {
-        this.meetingAddMembers = nicks;
-        syncAdd();
+        this.conclaveInviteTrustees = nicks;
+        syncInvite();
       },
     });
 
-    add.onclick = () => void this.addMeetingMembers();
-    syncAdd();
+    invite.onclick = () => void this.inviteConclaveTrustees();
+    syncInvite();
 
-    row.append(cancel, add);
+    row.append(cancel, invite);
     modal.append(h, p, picker.element, row);
     back.appendChild(modal);
     back.onclick = (e) => {
       if (e.target === back) {
-        this.meetingAddOpen = false;
+        this.conclaveInviteOpen = false;
         this.render();
       }
     };
     return back;
   }
 
-  private async createMeeting(): Promise<void> {
-    const name = this.meetingCreateName.trim();
-    if (!name || this.meetingCreateMembers.length === 0) {
-      this.announce("A meeting needs a name and at least one member.");
+  private async createConclave(): Promise<void> {
+    const name = this.conclaveCreateName.trim();
+    if (!name || this.conclaveCreateTrustees.length === 0) {
+      this.announce("A conclave needs a name and at least one trustee to invite.");
       return;
     }
     try {
-      const created = await api.createMeeting(name, this.meetingCreateMembers);
-      this.meetingCreateOpen = false;
-      await this.reloadMeetings();
-      if (created) this.meetingId = created.id;
-      this.announce(`${name} created.`);
+      const created = await api.createConclave(name, this.conclaveCreateTrustees);
+      this.conclaveCreateOpen = false;
+      await this.reloadConclaves();
+      if (created) this.conclaveId = created.id;
+      this.announce(`${name} created. Invites sent.`);
       this.render();
     } catch (e) {
       this.announce(
-        e instanceof AppError ? e.message : "Couldn't create the meeting.",
+        e instanceof AppError ? e.message : "Couldn't create the conclave.",
       );
     }
   }
 
-  private async addMeetingMembers(): Promise<void> {
-    const meeting = this.meetingId ? meetingById(this.meetingId) : undefined;
-    if (!meeting || this.meetingAddMembers.length === 0) return;
+  private async inviteConclaveTrustees(): Promise<void> {
+    const conclave = this.conclaveId ? conclaveById(this.conclaveId) : undefined;
+    if (!conclave || this.conclaveInviteTrustees.length === 0) return;
     try {
-      for (const nick of this.meetingAddMembers) {
-        await api.addMeetingMember(meeting.id, nick);
+      for (const nick of this.conclaveInviteTrustees) {
+        await api.inviteConclaveTrustee(conclave.id, nick);
       }
-      this.meetingAddOpen = false;
-      this.meetingAddMembers = [];
-      await this.reloadMeetings();
+      this.conclaveInviteOpen = false;
+      this.conclaveInviteTrustees = [];
+      await this.reloadConclaves();
       this.render();
     } catch (e) {
       this.announce(
-        e instanceof AppError ? e.message : "Couldn't add that member.",
+        e instanceof AppError ? e.message : "Couldn't send that invite.",
       );
     }
   }
 
-  private async removeMeetingMember(
-    meetingId: string,
+  private async kickConclaveTrustee(
+    conclaveId: string,
     nickname: string,
   ): Promise<void> {
     try {
-      await api.removeMeetingMember(meetingId, nickname);
-      await this.reloadMeetings();
+      await api.kickConclaveTrustee(conclaveId, nickname);
+      await this.reloadConclaves();
       this.render();
     } catch (e) {
       this.announce(
-        e instanceof AppError ? e.message : "Couldn't remove that member.",
+        e instanceof AppError ? e.message : "Couldn't remove that trustee.",
       );
     }
   }
 
-  private async sendMeetingMessage(
-    meetingId: string,
+  private async leaveConclave(conclaveId: string): Promise<void> {
+    try {
+      await api.leaveConclave(conclaveId);
+      if (this.conclaveId === conclaveId) this.conclaveId = null;
+      await this.reloadConclaves();
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't leave the conclave.",
+      );
+    }
+  }
+
+  private async acceptConclaveInvite(conclaveId: string): Promise<void> {
+    try {
+      const joined = await api.acceptConclaveInvite(conclaveId);
+      await this.reloadConclaves();
+      if (joined) this.conclaveId = joined.id;
+      this.announce("Invite accepted.");
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't accept the invite.",
+      );
+    }
+  }
+
+  private async declineConclaveInvite(conclaveId: string): Promise<void> {
+    try {
+      await api.declineConclaveInvite(conclaveId);
+      await this.reloadConclaves();
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't decline the invite.",
+      );
+    }
+  }
+
+  private async sendConclaveMessage(
+    conclaveId: string,
     text: string,
     ta: HTMLTextAreaElement,
     send: HTMLButtonElement,
   ): Promise<void> {
     if (!text) return;
     try {
-      await api.sendMeetingMessage(meetingId, text);
+      await api.sendConclaveMessage(conclaveId, text);
       // Cleared only on success, so a failure leaves the text in the box.
       ta.value = "";
       send.classList.remove("ready");
-      await this.reloadMeetings();
+      await this.reloadConclaves();
       this.render();
     } catch (e) {
       this.announce(
         e instanceof AppError ? e.message : "Couldn't send. Try again.",
+      );
+    }
+  }
+
+  /** Open the end dialog for a conclave, always with an empty confirmation. */
+  private openConclaveEnd(id: string): void {
+    this.conclaveEndId = id;
+    this.conclaveEndConfirm = "";
+    this.render();
+  }
+
+  /** Close the end dialog and forget anything typed into it. */
+  private closeConclaveEnd(): void {
+    this.conclaveEndId = null;
+    this.conclaveEndConfirm = "";
+  }
+
+  /**
+   * The end-conclave dialog.
+   *
+   * Mirrors the Trust delete dialog: a typed confirmation, focused on the field
+   * rather than the destructive button, so ending is never one click. The copy
+   * says plainly that this is local — the message log stays in the vault and no
+   * other member is notified, because membership is local-only.
+   */
+  private renderConclaveEndModal(): HTMLElement {
+    const id = this.conclaveEndId!;
+    const conclave = conclaveById(id);
+    const name = conclave ? conclave.name : "this conclave";
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal conclave-end-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `End ${name}`);
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = `End ${name}?`;
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-3)";
+    p.textContent =
+      "This ends the conclave for everyone. Its messages stay in every trustee's vault, so the history is kept rather than destroyed.";
+    const p2 = document.createElement("p");
+    p2.className = "muted text-13";
+    p2.style.marginTop = "var(--space-2)";
+    p2.textContent =
+      "Every joined trustee is told, and the conclave becomes read-only on their side too — no one can send in it after this.";
+    const note = document.createElement("p");
+    note.className = "faint text-12";
+    note.style.marginTop = "var(--space-2)";
+    note.textContent =
+      "Ending cannot be undone. As the convener you could also leave, which ends it the same way.";
+
+    const label = document.createElement("label");
+    label.className = "trust-delete-field";
+    const labelText = document.createElement("span");
+    labelText.className = "text-13";
+    labelText.textContent = "Type END to confirm";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "input-field";
+    input.setAttribute("autocomplete", "off");
+    input.setAttribute("autocapitalize", "characters");
+    input.setAttribute("spellcheck", "false");
+    input.value = this.conclaveEndConfirm;
+    label.append(labelText, input);
+
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.closeConclaveEnd();
+      this.render();
+    };
+    const end = document.createElement("button");
+    end.type = "button";
+    end.className = "btn-primary pressable conclave-end-confirm";
+    end.style.background = "var(--danger)";
+    end.textContent = "End conclave";
+    // One rule, checked by the button, the Enter key, and the click handler, so
+    // there is no way to end a conclave without typing the word.
+    const confirmed = () => input.value.trim().toUpperCase() === "END";
+    const sync = () => {
+      this.conclaveEndConfirm = input.value;
+      end.disabled = !confirmed();
+    };
+    input.oninput = sync;
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (confirmed()) void this.endConclave(id);
+      }
+    };
+    sync();
+    end.onclick = () => {
+      if (confirmed()) void this.endConclave(id);
+    };
+
+    row.append(cancel, end);
+    modal.append(h, p, p2, note, label, row);
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.closeConclaveEnd();
+        this.render();
+      }
+    };
+    // Focus the field, not the destructive button, so a stray Enter cannot end
+    // the conclave.
+    queueMicrotask(() => input.focus());
+    return back;
+  }
+
+  private async endConclave(id: string): Promise<void> {
+    try {
+      await api.endConclave(id);
+      this.closeConclaveEnd();
+      await this.reloadConclaves();
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't end the conclave.",
       );
     }
   }

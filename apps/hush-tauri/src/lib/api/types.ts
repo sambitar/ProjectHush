@@ -57,16 +57,16 @@ export interface ReceivedDto {
   subject?: string | null;
   /** Mail only: attachment references (bytes via `/api/blob/{id}`). */
   attachments?: MailAttachmentDto[];
-  /** Meeting only: the id the message's meeting is keyed on. */
-  meeting_id?: string | null;
-  /** Meeting only: the meeting's name, for materialising it on first sight. */
-  meeting_name?: string | null;
-  /** Meeting only: the sender's member list, for materialising it on first sight. */
-  meeting_members?: string[];
+  /** Conclave only: the id the message's conclave is keyed on. */
+  conclave_id?: string | null;
+  /** Conclave only: the conclave's name. */
+  conclave_name?: string | null;
+  /** Conclave only: the sender's joined trustee nicknames. */
+  conclave_trustees?: string[];
 }
 
-/** One message in a meeting's own log. */
-export interface MeetingMessageDto {
+/** One message in a conclave's own log. */
+export interface ConclaveMessageDto {
   id: string;
   outgoing: boolean;
   /** The sender's nickname as this vault knows it; absent for our own messages. */
@@ -76,18 +76,53 @@ export interface MeetingMessageDto {
 }
 
 /**
- * A meeting: a local record in the vault, not a relay-side room.
- *
- * Group chat is sender-side fan-out over the members' 1:1 sessions, and each
- * message carries this descriptor so a recipient can materialise the meeting.
- * The member list is the creator's local view and is not shared.
+ * A person in a conclave. `invited` has been asked and not yet answered;
+ * `joined` receives the conclave's messages; `left` and `kicked` are terminal.
  */
-export interface MeetingDto {
+export type TrusteeStateDto = "invited" | "joined" | "left" | "kicked";
+
+/** One trustee in a conclave, keyed on the stable account id. */
+export interface ConclaveTrusteeDto {
+  /** The trustee's account id (hex of the identity key). */
+  account_id: string;
+  /** The local nickname for this trustee; a display hint only. */
+  nick: string;
+  state: TrusteeStateDto;
+}
+
+/**
+ * A conclave: a local record in the vault, not a relay-side room.
+ *
+ * Group chat is sender-side fan-out over the trustees' 1:1 sessions. Membership
+ * is consensual: naming someone sends an invite they must accept, and only the
+ * convener may invite, kick, or end.
+ */
+export interface ConclaveDto {
   id: string;
   name: string;
-  members: string[];
+  /** The convener's account id: the only authority for invite, kick and end. */
+  convener: string;
+  /** The trustees, with per-trustee state. */
+  trustees: ConclaveTrusteeDto[];
   created_ms: number;
-  messages: MeetingMessageDto[];
+  messages: ConclaveMessageDto[];
+  /** True once the convener has ended it: read-only on every peer. */
+  ended: boolean;
+}
+
+/** An invitation received but not yet accepted or declined. */
+export interface PendingInviteDto {
+  conclave_id: string;
+  name: string;
+  /** The convener's account id. */
+  convener: string;
+  /** The account id of whoever sent the invite. */
+  from_account: string;
+  /** The sender's nickname as this vault knows it. */
+  from_nick: string;
+  /** The trustees the invite carried. */
+  trustees: ConclaveTrusteeDto[];
+  received_ms: number;
 }
 
 export interface ChatRecordDto {

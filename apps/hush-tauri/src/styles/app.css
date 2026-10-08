@@ -1119,6 +1119,14 @@
   box-shadow: var(--shadow-2);
 }
 
+/* Inside a dialog the picker sits directly above the action buttons, so a list
+   dropping downwards would cover them and swallow the click. Opening upwards
+   keeps the options and the buttons apart in either direction. */
+.contact-picker-drop-up .contact-picker-popup {
+  top: auto;
+  bottom: calc(100% + var(--space-1));
+}
+
 .contact-picker-option {
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
@@ -1476,9 +1484,9 @@
   background: var(--surface);
 }
 
-/* --------------------------------------------------------------- meetings */
+/* --------------------------------------------------------------- conclaves */
 
-.meetings-pane {
+.conclaves-pane {
   flex: 1;
   display: flex;
   min-width: 0;
@@ -1486,7 +1494,7 @@
   background: var(--bg);
 }
 
-.meetings-list {
+.conclaves-list {
   width: 320px;
   flex-shrink: 0;
   border-right: 1px solid var(--border);
@@ -1497,7 +1505,7 @@
   overflow: auto;
 }
 
-.meetings-list-head {
+.conclaves-list-head {
   padding: var(--space-4);
   display: flex;
   align-items: center;
@@ -1506,23 +1514,23 @@
   border-bottom: 1px solid var(--border);
 }
 
-.meetings-new {
+.conclaves-new {
   width: auto;
   flex-shrink: 0;
 }
 
-.meetings-filter {
+.conclaves-filter {
   margin: var(--space-4) var(--space-4) 0;
 }
 
-.meetings-cards {
+.conclaves-cards {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
   padding: var(--space-4);
 }
 
-.meeting-card {
+.conclave-card {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
@@ -1532,23 +1540,23 @@
 }
 
 /* The card's own display would otherwise beat [hidden] in the filter. */
-.meeting-card[hidden] {
+.conclave-card[hidden] {
   display: none;
 }
 
-.meeting-card.selected {
+.conclave-card.selected {
   border-color: var(--accent);
   box-shadow: var(--shadow-1), 0 0 0 1px var(--accent);
 }
 
-.meeting-card-top {
+.conclave-card-top {
   display: flex;
   align-items: center;
   gap: var(--space-3);
   min-width: 0;
 }
 
-.meeting-card-icon {
+.conclave-card-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1560,35 +1568,35 @@
   color: var(--accent-strong);
 }
 
-.meeting-card-meta {
+.conclave-card-meta {
   display: flex;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
 }
 
-.meeting-card-name {
+.conclave-card-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.meeting-card-preview {
+.conclave-card-preview {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
 
-.meetings-filter-empty {
+.conclaves-filter-empty {
   padding: 0 var(--space-4) var(--space-4);
 }
 
-.meetings-empty {
+.conclaves-empty {
   flex: 1;
 }
 
-.meetings-detail {
+.conclaves-detail {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -1596,7 +1604,7 @@
   min-height: 0;
 }
 
-.meeting-header {
+.conclave-header {
   padding: var(--space-4);
   border-bottom: 1px solid var(--border);
   background: var(--surface);
@@ -1606,7 +1614,7 @@
   gap: var(--space-3);
 }
 
-.meeting-add-member {
+.conclave-add-member {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
@@ -1614,12 +1622,23 @@
   flex-shrink: 0;
 }
 
-.meeting-add-member svg {
+.conclave-add-member svg {
   width: 16px;
   height: 16px;
 }
 
-.meeting-members {
+.conclave-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.conclave-end {
+  width: auto;
+}
+
+.conclave-members {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
@@ -1663,28 +1682,90 @@
   color: var(--danger, var(--accent-strong));
 }
 
-.meeting-messages {
+/* A trustee's role or join state, shown inline on the chip. */
+.member-chip-tag {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  color: var(--text-dim);
+  padding: 0 2px;
+}
+
+.member-chip-convener {
+  border-color: var(--accent);
+}
+
+.member-chip-convener .member-chip-tag {
+  color: var(--accent-strong, var(--accent));
+}
+
+/* Invited, left and kicked trustees are shown but de-emphasised: they are not
+   in the fan-out set. */
+.member-chip-invited,
+.member-chip-left,
+.member-chip-kicked {
+  opacity: 0.7;
+}
+
+.member-chip-left .member-chip-label,
+.member-chip-kicked .member-chip-label {
+  text-decoration: line-through;
+}
+
+/* Pending invitations, above the conclave cards. */
+.conclave-invites {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-3) 0;
+}
+
+.conclave-invite-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 10px);
+  background: var(--surface-2);
+}
+
+.conclave-invite-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+/* The read-only banner shown in place of the composer once a conclave ends. */
+.conclave-ended-note {
+  padding: var(--space-4);
+  border-top: 1px solid var(--border);
+  text-align: center;
+  background: var(--surface);
+}
+
+.conclave-messages {
   flex: 1;
   overflow: auto;
   padding: var(--space-4);
 }
 
-.meeting-no-messages {
+.conclave-no-messages {
   text-align: center;
   margin-top: var(--space-4);
 }
 
-/* The sender's name above an incoming bubble, since a meeting has several. */
-.meeting-sender {
+/* The sender's name above an incoming bubble, since a conclave has several. */
+.conclave-sender {
   margin: 0 var(--space-2) 2px;
 }
 
-.meeting-create-modal,
-.meeting-add-modal {
+.conclave-create-modal,
+.conclave-add-modal {
   width: min(480px, 100%);
 }
 
-.meeting-field {
+.conclave-field {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);

@@ -8,7 +8,7 @@
  * `aria-activedescendant` so a screen reader follows the arrow keys.
  *
  * It is deliberately not a general autocomplete. It serves two callers — the
- * mail composer's single recipient and the meeting creator's member list — so it
+ * mail composer's single recipient and the conclave creator's member list — so it
  * has a small interface: contacts in, the selection out. The caller owns the
  * selection (the composer keeps it in `mailComposeTo` so a rebuild cannot lose
  * it); this control only mirrors that value and reports changes.
@@ -47,6 +47,12 @@ export interface ContactPickerOptions {
   emptyMessage?: string;
   /** Shown when the typed query matches no contact. */
   noMatchMessage?: string;
+  /**
+   * Open the list above the field instead of below it. Needed inside a dialog,
+   * where the picker sits directly above the action buttons: a list dropping
+   * downwards would cover them and swallow the click.
+   */
+  dropUp?: boolean;
   /** Fired only when the user commits a single selection. */
   onChange?: (nickname: string) => void;
   /** Fired whenever the set changes in multiple mode. */
@@ -113,6 +119,7 @@ export class ContactPicker {
     this.element = document.createElement("div");
     this.element.className = "contact-picker";
     if (this.multiple) this.element.classList.add("contact-picker-multi");
+    if (opts.dropUp) this.element.classList.add("contact-picker-drop-up");
 
     this.input = document.createElement("input");
     this.input.type = "text";

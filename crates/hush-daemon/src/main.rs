@@ -18,8 +18,8 @@ use axum::{
 use clap::Parser;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use hush_core::{
-    notification_body, notification_body_for_key, ChatRecord, FileMailer, Mailer, MeetingRecord,
-    MessagePayload, NullMailer, ReceivedMessage,
+    notification_body, notification_body_for_key, ChatRecord, ConclaveRecord, FileMailer, Mailer,
+    MessagePayload, NullMailer, PendingInvite, ReceivedMessage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -176,12 +176,12 @@ struct ReceivedDto {
     subject: Option<String>,
     /// Mail only: attachment references (bytes are fetched via `/api/blob/{id}`).
     attachments: Vec<MailAttachmentDto>,
-    /// Meeting only: the id the message's meeting is keyed on.
-    meeting_id: Option<String>,
-    /// Meeting only: the meeting's name, for materialising it on first sight.
-    meeting_name: Option<String>,
-    /// Meeting only: the sender's member list, for materialising it on first sight.
-    meeting_members: Vec<String>,
+    /// Conclave only: the id the message's conclave is keyed on.
+    conclave_id: Option<String>,
+    /// Conclave only: the conclave's name, for materialising it on first sight.
+    conclave_name: Option<String>,
+    /// Conclave only: the sender's trustee nicknames, for rendering on first sight.
+    conclave_trustees: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -278,10 +278,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/mail/draft/{id}", delete(delete_draft))
         .route("/api/mail/{id}", delete(delete_mail))
         .route("/api/mail", get(mail))
-        .route("/api/meetings", get(meetings).post(create_meeting))
-        .route("/api/meetings/message", post(send_meeting_message))
-        .route("/api/meetings/members/add", post(add_meeting_member))
-        .route("/api/meetings/members/remove", post(remove_meeting_member))
+        .route("/api/conclaves", get(conclaves).post(create_conclave))
+        .route("/api/conclaves/message", post(send_conclave_message))
+        .route("/api/conclaves/trustees/invite", post(invite_conclave_trustee))
+        .route("/api/conclaves/trustees/kick", post(kick_conclave_trustee))
+        .route("/api/conclaves/trustees/accept", post(accept_conclave_invite))
+        .route("/api/conclaves/trustees/decline", post(decline_conclave_invite))
+        .route("/api/conclaves/trustees/leave", post(leave_conclave))
+        .route("/api/conclaves/invites", get(pending_invites))
+        .route("/api/conclaves/end", post(end_conclave))
         .route("/api/invite", post(invite))
         .route("/api/contacts", get(contacts))
         .route("/api/contacts/add", post(add_contact))
@@ -861,86 +866,151 @@ async fn mail(
 }
 
 #[derive(Deserialize)]
-struct CreateMeetingRequest {
+struct CreateConclaveRequest {
     name: String,
-    members: Vec<String>,
+    /// The contacts to invite. `alias` accepts the pre-rename `members` key.
+    #[serde(alias = "members")]
+    trustees: Vec<String>,
 }
 
 #[derive(Deserialize)]
-struct SendMeetingMessageRequest {
-    meeting_id: String,
+struct SendConclaveMessageRequest {
+    conclave_id: String,
     body: String,
 }
 
 #[derive(Deserialize)]
-struct MeetingMemberRequest {
-    meeting_id: String,
+struct ConclaveTrusteeRequest {
+    conclave_id: String,
     nickname: String,
 }
 
-/// Every meeting this vault holds, each with its own message log.
-async fn meetings(
+#[derive(Deserialize)]
+struct ConclaveIdRequest {
+    conclave_id: String,
+}
+
+/// Every conclave this vault holds, each with its own message log.
+async fn conclaves(
     State(state): State<Arc<App>>,
-) -> Result<Json<Vec<MeetingRecord>>, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<Vec<ConclaveRecord>>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    let result = map_err(state.worker.meetings().await)?;
+    let result = map_err(state.worker.conclaves().await)?;
     match result {
-        WorkResult::Meetings(list) => Ok(Json(list)),
+        WorkResult::Conclaves(list) => Ok(Json(list)),
         _ => Err(unexpected_worker_response()),
     }
 }
 
-async fn create_meeting(
+async fn create_conclave(
     State(state): State<Arc<App>>,
-    Json(body): Json<CreateMeetingRequest>,
-) -> Result<Json<MeetingRecord>, (StatusCode, Json<ApiError>)> {
+    Json(body): Json<CreateConclaveRequest>,
+) -> Result<Json<ConclaveRecord>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    let result = map_err(state.worker.create_meeting(&body.name, body.members).await)?;
+    let result = map_err(state.worker.create_conclave(&body.name, body.trustees).await)?;
     match result {
-        WorkResult::MeetingCreated(meeting) => Ok(Json(meeting)),
+        WorkResult::ConclaveCreated(conclave) => Ok(Json(conclave)),
         _ => Err(unexpected_worker_response()),
     }
 }
 
-async fn send_meeting_message(
+async fn send_conclave_message(
     State(state): State<Arc<App>>,
-    Json(body): Json<SendMeetingMessageRequest>,
+    Json(body): Json<SendConclaveMessageRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(
         state
             .worker
-            .send_meeting_message(&body.meeting_id, &body.body)
+            .send_conclave_message(&body.conclave_id, &body.body)
             .await,
     )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn add_meeting_member(
+async fn invite_conclave_trustee(
     State(state): State<Arc<App>>,
-    Json(body): Json<MeetingMemberRequest>,
+    Json(body): Json<ConclaveTrusteeRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(
         state
             .worker
-            .add_meeting_member(&body.meeting_id, &body.nickname)
+            .invite_conclave_trustee(&body.conclave_id, &body.nickname)
             .await,
     )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn remove_meeting_member(
+async fn kick_conclave_trustee(
     State(state): State<Arc<App>>,
-    Json(body): Json<MeetingMemberRequest>,
+    Json(body): Json<ConclaveTrusteeRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(
         state
             .worker
-            .remove_meeting_member(&body.meeting_id, &body.nickname)
+            .kick_conclave_trustee(&body.conclave_id, &body.nickname)
             .await,
     )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn accept_conclave_invite(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ConclaveIdRequest>,
+) -> Result<Json<ConclaveRecord>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.accept_conclave_invite(&body.conclave_id).await)?;
+    match result {
+        WorkResult::ConclaveAccepted(conclave) => Ok(Json(conclave)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn decline_conclave_invite(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ConclaveIdRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .decline_conclave_invite(&body.conclave_id)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn leave_conclave(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ConclaveIdRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.leave_conclave(&body.conclave_id).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Invitations this vault has received but not yet accepted or declined.
+async fn pending_invites(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<PendingInvite>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.pending_invites().await)?;
+    match result {
+        WorkResult::PendingInvites(list) => Ok(Json(list)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// End a conclave for everyone: the convener broadcasts an `ended` descriptor so
+/// the conclave becomes read-only on every peer, not only locally.
+async fn end_conclave(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ConclaveIdRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.end_conclave(&body.conclave_id).await)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1210,9 +1280,9 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
             thread_id: None,
             subject: None,
             attachments: Vec::new(),
-            meeting_id: None,
-            meeting_name: None,
-            meeting_members: Vec::new(),
+            conclave_id: None,
+            conclave_name: None,
+            conclave_trustees: Vec::new(),
         }),
         MessagePayload::File { name, data } => Some(ReceivedDto {
             from,
@@ -1224,9 +1294,9 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
             thread_id: None,
             subject: None,
             attachments: Vec::new(),
-            meeting_id: None,
-            meeting_name: None,
-            meeting_members: Vec::new(),
+            conclave_id: None,
+            conclave_name: None,
+            conclave_trustees: Vec::new(),
         }),
         MessagePayload::Mail {
             thread_id,
@@ -1250,18 +1320,18 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
                     blob_id: hex::encode(a.blob_id.0),
                 })
                 .collect(),
-            meeting_id: None,
-            meeting_name: None,
-            meeting_members: Vec::new(),
+            conclave_id: None,
+            conclave_name: None,
+            conclave_trustees: Vec::new(),
         }),
-        MessagePayload::Meeting {
-            meeting_id,
+        MessagePayload::Conclave {
+            conclave_id,
             name,
-            members,
+            trustees,
             body,
         } => Some(ReceivedDto {
             from,
-            kind: "meeting".into(),
+            kind: "conclave".into(),
             text: Some(body),
             file_name: None,
             file_size: None,
@@ -1269,12 +1339,19 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
             thread_id: None,
             subject: None,
             attachments: Vec::new(),
-            meeting_id: Some(meeting_id),
-            meeting_name: Some(name),
-            meeting_members: members,
+            conclave_id: Some(conclave_id),
+            conclave_name: Some(name),
+            conclave_trustees: trustees,
         }),
-        // Queue grants are handled inside `recv` and never surface as inbox items.
-        MessagePayload::QueueGrant { .. } => None,
+        // Control payloads are handled inside `recv` and never surface as inbox
+        // items.
+        MessagePayload::QueueGrant { .. }
+        | MessagePayload::ConclaveInvite { .. }
+        | MessagePayload::ConclaveAccept { .. }
+        | MessagePayload::ConclaveDecline { .. }
+        | MessagePayload::ConclaveLeave { .. }
+        | MessagePayload::ConclaveUpdate { .. }
+        | MessagePayload::ConclaveEnd { .. } => None,
     }
 }
 
