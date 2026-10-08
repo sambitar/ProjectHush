@@ -7,9 +7,9 @@
  * narrowed list, and the highlighted option is tracked with
  * `aria-activedescendant` so a screen reader follows the arrow keys.
  *
- * It is deliberately not a general autocomplete. One control needs it and the
- * Rule of Three has not been met, so it stays a single-purpose module with a
- * small interface: contacts in, selected nickname out. The caller owns the
+ * It is deliberately not a general autocomplete. It serves two callers — the
+ * mail composer's single recipient and the meeting creator's member list — so it
+ * has a small interface: contacts in, the selection out. The caller owns the
  * selection (the composer keeps it in `mailComposeTo` so a rebuild cannot lose
  * it); this control only mirrors that value and reports changes.
  */
@@ -25,8 +25,16 @@ export interface ContactPickerItem {
 
 export interface ContactPickerOptions {
   items: ContactPickerItem[];
-  /** The currently selected nickname, or "" for none. */
-  value: string;
+  /** The currently selected nickname, or "" for none. Single-select only. */
+  value?: string;
+  /**
+   * When true the field picks a set of nicknames instead of one. Selected
+   * contacts render as removable chips and the listbox stays open so several
+   * can be chosen in a row. Single-select behaviour is untouched.
+   */
+  multiple?: boolean;
+  /** The initial selection when `multiple` is set. Ignored otherwise. */
+  values?: string[];
   /** Accessible name for the field. */
   label?: string;
   placeholder?: string;
@@ -39,8 +47,10 @@ export interface ContactPickerOptions {
   emptyMessage?: string;
   /** Shown when the typed query matches no contact. */
   noMatchMessage?: string;
-  /** Fired only when the user commits a selection. */
-  onChange: (nickname: string) => void;
+  /** Fired only when the user commits a single selection. */
+  onChange?: (nickname: string) => void;
+  /** Fired whenever the set changes in multiple mode. */
+  onChangeMulti?: (nicknames: string[]) => void;
 }
 
 let pickerUid = 0;
@@ -67,15 +77,20 @@ export class ContactPicker {
   private readonly popup: HTMLElement;
   private readonly list: HTMLElement;
   private readonly empty: HTMLElement;
+  private readonly chips: HTMLElement;
   private readonly items: ContactPickerItem[];
   private readonly listId: string;
   private readonly locked: boolean;
+  private readonly multiple: boolean;
   private readonly emptyMessage: string;
   private readonly noMatchMessage: string;
-  private readonly onChange: (nickname: string) => void;
+  private readonly onChange?: (nickname: string) => void;
+  private readonly onChangeMulti?: (nicknames: string[]) => void;
 
   /** The committed nickname. The source of truth lives in the caller. */
   private selected: string;
+  /** The committed set in multiple mode. The source of truth lives in the caller. */
+  private selectedMulti: string[];
   private open = false;
   /** True while the field holds a query rather than the selected label. */
   private editing = false;
@@ -85,15 +100,19 @@ export class ContactPicker {
 
   constructor(opts: ContactPickerOptions) {
     this.items = opts.items;
-    this.selected = opts.value;
+    this.selected = opts.value ?? "";
+    this.selectedMulti = [...(opts.values ?? [])];
+    this.multiple = opts.multiple ?? false;
     this.locked = opts.locked ?? false;
     this.emptyMessage = opts.emptyMessage ?? "No contacts yet.";
     this.noMatchMessage = opts.noMatchMessage ?? "No contacts match that name.";
     this.onChange = opts.onChange;
+    this.onChangeMulti = opts.onChangeMulti;
     this.listId = `contact-picker-list-${++pickerUid}`;
 
     this.element = document.createElement("div");
     this.element.className = "contact-picker";
+    if (this.multiple) this.element.classList.add("contact-picker-multi");
 
     this.input = document.createElement("input");
     this.input.type = "text";
@@ -126,6 +145,7 @@ export class ContactPicker {
     this.list.id = this.listId;
     this.list.setAttribute("role", "listbox");
     this.list.setAttribute("aria-label", opts.label ?? "Contacts");
+    if (this.multiple) this.list.setAttribute("aria-multiselectable", "true");
 
     this.empty = document.createElement("p");
     this.empty.className = "contact-picker-empty text-13 muted";
@@ -135,8 +155,16 @@ export class ContactPicker {
     this.empty.setAttribute("role", "status");
     this.empty.hidden = true;
 
+    this.chips = document.createElement("div");
+    this.chips.className = "contact-picker-chips";
+    this.chips.hidden = true;
+
     this.popup.append(this.list, this.empty);
-    this.element.append(this.input, this.popup);
+    if (this.multiple) {
+      this.element.append(this.chips, this.input, this.popup);
+    } else {
+      this.element.append(this.input, this.popup);
+    }
 
     if (!this.locked) {
       this.input.addEventListener("focus", () => this.handleFocus());
@@ -154,9 +182,21 @@ export class ContactPicker {
     return this.selected;
   }
 
+  /** The committed set in multiple mode, in the order they were chosen. */
+  get values(): string[] {
+    return [...this.selectedMulti];
+  }
+
   /** The label shown for a nickname, falling back to the nickname itself. */
   private labelFor(nickname: string): string {
     return this.items.find((it) => it.nickname === nickname)?.label ?? nickname;
+  }
+
+  /** Whether a nickname is part of the committed selection, in either mode. */
+  private isSelected(nickname: string): boolean {
+    return this.multiple
+      ? this.selectedMulti.includes(nickname)
+      : nickname === this.selected;
   }
 
   private handleFocus(): void {
@@ -211,6 +251,19 @@ export class ContactPicker {
         // Let focus move on; blur closes the popup and restores the label.
         this.close();
         return;
+    }
+    if (this.multiple) {
+      // The field is always a fresh query here, so Backspace on an empty field
+      // removes the most recently added chip rather than editing nothing.
+      if (
+        (e.key === "Backspace" || e.key === "Delete") &&
+        this.input.value === "" &&
+        this.selectedMulti.length > 0
+      ) {
+        e.preventDefault();
+        this.toggleSelected(this.selectedMulti[this.selectedMulti.length - 1]);
+      }
+      return;
     }
     if (!this.editing && (e.key === "Backspace" || e.key === "Delete")) {
       // Editing the label text itself would be a lie about what is selected, so
@@ -271,6 +324,10 @@ export class ContactPicker {
   private select(index: number): void {
     const item = this.filtered[index];
     if (!item) return;
+    if (this.multiple) {
+      this.toggleSelected(item.nickname);
+      return;
+    }
     this.selected = item.nickname;
     this.editing = false;
     this.query = "";
@@ -278,7 +335,28 @@ export class ContactPicker {
     this.highlight = -1;
     this.renderValue();
     this.refresh();
-    this.onChange(item.nickname);
+    this.onChange?.(item.nickname);
+  }
+
+  /**
+   * Add or remove one nickname in multiple mode.
+   *
+   * The popup stays open and the query is cleared so the next contact can be
+   * picked without re-opening the list; the caller is told the whole new set.
+   */
+  private toggleSelected(nickname: string): void {
+    const at = this.selectedMulti.indexOf(nickname);
+    if (at >= 0) {
+      this.selectedMulti.splice(at, 1);
+    } else {
+      this.selectedMulti.push(nickname);
+    }
+    this.editing = false;
+    this.query = "";
+    this.highlight = -1;
+    this.renderValue();
+    this.refresh();
+    this.onChangeMulti?.([...this.selectedMulti]);
   }
 
   private close(): void {
@@ -296,6 +374,7 @@ export class ContactPicker {
     this.filtered = this.computeFiltered();
     this.highlight = this.defaultHighlight();
     this.renderOptions();
+    this.renderChips();
     this.popup.hidden = !this.open;
     this.syncAria();
   }
@@ -326,7 +405,7 @@ export class ContactPicker {
       opt.className = "contact-picker-option";
       opt.id = `${this.listId}-opt-${i}`;
       opt.setAttribute("role", "option");
-      opt.setAttribute("aria-selected", String(it.nickname === this.selected));
+      opt.setAttribute("aria-selected", String(this.isSelected(it.nickname)));
       if (i === this.highlight) opt.classList.add("is-highlighted");
       opt.textContent = it.label;
       // Keep focus in the input so blur does not close before the click lands.
@@ -353,6 +432,34 @@ export class ContactPicker {
     options[this.highlight]?.scrollIntoView({ block: "nearest" });
   }
 
+  /** Repaint the chip row in multiple mode. A no-op for single-select. */
+  private renderChips(): void {
+    if (!this.multiple) return;
+    this.chips.replaceChildren();
+    for (const nickname of this.selectedMulti) {
+      const label = this.labelFor(nickname);
+      const chip = document.createElement("span");
+      chip.className = "contact-chip";
+      const text = document.createElement("span");
+      text.className = "contact-chip-label";
+      text.textContent = label;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "contact-chip-remove";
+      remove.setAttribute("aria-label", `Remove ${label}`);
+      remove.textContent = "×";
+      // Keep focus in the input so the popup does not close mid-interaction.
+      remove.addEventListener("mousedown", (e) => e.preventDefault());
+      remove.addEventListener("click", (e) => {
+        e.preventDefault();
+        this.toggleSelected(nickname);
+      });
+      chip.append(text, remove);
+      this.chips.appendChild(chip);
+    }
+    this.chips.hidden = this.selectedMulti.length === 0;
+  }
+
   private syncAria(): void {
     this.input.setAttribute("aria-expanded", String(this.open));
     if (this.open && this.highlight >= 0) {
@@ -367,6 +474,12 @@ export class ContactPicker {
 
   /** Mirror the committed state into the field without disturbing the caret. */
   private renderValue(): void {
+    if (this.multiple) {
+      // No label to mirror: the field only ever holds the in-progress query.
+      const next = this.editing ? this.query : "";
+      if (this.input.value !== next) this.input.value = next;
+      return;
+    }
     const next = this.editing ? this.query : this.labelFor(this.selected);
     if (this.input.value !== next) this.input.value = next;
   }

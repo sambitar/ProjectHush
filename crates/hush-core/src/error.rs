@@ -62,6 +62,10 @@ pub enum Error {
     DropNeedsKey,
     #[error("this drop was sealed under a PIN; open it with the PIN, not a private key")]
     DropNeedsPin,
+    #[error("meeting not found")]
+    MeetingNotFound,
+    #[error("a meeting needs a name and at least one member")]
+    InvalidMeeting,
 }
 
 impl From<argon2::Error> for Error {

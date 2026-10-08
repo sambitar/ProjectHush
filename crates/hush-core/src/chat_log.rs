@@ -641,6 +641,82 @@ mod tests {
         // Both live in the one log; only the chat projection hides the draft.
         assert_eq!(log.chat_records().count() + log.draft_records().count(), 2);
     }
+
+    #[test]
+    fn a_meeting_and_its_messages_survive_a_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("hush-meeting-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        let id = log
+            .create_meeting(&master, "Standup", &["bob".into(), "carol".into()])
+            .unwrap();
+        log.append_meeting_message(&master, &id, true, None, "morning")
+            .unwrap();
+
+        let reloaded = ChatLog::load(&dir, &master).unwrap();
+        let meeting = reloaded.meeting(&id).expect("the meeting survives a reload");
+        assert_eq!(meeting.name, "Standup");
+        assert_eq!(meeting.members, vec!["bob".to_string(), "carol".to_string()]);
+        assert_eq!(meeting.messages.len(), 1);
+        assert_eq!(meeting.messages[0].body, "morning");
+        assert!(meeting.messages[0].outgoing);
+        // A meeting is not chat history, so the chat rail cannot show it twice.
+        assert_eq!(reloaded.chat_records().count(), 0);
+    }
+
+    #[test]
+    fn a_meeting_materialises_once_from_a_descriptor_and_then_only_appends() {
+        let dir = std::env::temp_dir().join(format!("hush-meeting-desc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        assert!(
+            log.ensure_meeting(&master, "m-1", "Standup", &["bob".into()])
+                .unwrap(),
+            "an unknown meeting is created"
+        );
+        assert!(
+            !log.ensure_meeting(&master, "m-1", "Renamed", &["bob".into(), "carol".into()])
+                .unwrap(),
+            "a descriptor for a known meeting must not overwrite local state"
+        );
+        assert_eq!(log.meeting("m-1").unwrap().name, "Standup");
+        assert_eq!(log.meeting("m-1").unwrap().members.len(), 1);
+
+        log.append_meeting_message(&master, "m-1", false, Some("bob"), "hi")
+            .unwrap();
+        assert_eq!(log.meeting("m-1").unwrap().messages[0].from.as_deref(), Some("bob"));
+
+        // Appending to an unknown meeting reports "nothing to do" rather than
+        // inventing a meeting with no name or members.
+        assert!(!log
+            .append_meeting_message(&master, "missing", false, None, "x")
+            .unwrap());
+    }
+
+    #[test]
+    fn meeting_membership_can_be_changed() {
+        let dir = std::env::temp_dir().join(format!("hush-meeting-mem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        let id = log.create_meeting(&master, "Trip", &["bob".into()]).unwrap();
+        assert!(log.add_meeting_member(&master, &id, "carol").unwrap());
+        assert!(
+            !log.add_meeting_member(&master, &id, "carol").unwrap(),
+            "adding the same member twice is a no-op"
+        );
+        assert!(log.remove_meeting_member(&master, &id, "bob").unwrap());
+        assert_eq!(log.meeting(&id).unwrap().members, vec!["carol".to_string()]);
+        assert!(!log.remove_meeting_member(&master, &id, "nobody").unwrap());
+    }
 }
 
 fn now_ms() -> u64 {

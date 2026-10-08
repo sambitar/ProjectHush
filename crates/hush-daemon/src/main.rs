@@ -18,8 +18,8 @@ use axum::{
 use clap::Parser;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use hush_core::{
-    notification_body, notification_body_for_key, ChatRecord, FileMailer, Mailer, MessagePayload,
-    NullMailer, ReceivedMessage,
+    notification_body, notification_body_for_key, ChatRecord, FileMailer, Mailer, MeetingRecord,
+    MessagePayload, NullMailer, ReceivedMessage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -176,6 +176,12 @@ struct ReceivedDto {
     subject: Option<String>,
     /// Mail only: attachment references (bytes are fetched via `/api/blob/{id}`).
     attachments: Vec<MailAttachmentDto>,
+    /// Meeting only: the id the message's meeting is keyed on.
+    meeting_id: Option<String>,
+    /// Meeting only: the meeting's name, for materialising it on first sight.
+    meeting_name: Option<String>,
+    /// Meeting only: the sender's member list, for materialising it on first sight.
+    meeting_members: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -272,6 +278,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/mail/draft/{id}", delete(delete_draft))
         .route("/api/mail/{id}", delete(delete_mail))
         .route("/api/mail", get(mail))
+        .route("/api/meetings", get(meetings).post(create_meeting))
+        .route("/api/meetings/message", post(send_meeting_message))
+        .route("/api/meetings/members/add", post(add_meeting_member))
+        .route("/api/meetings/members/remove", post(remove_meeting_member))
         .route("/api/invite", post(invite))
         .route("/api/contacts", get(contacts))
         .route("/api/contacts/add", post(add_contact))
@@ -851,6 +861,90 @@ async fn mail(
 }
 
 #[derive(Deserialize)]
+struct CreateMeetingRequest {
+    name: String,
+    members: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SendMeetingMessageRequest {
+    meeting_id: String,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct MeetingMemberRequest {
+    meeting_id: String,
+    nickname: String,
+}
+
+/// Every meeting this vault holds, each with its own message log.
+async fn meetings(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<MeetingRecord>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.meetings().await)?;
+    match result {
+        WorkResult::Meetings(list) => Ok(Json(list)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn create_meeting(
+    State(state): State<Arc<App>>,
+    Json(body): Json<CreateMeetingRequest>,
+) -> Result<Json<MeetingRecord>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.create_meeting(&body.name, body.members).await)?;
+    match result {
+        WorkResult::MeetingCreated(meeting) => Ok(Json(meeting)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn send_meeting_message(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SendMeetingMessageRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .send_meeting_message(&body.meeting_id, &body.body)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn add_meeting_member(
+    State(state): State<Arc<App>>,
+    Json(body): Json<MeetingMemberRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .add_meeting_member(&body.meeting_id, &body.nickname)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_meeting_member(
+    State(state): State<Arc<App>>,
+    Json(body): Json<MeetingMemberRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .remove_meeting_member(&body.meeting_id, &body.nickname)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
 struct SaveDraftRequest {
     /// Set to edit an existing draft; omitted to create one.
     #[serde(default)]
@@ -1116,6 +1210,9 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
             thread_id: None,
             subject: None,
             attachments: Vec::new(),
+            meeting_id: None,
+            meeting_name: None,
+            meeting_members: Vec::new(),
         }),
         MessagePayload::File { name, data } => Some(ReceivedDto {
             from,
@@ -1127,6 +1224,9 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
             thread_id: None,
             subject: None,
             attachments: Vec::new(),
+            meeting_id: None,
+            meeting_name: None,
+            meeting_members: Vec::new(),
         }),
         MessagePayload::Mail {
             thread_id,
@@ -1150,6 +1250,28 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
                     blob_id: hex::encode(a.blob_id.0),
                 })
                 .collect(),
+            meeting_id: None,
+            meeting_name: None,
+            meeting_members: Vec::new(),
+        }),
+        MessagePayload::Meeting {
+            meeting_id,
+            name,
+            members,
+            body,
+        } => Some(ReceivedDto {
+            from,
+            kind: "meeting".into(),
+            text: Some(body),
+            file_name: None,
+            file_size: None,
+            blob_id: None,
+            thread_id: None,
+            subject: None,
+            attachments: Vec::new(),
+            meeting_id: Some(meeting_id),
+            meeting_name: Some(name),
+            meeting_members: members,
         }),
         // Queue grants are handled inside `recv` and never surface as inbox items.
         MessagePayload::QueueGrant { .. } => None,

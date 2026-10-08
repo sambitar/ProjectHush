@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::thread;
 
-use hush_core::{Account, ChatRecord, InboxResult};
+use hush_core::{Account, ChatRecord, InboxResult, MeetingRecord};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct AccountWorker {
@@ -142,6 +142,29 @@ enum Work {
     RetryOutbox {
         reply: oneshot::Sender<WorkResult>,
     },
+    Meetings {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    CreateMeeting {
+        name: String,
+        members: Vec<String>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SendMeetingMessage {
+        meeting_id: String,
+        body: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    AddMeetingMember {
+        meeting_id: String,
+        nickname: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    RemoveMeetingMember {
+        meeting_id: String,
+        nickname: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -188,6 +211,10 @@ pub enum WorkResult {
     DraftSaved(String),
     Blob(Vec<u8>),
     BlobId(String),
+    /// Every meeting this vault holds, with its message log.
+    Meetings(Vec<MeetingRecord>),
+    /// The meeting that was just created.
+    MeetingCreated(MeetingRecord),
     /// The supplied current passphrase did not match the vault.
     WrongPassphrase,
     Err(String),
@@ -578,6 +605,72 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::Meetings { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::Meetings(a.meetings()),
+                            };
+                            (reply, result)
+                        }
+                        Work::CreateMeeting {
+                            name,
+                            members,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.create_meeting(&name, &members).await {
+                                    Ok(meeting) => WorkResult::MeetingCreated(meeting),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendMeetingMessage {
+                            meeting_id,
+                            body,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.send_meeting_message(&meeting_id, &body).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::AddMeetingMember {
+                            meeting_id,
+                            nickname,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.add_meeting_member(&meeting_id, &nickname).await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RemoveMeetingMember {
+                            meeting_id,
+                            nickname,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a.remove_meeting_member(&meeting_id, &nickname).await {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
                         Work::Blob { id_hex, reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
@@ -842,5 +935,45 @@ impl AccountWorker {
     /// Flush the Outbox. Called on a timer, not by the UI.
     pub async fn retry_outbox(&self) -> WorkResult {
         self.call(|reply| Work::RetryOutbox { reply }).await
+    }
+
+    pub async fn meetings(&self) -> WorkResult {
+        self.call(|reply| Work::Meetings { reply }).await
+    }
+
+    pub async fn create_meeting(&self, name: &str, members: Vec<String>) -> WorkResult {
+        self.call(|reply| Work::CreateMeeting {
+            name: name.to_string(),
+            members,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn send_meeting_message(&self, meeting_id: &str, body: &str) -> WorkResult {
+        self.call(|reply| Work::SendMeetingMessage {
+            meeting_id: meeting_id.to_string(),
+            body: body.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn add_meeting_member(&self, meeting_id: &str, nickname: &str) -> WorkResult {
+        self.call(|reply| Work::AddMeetingMember {
+            meeting_id: meeting_id.to_string(),
+            nickname: nickname.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn remove_meeting_member(&self, meeting_id: &str, nickname: &str) -> WorkResult {
+        self.call(|reply| Work::RemoveMeetingMember {
+            meeting_id: meeting_id.to_string(),
+            nickname: nickname.to_string(),
+            reply,
+        })
+        .await
     }
 }

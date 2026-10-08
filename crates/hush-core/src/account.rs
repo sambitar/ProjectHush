@@ -9,7 +9,9 @@ use uuid::Uuid;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 
 use crate::backup::{export_vault, import_vault};
-use crate::chat_log::{ChatLog, ChatRecordPayload, MailAttachmentRecord, MailState};
+use crate::chat_log::{
+    ChatLog, ChatRecordPayload, MailAttachmentRecord, MailState, MeetingRecord,
+};
 use crate::crypto::random_bytes;
 use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
 use crate::drop::{
@@ -1163,6 +1165,105 @@ impl Account {
         self.chat_log.draft_records().cloned().collect()
     }
 
+    /// The meetings this vault holds, in creation order.
+    pub fn meetings(&self) -> Vec<MeetingRecord> {
+        self.chat_log.meetings().to_vec()
+    }
+
+    /// Create a meeting and return its record.
+    ///
+    /// A meeting needs a name and at least one member: an empty meeting has no
+    /// one to fan out to, so it would be a record the user can never use.
+    pub async fn create_meeting(
+        &mut self,
+        name: &str,
+        members: &[String],
+    ) -> Result<MeetingRecord, Error> {
+        let name = name.trim();
+        if name.is_empty() || members.is_empty() {
+            return Err(Error::InvalidMeeting);
+        }
+        // Fail fast on an unknown member: fan-out cannot conjure a contact, and a
+        // half-delivered meeting is worse than a refused one.
+        for nickname in members {
+            if self.find_contact(nickname).is_none() {
+                return Err(Error::ContactNotFound);
+            }
+        }
+        let master = *self.vault.master_key();
+        let id = self.chat_log.create_meeting(&master, name, members)?;
+        self.chat_log
+            .meeting(&id)
+            .cloned()
+            .ok_or(Error::MeetingNotFound)
+    }
+
+    /// Send a message to every member of a meeting over their own 1:1 session.
+    ///
+    /// This is the whole of "group chat": N independent encryptions and N queue
+    /// puts. Each blob carries the meeting descriptor, so a recipient that has
+    /// never seen this meeting materialises it on receipt. Delivery is
+    /// store-and-forward, so a member who is away still gets the message; there
+    /// is no delivery receipt and no server-side room.
+    pub async fn send_meeting_message(
+        &mut self,
+        meeting_id: &str,
+        body: &str,
+    ) -> Result<(), Error> {
+        let meeting = self
+            .chat_log
+            .meeting(meeting_id)
+            .cloned()
+            .ok_or(Error::MeetingNotFound)?;
+        // Send first, then log: a member list can legitimately include a contact
+        // deleted since the meeting was created, and a partial fan-out must not
+        // leave a message the sender cannot see was only partly delivered.
+        for member in &meeting.members {
+            let payload = MessagePayload::Meeting {
+                meeting_id: meeting.id.clone(),
+                name: meeting.name.clone(),
+                members: meeting.members.clone(),
+                body: body.to_string(),
+            };
+            self.send_payload_inner(member, payload, false).await?;
+        }
+        let master = *self.vault.master_key();
+        self.chat_log
+            .append_meeting_message(&master, meeting_id, true, None, body)?;
+        Ok(())
+    }
+
+    pub async fn add_meeting_member(
+        &mut self,
+        meeting_id: &str,
+        nickname: &str,
+    ) -> Result<(), Error> {
+        if self.chat_log.meeting(meeting_id).is_none() {
+            return Err(Error::MeetingNotFound);
+        }
+        if self.find_contact(nickname).is_none() {
+            return Err(Error::ContactNotFound);
+        }
+        let master = *self.vault.master_key();
+        self.chat_log
+            .add_meeting_member(&master, meeting_id, nickname)?;
+        Ok(())
+    }
+
+    pub async fn remove_meeting_member(
+        &mut self,
+        meeting_id: &str,
+        nickname: &str,
+    ) -> Result<(), Error> {
+        if self.chat_log.meeting(meeting_id).is_none() {
+            return Err(Error::MeetingNotFound);
+        }
+        let master = *self.vault.master_key();
+        self.chat_log
+            .remove_meeting_member(&master, meeting_id, nickname)?;
+        Ok(())
+    }
+
     pub async fn heartbeat_presence(&self) -> Result<(), Error> {
         let relay = RelayClient::try_new(&self.state.relay)?;
         relay
@@ -1521,6 +1622,28 @@ impl Account {
                     MessagePayload::Text { body } => {
                         let master = *self.vault.master_key();
                         self.chat_log.append_text(&master, &nick, false, body)?;
+                        (None, Vec::new())
+                    }
+                    // A meeting message: materialise the meeting if this vault
+                    // has never seen it, then file the message in it. The
+                    // descriptor is the only way a recipient learns a meeting
+                    // exists; there is no server-side room to join.
+                    MessagePayload::Meeting {
+                        meeting_id,
+                        name,
+                        members,
+                        body,
+                    } => {
+                        let master = *self.vault.master_key();
+                        self.chat_log
+                            .ensure_meeting(&master, meeting_id, name, members)?;
+                        self.chat_log.append_meeting_message(
+                            &master,
+                            meeting_id,
+                            false,
+                            Some(&nick),
+                            body,
+                        )?;
                         (None, Vec::new())
                     }
                     // Handled above, before this match.

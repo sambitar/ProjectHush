@@ -120,6 +120,33 @@ Mail is a payload **kind** on the same Signal session and the same queue — not
 
 Relay view of a mail message is unchanged from any other message: an opaque ciphertext blob. Subject, body, and attachment names are inside the Signal envelope and never appear in relay storage.
 
+### Meetings
+
+A meeting is **not** a relay-side room and there is no group object in the protocol. Group chat is
+sender-side fan-out: the sender encrypts the message once per member over that member's existing 1:1
+session and puts N blobs (N puts for N members) — exactly the same primitive as two-party chat, just
+repeated. Nothing on the relay or in the wire format changes.
+
+- **Wire payload:** `MessagePayload::Meeting { meeting_id, name, members[], body }`. The descriptor
+  (`meeting_id`, `name`, `members`) rides on **every** message, so a recipient that has never seen the
+  meeting can materialise it locally from the first message it receives; once the meeting exists, later
+  messages simply append.
+- **Delivery:** store-and-forward, like mail (the fan-out uses the same `require_online: false` path), so
+  an away member still receives the message on their next drain. There is no delivery receipt and no
+  server-side membership to read.
+- **Local storage:** meetings reuse the encrypted `chat.enc` log via a `MeetingRecord` (`id`, `name`,
+  `members`, `created_ms`, `messages: MeetingMessage[]`). A meeting's messages are kept in the meeting's
+  own log, not in the 1:1 `ChatRecord` projection. One log, one encryption path, one backup path.
+- **Membership is local.** Adding or removing a member changes only the actor's own member list and
+  therefore only who they fan out to next; it is not announced to anyone and does not rewrite history for
+  others. A descriptor for a meeting a client already holds is ignored for membership purposes. This is a
+  deliberate first-cut limitation, not a shared-invitation protocol.
+- **Not a directory:** `members` holds the sender's local nicknames. They need not match the recipient's
+  names for the same people, and the relay never sees them.
+
+Relay view of a meeting message is unchanged from any other message: an opaque ciphertext blob. The
+meeting name, member list, and body are inside the Signal envelope and never appear in relay storage.
+
 ## What the relay HTTP API looks like (shape)
 
 - `PUT /q/{id}` — store blob (authz for that queue)

@@ -13,6 +13,153 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-08 — Meetings rail (local record, sender-side fan-out)
+
+Built the Meetings feature: a vault-held `MeetingRecord` with its own message log, a
+`MessagePayload::Meeting { meeting_id, name, members[], body }` descriptor on every message,
+sender-side fan-out over the members' 1:1 sessions, recipient-side materialisation from the
+descriptor, daemon routes, and a Meetings rail in the UI. Problems hit:
+
+### [FIXED] `hush-cli` matched on `MessagePayload` without a `Meeting` arm, so the workspace would not build
+
+- **Attempted:** `cargo test --workspace` after wiring the core and daemon.
+- **Symptom:** `error[E0004]: non-exhaustive patterns: 'MessagePayload::Meeting { .. }' not covered`
+  at `crates/hush-cli/src/main.rs:147`. The core and daemon crates compiled; the CLI did not, and
+  the whole workspace build failed, so no test ran.
+- **Cause:** adding the enum variant made every existing `match` on `MessagePayload` non-exhaustive.
+  The `recv` match in the CLI prints inbox items and is easy to forget because it is not part of the
+  feature.
+- **Resolution:** added a `Meeting` arm to the CLI that prints the meeting message. `cargo test
+  --workspace` then passed. This is the same class of breakage as the existing `[OPEN] 350d2d1`
+  entry above, but in a different crate: that entry names `account.rs`; the CLI was a second,
+  unlisted site.
+- **Lesson:** a new `MessagePayload` variant means grepping every `match` on it, not just the ones in
+  the crates you are editing.
+
+### [WORKED AROUND] Two ad-hoc daemons collided on the default socket path (tooling, not the repo)
+
+- **Attempted:** run two daemons for an end-to-end Meetings check with a shared
+  `HUSH_RUNTIME_DIR` and only `--addr` set.
+- **Symptom:** the second daemon exited at startup:
+  `Error: Custom { kind: AddrInUse, error: "another hush-daemon is already listening on
+  <run-dir>/hush-daemon.sock (use --socket to pick a different path)" }`.
+- **Resolution:** passed an explicit `--socket` per daemon in the throwaway script. The repo's
+  `scripts/run-two-ui.sh` already does this; the fault was in my one-off script.
+- **Lesson:** the default socket path is derived from the runtime dir, so two daemons sharing one
+  runtime dir need explicit `--socket` values.
+
+### [WORKED AROUND] `/api/invite` is `POST`, and the smoke script assumed `GET`
+
+- **Attempted:** read the invite with `GET /api/invite`.
+- **Symptom:** empty response, so invite extraction failed. The route is `post(invite)`.
+- **Resolution:** switched the script to `POST`. Tooling-only; the route is unchanged and correct.
+
+### [OPEN] The Meetings UI was not exercised in a running app
+
+- **Attempted:** verify the rail, the list/detail panes, the create and add-member modals, and the
+  multi-select `ContactPicker` end to end.
+- **Symptom / limit:** no display was available, so the UI could not be driven in a real window. The
+  feature was verified at the daemon HTTP layer with two live daemons plus a relay (create, send,
+  fan-out, materialisation, append, membership add/remove, unknown-member 400), and the frontend was
+  checked with `npx tsc --noEmit` (exit 0) and `ReadLints` (no errors) only.
+- **Consequence:** the multi-select `ContactPicker` behaviour (chip tokens, keep-open-on-select,
+  Backspace removing the last chip) and the layout are **unverified in a browser**. The single-select
+  mail composer path is untouched and still typechecks, but it was not re-driven either.
+- **Needed to close:** a manual pass in `scripts/run-two-ui.sh --dev` with two tabs.
+
+### [OPEN] Membership changes are local only, and the UI says so
+
+- **Attempted:** add/remove meeting members.
+- **Reality:** a membership change edits only the actor's own `MeetingRecord.members`; it is not sent
+  to anyone and does not change another client's member list or history. A recipient that receives a
+  descriptor for a meeting it already holds ignores the descriptor's member list.
+- **Consequence:** after A removes B, B still sees the meeting and A's *earlier* messages; B simply
+  stops receiving new fan-out from A. This is the agreed first-cut scope, not a bug, but it is a real
+  limitation and is stated in `docs/PROTOCOL.md` and in the add-member dialog copy rather than hidden.
+
+---
+
+## 2026-10-08 — Dev login silently failed against a stale daemon
+
+After the Meetings frontend landed, the dev app would not log in. The cause was a version
+mismatch, not a code defect, but the failure mode was silent and misleading.
+
+### [FIXED] A stale daemon turned a 404 into a fake "vault locked" screen
+
+- **Attempted:** log in to the dev app at `http://localhost:5173/?api=http://127.0.0.1:9876`.
+- **Symptom:** submitting the correct passphrase returned the user to the unlock screen, with no
+  error shown anywhere and no browser console error. The daemon was demonstrably healthy:
+  `GET /api/status` returned `200 {"locked":false,...}` and `POST /api/unlock` returned `204`. The
+  DOM stayed on `.unlock-screen` with no `.shell`.
+- **Cause:** the new `App.refreshStatus()` calls `reloadMeetings()`, which hits
+  `GET /api/meetings`. The running daemons had started at 09:12, before
+  `target/debug/hush-daemon` was rebuilt at 11:44, so they did not serve that route and answered
+  `404`. The pre-existing catch-all in `refreshStatus` (`apps/hush-tauri/src/app.ts`, around line
+  340) treats *any* error as "the vault is locked" and sets `this.status = { locked: true, ... }`,
+  so the UI snapped back to the unlock form even though the unlock had succeeded. In-page probe:
+  `{"status_http":200,"locked":false,"contacts_http":200,"meetings_http":404}`.
+- **Resolution:** rebuilt the daemons and restarted the stack with `scripts/run-two-ui.sh --dev`.
+  No source change was needed. `GET /api/meetings` now answers `401` when locked and `200` when
+  unlocked, and the unlocked shell renders.
+- **Lesson:** Vite serves the frontend from source, so the frontend is always current while the
+  daemon binary is only as new as its last build. Any frontend change that calls a new endpoint
+  will fail against a daemon started before that endpoint existed. Restart the dev stack after
+  landing daemon-side changes.
+
+### [OPEN] `refreshStatus` treats any auxiliary-load error as "vault locked"
+
+- **Attempted:** nothing yet; found while diagnosing the above.
+- **Symptom:** a failure to load an *optional* resource (the mailbox or the meeting list) forces the
+  whole app into the locked state, hides the real error, and makes a healthy, unlocked daemon look
+  like a failed login. The user sees wrong-passphrase behaviour for a problem that has nothing to
+  do with the passphrase.
+- **Resolution:** not fixed. The fix is to scope the `try` so that mailbox/meeting load failures
+  cannot flip `status.locked`, and ideally to surface the real error instead of swallowing it.
+  Deferred so as not to edit `app.ts` while another agent's commit was in flight.
+- **Lesson:** a catch-all that maps every error onto a user-visible state will misattribute
+  unrelated failures; scope error handling to the operation that can actually fail.
+
+---
+
+## 2026-10-08 — Committed a half-wired Meetings change to master
+
+Committed the whole working tree to `master` as `350d2d1` while a Meetings worker was
+mid-implementation. The commit does not compile.
+
+### [OPEN] `350d2d1` on master fails to build: `MessagePayload::Meeting` has no match arm
+
+- **Attempted:** commit the accumulated work (multi-device removal, outsider mail, Trusts, the
+  mail pane rework) to `master` as a single checkpoint, after first trying to confirm that no
+  agent had edits in flight.
+- **Symptom:** `cargo test --workspace` exits 101 and zero tests run:
+
+  ```
+  error[E0004]: non-exhaustive patterns: `&MessagePayload::Meeting { .. }` not covered
+     --> crates/hush-core/src/account.rs:1479:62
+      |
+  1479 |     let (file_blob_id, mail_attachments) = match &payload {
+      |                                             ^^^^^^^^ pattern `&MessagePayload::Meeting { .. }` not covered
+  ```
+
+  `cargo build -p hush-core` fails identically, and every other crate depends on it, so nothing
+  downstream builds either. `npx tsc --noEmit` passes (exit 0).
+- **Cause:** the concurrent Meetings worker had already written `crates/hush-core/src/payload.rs`
+  (the `Meeting` variant plus a round-trip test) and `crates/hush-core/src/chat_log.rs`
+  (`MeetingRecord` / `MeetingMessage`), but had not yet added the match arm in `account.rs`. The
+  commit captured that half-wired state. Parent `ff2a8d5` has no `Meeting` anywhere, so the
+  breakage is introduced by this commit.
+- **Why the pre-commit check missed it:** it relied on file mtimes for `app.ts` / `app.css` and a
+  `find . -newermt '-4 minutes'` window. Neither proves a concurrent agent is idle: the worker had
+  written `payload.rs` just outside that window, and the probe never looked at `payload.rs` or
+  `chat_log.rs` at all. No build was run before committing.
+- **Resolution:** not yet. The worker is still editing the same files, so the working tree is left
+  alone rather than raced. When it lands, the completed feature will be built and committed, which
+  restores a compiling `master`. The tip of `master` is broken until then.
+- **Lesson:** a build is the only evidence that a tree is committable. Run `cargo check` before
+  committing, not after, and do not treat an mtime probe as proof that a concurrent writer is done.
+
+---
+
 ## 2026-10-08 — Internal-mail keyboard contact picker (the composer To field)
 
 Replaced the composer's native `<select>` recipient list with a typeable, keyboard-driven

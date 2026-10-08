@@ -5,6 +5,7 @@ import type {
   ContactDto,
   InviteResponse,
   MailboxDto,
+  MeetingDto,
   RecvResponse,
   StatusResponse,
 } from "./types";
@@ -209,6 +210,33 @@ export const api = {
     request<null>("/api/mail/handle", {
       method: "POST",
       body: JSON.stringify({ handle }),
+    }),
+  /** Every meeting this vault holds, each with its own message log. */
+  meetings: () => request<MeetingDto[]>("/api/meetings"),
+  createMeeting: (name: string, members: string[]) =>
+    request<MeetingDto>("/api/meetings", {
+      method: "POST",
+      body: JSON.stringify({ name, members }),
+    }),
+  /**
+   * Send in a meeting. The daemon fans this out to every member over their own
+   * 1:1 session, so the response says nothing about per-member delivery.
+   */
+  sendMeetingMessage: (meetingId: string, body: string) =>
+    request<null>("/api/meetings/message", {
+      method: "POST",
+      body: JSON.stringify({ meeting_id: meetingId, body }),
+    }),
+  /** Membership changes are local to this vault. */
+  addMeetingMember: (meetingId: string, nickname: string) =>
+    request<null>("/api/meetings/members/add", {
+      method: "POST",
+      body: JSON.stringify({ meeting_id: meetingId, nickname }),
+    }),
+  removeMeetingMember: (meetingId: string, nickname: string) =>
+    request<null>("/api/meetings/members/remove", {
+      method: "POST",
+      body: JSON.stringify({ meeting_id: meetingId, nickname }),
     }),
   blob: (id: string) =>
     request<{ data_base64: string }>(`/api/blob/${encodeURIComponent(id)}`),

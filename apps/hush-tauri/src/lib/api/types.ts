@@ -57,6 +57,37 @@ export interface ReceivedDto {
   subject?: string | null;
   /** Mail only: attachment references (bytes via `/api/blob/{id}`). */
   attachments?: MailAttachmentDto[];
+  /** Meeting only: the id the message's meeting is keyed on. */
+  meeting_id?: string | null;
+  /** Meeting only: the meeting's name, for materialising it on first sight. */
+  meeting_name?: string | null;
+  /** Meeting only: the sender's member list, for materialising it on first sight. */
+  meeting_members?: string[];
+}
+
+/** One message in a meeting's own log. */
+export interface MeetingMessageDto {
+  id: string;
+  outgoing: boolean;
+  /** The sender's nickname as this vault knows it; absent for our own messages. */
+  from?: string | null;
+  body: string;
+  ts_ms: number;
+}
+
+/**
+ * A meeting: a local record in the vault, not a relay-side room.
+ *
+ * Group chat is sender-side fan-out over the members' 1:1 sessions, and each
+ * message carries this descriptor so a recipient can materialise the meeting.
+ * The member list is the creator's local view and is not shared.
+ */
+export interface MeetingDto {
+  id: string;
+  name: string;
+  members: string[];
+  created_ms: number;
+  messages: MeetingMessageDto[];
 }
 
 export interface ChatRecordDto {

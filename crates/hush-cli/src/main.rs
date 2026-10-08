@@ -184,6 +184,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("  attachment -> {}", out.display());
                         }
                     }
+                    // A meeting message; the meeting itself is materialised in
+                    // the vault during `recv`.
+                    MessagePayload::Meeting {
+                        meeting_id,
+                        name,
+                        body,
+                        ..
+                    } => {
+                        println!(
+                            "{}: meeting [{}] {} — {}",
+                            msg.from_nick, meeting_id, name, body
+                        );
+                    }
                     // Queue grants are handled inside `recv` and never surface as
                     // inbox items.
                     MessagePayload::QueueGrant { .. } => {}

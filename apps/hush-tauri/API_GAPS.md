@@ -8,6 +8,7 @@ These features use local mocks in `src/lib/api/mock.ts` and `src/lib/chatStore.t
 
 - Message history: loaded from **`GET /api/messages`** after unlock (Task **5c.3**); new messages still arrive via **`POST /api/recv`**
 - Live presence: **`POST /api/presence/heartbeat`** + **`online`** on contacts; chat send blocked when contact offline. Mail is real (Task **5d**): **`POST /api/mail/send`**, **`GET /api/mail`**, **`POST /api/mail/handle`**, and `kind: "mail"` on **`POST /api/recv`** deliver store-and-forward while the recipient is away.
+- Meetings are real (2026-10-08): **`GET/POST /api/meetings`**, **`POST /api/meetings/message`**, **`POST /api/meetings/members/add`**, **`POST /api/meetings/members/remove`**, and `kind: "meeting"` on **`POST /api/recv`** (which also materialises an unknown meeting from the descriptor). Group chat is sender-side fan-out over the members' 1:1 sessions; there is no relay-side room. Membership changes are local to the actor in this cut — no shared invitations yet.
 - Reactions
 - Mute, block, nickname override (persisted in **`ui-prefs.json`** under data root via **`GET/PUT /api/ui-prefs`**)
 - Report abusive relay slot (local block list exists; no server report API yet)

@@ -40,6 +40,8 @@ import {
   RemoveFormatting,
   Link,
   Handshake,
+  Users,
+  UserPlus,
   type IconNode,
 } from "lucide";
 
@@ -47,6 +49,8 @@ const ICONS: Record<string, IconNode> = {
   lock: Lock,
   chats: MessageCircle,
   trusts: Handshake,
+  meetings: Users,
+  addMember: UserPlus,
   mail: Mail,
   files: Folder,
   vault: Shield,

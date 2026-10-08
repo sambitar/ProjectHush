@@ -40,7 +40,10 @@ pub use drop::{
     DROP_PUBLIC_KEY_PREFIX, DROP_V2_HEADER_LEN, MAX_DROP_BYTES,
 };
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
-pub use chat_log::{ChatRecord, ChatRecordPayload, ExternalMail, MailAttachmentRecord, MailState};
+pub use chat_log::{
+    ChatRecord, ChatRecordPayload, ExternalMail, MailAttachmentRecord, MailState, MeetingMessage,
+    MeetingRecord,
+};
 pub use error::Error;
 pub use invite::InvitePayload;
 pub use mail::{format_address, normalize_handle, MAIL_DOMAIN, MAX_HANDLE_LEN};

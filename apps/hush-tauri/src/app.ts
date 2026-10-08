@@ -59,7 +59,16 @@ import {
   readFileAsBase64,
   resolveMessageFileBytes,
 } from "./lib/fileBytes";
-import { groupMessages } from "./lib/messageGroups";
+import { groupMessages, dayLabel } from "./lib/messageGroups";
+import {
+  candidatesToAdd,
+  clearMeetingStore,
+  listMeetings,
+  loadMeetings,
+  meetingById,
+  meetingPreview,
+  type Meeting,
+} from "./lib/meetingStore";
 import { icon, type IconName } from "./lib/icons";
 import { avatarWithPresence, createAvatarEl } from "./components/ui/Avatar";
 import { RichTextEditor } from "./components/ui/RichTextEditor";
@@ -68,7 +77,7 @@ import { bodyToDisplayHtml, isBlankHtml } from "./lib/richText";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
 import QRCode from "qrcode";
 
-type Rail = "chats" | "trusts" | "mail" | "files" | "vault" | "settings";
+type Rail = "chats" | "trusts" | "meetings" | "mail" | "files" | "vault" | "settings";
 type SettingsSection =
   | "appearance"
   | "profile"
@@ -242,6 +251,26 @@ export class App {
    */
   private trustDeleteConfirm = "";
 
+  /**
+   * The meeting open in the Meetings rail, if any.
+   *
+   * Like the mail reading pane, the selection is held outside the DOM so a
+   * background re-render cannot lose it.
+   */
+  private meetingId: string | null = null;
+  private meetingCreateOpen = false;
+  /**
+   * The in-progress create-meeting form.
+   *
+   * Held here rather than read back out of the DOM because the picker re-renders
+   * on every selection; a rebuilt field would forget what was typed.
+   */
+  private meetingCreateName = "";
+  private meetingCreateMembers: string[] = [];
+  /** The add-member dialog's pending selection. */
+  private meetingAddOpen = false;
+  private meetingAddMembers: string[] = [];
+
   /** Read/star/archive/trash, straight from `ui-prefs.json`. */
   private mailPrefs(): MailFlags {
     return mailFlags();
@@ -275,6 +304,8 @@ export class App {
         this.addFriendOpen = false;
         this.profileNick = null;
         this.closeTrustDelete();
+        this.meetingCreateOpen = false;
+        this.meetingAddOpen = false;
         if (this.filesContactNick) this.filesContactNick = null;
         this.render();
       }
@@ -302,6 +333,7 @@ export class App {
         this.mailHandle = status.mail_handle ?? null;
         this.mailDomain = status.mail_domain ?? "myserver.com";
         await this.reloadMailbox();
+        await this.reloadMeetings();
         this.startPoll();
       }
     } catch {
@@ -336,6 +368,14 @@ export class App {
     return loadMailbox(box.mail ?? [], box.drafts ?? []);
   }
 
+  /** Re-read the meeting list. Returns whether it changed, so the poll can
+   *  skip a repaint that would steal the caret out of the meeting composer. */
+  private async reloadMeetings(): Promise<boolean> {
+    const list = await api.meetings();
+    if (!list) return false;
+    return loadMeetings(list);
+  }
+
   private stopPoll(): void {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = null;
@@ -361,12 +401,19 @@ export class App {
       }
       for (const w of r.warnings) this.announce(w);
       let mailArrived = false;
+      let meetingArrived = false;
       for (const m of r.messages) {
         if (m.kind === "mail") {
           // Reloaded from the daemon rather than appended here, so the message
           // carries the record id the read/unread flags are keyed on.
           mailArrived = true;
           this.announce(`New mail from ${m.from}`);
+        } else if (m.kind === "meeting") {
+          // The daemon already filed it into the meeting (materialising the
+          // meeting first if it was unknown), so re-read rather than guess at
+          // the record id here.
+          meetingArrived = true;
+          this.announce(`New meeting message from ${m.from}`);
         } else {
           ingestIncoming(m.from, m);
           this.announce(`New message from ${m.from}`);
@@ -380,8 +427,16 @@ export class App {
       if (mailArrived || this.rail === "mail") {
         mailboxChanged = await this.reloadMailbox();
       }
+      let meetingsChanged = false;
+      if (meetingArrived || this.rail === "meetings") {
+        meetingsChanged = await this.reloadMeetings();
+      }
       // Never repaint over a half-written message.
-      if ((r.messages.length || presenceChanged || mailboxChanged) && !this.mailComposeOpen) {
+      const composing = this.mailComposeOpen || this.meetingCreateOpen || this.meetingAddOpen;
+      if (
+        (r.messages.length || presenceChanged || mailboxChanged || meetingsChanged) &&
+        !composing
+      ) {
         this.render();
       }
     } catch {
@@ -393,6 +448,7 @@ export class App {
     await api.lock();
     clearChatStore();
     clearMailStore();
+    clearMeetingStore();
     clearMockLocal();
     this.selectedNick = null;
     this.filesContactNick = null;
@@ -403,6 +459,12 @@ export class App {
     this.mailReplyTo = null;
     this.mailReplyThread = null;
     this.mailSearch = "";
+    this.meetingId = null;
+    this.meetingCreateOpen = false;
+    this.meetingCreateName = "";
+    this.meetingCreateMembers = [];
+    this.meetingAddOpen = false;
+    this.meetingAddMembers = [];
     this.unlockedAt = 0;
     this.stopPoll();
     await this.refreshStatus();
@@ -423,6 +485,8 @@ export class App {
       shell.appendChild(this.renderMainChat());
     } else if (this.rail === "trusts") {
       shell.appendChild(this.renderTrusts());
+    } else if (this.rail === "meetings") {
+      shell.appendChild(this.renderMeetings());
     } else if (this.rail === "mail") {
       shell.appendChild(this.renderMailFolders());
       shell.appendChild(this.renderMailMain());
@@ -439,6 +503,8 @@ export class App {
     if (this.profileNick) this.root.appendChild(this.renderProfile());
     if (this.recoveryModalCode) this.root.appendChild(this.renderRecoveryModal());
     if (this.trustDeleteNick) this.root.appendChild(this.renderTrustDeleteModal());
+    if (this.meetingCreateOpen) this.root.appendChild(this.renderMeetingCreateModal());
+    if (this.meetingAddOpen) this.root.appendChild(this.renderMeetingAddMemberModal());
   }
 
   private async maybeShowRecoveryCode(): Promise<void> {
@@ -577,6 +643,11 @@ export class App {
           if (changed && this.rail === "mail" && !this.mailComposeOpen) this.render();
         });
       }
+      if (id === "meetings") {
+        void this.reloadMeetings().then((changed) => {
+          if (changed && this.rail === "meetings" && !this.meetingCreateOpen) this.render();
+        });
+      }
     };
     return b;
   }
@@ -593,6 +664,7 @@ export class App {
     rail.appendChild(logo);
     rail.appendChild(this.railBtn("chats", "Chats", "chats"));
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
+    rail.appendChild(this.railBtn("meetings", "Meetings", "meetings"));
     rail.appendChild(this.railBtn("mail", "Mail", "mail", hasUnreadMail(this.mailPrefs())));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
@@ -1147,6 +1219,551 @@ export class App {
   private emailContact(nick: string): void {
     this.rail = "mail";
     this.openCompose({ to: nick });
+  }
+
+  // ---------------------------------------------------------------------
+  // Meetings
+  //
+  // A meeting is a local record in the vault, not a relay-side room: sending in
+  // one fans the message out to each member over their own 1:1 session. The
+  // daemon owns the record and the fan-out; this rail renders the daemon's view
+  // and drives create, send, and the local membership changes.
+  // ---------------------------------------------------------------------
+
+  private renderMeetings(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "meetings-pane";
+    pane.appendChild(this.renderMeetingsList());
+    pane.appendChild(this.renderMeetingDetail());
+    return pane;
+  }
+
+  /** The left column: a filter over meeting cards, newest first. */
+  private renderMeetingsList(): HTMLElement {
+    const col = document.createElement("div");
+    col.className = "meetings-list";
+
+    const head = document.createElement("div");
+    head.className = "meetings-list-head";
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.textContent = "Meetings";
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "btn-primary pressable meetings-new";
+    add.textContent = "New meeting";
+    add.disabled = this.contacts.length === 0;
+    add.title = this.contacts.length
+      ? "Create a meeting"
+      : "Add a trust before you can meet with anyone";
+    add.onclick = () => this.openMeetingCreate();
+    head.append(h, add);
+    col.appendChild(head);
+
+    const meetings = listMeetings();
+    if (!meetings.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state meetings-empty";
+      const t = document.createElement("h2");
+      t.className = "text-22";
+      t.textContent = "No meetings yet";
+      const p = document.createElement("p");
+      p.className = "muted";
+      p.textContent = this.contacts.length
+        ? "Start a meeting and bring a few people in."
+        : "Add a trust, then you can meet with them.";
+      empty.append(t, p);
+      if (this.contacts.length) {
+        const b = document.createElement("button");
+        b.className = "btn-primary pressable";
+        b.textContent = "New meeting";
+        b.onclick = () => this.openMeetingCreate();
+        empty.appendChild(b);
+      }
+      col.appendChild(empty);
+      return col;
+    }
+
+    const filter = document.createElement("div");
+    filter.className = "search-pill meetings-filter";
+    const filterInput = document.createElement("input");
+    filterInput.type = "search";
+    filterInput.placeholder = "Filter meetings";
+    filterInput.setAttribute("aria-label", "Filter meetings");
+    filter.append(icon("search"), filterInput);
+    col.appendChild(filter);
+
+    const cards = document.createElement("div");
+    cards.className = "meetings-cards";
+    for (const m of meetings) cards.appendChild(this.meetingCard(m));
+
+    const noMatch = document.createElement("p");
+    noMatch.className = "muted text-13 meetings-filter-empty";
+    noMatch.hidden = true;
+    noMatch.textContent = "No meetings match that filter.";
+    filterInput.oninput = () => {
+      const q = filterInput.value.trim().toLocaleLowerCase();
+      let shown = 0;
+      for (const el of Array.from(cards.children) as HTMLElement[]) {
+        const match =
+          !q || (el.dataset.meetingName ?? "").toLocaleLowerCase().includes(q);
+        el.hidden = !match;
+        if (match) shown++;
+      }
+      noMatch.hidden = shown > 0;
+    };
+
+    col.append(cards, noMatch);
+    return col;
+  }
+
+  /** One meeting card: name, member count, and a preview of the last message. */
+  private meetingCard(m: Meeting): HTMLElement {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = `tile meeting-card pressable${
+      this.meetingId === m.id ? " selected" : ""
+    }`;
+    card.dataset.meetingName = m.name;
+
+    const top = document.createElement("div");
+    top.className = "meeting-card-top";
+    const badge = document.createElement("span");
+    badge.className = "meeting-card-icon";
+    badge.appendChild(icon("meetings"));
+    const meta = document.createElement("div");
+    meta.className = "meeting-card-meta";
+    const name = document.createElement("div");
+    name.className = "text-17 meeting-card-name";
+    name.textContent = m.name;
+    const sub = document.createElement("div");
+    sub.className = "muted text-12";
+    sub.textContent = `${m.members.length} ${
+      m.members.length === 1 ? "member" : "members"
+    }`;
+    meta.append(name, sub);
+    top.append(badge, meta);
+    card.appendChild(top);
+
+    const preview = document.createElement("div");
+    preview.className = "meeting-card-preview muted text-13";
+    preview.textContent = meetingPreview(m);
+    card.appendChild(preview);
+
+    card.onclick = () => {
+      this.meetingId = m.id;
+      this.render();
+    };
+    return card;
+  }
+
+  /** The right column: the selected meeting's members and group chat. */
+  private renderMeetingDetail(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "meetings-detail";
+    const meeting = this.meetingId ? meetingById(this.meetingId) : undefined;
+    if (!meeting) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state";
+      const t = document.createElement("h2");
+      t.className = "text-22";
+      t.textContent = "Pick a meeting";
+      const p = document.createElement("p");
+      p.className = "muted";
+      p.textContent = "Choose a meeting on the left, or start a new one.";
+      empty.append(t, p);
+      pane.appendChild(empty);
+      return pane;
+    }
+
+    const header = document.createElement("div");
+    header.className = "meeting-header";
+    const titles = document.createElement("div");
+    const n = document.createElement("div");
+    n.className = "text-17";
+    n.style.fontWeight = "500";
+    n.textContent = meeting.name;
+    const sub = document.createElement("div");
+    sub.className = "text-13 muted";
+    sub.textContent = `${meeting.members.length} ${
+      meeting.members.length === 1 ? "member" : "members"
+    }`;
+    titles.append(n, sub);
+
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "btn-secondary pressable meeting-add-member";
+    addBtn.appendChild(icon("addMember"));
+    const addLabel = document.createElement("span");
+    addLabel.textContent = "Add member";
+    addBtn.appendChild(addLabel);
+    const remaining = candidatesToAdd(
+      meeting,
+      this.contacts.map((c) => c.nickname),
+    );
+    addBtn.disabled = remaining.length === 0;
+    addBtn.title = remaining.length
+      ? "Add a member"
+      : "Everyone you know is already in this meeting";
+    addBtn.onclick = () => {
+      this.meetingAddOpen = true;
+      this.meetingAddMembers = [];
+      this.render();
+    };
+    header.append(titles, addBtn);
+
+    // Member chips. Removing is local: it changes this vault's member list and
+    // stops future fan-out to them; it is not a shared change.
+    const members = document.createElement("div");
+    members.className = "meeting-members";
+    for (const nick of meeting.members) {
+      const chip = document.createElement("span");
+      chip.className = "member-chip";
+      const label = document.createElement("span");
+      label.className = "member-chip-label";
+      label.textContent = displayNick(nick);
+      chip.appendChild(label);
+      if (meeting.members.length > 1) {
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "member-chip-remove";
+        rm.setAttribute("aria-label", `Remove ${displayNick(nick)} from ${meeting.name}`);
+        rm.title = "Remove from meeting";
+        rm.textContent = "×";
+        rm.onclick = () => void this.removeMeetingMember(meeting.id, nick);
+        chip.appendChild(rm);
+      }
+      members.appendChild(chip);
+    }
+
+    const scroll = document.createElement("div");
+    scroll.className = "meeting-messages";
+    if (!meeting.messages.length) {
+      const hint = document.createElement("p");
+      hint.className = "muted text-13 meeting-no-messages";
+      hint.textContent = "No messages yet. Say hello.";
+      scroll.appendChild(hint);
+    }
+    let lastDay = "";
+    for (const msg of meeting.messages) {
+      const day = dayLabel(msg.createdAt);
+      if (day !== lastDay) {
+        lastDay = day;
+        const sep = document.createElement("div");
+        sep.className = "day-sep";
+        sep.textContent = day;
+        scroll.appendChild(sep);
+      }
+      const group = document.createElement("div");
+      group.className = `bubble-group ${msg.outgoing ? "out" : "in"}`;
+      if (!msg.outgoing) {
+        // A meeting is several people, so the sender has to be named.
+        const who = document.createElement("div");
+        who.className = "meeting-sender text-12 muted";
+        who.textContent = msg.from ? displayNick(msg.from) : "Unknown";
+        group.appendChild(who);
+      }
+      const b = document.createElement("div");
+      b.className = `bubble ${msg.outgoing ? "out" : "in"} tail`;
+      b.textContent = msg.body;
+      group.appendChild(b);
+      scroll.appendChild(group);
+    }
+    scroll.scrollTop = scroll.scrollHeight;
+
+    // No offline gate here: a meeting message is store-and-forward, so a member
+    // who is away still gets it when they next sync.
+    const composer = document.createElement("div");
+    composer.className = "composer";
+    const inner = document.createElement("div");
+    inner.className = "composer-inner";
+    const ta = document.createElement("textarea");
+    ta.rows = 1;
+    ta.placeholder = `Message ${meeting.name}`;
+    const send = document.createElement("button");
+    send.className = "send-fab btn-icon-round pressable";
+    send.appendChild(icon("send"));
+    const syncSend = () =>
+      send.classList.toggle("ready", ta.value.trim().length > 0);
+    ta.oninput = () => {
+      syncSend();
+      ta.style.height = "auto";
+      ta.style.height = `${ta.scrollHeight}px`;
+    };
+    ta.onkeydown = (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        void this.sendMeetingMessage(meeting.id, ta.value.trim(), ta, send);
+      }
+    };
+    send.onclick = () =>
+      void this.sendMeetingMessage(meeting.id, ta.value.trim(), ta, send);
+    inner.append(ta, send);
+    composer.appendChild(inner);
+    syncSend();
+
+    pane.append(header, members, scroll, composer);
+    return pane;
+  }
+
+  private openMeetingCreate(): void {
+    this.meetingCreateOpen = true;
+    this.meetingCreateName = "";
+    this.meetingCreateMembers = [];
+    this.render();
+  }
+
+  private renderMeetingCreateModal(): HTMLElement {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal meeting-create-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "New meeting");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "New meeting";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-2)";
+    p.textContent = "Give it a name and choose who is in it.";
+
+    const nameLabel = document.createElement("label");
+    nameLabel.className = "meeting-field";
+    const nameText = document.createElement("span");
+    nameText.className = "text-13";
+    nameText.textContent = "Name";
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "input-field";
+    nameInput.placeholder = "e.g. Weekly sync";
+    nameInput.autocomplete = "off";
+    nameInput.value = this.meetingCreateName;
+    nameLabel.append(nameText, nameInput);
+
+    const membersField = document.createElement("div");
+    membersField.className = "meeting-field";
+    const membersText = document.createElement("span");
+    membersText.className = "text-13";
+    membersText.textContent = "Members";
+    membersField.appendChild(membersText);
+
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.meetingCreateOpen = false;
+      this.render();
+    };
+    const create = document.createElement("button");
+    create.type = "button";
+    create.className = "btn-primary pressable";
+    create.textContent = "Create meeting";
+    // Declared before the picker so its change callback can reach it without a
+    // temporal-dead-zone reference.
+    const syncCreate = () => {
+      create.disabled =
+        this.meetingCreateName.trim().length === 0 ||
+        this.meetingCreateMembers.length === 0;
+    };
+
+    const picker = new ContactPicker({
+      items: this.contacts.map((c) => ({
+        nickname: c.nickname,
+        label: c.mail_handle
+          ? `${displayNick(c.nickname)} (${c.mail_handle}@${this.mailDomain})`
+          : displayNick(c.nickname),
+        keywords: c.nickname,
+      })),
+      multiple: true,
+      values: this.meetingCreateMembers,
+      label: "Members",
+      placeholder: "Type a name…",
+      emptyMessage: "No contacts yet. Add someone in Trusts first.",
+      noMatchMessage: "No contacts match that name.",
+      onChangeMulti: (nicks) => {
+        this.meetingCreateMembers = nicks;
+        syncCreate();
+      },
+    });
+    membersField.appendChild(picker.element);
+
+    nameInput.oninput = () => {
+      this.meetingCreateName = nameInput.value;
+      syncCreate();
+    };
+    create.onclick = () => void this.createMeeting();
+    syncCreate();
+
+    row.append(cancel, create);
+    modal.append(h, p, nameLabel, membersField, row);
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.meetingCreateOpen = false;
+        this.render();
+      }
+    };
+    queueMicrotask(() => nameInput.focus());
+    return back;
+  }
+
+  private renderMeetingAddMemberModal(): HTMLElement {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal meeting-add-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    const meeting = this.meetingId ? meetingById(this.meetingId) : undefined;
+    modal.setAttribute("aria-label", "Add a member");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Add a member";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-2)";
+    p.textContent = meeting
+      ? `Add someone to ${meeting.name}. Membership changes are local to you for now — they are not announced to the others.`
+      : "Add someone to this meeting.";
+
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.meetingAddOpen = false;
+      this.render();
+    };
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "btn-primary pressable";
+    add.textContent = "Add";
+    const syncAdd = () => {
+      add.disabled = this.meetingAddMembers.length === 0;
+    };
+
+    const remaining = meeting
+      ? candidatesToAdd(meeting, this.contacts.map((c) => c.nickname))
+      : [];
+    const picker = new ContactPicker({
+      items: remaining.map((nick) => {
+        const c = this.contacts.find((x) => x.nickname === nick);
+        return {
+          nickname: nick,
+          label: c?.mail_handle
+            ? `${displayNick(nick)} (${c.mail_handle}@${this.mailDomain})`
+            : displayNick(nick),
+          keywords: nick,
+        };
+      }),
+      multiple: true,
+      values: this.meetingAddMembers,
+      label: "Members to add",
+      placeholder: "Type a name…",
+      emptyMessage: "Everyone you know is already in this meeting.",
+      noMatchMessage: "No contacts match that name.",
+      onChangeMulti: (nicks) => {
+        this.meetingAddMembers = nicks;
+        syncAdd();
+      },
+    });
+
+    add.onclick = () => void this.addMeetingMembers();
+    syncAdd();
+
+    row.append(cancel, add);
+    modal.append(h, p, picker.element, row);
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.meetingAddOpen = false;
+        this.render();
+      }
+    };
+    return back;
+  }
+
+  private async createMeeting(): Promise<void> {
+    const name = this.meetingCreateName.trim();
+    if (!name || this.meetingCreateMembers.length === 0) {
+      this.announce("A meeting needs a name and at least one member.");
+      return;
+    }
+    try {
+      const created = await api.createMeeting(name, this.meetingCreateMembers);
+      this.meetingCreateOpen = false;
+      await this.reloadMeetings();
+      if (created) this.meetingId = created.id;
+      this.announce(`${name} created.`);
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't create the meeting.",
+      );
+    }
+  }
+
+  private async addMeetingMembers(): Promise<void> {
+    const meeting = this.meetingId ? meetingById(this.meetingId) : undefined;
+    if (!meeting || this.meetingAddMembers.length === 0) return;
+    try {
+      for (const nick of this.meetingAddMembers) {
+        await api.addMeetingMember(meeting.id, nick);
+      }
+      this.meetingAddOpen = false;
+      this.meetingAddMembers = [];
+      await this.reloadMeetings();
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't add that member.",
+      );
+    }
+  }
+
+  private async removeMeetingMember(
+    meetingId: string,
+    nickname: string,
+  ): Promise<void> {
+    try {
+      await api.removeMeetingMember(meetingId, nickname);
+      await this.reloadMeetings();
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't remove that member.",
+      );
+    }
+  }
+
+  private async sendMeetingMessage(
+    meetingId: string,
+    text: string,
+    ta: HTMLTextAreaElement,
+    send: HTMLButtonElement,
+  ): Promise<void> {
+    if (!text) return;
+    try {
+      await api.sendMeetingMessage(meetingId, text);
+      // Cleared only on success, so a failure leaves the text in the box.
+      ta.value = "";
+      send.classList.remove("ready");
+      await this.reloadMeetings();
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't send. Try again.",
+      );
+    }
   }
 
   /** Open the delete dialog for a contact, always with an empty confirmation. */
