@@ -4,6 +4,7 @@ import type {
   ChatRecordDto,
   ContactDto,
   InviteResponse,
+  MailboxDto,
   RecvResponse,
   StatusResponse,
 } from "./types";
@@ -138,7 +139,7 @@ export const api = {
     request<null>("/api/presence/heartbeat", { method: "POST" }),
   recv: () => request<RecvResponse>("/api/recv", { method: "POST" }),
   messages: () => request<ChatRecordDto[]>("/api/messages"),
-  mail: () => request<ChatRecordDto[]>("/api/mail"),
+  mail: () => request<MailboxDto>("/api/mail"),
   sendMail: (
     to: string,
     body: {
@@ -148,10 +149,29 @@ export const api = {
       attachments: { name: string; data_base64: string }[];
     },
   ) =>
-    request<{ thread_id: string }>("/api/mail/send", {
+    request<{ thread_id: string; queued: boolean }>("/api/mail/send", {
       method: "POST",
       body: JSON.stringify({ to, ...body }),
     }),
+  saveDraft: (body: {
+    id?: string;
+    thread_id?: string;
+    to: string;
+    subject?: string;
+    body: string;
+    attachments: { name: string; data_base64: string }[];
+  }) =>
+    request<{ id: string }>("/api/mail/draft", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  deleteDraft: (id: string) =>
+    request<null>(`/api/mail/draft/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  /** Remove a mail record from the log. Trash's "delete forever". */
+  deleteMail: (id: string) =>
+    request<null>(`/api/mail/${encodeURIComponent(id)}`, { method: "DELETE" }),
   setMailHandle: (handle: string) =>
     request<null>("/api/mail/handle", {
       method: "POST",

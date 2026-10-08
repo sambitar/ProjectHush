@@ -19,6 +19,20 @@ pub struct UiPrefs {
     /// Minutes of inactivity before the daemon locks; `0` disables idle auto-lock.
     #[serde(default = "default_auto_lock_minutes")]
     pub auto_lock_minutes: u32,
+    /// Mail record ids the user has opened.
+    ///
+    /// Read/star/archive/trash are *UI* state, not vault state, so they sit
+    /// beside mute and block instead of in the encrypted log: they are ids, not
+    /// content, and rewriting the log on every read receipt would be a lot of
+    /// disk churn for a checkbox. Ids are opaque, so this leaks counts at most.
+    #[serde(default)]
+    pub mail_read: Vec<String>,
+    #[serde(default)]
+    pub mail_starred: Vec<String>,
+    #[serde(default)]
+    pub mail_archived: Vec<String>,
+    #[serde(default)]
+    pub mail_trashed: Vec<String>,
 }
 
 fn default_theme() -> String {

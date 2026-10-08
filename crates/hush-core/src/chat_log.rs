@@ -27,10 +27,28 @@ pub struct MailAttachmentRecord {
     pub size: u64,
 }
 
+/// Where an outgoing mail message is in its journey.
+///
+/// Hush has no delivery receipt, so this is deliberately only two states: the
+/// relay accepted the ciphertext (`Sent`), or it did not and we still owe the
+/// recipient a copy (`Queued`). Anything finer would be a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MailState {
+    /// Handed to the relay. This is what the Sent folder shows.
+    #[default]
+    Sent,
+    /// Composed, recorded, but the relay did not accept it. The daemon retries
+    /// and flips this to `Sent`; the Outbox folder shows exactly these.
+    Queued,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ChatRecordPayload {
-    Text { body: String },
+    Text {
+        body: String,
+    },
     File {
         name: String,
         blob_id_hex: String,
@@ -41,6 +59,29 @@ pub enum ChatRecordPayload {
         subject: Option<String>,
         body: String,
         attachments: Vec<MailAttachmentRecord>,
+        /// Defaulted so records written before the Outbox existed decode as
+        /// `Sent`, which is what they are.
+        #[serde(default)]
+        state: MailState,
+    },
+    /// A composed message that has not been sent. Unlike mail this is mutable:
+    /// it is edited and deleted in place, which is why the log grew
+    /// `replace_payload`/`remove_record` alongside it.
+    Draft {
+        /// Set when the draft is a reply, so sending keeps the conversation.
+        #[serde(default)]
+        thread_id: Option<String>,
+        /// Recipient nickname; empty for a draft that is not addressed yet.
+        #[serde(default)]
+        to: String,
+        #[serde(default)]
+        subject: Option<String>,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        attachments: Vec<MailAttachmentRecord>,
+        #[serde(default)]
+        updated_ms: u64,
     },
 }
 
@@ -72,10 +113,6 @@ impl ChatLog {
         let packed = encrypt(master, &plain)?;
         fs::write(&self.path, packed)?;
         Ok(())
-    }
-
-    pub fn messages(&self) -> &[ChatRecord] {
-        &self.file.messages
     }
 
     pub fn append_text(
@@ -124,6 +161,7 @@ impl ChatLog {
         )
     }
 
+    /// Append an outgoing or incoming mail message, returning its record id.
     #[allow(clippy::too_many_arguments)]
     pub fn append_mail(
         &mut self,
@@ -134,11 +172,13 @@ impl ChatLog {
         subject: Option<&str>,
         body: &str,
         attachments: &[MailAttachmentRecord],
-    ) -> Result<(), Error> {
+        state: MailState,
+    ) -> Result<String, Error> {
+        let id = Uuid::new_v4().to_string();
         self.push(
             master,
             ChatRecord {
-                id: Uuid::new_v4().to_string(),
+                id: id.clone(),
                 contact_nick: contact_nick.to_string(),
                 outgoing,
                 ts_ms: now_ms(),
@@ -147,9 +187,76 @@ impl ChatLog {
                     subject: subject.map(|s| s.to_string()),
                     body: body.to_string(),
                     attachments: attachments.to_vec(),
+                    state,
                 },
             },
-        )
+        )?;
+        Ok(id)
+    }
+
+    /// Append a new draft, returning its record id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_draft(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        thread_id: Option<&str>,
+        to: &str,
+        subject: Option<&str>,
+        body: &str,
+        attachments: &[MailAttachmentRecord],
+    ) -> Result<String, Error> {
+        let id = Uuid::new_v4().to_string();
+        self.push(
+            master,
+            ChatRecord {
+                id: id.clone(),
+                // A draft has no peer yet when it is unaddressed, so the
+                // contact column is filled in when it is sent.
+                contact_nick: to.to_string(),
+                outgoing: true,
+                ts_ms: now_ms(),
+                payload: ChatRecordPayload::Draft {
+                    thread_id: thread_id.map(|t| t.to_string()),
+                    to: to.to_string(),
+                    subject: subject.map(|s| s.to_string()),
+                    body: body.to_string(),
+                    attachments: attachments.to_vec(),
+                    updated_ms: now_ms(),
+                },
+            },
+        )?;
+        Ok(id)
+    }
+
+    /// Replace one record's payload in place, keeping its id and contact.
+    ///
+    /// Returns `false` when the id is unknown, so callers can tell "nothing to
+    /// do" from "written".
+    pub fn replace_payload(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        id: &str,
+        payload: ChatRecordPayload,
+        ts_ms: u64,
+    ) -> Result<bool, Error> {
+        let Some(record) = self.file.messages.iter_mut().find(|r| r.id == id) else {
+            return Ok(false);
+        };
+        record.payload = payload;
+        record.ts_ms = ts_ms;
+        self.save(master)?;
+        Ok(true)
+    }
+
+    /// Drop a record. Returns `false` when the id is unknown.
+    pub fn remove_record(&mut self, master: &[u8; MASTER_KEY_LEN], id: &str) -> Result<bool, Error> {
+        let before = self.file.messages.len();
+        self.file.messages.retain(|r| r.id != id);
+        if self.file.messages.len() == before {
+            return Ok(false);
+        }
+        self.save(master)?;
+        Ok(true)
     }
 
     /// Mail records only, in log order. The Mail rail filters the same encrypted
@@ -159,6 +266,23 @@ impl ChatLog {
             .messages
             .iter()
             .filter(|r| matches!(r.payload, ChatRecordPayload::Mail { .. }))
+    }
+
+    /// Drafts only, newest first.
+    pub fn draft_records(&self) -> impl Iterator<Item = &ChatRecord> {
+        self.file
+            .messages
+            .iter()
+            .filter(|r| matches!(r.payload, ChatRecordPayload::Draft { .. }))
+    }
+
+    /// Everything the chat rail renders. Drafts live in this log for the
+    /// encryption and backup, but they are not chat history.
+    pub fn chat_records(&self) -> impl Iterator<Item = &ChatRecord> {
+        self.file
+            .messages
+            .iter()
+            .filter(|r| !matches!(r.payload, ChatRecordPayload::Draft { .. }))
     }
 
     fn push(&mut self, master: &[u8; 32], record: ChatRecord) -> Result<(), Error> {
@@ -191,12 +315,114 @@ mod tests {
                 blob_id_hex: "ab".into(),
                 size: 3,
             }],
+            MailState::Sent,
         )
         .unwrap();
 
         let reloaded = ChatLog::load(&dir, &master).unwrap();
         assert_eq!(reloaded.mail_records().count(), 1);
-        assert_eq!(reloaded.messages().len(), 1);
+        assert_eq!(reloaded.chat_records().count(), 1);
+    }
+
+    #[test]
+    fn a_queued_message_keeps_its_state_across_a_reload() {
+        let dir = std::env::temp_dir().join(format!("hush-queued-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        let id = log
+            .append_mail(&master, "alice", true, "t-1", None, "waiting", &[], MailState::Queued)
+            .unwrap();
+
+        let reloaded = ChatLog::load(&dir, &master).unwrap();
+        let record = reloaded.mail_records().next().unwrap();
+        assert_eq!(record.id, id);
+        assert!(matches!(
+            record.payload,
+            ChatRecordPayload::Mail {
+                state: MailState::Queued,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_record_written_before_the_outbox_decodes_as_sent() {
+        // The wire shape from before `state` existed. It must keep loading, and
+        // it must mean Sent rather than Queued.
+        let json = r#"{"messages":[{"id":"r1","contact_nick":"alice","outgoing":true,"ts_ms":1,
+            "payload":{"t":"mail","thread_id":"t-1","subject":null,"body":"old","attachments":[]}}]}"#;
+        let file: ChatLogFile = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            &file.messages[0].payload,
+            ChatRecordPayload::Mail {
+                state: MailState::Sent,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_draft_is_editable_and_deletable() {
+        let dir = std::env::temp_dir().join(format!("hush-draft-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        let id = log
+            .append_draft(&master, None, "alice", Some("hi"), "first", &[])
+            .unwrap();
+        assert_eq!(log.draft_records().count(), 1);
+
+        let replaced = log
+            .replace_payload(
+                &master,
+                &id,
+                ChatRecordPayload::Draft {
+                    thread_id: None,
+                    to: "alice".into(),
+                    subject: Some("hi".into()),
+                    body: "second".into(),
+                    attachments: vec![],
+                    updated_ms: 5,
+                },
+                5,
+            )
+            .unwrap();
+        assert!(replaced);
+
+        let reloaded = ChatLog::load(&dir, &master).unwrap();
+        match &reloaded.draft_records().next().unwrap().payload {
+            ChatRecordPayload::Draft { body, .. } => assert_eq!(body, "second"),
+            other => panic!("expected a draft, got {other:?}"),
+        }
+
+        let mut log = reloaded;
+        assert!(log.remove_record(&master, &id).unwrap());
+        assert_eq!(log.draft_records().count(), 0);
+        // Removing an unknown id reports "nothing to do" rather than erroring.
+        assert!(!log.remove_record(&master, &id).unwrap());
+    }
+
+    #[test]
+    fn a_draft_is_not_chat_history() {
+        let dir = std::env::temp_dir().join(format!("hush-draft-chat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        log.append_text(&master, "alice", true, "hello").unwrap();
+        log.append_draft(&master, None, "alice", None, "unsent", &[])
+            .unwrap();
+
+        assert_eq!(log.chat_records().count(), 1);
+        assert_eq!(log.draft_records().count(), 1);
+        // Both live in the one log; only the chat projection hides the draft.
+        assert_eq!(log.chat_records().count() + log.draft_records().count(), 2);
     }
 }
 

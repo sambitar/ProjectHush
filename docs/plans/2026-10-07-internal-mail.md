@@ -6,6 +6,11 @@
 build checklist and are left as written; the residual v1 limitations are listed in
 `docs/plans/2026-10-04-v1-milestones.md` under Task 5d.
 
+**Phase 5 (2026-10-07)** adds the mail-client shell on top of this transport: a seven-folder rail,
+message list with search, reading pane, full-pane composer, encrypted drafts, and a retrying Outbox.
+See [Phase 5](#phase-5--mail-client-ui-folders-drafts-and-the-outbox-2026-10-07) at the end of this
+document for the design deltas and the verification evidence.
+
 **Goal:** Two members on the same relay can send each other email-shaped messages — a subject, a body,
 and multiple attachments — that arrive even when the recipient is offline, over the existing
 end-to-end Signal transport, with an `name@myserver.com` handle that is a label bound to a key and not
@@ -1573,3 +1578,84 @@ Expected: 0 failures, no new clippy errors (the repo has pre-existing warnings; 
   receiving from non-members (that is `5e`), no sending to outsiders (that is `5f`), no group mail.
 - **Untested-by-construction risk.** The Mail rail's real behaviour needs the two-peer UI run; a green
   `cargo test` only covers the core and daemon. Task 9 is the evidence, not the unit suite.
+
+---
+
+## Phase 5 — Mail client UI: folders, drafts, and the Outbox (2026-10-07)
+
+**Status:** Implemented and verified in a browser against a live two-daemon harness. This phase turns
+the single thread list from Phase 3 into an email client: a folder rail, a message list with search, a
+reading pane, a full-pane composer, encrypted drafts, and a retrying Outbox.
+
+**Goal:** Mail should behave like mail. Everything a user does to a message — reading it, starring it,
+archiving it, trashing it, drafting a reply — has a home in the UI, and a message that cannot reach the
+relay is not lost.
+
+### Settled design (continued)
+
+| # | Decision |
+|---|---|
+| M8 | **Seven folders**: Inbox, Sent, Outbox, Drafts, Starred, Archive, Trash. Starred is a flag view, not a location, so a starred archived message appears in both. |
+| M9 | **Folder membership is derived, not stored.** `mail_read`, `mail_starred`, `mail_archived`, `mail_trashed` are id lists in `ui-prefs.json`; the encrypted log is never rewritten to file a message. Deleting forever is the one operation that drops a record. |
+| M10 | **Drafts live in the encrypted log**, as `ChatRecordPayload::Draft` alongside `Mail`. A draft is a message you have not sent; keeping it in `ui-prefs.json` would put its subject and body on disk in cleartext. |
+| M11 | **The log is mutable for drafts and for the Outbox state flip.** `ChatLog` gained `replace_payload` and `remove_record`, so editing a draft rewrites its record instead of appending a second one, and a queued message flips to `Sent` in place. |
+| M12 | **A retryable send failure queues instead of failing.** `send_mail` returns `MailOutcome { thread_id, queued }`; `Error::Relay` and `Error::Io` are recorded as `MailState::Queued` and the message lands in Outbox. Anything else (unknown contact, bad attachment) still fails loudly. |
+| M13 | **The daemon retries the Outbox on a timer**, not from the UI: `outbox_loop` flushes queued mail every 30s while unlocked, so a message goes out even if the window is closed. |
+| M14 | **`RelayClient` has a 15s request timeout.** A relay that accepts the connection and never answers would otherwise hang the `AccountWorker` — and with it every other work item. |
+| M15 | **Compose is a full pane**, not a modal: To (contact picker), Subject, Body, attachments, Save draft, Discard draft (only when editing a saved draft), Send. |
+
+### What changed
+
+| File | Change |
+|---|---|
+| `crates/hush-core/src/chat_log.rs` | `MailState { Sent, Queued }`, `state` on `Mail`, `ChatRecordPayload::Draft`, `append_draft`, `replace_payload`, `remove_record`, `mail_records`, `draft_records`, `chat_records` |
+| `crates/hush-core/src/account.rs` | `send_mail -> MailOutcome`, `retry_outbox`, `save_draft`, `delete_draft`, `delete_mail`, `queued_mail_count`, `draft_records` |
+| `crates/hush-core/src/relay_client.rs` | `REQUEST_TIMEOUT` (15s) on the HTTP client |
+| `crates/hush-core/tests/internal_mail.rs` | queue-and-retry, draft round-trip, draft not plaintext, draft is not chat history |
+| `crates/hush-daemon/src/account_worker.rs` | `SaveDraft`, `DeleteDraft`, `DeleteMail`, `RetryOutbox`, `DraftRecords`; `MailSent { thread_id, queued }` |
+| `crates/hush-daemon/src/main.rs` | `POST /api/mail/draft`, `DELETE /api/mail/draft/{id}`, `DELETE /api/mail/{id}`, `GET /api/mail` returns `{ mail, drafts }`, `outbox_loop`, `PUT`/`DELETE` in the dev CORS layer |
+| `crates/hush-daemon/src/ui_prefs.rs` | the four mail flag lists |
+| `apps/hush-tauri/src/lib/mailStore.ts` | rebuilt around folders, drafts, and flag-derived membership; `isUnread`, `inFolder`, `listFolder`, `searchMessages`, `folderCount`, `unreadCount` |
+| `apps/hush-tauri/src/app.ts` | folder sidebar, message list + search, reading pane with action toolbar, draft list, full-pane composer, discard |
+| `apps/hush-tauri/src/lib/icons.ts` | `inbox`, `clock`, `file-text`, `star`, `archive`, `trash-2`, `reply`, `chevron-left`, `x` |
+| `apps/hush-tauri/src/styles/app.css` | folder rail, message rows, reading pane, composer |
+
+### Verification (fresh output, this session)
+
+- `cargo test -p hush-core` — all suites pass, including
+  `mail_queues_while_the_relay_is_down_and_goes_out_on_retry`, `a_draft_is_saved_edited_and_deleted`,
+  `a_draft_body_is_not_plaintext_on_disk`, `a_draft_is_not_chat_history`,
+  `a_queued_message_keeps_its_state_across_a_reload`.
+- `bash scripts/smoke-mail.sh` — 13 checks pass end to end over a real relay.
+- `cd apps/hush-tauri && npx tsc --noEmit && npm run build` — clean.
+- `cargo clippy --workspace --all-targets` — the pre-existing baseline only (7 `redundant_closure` in
+  `backup.rs`, 4 `ptr_arg`, 1 `items_after_test_module`); the `type_complexity` this phase introduced in
+  `decode_attachments` was fixed with an `ApiErrorResponse` alias.
+- Browser run against a live harness (daemon `127.0.0.1:9876`, second peer `9877`, relay `8799`):
+  - archive moved a message out of Inbox into Archive, and it stayed in Starred;
+  - Move to Trash → Trash → Restore to Inbox returned it to Inbox with the Trash badge cleared;
+  - Move to Trash → Delete forever removed the record: `chat.enc` shrank, Trash emptied, and the id was
+    dropped from all four flag lists in `ui-prefs.json`;
+  - Save draft wrote a `Draft` record (`chat.enc` 1006 → 1318 bytes) with no plaintext subject on disk,
+    the Drafts badge appeared, and reopening the draft refilled To/Subject/Body; re-saving replaced the
+    record in place (no duplicate, log roughly unchanged);
+  - Discard draft removed the record and returned `chat.enc` to 1006 bytes;
+  - with the relay killed, Send produced `queued: true`, the message appeared in Outbox with the
+    "Queued — the relay is unreachable" toast, and after the relay restarted the daemon's `outbox_loop`
+    delivered it: the record flipped to `state: "sent"`, the sender's Outbox badge cleared, Sent went to
+    3, and the recipient ingested it under the same `thread_id`.
+
+### Known limitations to record, not hide
+
+- **Flag lists are pruned only on delete forever.** Ids in `mail_read`/`mail_starred`/`mail_archived`/
+  `mail_trashed` are dropped by the delete-forever path; a record removed by any future route would
+  leave its id behind. Harmless today (the lists are only read as sets) but worth a collection pass if a
+  second removal route appears.
+- **Delete forever orphans attachment blobs.** The vault has no collection pass, so the bytes stay
+  until the vault is rewritten. Same trade chat already makes for deleted files.
+- **Attachment blobs are not garbage collected** for the same reason, and `put_blob` is
+  content-addressed, so re-saving a draft with the same file does not grow the vault.
+- **No drag-and-drop, no multi-select, no per-message delete inside a thread.** Actions apply to the
+  message you opened, falling back to the newest message in the thread.
+- **The Inbox badge shows unread when there is any, otherwise the total**, so it reads as a count of
+  what wants attention. The other folders always show their total.

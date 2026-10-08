@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::backup::{export_vault, import_vault};
-use crate::chat_log::{ChatLog, MailAttachmentRecord};
+use crate::chat_log::{ChatLog, ChatRecordPayload, MailAttachmentRecord, MailState};
 use crate::device::{DeviceKeys, LEGACY_DEVICE_FILE};
 use crate::device_list::{DeviceList, DeviceRecord};
 use crate::prekey::PreKeyRecord;
@@ -32,6 +32,57 @@ use crate::wire::{decode_relay_blob, encode_relay_blob};
 /// The window is what makes revocation eventual rather than instant: a peer may
 /// still encrypt to a device that was revoked inside this window.
 const DEVICE_LIST_TTL_SECS: u64 = 5 * 60;
+
+/// What happened to a mail send: which thread it belongs to, and whether the
+/// relay actually took it.
+#[derive(Debug, Clone)]
+pub struct MailOutcome {
+    pub thread_id: String,
+    /// True when delivery failed and the message is sitting in the Outbox.
+    pub queued: bool,
+}
+
+/// A queued message lifted out of the log, so the send path can take `&mut self`
+/// while it runs.
+struct QueuedMail {
+    id: String,
+    contact: String,
+    thread_id: String,
+    subject: Option<String>,
+    body: String,
+    attachments: Vec<MailAttachmentRecord>,
+}
+
+/// Whether a failed delivery is worth another attempt.
+///
+/// An unreachable relay or a local IO failure is transient — that is the case
+/// the Outbox exists for. A session that cannot be built is not: retrying would
+/// fail identically forever, so it surfaces to the user instead of quietly
+/// piling up in the Outbox.
+///
+/// A misconfigured relay URL also reports as `Relay`, so a vault pointed at a
+/// bad address queues rather than erroring. That is visible (the message waits
+/// in the Outbox) and fixable in Settings, which beats discarding the mail.
+fn is_worth_retrying(e: &Error) -> bool {
+    matches!(e, Error::Relay(_) | Error::Io(_))
+}
+
+fn blob_id_from_hex(s: &str) -> Option<BlobId> {
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&bytes);
+    Some(BlobId(id))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// One device belonging to a contact.
 ///
@@ -383,8 +434,10 @@ impl Account {
         import_vault(dir, archive)
     }
 
-    pub fn chat_history(&self) -> &[crate::chat_log::ChatRecord] {
-        self.chat_log.messages()
+    /// The chat rail's history. Drafts share this encrypted log — that keeps one
+    /// unlock path and one backup — but they are not chat.
+    pub fn chat_history(&self) -> Vec<crate::chat_log::ChatRecord> {
+        self.chat_log.chat_records().cloned().collect()
     }
 
     pub fn read_blob(&self, id: &BlobId) -> Result<Vec<u8>, Error> {
@@ -580,10 +633,184 @@ impl Account {
     /// the contact is online. Attachments are inlined on the wire (capped) and
     /// also stored as encrypted vault blobs on our side so the sent message is
     /// openable after a restart.
+    /// Send an internal mail message.
+    ///
+    /// Mail is async by design: unlike `send_text`, this does not check whether
+    /// the contact is online. When the relay refuses the ciphertext the message
+    /// is recorded as `Queued` and reported as such rather than failing, so the
+    /// Outbox can retry it later. Only failures no amount of retrying would fix
+    /// are returned as errors.
     pub async fn send_mail(
         &mut self,
         nickname: &str,
         thread_id: Option<&str>,
+        subject: Option<&str>,
+        body: &str,
+        attachments: &[(String, Vec<u8>)],
+    ) -> Result<MailOutcome, Error> {
+        if attachments.len() > MAX_MAIL_ATTACHMENTS {
+            return Err(Error::TooManyAttachments(MAX_MAIL_ATTACHMENTS));
+        }
+        let total: usize = attachments.iter().map(|(_, d)| d.len()).sum();
+        if total > MAX_INLINE_FILE_BYTES {
+            return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
+        }
+        // Fail fast on an unknown recipient: a retry cannot conjure a contact.
+        if self.find_contact(nickname).is_none() {
+            return Err(Error::ContactNotFound);
+        }
+        let thread_id = thread_id
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        // Attachment bytes are stored before the record because the record holds
+        // blob ids: a queued message has to be able to find its bytes again on
+        // the retry. `put_blob` is content-addressed, so this is idempotent.
+        let records = self.store_attachments(attachments)?;
+        let wire: Vec<MailAttachment> = attachments
+            .iter()
+            .map(|(name, data)| MailAttachment {
+                name: name.clone(),
+                data: data.clone(),
+            })
+            .collect();
+
+        let state = match self
+            .send_payload_inner(
+                nickname,
+                MessagePayload::Mail {
+                    thread_id: thread_id.clone(),
+                    subject: subject.map(|s| s.to_string()),
+                    body: body.to_string(),
+                    attachments: wire,
+                },
+                false,
+            )
+            .await
+        {
+            Ok(()) => MailState::Sent,
+            Err(e) if is_worth_retrying(&e) => MailState::Queued,
+            Err(e) => return Err(e),
+        };
+
+        let master = *self.vault.master_key();
+        self.chat_log.append_mail(
+            &master, nickname, true, &thread_id, subject, body, &records, state,
+        )?;
+        Ok(MailOutcome {
+            thread_id,
+            queued: state == MailState::Queued,
+        })
+    }
+
+    /// Attempt delivery of every queued message again, marking the ones the
+    /// relay accepts as `Sent`. Returns how many went out.
+    ///
+    /// The daemon calls this on a timer while the vault is unlocked. A message
+    /// that fails again simply stays queued, and one whose attachment blob has
+    /// gone missing is left alone rather than silently emptied.
+    pub async fn retry_outbox(&mut self) -> Result<usize, Error> {
+        // Collected first: the send path needs `&mut self`, so the log cannot
+        // stay borrowed while it runs.
+        let queued: Vec<QueuedMail> = self
+            .chat_log
+            .mail_records()
+            .filter_map(|r| match &r.payload {
+                ChatRecordPayload::Mail {
+                    thread_id,
+                    subject,
+                    body,
+                    attachments,
+                    state: MailState::Queued,
+                } if r.outgoing => Some(QueuedMail {
+                    id: r.id.clone(),
+                    contact: r.contact_nick.clone(),
+                    thread_id: thread_id.clone(),
+                    subject: subject.clone(),
+                    body: body.clone(),
+                    attachments: attachments.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        let mut delivered = 0;
+        for mail in queued {
+            let mut wire = Vec::with_capacity(mail.attachments.len());
+            for a in &mail.attachments {
+                let Some(id) = blob_id_from_hex(&a.blob_id_hex) else {
+                    wire.clear();
+                    break;
+                };
+                match self.vault.get_blob(&id) {
+                    Ok(data) => wire.push(MailAttachment {
+                        name: a.name.clone(),
+                        data,
+                    }),
+                    Err(_) => {
+                        wire.clear();
+                        break;
+                    }
+                }
+            }
+            if wire.len() != mail.attachments.len() {
+                continue;
+            }
+
+            let payload = MessagePayload::Mail {
+                thread_id: mail.thread_id.clone(),
+                subject: mail.subject.clone(),
+                body: mail.body.clone(),
+                attachments: wire,
+            };
+            if self
+                .send_payload_inner(&mail.contact, payload, false)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let master = *self.vault.master_key();
+            self.chat_log.replace_payload(
+                &master,
+                &mail.id,
+                ChatRecordPayload::Mail {
+                    thread_id: mail.thread_id,
+                    subject: mail.subject,
+                    body: mail.body,
+                    attachments: mail.attachments,
+                    state: MailState::Sent,
+                },
+                now_ms(),
+            )?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// How many messages are waiting for the relay. Drives the Outbox count.
+    pub fn queued_mail_count(&self) -> usize {
+        self.chat_log
+            .mail_records()
+            .filter(|r| {
+                matches!(
+                    r.payload,
+                    ChatRecordPayload::Mail {
+                        state: MailState::Queued,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// Create a draft, or replace an existing one when `id` is set. Returns the
+    /// draft's record id.
+    pub async fn save_draft(
+        &mut self,
+        id: Option<&str>,
+        thread_id: Option<&str>,
+        to: &str,
         subject: Option<&str>,
         body: &str,
         attachments: &[(String, Vec<u8>)],
@@ -595,31 +822,56 @@ impl Account {
         if total > MAX_INLINE_FILE_BYTES {
             return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
         }
-        let thread_id = thread_id
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let records = self.store_attachments(attachments)?;
+        let master = *self.vault.master_key();
+        let stamp = now_ms();
+        let draft = |records: Vec<MailAttachmentRecord>| ChatRecordPayload::Draft {
+            thread_id: thread_id.map(|t| t.to_string()),
+            to: to.to_string(),
+            subject: subject.map(|s| s.to_string()),
+            body: body.to_string(),
+            attachments: records,
+            updated_ms: stamp,
+        };
 
-        let wire: Vec<MailAttachment> = attachments
-            .iter()
-            .map(|(name, data)| MailAttachment {
-                name: name.clone(),
-                data: data.clone(),
-            })
-            .collect();
-        self.send_payload_inner(
-            nickname,
-            MessagePayload::Mail {
-                thread_id: thread_id.clone(),
-                subject: subject.map(|s| s.to_string()),
-                body: body.to_string(),
-                attachments: wire,
-            },
-            false,
-        )
-        .await?;
+        if let Some(id) = id {
+            if self
+                .chat_log
+                .replace_payload(&master, id, draft(records.clone()), stamp)?
+            {
+                return Ok(id.to_string());
+            }
+            // Unknown id: the draft was deleted elsewhere (another window, or a
+            // device that linked later). Fall through and write a fresh record
+            // rather than losing what was just typed.
+        }
 
-        // Store our own copies as blobs, then record the message. `put_blob`
-        // borrows the vault, so the ids are collected before the log is written.
+        self.chat_log
+            .append_draft(&master, thread_id, to, subject, body, &records)
+    }
+
+    /// Discard a draft. Returns whether it existed.
+    pub async fn delete_draft(&mut self, id: &str) -> Result<bool, Error> {
+        let master = *self.vault.master_key();
+        self.chat_log.remove_record(&master, id)
+    }
+
+    /// Remove a mail message from the log for good, which is what "delete
+    /// forever" from Trash means. Attachment blobs it referenced are left in the
+    /// vault: there is no collection pass, the same trade chat already makes.
+    pub async fn delete_mail(&mut self, id: &str) -> Result<bool, Error> {
+        let master = *self.vault.master_key();
+        self.chat_log.remove_record(&master, id)
+    }
+
+    /// Write attachment bytes to the vault and describe them for the log.
+    ///
+    /// `put_blob` is content-addressed, so re-saving a draft or re-sending the
+    /// same file does not grow the vault.
+    fn store_attachments(
+        &self,
+        attachments: &[(String, Vec<u8>)],
+    ) -> Result<Vec<MailAttachmentRecord>, Error> {
         let mut records = Vec::with_capacity(attachments.len());
         for (name, data) in attachments {
             let id = self.vault.put_blob(data)?;
@@ -629,15 +881,15 @@ impl Account {
                 size: data.len() as u64,
             });
         }
-        let master = *self.vault.master_key();
-        self.chat_log.append_mail(
-            &master, nickname, true, &thread_id, subject, body, &records,
-        )?;
-        Ok(thread_id)
+        Ok(records)
     }
 
     pub fn mail_records(&self) -> Vec<crate::chat_log::ChatRecord> {
         self.chat_log.mail_records().cloned().collect()
+    }
+
+    pub fn draft_records(&self) -> Vec<crate::chat_log::ChatRecord> {
+        self.chat_log.draft_records().cloned().collect()
     }
 
     pub async fn heartbeat_presence(&self) -> Result<(), Error> {
@@ -1252,6 +1504,7 @@ impl Account {
                         subject.as_deref(),
                         body,
                         &records,
+                        MailState::Sent,
                     )?;
                     (None, blobs)
                 }
@@ -1341,6 +1594,7 @@ impl Account {
                     subject.as_deref(),
                     &body,
                     &records,
+                    MailState::Sent,
                 )?;
             }
             // A copy of a copy is meaningless and would loop if we ever fanned

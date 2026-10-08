@@ -12,6 +12,77 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-07 — Mail client UI: folders, drafts, Outbox
+
+### [FIXED] "Drafts are deletable" was implemented in the store and the daemon, and reachable from nowhere
+
+- **Attempted:** verified the new Drafts folder in the browser by saving a draft, reopening it, and
+  editing it. Then went looking for the delete control, because the requirement said drafts are
+  deletable.
+- **Symptom:** there was none. `deleteDraft` existed in `mailStore`/`api`, `DELETE /api/mail/draft/{id}`
+  existed on the daemon, and a core test (`a_draft_is_saved_edited_and_deleted`) passed — but the
+  rendered compose pane held only `Attach files`, `Save draft`, `Send`, and the draft row in the list
+  offered nothing. The capability was verified at every layer except the one the user touches.
+- **Resolution:** added a `Discard draft` button to the composer, shown only while editing a saved
+  draft (a brand-new message is abandoned by closing compose, and nothing was written for it). Verified
+  in the browser: the record is removed, `chat.enc` returns to its pre-draft size, and the Drafts badge
+  clears.
+- **Lesson:** a green core test proves the function, not the feature. For anything with a UI, the
+  acceptance check has to name the control that triggers it, and "deletable" is not satisfied by a
+  function nobody can call.
+
+### [FIXED] Dev-mode CORS rejected `PUT` and `DELETE`, so draft save and delete worked from curl and failed in the browser
+
+- **Attempted:** exercised the new draft endpoints from the running dev UI.
+- **Symptom:** the preflight was refused. `local_ui_cors` allowed `GET`, `POST`, `OPTIONS` only, so
+  `POST /api/mail/draft` (fine) worked while `DELETE /api/mail/draft/{id}` and any `PUT` were blocked by
+  the browser before the request left it. The same calls returned 204 from `curl`, which is exactly why
+  this was not caught earlier: the smoke script and the tests do not run through a browser.
+- **Resolution:** added `Method::PUT` and `Method::DELETE` to the CORS layer.
+- **Lesson:** a curl-only smoke suite cannot see CORS. When a UI slice adds a new HTTP method, the
+  allowed-methods list is part of the change.
+
+### [FIXED] Changing `send_mail`'s return type stopped `internal_mail.rs` compiling
+
+- **Attempted:** made `send_mail` return `Result<MailOutcome, Error>` so a queued send could be reported
+  to the caller instead of surfacing as an error.
+- **Symptom:** the crate no longer compiled — the existing tests in `crates/hush-core/tests/internal_mail.rs`
+  assert on the old `Result<(), Error>` shape, so every call site in that file was a type mismatch. The
+  change was correct and the tests were simply written against the previous signature.
+- **Resolution:** updated the existing assertions and added the new queue/retry, draft round-trip, and
+  draft-not-plaintext tests in the same pass.
+- **Lesson:** a return-type change in `hush-core` is a workspace-wide edit. Grep the tests in other
+  crates before running them, or the first signal is a compile wall.
+
+### [FIXED] New `decode_attachments` tripped `clippy::type_complexity`
+
+- **Attempted:** ran `cargo clippy --workspace --all-targets` after the slice, per the completion
+  standard, to check nothing new had been added to the pre-existing warning baseline.
+- **Symptom:** `warning: very complex type used` at `crates/hush-daemon/src/main.rs:779` — the
+  `Result<Vec<(String, Vec<u8>)>, (StatusCode, Json<ApiError>)>` return of the new helper. The rest of
+  the warnings (7 `redundant_closure` in `backup.rs`, 4 `ptr_arg`, 1 `items_after_test_module`) are
+  pre-existing and were confirmed against `git show HEAD`.
+- **Resolution:** named the error half `type ApiErrorResponse = (StatusCode, Json<ApiError>)` and used it
+  in the signature.
+- **Lesson:** a warning count is only meaningful against a baseline. Check the offending file against
+  `HEAD` before deciding whether a warning is yours.
+
+### [WORKED AROUND] A toolbar click that reports `[active, focused]` has not necessarily done anything
+
+- **Attempted:** clicked `Move to Trash`, `Restore to Inbox`, and `Delete forever` and read the DOM
+  immediately after each.
+- **Symptom:** the snapshot came back with the button `active, focused` and the pane completely
+  unchanged, which reads as a dead handler. The actions are async — each one writes `ui-prefs.json` over
+  HTTP and re-renders after the response — so the read raced the write. Re-checking the DOM a second
+  later showed the correct result every time; no code was at fault.
+- **Resolution:** after each action, wait for the settle (a short sleep, or poll the folder badge) before
+  reading the DOM. Do not click a second time: the duplicate click is what turns a slow write into an
+  apparent bug.
+- **Lesson:** an `active`/`focused` button is evidence of a click, not of an effect. Tooling-related,
+  not a repo problem.
+
+---
+
 ## 2026-10-07 — Two-peer presence: Alice and Bob could not see each other
 
 Symptom: in the `scripts/run-two-ui.sh` harness both peers listed each other with

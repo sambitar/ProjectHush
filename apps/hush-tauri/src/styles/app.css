@@ -602,11 +602,218 @@
   gap: var(--space-1);
 }
 
+/* ------------------------------------------------------------------ mail */
+
+/* Folders | list (or reading pane, or composer). The rail's 64px is outside. */
+.mail-folders {
+  width: 208px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding-bottom: var(--space-4);
+}
+
+.mail-address {
+  margin: 0 var(--space-4) var(--space-3);
+  word-break: break-all;
+}
+
+.mail-folder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 var(--space-2);
+  overflow: auto;
+}
+
+.mail-folder {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-dim);
+  text-align: left;
+  font-size: 14px;
+}
+
+.mail-folder:hover {
+  background: var(--surface-2);
+}
+
+.mail-folder.active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.mail-folder-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mail-folder-count {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.mail-folder-count.unread {
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.mail-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.mail-toolbar .search-pill {
+  margin: 0;
+  min-width: 240px;
+}
+
+.mail-list {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+}
+
+.mail-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-3) var(--space-5);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  text-align: left;
+}
+
+.mail-row:hover {
+  background: var(--surface-2);
+}
+
+/* The dot column keeps read and unread rows aligned. */
+.mail-row-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: transparent;
+}
+
+.mail-row.unread .mail-row-dot {
+  background: var(--accent);
+}
+
+.mail-row-who {
+  flex-shrink: 0;
+  width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  color: var(--text-dim);
+}
+
+.mail-row.unread .mail-row-who {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.mail-row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.mail-row-subject {
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mail-row.unread .mail-row-subject {
+  font-weight: 600;
+}
+
+.mail-row-snippet {
+  font-size: 12px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mail-row-right {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-faint);
+}
+
+.mail-row-queued {
+  font-size: 11px;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--warning-soft);
+  color: var(--warning-text);
+}
+
+.mail-empty {
+  padding: var(--space-6) var(--space-5);
+}
+
+.mail-read-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.mail-read-titles {
+  flex: 1;
+  min-width: 0;
+}
+
+.mail-read-titles h1 {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mail-read-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
 .mail-messages {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
   overflow: auto;
+  min-height: 0;
+  padding: var(--space-5);
 }
 
 .mail-message {
@@ -615,12 +822,23 @@
   border-radius: var(--radius-md);
   padding: var(--space-4);
   box-shadow: var(--shadow-1);
-  max-width: 640px;
+  max-width: 680px;
 }
 
 .mail-message.outgoing {
   background: var(--accent-soft);
   align-self: flex-end;
+}
+
+/* The message you clicked, so a thread makes it obvious where you came in. */
+.mail-message.open {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-2);
+}
+
+.mail-message-body {
+  white-space: pre-wrap;
+  margin-top: var(--space-2);
 }
 
 .mail-attachment {
@@ -652,6 +870,53 @@
   margin-top: 0;
 }
 
+.mail-compose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-width: 680px;
+  padding: var(--space-5);
+  overflow: auto;
+  min-height: 0;
+}
+
+.mail-compose-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.mail-compose-label {
+  flex-shrink: 0;
+  width: 64px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.mail-compose-row .input-field {
+  flex: 1;
+  min-width: 0;
+}
+
+.mail-compose-body {
+  min-height: 220px;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.5;
+}
+
+.mail-compose-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+/* Push the send button to the end, so it is always the last thing you reach. */
+.mail-compose-actions .btn-primary {
+  margin-left: auto;
+}
+
 .mail-composer {
   display: flex;
   flex-direction: column;
@@ -665,6 +930,6 @@
 }
 
 .mail-file-input {
-  font: inherit;
+  display: none;
 }
 

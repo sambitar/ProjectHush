@@ -19,6 +19,15 @@ import {
   Moon,
   Sun,
   Monitor,
+  Inbox,
+  Clock,
+  FileText,
+  Star,
+  Archive,
+  Trash2,
+  Reply,
+  ChevronLeft,
+  X,
   type IconNode,
 } from "lucide";
 
@@ -42,6 +51,15 @@ const ICONS: Record<string, IconNode> = {
   moon: Moon,
   sun: Sun,
   monitor: Monitor,
+  inbox: Inbox,
+  outbox: Clock,
+  drafts: FileText,
+  star: Star,
+  archive: Archive,
+  trash: Trash2,
+  reply: Reply,
+  back: ChevronLeft,
+  close: X,
 };
 
 export type IconName = keyof typeof ICONS;

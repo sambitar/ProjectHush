@@ -14,7 +14,7 @@ use axum::{
     body::Bytes,
     extract::{Path, State},
     http::{header, Method, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use clap::Parser;
@@ -167,7 +167,7 @@ fn local_ui_cors() -> CorsLayer {
                     || s == "tauri://localhost"
             })
         }))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE])
 }
 
@@ -222,6 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(auto_lock_loop(state.clone()));
     tokio::spawn(vault_mount_watch(state.clone()));
+    tokio::spawn(outbox_loop(state.clone()));
     suspend_lock::spawn_suspend_lock_watch(state.clone());
 
     let router = Router::new()
@@ -231,6 +232,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/change-passphrase", post(change_passphrase))
         .route("/api/mail/handle", post(set_mail_handle))
         .route("/api/mail/send", post(send_mail))
+        .route("/api/mail/draft", post(save_draft))
+        .route("/api/mail/draft/{id}", delete(delete_draft))
+        .route("/api/mail/{id}", delete(delete_mail))
         .route("/api/mail", get(mail))
         .route("/api/invite", post(invite))
         .route("/api/contacts", get(contacts))
@@ -441,10 +445,25 @@ async fn auto_lock_loop(state: Arc<App>) {
     }
 }
 
+/// Flush the Outbox on a timer while the vault is unlocked.
+///
+/// Queued mail is the one piece of work with no user action behind it: the
+/// message is already written, and the only thing missing is a relay that will
+/// take it. Retrying here means a message composed while the relay was down goes
+/// out on its own. A tick with nothing queued touches no network at all.
+async fn outbox_loop(state: Arc<App>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        if !*state.unlocked.lock().await {
+            continue;
+        }
+        let _ = state.worker.retry_outbox().await;
+    }
+}
+
 async fn touch(state: &App) {
     *state.unlocked_at.lock().await = Some(Instant::now());
 }
-
 fn map_err(result: WorkResult) -> Result<WorkResult, (StatusCode, Json<ApiError>)> {
     match result {
         WorkResult::Err(msg) if msg == "locked" => {
@@ -616,6 +635,8 @@ struct SendMailRequest {
 #[derive(Serialize)]
 struct SendMailResponse {
     thread_id: String,
+    /// True when the relay refused it and the message is in the Outbox.
+    queued: bool,
 }
 
 async fn send_mail(
@@ -623,18 +644,7 @@ async fn send_mail(
     Json(body): Json<SendMailRequest>,
 ) -> Result<Json<SendMailResponse>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    let mut attachments = Vec::with_capacity(body.attachments.len());
-    for a in &body.attachments {
-        let data = STANDARD.decode(a.data_base64.trim()).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiError {
-                    error: format!("invalid base64 for attachment {:?}", a.name),
-                }),
-            )
-        })?;
-        attachments.push((a.name.clone(), data));
-    }
+    let attachments = decode_attachments(&body.attachments)?;
     // An all-whitespace subject is no subject at all.
     let subject = body
         .subject
@@ -655,7 +665,9 @@ async fn send_mail(
             .await,
     )?;
     match result {
-        WorkResult::MailSent(thread_id) => Ok(Json(SendMailResponse { thread_id })),
+        WorkResult::MailSent { thread_id, queued } => {
+            Ok(Json(SendMailResponse { thread_id, queued }))
+        }
         _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
@@ -665,20 +677,131 @@ async fn send_mail(
     }
 }
 
+/// The Mail rail's whole mailbox. Messages and drafts come back together because
+/// every caller wants both, and two round trips would only be two chances for
+/// the two halves to disagree.
+#[derive(Serialize)]
+struct MailboxResponse {
+    mail: Vec<ChatRecord>,
+    drafts: Vec<ChatRecord>,
+}
+
 async fn mail(
     State(state): State<Arc<App>>,
-) -> Result<Json<Vec<ChatRecord>>, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<MailboxResponse>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    let result = map_err(state.worker.mail_records().await)?;
+    let mail = match map_err(state.worker.mail_records().await)? {
+        WorkResult::Mail(list) => list,
+        _ => return Err(unexpected_worker_response()),
+    };
+    let drafts = match map_err(state.worker.draft_records().await)? {
+        WorkResult::Drafts(list) => list,
+        _ => return Err(unexpected_worker_response()),
+    };
+    Ok(Json(MailboxResponse { mail, drafts }))
+}
+
+#[derive(Deserialize)]
+struct SaveDraftRequest {
+    /// Set to edit an existing draft; omitted to create one.
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    attachments: Vec<MailAttachmentInput>,
+}
+
+#[derive(Serialize)]
+struct SaveDraftResponse {
+    id: String,
+}
+
+async fn save_draft(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SaveDraftRequest>,
+) -> Result<Json<SaveDraftResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let attachments = decode_attachments(&body.attachments)?;
+    let subject = body
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let result = map_err(
+        state
+            .worker
+            .save_draft(
+                body.id,
+                body.thread_id,
+                body.to.trim(),
+                subject,
+                &body.body,
+                attachments,
+            )
+            .await,
+    )?;
     match result {
-        WorkResult::Mail(list) => Ok(Json(list)),
-        _ => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: "unexpected worker response".into(),
-            }),
-        )),
+        WorkResult::DraftSaved(id) => Ok(Json(SaveDraftResponse { id })),
+        _ => Err(unexpected_worker_response()),
     }
+}
+
+async fn delete_draft(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.delete_draft(&id).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Drop a mail record from the log. This is "delete forever" from Trash, not the
+/// trash flag — the flag lives in `ui-prefs`.
+async fn delete_mail(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.delete_mail(&id).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a handler returns next to a non-2xx status: the code and the JSON body.
+type ApiErrorResponse = (StatusCode, Json<ApiError>);
+
+fn decode_attachments(
+    attachments: &[MailAttachmentInput],
+) -> Result<Vec<(String, Vec<u8>)>, ApiErrorResponse> {
+    let mut out = Vec::with_capacity(attachments.len());
+    for a in attachments {
+        let data = STANDARD.decode(a.data_base64.trim()).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("invalid base64 for attachment {:?}", a.name),
+                }),
+            )
+        })?;
+        out.push((a.name.clone(), data));
+    }
+    Ok(out)
+}
+
+fn unexpected_worker_response() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            error: "unexpected worker response".into(),
+        }),
+    )
 }
 
 async fn invite(

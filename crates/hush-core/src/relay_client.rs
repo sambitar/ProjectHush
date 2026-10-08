@@ -8,6 +8,14 @@ pub struct RelayClient {
     http: Client,
 }
 
+/// How long a single relay request may take.
+///
+/// Without this, a relay address that black-holes traffic hangs on the OS TCP
+/// timeout — minutes — and every other request in the account worker queues
+/// behind it. The Outbox retry makes that load-bearing: it runs on a timer with
+/// nobody waiting on the result, so an unbounded request would freeze the UI.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Debug, Deserialize)]
 struct ListResponse {
     blobs: Vec<BlobMeta>,
@@ -101,6 +109,7 @@ impl RelayClient {
         Self::try_new(base).unwrap_or_else(|_| Self {
             base: base.trim().trim_end_matches('/').to_string(),
             http: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("http client"),
         })
@@ -111,6 +120,7 @@ impl RelayClient {
         Ok(Self {
             base,
             http: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("http client"),
         })

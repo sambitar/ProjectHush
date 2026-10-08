@@ -23,17 +23,31 @@ import {
 import { MAX_FILE_BYTES, RECV_POLL_MS } from "./lib/constants";
 import {
   clearMailStore,
+  draftById,
+  folderCount,
   getThread as getMailThread,
   hasUnreadMail,
-  ingestIncomingMail,
-  listThreads,
-  loadMail,
-  markThreadRead,
-  threadHasUnread,
+  isUnread,
+  listDrafts,
+  listFolder,
+  loadMailbox,
+  preview,
+  previewText,
+  searchMessages,
   threadSubject,
+  unreadCount,
   type MailAttachmentRef,
+  type MailFlags,
+  type MailFolder,
+  type MailMessage,
 } from "./lib/mailStore";
-import { getAutoLockMs, getAutoLockMinutes, patchUiPrefs } from "./lib/api/uiPrefs";
+import {
+  getAutoLockMs,
+  getAutoLockMinutes,
+  mailFlags,
+  patchUiPrefs,
+  setMailFlag,
+} from "./lib/api/uiPrefs";
 import { displayNick, getMockSettings, setMuted, setNickOverride, clearMockLocal, isMuted, refreshContactPrefs } from "./lib/api/mock";
 import { clearContactUiPrefs } from "./lib/api/uiPrefs";
 import { fileToBase64, formatBytes, formatRelative } from "./lib/format";
@@ -62,6 +76,31 @@ type SettingsSection =
 const MAX_MAIL_ATTACHMENTS = 8;
 const MAX_MAIL_BYTES = 256 * 1024;
 
+const MAIL_FOLDER_LABEL: Record<MailFolder, string> = {
+  inbox: "Inbox",
+  sent: "Sent",
+  outbox: "Outbox",
+  drafts: "Drafts",
+  starred: "Starred",
+  archive: "Archive",
+  trash: "Trash",
+};
+
+const MAIL_EMPTY: Record<MailFolder, string> = {
+  inbox: "No mail yet — write to a contact.",
+  sent: "Nothing sent yet.",
+  outbox: "Nothing waiting. Mail the relay could not take would queue here.",
+  drafts: "No drafts.",
+  starred: "No starred mail.",
+  archive: "Nothing archived.",
+  trash: "Trash is empty.",
+};
+
+/** `Re:` a subject, without stacking prefixes on an existing reply. */
+function reSubject(subject: string): string {
+  return /^re:/i.test(subject.trim()) ? subject : `Re: ${subject}`;
+}
+
 export class App {
   private root: HTMLElement;
   private status: StatusResponse | null = null;
@@ -81,10 +120,34 @@ export class App {
   private recoveryModalCode: string | null = null;
   private linkDevicePayload: string | null = null;
   private unlockLinkMode = false;
+  private mailFolder: MailFolder = "inbox";
+  /** The conversation open in the reading pane. */
   private mailThreadId: string | null = null;
+  /** The message the user clicked, highlighted inside its conversation. */
+  private mailOpenId: string | null = null;
+  private mailSearch = "";
   private mailComposeOpen = false;
+  /** Set when compose is editing an existing draft rather than a new message. */
+  private mailDraftId: string | null = null;
+  /** Reply target and thread, when compose was opened from a conversation. */
+  private mailReplyTo: string | null = null;
+  private mailReplyThread: string | null = null;
+  /** Subject to prefill, for a reply. */
+  private mailSubjectSeed: string | null = null;
+  /**
+   * Attachments held for the open compose.
+   *
+   * Bytes rather than refs, because both save and send post the bytes, and a
+   * draft being edited has to carry its existing files forward.
+   */
+  private mailComposeFiles: { name: string; dataBase64: string; size: number }[] = [];
   private mailHandle: string | null = null;
   private mailDomain = "myserver.com";
+
+  /** Read/star/archive/trash, straight from `ui-prefs.json`. */
+  private mailPrefs(): MailFlags {
+    return mailFlags();
+  }
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -134,8 +197,7 @@ export class App {
         }
         this.mailHandle = status.mail_handle ?? null;
         this.mailDomain = status.mail_domain ?? "myserver.com";
-        const mail = await api.mail();
-        if (mail) loadMail(mail);
+        await this.reloadMailbox();
         this.startPoll();
       }
     } catch {
@@ -162,6 +224,14 @@ export class App {
     this.pollTimer = window.setInterval(() => this.pollRecv(), RECV_POLL_MS);
   }
 
+  /** Pull the whole mailbox: messages and drafts arrive together so the two
+   *  halves of the Mail rail can never disagree. Returns whether it changed. */
+  private async reloadMailbox(): Promise<boolean> {
+    const box = await api.mail();
+    if (!box) return false;
+    return loadMailbox(box.mail ?? [], box.drafts ?? []);
+  }
+
   private stopPoll(): void {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = null;
@@ -185,15 +255,30 @@ export class App {
         return;
       }
       for (const w of r.warnings) this.announce(w);
+      let mailArrived = false;
       for (const m of r.messages) {
         if (m.kind === "mail") {
-          if (ingestIncomingMail(m)) this.announce(`New mail from ${m.from}`);
+          // Reloaded from the daemon rather than appended here, so the message
+          // carries the record id the read/unread flags are keyed on.
+          mailArrived = true;
+          this.announce(`New mail from ${m.from}`);
         } else {
           ingestIncoming(m.from, m);
           this.announce(`New message from ${m.from}`);
         }
       }
-      if (r.messages.length || presenceChanged) this.render();
+      // Mail also changes without an incoming message reaching this poll: the
+      // daemon's Outbox flush moves a message from Queued to Sent, and another
+      // device can file or delete one. While the Mail rail is up, re-read the
+      // mailbox so the list is never stale.
+      let mailboxChanged = false;
+      if (mailArrived || this.rail === "mail") {
+        mailboxChanged = await this.reloadMailbox();
+      }
+      // Never repaint over a half-written message.
+      if ((r.messages.length || presenceChanged || mailboxChanged) && !this.mailComposeOpen) {
+        this.render();
+      }
     } catch {
       /* daemon busy */
     }
@@ -207,7 +292,12 @@ export class App {
     this.selectedNick = null;
     this.filesContactNick = null;
     this.mailThreadId = null;
+    this.mailOpenId = null;
     this.mailComposeOpen = false;
+    this.mailDraftId = null;
+    this.mailReplyTo = null;
+    this.mailReplyThread = null;
+    this.mailSearch = "";
     this.unlockedAt = 0;
     this.stopPoll();
     await this.refreshStatus();
@@ -231,7 +321,8 @@ export class App {
       shell.appendChild(this.renderConvList());
       shell.appendChild(this.renderMainChat());
     } else if (this.rail === "mail") {
-      shell.appendChild(this.renderMail());
+      shell.appendChild(this.renderMailFolders());
+      shell.appendChild(this.renderMailMain());
     } else if (this.rail === "files") {
       shell.appendChild(this.renderFiles());
     } else if (this.rail === "vault") {
@@ -477,6 +568,13 @@ export class App {
     b.onclick = () => {
       this.rail = id;
       this.render();
+      // The Mail rail reads the encrypted log, so pick up anything that landed
+      // while another rail was showing.
+      if (id === "mail") {
+        void this.reloadMailbox().then((changed) => {
+          if (changed && this.rail === "mail" && !this.mailComposeOpen) this.render();
+        });
+      }
     };
     return b;
   }
@@ -492,7 +590,7 @@ export class App {
     logo.appendChild(icon("vault"));
     rail.appendChild(logo);
     rail.appendChild(this.railBtn("chats", "Chats", "chats"));
-    rail.appendChild(this.railBtn("mail", "Mail", "mail", hasUnreadMail()));
+    rail.appendChild(this.railBtn("mail", "Mail", "mail", hasUnreadMail(this.mailPrefs())));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
     rail.appendChild(spacer);
@@ -1042,7 +1140,90 @@ export class App {
     return this.mailHandle ? `${this.mailHandle}@${this.mailDomain}` : null;
   }
 
-  private renderMail(): HTMLElement {
+  /** A 14px icon, for the inline marks in list rows. */
+  private iconSmall(name: IconName): SVGElement {
+    const el = icon(name);
+    el.setAttribute("width", "14");
+    el.setAttribute("height", "14");
+    return el;
+  }
+
+  // ------------------------------------------------------------- sidebar
+
+  private renderMailFolders(): HTMLElement {
+    const col = document.createElement("div");
+    col.className = "mail-folders";
+
+    const head = document.createElement("div");
+    head.className = "conv-list-header";
+    const h = document.createElement("span");
+    h.className = "text-22";
+    h.textContent = "Mail";
+    const compose = document.createElement("button");
+    compose.type = "button";
+    compose.className = "btn-icon-round pressable";
+    compose.appendChild(icon("plus"));
+    compose.setAttribute("aria-label", "Compose");
+    compose.onclick = () => this.openCompose({});
+    head.append(h, compose);
+
+    const addr = document.createElement("p");
+    addr.className = "muted text-12 mail-address";
+    addr.textContent =
+      this.mailAddress() ?? "No address yet — set one in Settings → Profile.";
+    col.append(head, addr);
+
+    const flags = this.mailPrefs();
+    const folders: { id: MailFolder; ic: IconName }[] = [
+      { id: "inbox", ic: "inbox" },
+      { id: "sent", ic: "send" },
+      { id: "outbox", ic: "outbox" },
+      { id: "drafts", ic: "drafts" },
+      { id: "starred", ic: "star" },
+      { id: "archive", ic: "archive" },
+      { id: "trash", ic: "trash" },
+    ];
+
+    const list = document.createElement("div");
+    list.className = "mail-folder-list";
+    for (const f of folders) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `mail-folder pressable${this.mailFolder === f.id ? " active" : ""}`;
+      btn.appendChild(icon(f.ic));
+      const label = document.createElement("span");
+      label.className = "mail-folder-name";
+      label.textContent = MAIL_FOLDER_LABEL[f.id];
+      btn.appendChild(label);
+
+      // Inbox shows how much is unread; the rest show how much is in them.
+      const unread = f.id === "inbox" ? unreadCount(flags) : 0;
+      const count = unread > 0 ? unread : folderCount(f.id, flags);
+      if (count > 0) {
+        const badge = document.createElement("span");
+        badge.className = unread > 0 ? "mail-folder-count unread" : "mail-folder-count";
+        badge.textContent = String(count);
+        btn.appendChild(badge);
+      }
+      btn.onclick = () => this.openFolder(f.id);
+      list.appendChild(btn);
+    }
+    col.appendChild(list);
+    return col;
+  }
+
+  private openFolder(folder: MailFolder): void {
+    this.mailFolder = folder;
+    this.mailThreadId = null;
+    this.mailOpenId = null;
+    this.mailComposeOpen = false;
+    this.mailDraftId = null;
+    this.render();
+  }
+
+  // ----------------------------------------------------------- main pane
+
+  private renderMailMain(): HTMLElement {
     if (this.mailComposeOpen) return this.renderMailCompose();
     if (this.mailThreadId) return this.renderMailThread(this.mailThreadId);
     return this.renderMailList();
@@ -1051,133 +1232,327 @@ export class App {
   private renderMailList(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane";
-    pane.style.padding = "var(--space-5)";
-    const head = document.createElement("div");
-    head.style.display = "flex";
-    head.style.alignItems = "center";
-    head.style.justifyContent = "space-between";
-    const h = document.createElement("h1");
-    h.className = "text-22";
-    h.textContent = "Mail";
-    const newBtn = document.createElement("button");
-    newBtn.type = "button";
-    newBtn.className = "btn-primary pressable";
-    newBtn.textContent = "New mail";
-    newBtn.onclick = () => {
-      this.mailComposeOpen = true;
+
+    const bar = document.createElement("div");
+    bar.className = "mail-toolbar";
+    const title = document.createElement("h1");
+    title.className = "text-17";
+    title.textContent = MAIL_FOLDER_LABEL[this.mailFolder];
+    const search = document.createElement("div");
+    search.className = "search-pill";
+    search.appendChild(icon("search"));
+    const inp = document.createElement("input");
+    inp.placeholder = "Search mail";
+    inp.value = this.mailSearch;
+    inp.oninput = () => {
+      this.mailSearch = inp.value;
       this.render();
     };
-    head.append(h, newBtn);
-    const hint = document.createElement("p");
-    hint.className = "muted text-13";
-    hint.style.marginTop = "var(--space-2)";
-    hint.textContent = this.mailAddress()
-      ? `Your address is ${this.mailAddress()}`
-      : "Set your address in Settings → Profile so contacts can recognise you.";
-    pane.append(head, hint);
+    search.appendChild(inp);
+    bar.append(title, search);
+    pane.appendChild(bar);
 
-    const threads = listThreads();
-    if (!threads.length) {
-      const empty = document.createElement("p");
-      empty.className = "muted";
-      empty.style.marginTop = "var(--space-5)";
-      empty.textContent = "No mail yet — write to a contact.";
-      pane.appendChild(empty);
+    if (this.mailFolder === "drafts") {
+      pane.appendChild(this.renderDraftList());
       return pane;
     }
-    const list = document.createElement("div");
-    list.className = "mail-thread-list";
-    list.style.marginTop = "var(--space-4)";
-    for (const t of threads) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "conv-row pressable";
-      row.style.width = "100%";
-      row.style.textAlign = "left";
-      const meta = document.createElement("div");
-      meta.style.flex = "1";
-      meta.style.minWidth = "0";
-      const subject = document.createElement("div");
-      subject.className = "text-15";
-      subject.style.fontWeight = "500";
-      subject.textContent = t.subject;
-      const sub = document.createElement("div");
-      sub.className = "text-13 muted";
-      sub.textContent = `${displayNick(t.contactNick)} · ${t.count} message${t.count === 1 ? "" : "s"}`;
-      meta.append(subject, sub);
-      const time = document.createElement("span");
-      time.className = "text-12 faint";
-      time.textContent = formatRelative(t.lastAt);
-      if (threadHasUnread(t.threadId)) {
-        const dot = document.createElement("span");
-        dot.className = "mail-unread-dot";
-        dot.setAttribute("aria-label", "Unread");
-        row.append(dot);
-      }
-      row.append(meta, time);
-      row.onclick = () => {
-        markThreadRead(t.threadId);
-        this.mailThreadId = t.threadId;
-        this.mailComposeOpen = false;
-        this.render();
-      };
-      list.appendChild(row);
+
+    const flags = this.mailPrefs();
+    const rows = searchMessages(
+      listFolder(this.mailFolder, flags),
+      this.mailSearch,
+    );
+    if (!rows.length) {
+      pane.appendChild(
+        this.mailEmpty(
+          this.mailSearch
+            ? "No mail matches that search."
+            : MAIL_EMPTY[this.mailFolder],
+        ),
+      );
+      return pane;
     }
+
+    const list = document.createElement("div");
+    list.className = "mail-list";
+    for (const m of rows) list.appendChild(this.mailRow(m, flags));
     pane.appendChild(list);
     return pane;
+  }
+
+  /** One row in the message list: who, subject, snippet, when. */
+  private mailRow(m: MailMessage, flags: MailFlags): HTMLElement {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `mail-row pressable${isUnread(m, flags) ? " unread" : ""}`;
+
+    const dot = document.createElement("span");
+    dot.className = "mail-row-dot";
+
+    const who = document.createElement("span");
+    who.className = "mail-row-who";
+    who.textContent = m.outgoing
+      ? `To ${displayNick(m.contactNick)}`
+      : displayNick(m.contactNick);
+
+    const main = document.createElement("div");
+    main.className = "mail-row-main";
+    const subject = document.createElement("div");
+    subject.className = "mail-row-subject";
+    subject.textContent = m.subject || "(no subject)";
+    const snip = document.createElement("div");
+    snip.className = "mail-row-snippet";
+    snip.textContent = preview(m);
+    main.append(subject, snip);
+
+    const right = document.createElement("div");
+    right.className = "mail-row-right";
+    const time = document.createElement("span");
+    time.className = "text-12 faint";
+    time.textContent = formatRelative(m.createdAt);
+    right.appendChild(time);
+    if (m.state === "queued") {
+      const queued = document.createElement("span");
+      queued.className = "mail-row-queued";
+      queued.textContent = "Queued";
+      right.appendChild(queued);
+    }
+    if (flags.starred.has(m.id)) right.appendChild(this.iconSmall("star"));
+    if (m.attachments.length) right.appendChild(this.iconSmall("attach"));
+
+    row.append(dot, who, main, right);
+    row.onclick = () => this.openMessage(m);
+    return row;
+  }
+
+  private renderDraftList(): HTMLElement {
+    const drafts = listDrafts();
+    if (!drafts.length) return this.mailEmpty(MAIL_EMPTY.drafts);
+
+    const list = document.createElement("div");
+    list.className = "mail-list";
+    for (const d of drafts) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "mail-row pressable";
+
+      const dot = document.createElement("span");
+      dot.className = "mail-row-dot";
+
+      const who = document.createElement("span");
+      who.className = "mail-row-who";
+      who.textContent = d.to ? `To ${displayNick(d.to)}` : "No recipient";
+
+      const main = document.createElement("div");
+      main.className = "mail-row-main";
+      const subject = document.createElement("div");
+      subject.className = "mail-row-subject";
+      subject.textContent = d.subject || "(no subject)";
+      const snip = document.createElement("div");
+      snip.className = "mail-row-snippet";
+      snip.textContent = previewText(d.body, d.attachments.length);
+      main.append(subject, snip);
+
+      const right = document.createElement("div");
+      right.className = "mail-row-right";
+      const time = document.createElement("span");
+      time.className = "text-12 faint";
+      time.textContent = formatRelative(d.updatedAt);
+      right.appendChild(time);
+      if (d.attachments.length) right.appendChild(this.iconSmall("attach"));
+
+      row.append(dot, who, main, right);
+      row.onclick = () => this.openCompose({ draftId: d.id });
+      list.appendChild(row);
+    }
+    return list;
+  }
+
+  /** Open a message: show its conversation, and mark what you have seen read. */
+  private openMessage(m: MailMessage): void {
+    this.mailThreadId = m.threadId;
+    this.mailOpenId = m.id;
+    this.mailComposeOpen = false;
+    this.mailDraftId = null;
+    this.render();
+    // The read flags are a prefs write, so the pane opens first and the unread
+    // dot clears a moment later rather than holding up the click.
+    void this.markThreadRead(m.threadId).then(() => {
+      if (this.mailThreadId === m.threadId) this.render();
+    });
+  }
+
+  private async markThreadRead(threadId: string): Promise<void> {
+    const flags = this.mailPrefs();
+    const unseen = getMailThread(threadId).filter((m) => isUnread(m, flags));
+    if (!unseen.length) return;
+    const read = new Set(flags.read);
+    for (const m of unseen) read.add(m.id);
+    await patchUiPrefs({ mail_read: [...read] });
   }
 
   private renderMailThread(threadId: string): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane";
-    pane.style.padding = "var(--space-5)";
     const msgs = getMailThread(threadId);
-    const contact = msgs[0]?.contactNick ?? "";
+    const contact =
+      msgs.find((m) => !m.outgoing)?.contactNick ?? msgs[0]?.contactNick ?? "";
+    const flags = this.mailPrefs();
+    // Actions apply to the message you clicked, falling back to the newest one.
+    const targetId = this.mailOpenId ?? msgs[msgs.length - 1]?.id ?? "";
+
+    const head = document.createElement("div");
+    head.className = "mail-read-head";
     const back = document.createElement("button");
     back.type = "button";
-    back.className = "btn-secondary text-13 pressable";
-    back.textContent = "← All mail";
+    back.className = "btn-icon-round pressable";
+    back.appendChild(icon("back"));
+    back.setAttribute("aria-label", `Back to ${MAIL_FOLDER_LABEL[this.mailFolder]}`);
     back.onclick = () => {
       this.mailThreadId = null;
+      this.mailOpenId = null;
       this.render();
     };
+
+    const titles = document.createElement("div");
+    titles.className = "mail-read-titles";
     const h = document.createElement("h1");
-    h.className = "text-22";
-    h.style.marginTop = "var(--space-4)";
-    h.textContent = threadSubject(msgs);
-    const sub = document.createElement("p");
+    h.className = "text-17";
+    h.textContent = threadSubject(threadId);
+    const sub = document.createElement("div");
     sub.className = "muted text-13";
-    sub.textContent = `With ${displayNick(contact)}`;
-    pane.append(back, h, sub);
+    sub.textContent = `With ${displayNick(contact)} · ${msgs.length} message${msgs.length === 1 ? "" : "s"}`;
+    titles.append(h, sub);
+
+    const actions = document.createElement("div");
+    actions.className = "mail-read-actions";
+    if (flags.trashed.has(targetId)) {
+      actions.append(
+        this.mailAction("Restore to Inbox", "inbox", () =>
+          void this.flagMail("mail_trashed", targetId, false),
+        ),
+        this.mailAction("Delete forever", "trash", () =>
+          void this.deleteMailForever(targetId),
+        ),
+      );
+    } else {
+      const starred = flags.starred.has(targetId);
+      actions.append(
+        this.mailAction(starred ? "Unstar" : "Star", "star", () =>
+          void this.flagMail("mail_starred", targetId, !starred), starred),
+        this.mailAction("Archive", "archive", () =>
+          void this.flagMail("mail_archived", targetId, true),
+        ),
+        this.mailAction("Move to Trash", "trash", () =>
+          void this.flagMail("mail_trashed", targetId, true),
+        ),
+      );
+    }
+    actions.appendChild(
+      this.mailAction("Reply", "reply", () =>
+        this.openCompose({
+          to: contact,
+          threadId,
+          subject: reSubject(threadSubject(threadId)),
+        }),
+      ),
+    );
+    head.append(back, titles, actions);
+    pane.appendChild(head);
 
     const list = document.createElement("div");
     list.className = "mail-messages";
-    list.style.marginTop = "var(--space-4)";
     for (const m of msgs) {
       const card = document.createElement("div");
-      card.className = `mail-message${m.outgoing ? " outgoing" : ""}`;
+      card.className = `mail-message${m.outgoing ? " outgoing" : ""}${m.id === this.mailOpenId ? " open" : ""}`;
       const meta = document.createElement("div");
       meta.className = "text-12 faint";
       meta.textContent = `${m.outgoing ? "You" : displayNick(m.contactNick)} · ${formatRelative(m.createdAt)}`;
       const body = document.createElement("div");
-      body.className = "text-15";
-      body.style.whiteSpace = "pre-wrap";
+      body.className = "text-15 mail-message-body";
       body.textContent = m.body;
       card.append(meta, body);
-      for (const a of m.attachments) {
-        card.appendChild(this.mailAttachmentChip(a));
-      }
+      for (const a of m.attachments) card.appendChild(this.mailAttachmentChip(a));
       list.appendChild(card);
     }
     pane.appendChild(list);
-    pane.appendChild(
-      this.renderMailComposer({
-        to: contact,
-        threadId,
-        subject: msgs.find((m) => m.subject)?.subject,
-      }),
-    );
     return pane;
+  }
+
+  private mailAction(
+    label: string,
+    ic: IconName,
+    onClick: () => void,
+    active = false,
+  ): HTMLElement {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = `btn-icon-round pressable${active ? " active" : ""}`;
+    b.appendChild(icon(ic));
+    b.setAttribute("aria-label", label);
+    b.title = label;
+    b.onclick = onClick;
+    return b;
+  }
+
+  private mailEmpty(text: string): HTMLElement {
+    const empty = document.createElement("p");
+    empty.className = "muted mail-empty";
+    empty.textContent = text;
+    return empty;
+  }
+
+  /**
+   * Flip one folder flag.
+   *
+   * Folder membership is derived from these lists, so filing a message is a
+   * prefs write rather than a rewrite of the encrypted log.
+   */
+  private async flagMail(
+    flag: "mail_starred" | "mail_archived" | "mail_trashed",
+    id: string,
+    on: boolean,
+  ): Promise<void> {
+    if (!id) return;
+    await setMailFlag(flag, id, on);
+    // Filing the open message away drops you back to the list it left.
+    if (on && (flag === "mail_trashed" || flag === "mail_archived")) {
+      this.mailThreadId = null;
+      this.mailOpenId = null;
+    }
+    this.render();
+  }
+
+  /**
+   * Remove a message from the encrypted log for good.
+   *
+   * The log is the archive, so this really does drop the record — but the
+   * attachment blobs it pointed at are left in the vault, which has no
+   * collection pass. That is the same trade chat already makes.
+   */
+  private async deleteMailForever(id: string): Promise<void> {
+    if (!id) return;
+    try {
+      await api.deleteMail(id);
+    } catch (e) {
+      this.announce(e instanceof AppError ? e.message : "Could not delete.");
+      return;
+    }
+    // Drop the id from the flag lists too, or they accumulate ids for records
+    // that no longer exist.
+    const flags = this.mailPrefs();
+    const drop = (s: Set<string>) => [...s].filter((x) => x !== id);
+    await patchUiPrefs({
+      mail_read: drop(flags.read),
+      mail_starred: drop(flags.starred),
+      mail_archived: drop(flags.archived),
+      mail_trashed: drop(flags.trashed),
+    });
+    this.mailThreadId = null;
+    this.mailOpenId = null;
+    await this.reloadMailbox();
+    this.announce("Message deleted");
+    this.render();
   }
 
   private mailAttachmentChip(a: MailAttachmentRef): HTMLElement {
@@ -1201,42 +1576,88 @@ export class App {
     return chip;
   }
 
-  private renderMailCompose(): HTMLElement {
-    const pane = document.createElement("div");
-    pane.className = "main-pane";
-    pane.style.padding = "var(--space-5)";
-    const back = document.createElement("button");
-    back.type = "button";
-    back.className = "btn-secondary text-13 pressable";
-    back.textContent = "← All mail";
-    back.onclick = () => {
-      this.mailComposeOpen = false;
-      this.render();
-    };
-    const h = document.createElement("h1");
-    h.className = "text-22";
-    h.style.marginTop = "var(--space-4)";
-    h.textContent = "New mail";
-    pane.append(back, h, this.renderMailComposer({}));
-    return pane;
-  }
+  // ------------------------------------------------------------- compose
 
-  /**
-   * Composer shared by new mail and replies. In a reply the recipient is fixed
-   * to the thread's contact and `thread_id` keeps the conversation together.
-   */
-  private renderMailComposer(opts: {
+  /** Open the full-pane composer for a new message, a reply, or a draft. */
+  private openCompose(opts: {
+    draftId?: string;
     to?: string;
     threadId?: string;
     subject?: string;
-  }): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "mail-composer";
-    wrap.style.marginTop = "var(--space-4)";
-    const isReply = !!opts.threadId;
+  }): void {
+    this.mailComposeOpen = true;
+    this.mailDraftId = opts.draftId ?? null;
+    this.mailReplyTo = opts.to ?? null;
+    this.mailReplyThread = opts.threadId ?? null;
+    this.mailSubjectSeed = opts.subject ?? null;
+    this.mailComposeFiles = [];
+    this.render();
 
+    // Editing a draft has to carry its attachments forward, and the log only
+    // kept blob ids — so the bytes come back out of the vault.
+    const draft = opts.draftId ? draftById(opts.draftId) : undefined;
+    if (draft?.attachments.length) {
+      void this.loadDraftAttachments(draft.attachments);
+    }
+  }
+
+  private async loadDraftAttachments(refs: MailAttachmentRef[]): Promise<void> {
+    const loaded: { name: string; dataBase64: string; size: number }[] = [];
+    for (const a of refs) {
+      try {
+        const r = await api.blob(a.blobId);
+        if (r?.data_base64) {
+          loaded.push({ name: a.name, dataBase64: r.data_base64, size: a.size });
+        }
+      } catch {
+        this.announce(`Could not load ${a.name} from the vault`);
+      }
+    }
+    // The composer may have been closed while those fetches were in flight.
+    if (!this.mailComposeOpen) return;
+    this.mailComposeFiles = loaded;
+    this.render();
+  }
+
+  private closeCompose(): void {
+    this.mailComposeOpen = false;
+    this.mailDraftId = null;
+    this.mailReplyTo = null;
+    this.mailReplyThread = null;
+    this.mailSubjectSeed = null;
+    this.mailComposeFiles = [];
+    this.render();
+  }
+
+  private renderMailCompose(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+    const draft = this.mailDraftId ? draftById(this.mailDraftId) : undefined;
+
+    const head = document.createElement("div");
+    head.className = "mail-toolbar";
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-icon-round pressable";
+    back.appendChild(icon("back"));
+    back.setAttribute("aria-label", "Back to mail");
+    back.onclick = () => this.closeCompose();
+    const title = document.createElement("h1");
+    title.className = "text-17";
+    title.textContent = draft
+      ? "Edit draft"
+      : this.mailReplyThread
+        ? "Reply"
+        : "New mail";
+    head.append(back, title);
+    pane.appendChild(head);
+
+    const form = document.createElement("div");
+    form.className = "mail-compose";
+
+    const isReply = !!this.mailReplyThread;
     const toSel = document.createElement("select");
-    toSel.className = "input-field";
+    toSel.className = "input-field mail-compose-to";
     for (const c of this.contacts) {
       const o = document.createElement("option");
       o.value = c.nickname;
@@ -1245,133 +1666,276 @@ export class App {
         : displayNick(c.nickname);
       toSel.appendChild(o);
     }
-    if (opts.to) toSel.value = opts.to;
+    const wanted = this.mailReplyTo ?? draft?.to ?? "";
+    if (wanted) toSel.value = wanted;
+    // A reply goes back to the thread's contact; changing it would fork the
+    // conversation, so the picker is fixed.
     toSel.disabled = isReply;
+    form.appendChild(this.composeRow("To", toSel));
 
     const subj = document.createElement("input");
-    subj.className = "input-field";
-    subj.placeholder = "Subject";
-    if (opts.subject) {
-      subj.value = /^re:/i.test(opts.subject)
-        ? opts.subject
-        : `Re: ${opts.subject}`;
-    }
+    subj.className = "input-field mail-compose-subject";
+    subj.placeholder = "(no subject)";
+    subj.value = draft?.subject ?? this.mailSubjectSeed ?? "";
+    form.appendChild(this.composeRow("Subject", subj));
 
     const body = document.createElement("textarea");
-    body.className = "input-field";
+    body.className = "input-field mail-compose-body";
     body.placeholder = "Write your message";
-    body.rows = 4;
+    body.value = draft?.body ?? "";
+    form.appendChild(body);
 
     const files = document.createElement("input");
     files.type = "file";
     files.multiple = true;
     files.className = "mail-file-input";
+    files.onchange = () => {
+      void this.addComposeFiles(Array.from(files.files ?? []));
+      // Reset so picking the same file twice still fires a change event.
+      files.value = "";
+    };
 
     const preview = document.createElement("div");
     preview.className = "mail-attachment-preview";
-    files.onchange = () => {
-      preview.innerHTML = "";
-      const picked = Array.from(files.files ?? []);
-      if (!picked.length) return;
-      const total = picked.reduce((n, f) => n + f.size, 0);
-      const summary = document.createElement("div");
-      summary.className = "text-12 faint";
-      summary.textContent = `${picked.length} file${picked.length === 1 ? "" : "s"} · ${formatBytes(total)}`;
-      preview.appendChild(summary);
-      for (const f of picked) {
-        const row = document.createElement("div");
-        row.className = "mail-attachment";
-        const name = document.createElement("span");
-        name.className = "text-13";
-        name.textContent = f.name;
-        const size = document.createElement("span");
-        size.className = "text-12 faint";
-        size.textContent = formatBytes(f.size);
-        row.append(name, size);
-        preview.appendChild(row);
-      }
-    };
+    for (const [i, f] of this.mailComposeFiles.entries()) {
+      const chip = document.createElement("div");
+      chip.className = "mail-attachment";
+      const name = document.createElement("span");
+      name.className = "text-13";
+      name.textContent = f.name;
+      const size = document.createElement("span");
+      size.className = "text-12 faint";
+      size.textContent = formatBytes(f.size);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-icon-round pressable";
+      remove.appendChild(this.iconSmall("close"));
+      remove.setAttribute("aria-label", `Remove ${f.name}`);
+      remove.onclick = () => {
+        this.mailComposeFiles.splice(i, 1);
+        this.render();
+      };
+      chip.append(name, size, remove);
+      preview.appendChild(chip);
+    }
 
     const err = document.createElement("p");
     err.className = "text-13";
     err.style.color = "var(--danger)";
     err.hidden = true;
 
+    const attach = document.createElement("button");
+    attach.type = "button";
+    attach.className = "btn-secondary text-13 pressable";
+    attach.textContent = this.mailComposeFiles.length ? "Add files" : "Attach files";
+    attach.onclick = () => files.click();
+
+    const saveDraft = document.createElement("button");
+    saveDraft.type = "button";
+    saveDraft.className = "btn-secondary pressable";
+    saveDraft.textContent = "Save draft";
+    saveDraft.onclick = () =>
+      void this.saveDraft(saveDraft, {
+        to: toSel.value,
+        subject: subj.value,
+        body: body.value,
+        err,
+      });
+
     const send = document.createElement("button");
     send.type = "button";
     send.className = "btn-primary pressable";
-    send.textContent = isReply ? "Reply" : "Send";
-    send.onclick = () => void this.sendMail(send, {
-      to: toSel.value,
-      threadId: opts.threadId,
-      subject: subj.value,
-      body: body.value,
-      files: files.files,
-      err,
-      isReply,
-    });
+    send.textContent = isReply ? "Send reply" : "Send";
+    send.onclick = () =>
+      void this.sendMail(send, {
+        to: toSel.value,
+        subject: subj.value,
+        body: body.value,
+        err,
+      });
 
-    wrap.append(toSel, subj, body, files, preview, send, err);
-    return wrap;
+    const actions = document.createElement("div");
+    actions.className = "mail-compose-actions";
+    actions.append(attach, saveDraft);
+    // Only a saved draft can be discarded. A brand new message is thrown away
+    // by closing compose, which is what Back already does.
+    if (this.mailDraftId) {
+      const discard = document.createElement("button");
+      discard.type = "button";
+      discard.className = "btn-secondary pressable";
+      discard.textContent = "Discard draft";
+      discard.onclick = () => void this.discardDraft(discard, err);
+      actions.appendChild(discard);
+    }
+    actions.appendChild(send);
+
+    form.append(files, preview, actions, err);
+    pane.appendChild(form);
+    return pane;
   }
 
-  private async sendMail(
+  private composeRow(label: string, field: HTMLElement): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "mail-compose-row";
+    const l = document.createElement("span");
+    l.className = "mail-compose-label";
+    l.textContent = label;
+    row.append(l, field);
+    return row;
+  }
+
+  private async addComposeFiles(picked: File[]): Promise<void> {
+    const next = [...this.mailComposeFiles];
+    for (const f of picked) {
+      next.push({
+        name: f.name,
+        dataBase64: await fileToBase64(f),
+        size: f.size,
+      });
+    }
+    this.mailComposeFiles = next;
+    this.render();
+  }
+
+  /** The client-side half of the daemon's caps, so the limit is explained
+   *  before a round trip rather than after one. */
+  private composeError(
+    to: string,
+    body: string,
+  ): string | null {
+    if (!to) return "Add a contact first.";
+    if (this.mailComposeFiles.length > MAX_MAIL_ATTACHMENTS) {
+      return `At most ${MAX_MAIL_ATTACHMENTS} attachments.`;
+    }
+    const total = this.mailComposeFiles.reduce((n, f) => n + f.size, 0);
+    if (total > MAX_MAIL_BYTES) {
+      return `Attachments are limited to ${Math.round(MAX_MAIL_BYTES / 1024)} KB in total.`;
+    }
+    if (!body.trim() && !this.mailComposeFiles.length) {
+      return "Write a message or attach a file.";
+    }
+    return null;
+  }
+
+  private async saveDraft(
     btn: HTMLButtonElement,
-    input: {
-      to: string;
-      threadId?: string;
-      subject: string;
-      body: string;
-      files: FileList | null;
-      err: HTMLElement;
-      isReply: boolean;
-    },
+    input: { to: string; subject: string; body: string; err: HTMLElement },
   ): Promise<void> {
     input.err.hidden = true;
-    if (!input.to) {
+    // A draft with no recipient and no text is not worth keeping.
+    if (!input.to && !input.body.trim() && !input.subject.trim() && !this.mailComposeFiles.length) {
       input.err.hidden = false;
-      input.err.textContent = "Add a contact first.";
-      return;
-    }
-    const picked = Array.from(input.files ?? []);
-    if (picked.length > MAX_MAIL_ATTACHMENTS) {
-      input.err.hidden = false;
-      input.err.textContent = `At most ${MAX_MAIL_ATTACHMENTS} attachments.`;
-      return;
-    }
-    const total = picked.reduce((n, f) => n + f.size, 0);
-    if (total > MAX_MAIL_BYTES) {
-      input.err.hidden = false;
-      input.err.textContent = `Attachments are limited to ${Math.round(MAX_MAIL_BYTES / 1024)} KB in total.`;
-      return;
-    }
-    const subject = input.subject.trim();
-    if (!input.body.trim() && !picked.length) {
-      input.err.hidden = false;
-      input.err.textContent = "Write a message or attach a file.";
+      input.err.textContent = "Nothing to save yet.";
       return;
     }
     btn.disabled = true;
     try {
-      const attachments = await Promise.all(
-        picked.map(async (f) => ({
-          name: f.name,
-          data_base64: await fileToBase64(f),
-        })),
-      );
-      const resp = await api.sendMail(input.to, {
-        thread_id: input.threadId,
-        subject: subject || undefined,
+      await api.saveDraft({
+        id: this.mailDraftId ?? undefined,
+        thread_id: this.mailReplyThread ?? undefined,
+        to: input.to,
+        subject: input.subject.trim() || undefined,
         body: input.body,
-        attachments,
+        attachments: this.mailComposeFiles.map((f) => ({
+          name: f.name,
+          data_base64: f.dataBase64,
+        })),
       });
-      // Reload from the daemon so the sent copy carries real blob ids for its
-      // attachments (the send response only returns the thread id).
-      const mail = await api.mail();
-      if (mail) loadMail(mail);
-      this.mailThreadId = resp?.thread_id ?? input.threadId ?? null;
+      await this.reloadMailbox();
+      this.mailFolder = "drafts";
+      this.closeCompose();
+      this.announce("Draft saved");
+    } catch (e) {
+      input.err.hidden = false;
+      input.err.textContent =
+        e instanceof AppError ? e.message : "Couldn't save the draft.";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  /**
+   * Throw the open draft away for good, dropping its record from the log.
+   *
+   * Only reachable from a saved draft; a new message is abandoned by leaving
+   * compose, and nothing was written for it in the first place.
+   */
+  private async discardDraft(
+    btn: HTMLButtonElement,
+    err: HTMLElement,
+  ): Promise<void> {
+    const id = this.mailDraftId;
+    if (!id) return;
+    err.hidden = true;
+    btn.disabled = true;
+    try {
+      await api.deleteDraft(id);
+      await this.reloadMailbox();
       this.mailComposeOpen = false;
-      this.announce(input.isReply ? "Reply sent" : "Mail sent");
+      this.mailDraftId = null;
+      this.mailComposeFiles = [];
+      this.announce("Draft discarded");
+      this.render();
+    } catch (e) {
+      btn.disabled = false;
+      err.hidden = false;
+      err.textContent =
+        e instanceof AppError ? e.message : "Couldn't discard the draft.";
+    }
+  }
+
+  private async sendMail(
+    btn: HTMLButtonElement,
+    input: { to: string; subject: string; body: string; err: HTMLElement },
+  ): Promise<void> {
+    input.err.hidden = true;
+    const problem = this.composeError(input.to, input.body);
+    if (problem) {
+      input.err.hidden = false;
+      input.err.textContent = problem;
+      return;
+    }
+    btn.disabled = true;
+    const draftId = this.mailDraftId;
+    const isReply = !!this.mailReplyThread;
+    try {
+      const resp = await api.sendMail(input.to, {
+        thread_id: this.mailReplyThread ?? undefined,
+        subject: input.subject.trim() || undefined,
+        body: input.body,
+        attachments: this.mailComposeFiles.map((f) => ({
+          name: f.name,
+          data_base64: f.dataBase64,
+        })),
+      });
+      // Sending a draft consumes it, or the same message would sit in Drafts
+      // forever after going out.
+      if (draftId) {
+        try {
+          await api.deleteDraft(draftId);
+        } catch {
+          /* the mail is sent; a stale draft is not worth an error */
+        }
+      }
+      await this.reloadMailbox();
+      this.mailComposeOpen = false;
+      this.mailDraftId = null;
+      this.mailReplyTo = null;
+      this.mailReplyThread = null;
+      this.mailSubjectSeed = null;
+      this.mailComposeFiles = [];
+      // Show the message where it landed: Sent, or the Outbox if the relay
+      // refused it — saying "sent" then filing it under Outbox would be a lie.
+      this.mailFolder = resp?.queued ? "outbox" : "sent";
+      this.mailThreadId = resp?.thread_id ?? null;
+      this.mailOpenId = null;
+      this.announce(
+        resp?.queued
+          ? "Queued — the relay is unreachable, it will send when it is back"
+          : isReply
+            ? "Reply sent"
+            : "Mail sent",
+      );
       this.render();
     } catch (e) {
       input.err.hidden = false;

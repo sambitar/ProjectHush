@@ -60,7 +60,24 @@ export interface ChatRecordDto {
         subject?: string | null;
         body: string;
         attachments: { name: string; blob_id_hex: string; size: number }[];
+        /** `queued` means the relay refused it and the Outbox is holding it. */
+        state: "sent" | "queued";
+      }
+    | {
+        t: "draft";
+        thread_id?: string | null;
+        to: string;
+        subject?: string | null;
+        body: string;
+        attachments: { name: string; blob_id_hex: string; size: number }[];
+        updated_ms: number;
       };
+}
+
+/** `GET /api/mail`: messages and drafts together, so the two cannot disagree. */
+export interface MailboxDto {
+  mail: ChatRecordDto[];
+  drafts: ChatRecordDto[];
 }
 
 export interface RecvResponse {

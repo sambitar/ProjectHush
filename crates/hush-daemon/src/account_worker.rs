@@ -98,6 +98,29 @@ enum Work {
     MailRecords {
         reply: oneshot::Sender<WorkResult>,
     },
+    DraftRecords {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SaveDraft {
+        id: Option<String>,
+        thread_id: Option<String>,
+        to: String,
+        subject: Option<String>,
+        body: String,
+        attachments: Vec<(String, Vec<u8>)>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    DeleteDraft {
+        id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    DeleteMail {
+        id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    RetryOutbox {
+        reply: oneshot::Sender<WorkResult>,
+    },
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -134,9 +157,12 @@ pub enum WorkResult {
     Backup(Vec<u8>),
     RecoveryCode(String),
     Messages(Vec<ChatRecord>),
-    /// The thread id the mail was filed under.
-    MailSent(String),
+    /// The thread the mail was filed under, and whether the relay took it.
+    MailSent { thread_id: String, queued: bool },
     Mail(Vec<ChatRecord>),
+    Drafts(Vec<ChatRecord>),
+    /// The record id of the saved draft.
+    DraftSaved(String),
     Blob(Vec<u8>),
     BlobId(String),
     /// The supplied current passphrase did not match the vault.
@@ -332,7 +358,7 @@ impl AccountWorker {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => {
-                                    WorkResult::Messages(a.chat_history().to_vec())
+                                    WorkResult::Messages(a.chat_history())
                                 }
                             };
                             (reply, result)
@@ -425,7 +451,10 @@ impl AccountWorker {
                                     )
                                     .await
                                 {
-                                    Ok(thread) => WorkResult::MailSent(thread),
+                                    Ok(outcome) => WorkResult::MailSent {
+                                        thread_id: outcome.thread_id,
+                                        queued: outcome.queued,
+                                    },
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
@@ -435,6 +464,73 @@ impl AccountWorker {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => WorkResult::Mail(a.mail_records()),
+                            };
+                            (reply, result)
+                        }
+                        Work::DraftRecords { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::Drafts(a.draft_records()),
+                            };
+                            (reply, result)
+                        }
+                        Work::SaveDraft {
+                            id,
+                            thread_id,
+                            to,
+                            subject,
+                            body,
+                            attachments,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .save_draft(
+                                        id.as_deref(),
+                                        thread_id.as_deref(),
+                                        &to,
+                                        subject.as_deref(),
+                                        &body,
+                                        &attachments,
+                                    )
+                                    .await
+                                {
+                                    Ok(saved) => WorkResult::DraftSaved(saved),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::DeleteDraft { id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.delete_draft(&id).await {
+                                    Ok(_) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::DeleteMail { id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.delete_mail(&id).await {
+                                    Ok(_) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RetryOutbox { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.retry_outbox().await {
+                                    // A failed flush is not worth surfacing: the
+                                    // messages are still queued and the next tick
+                                    // tries again.
+                                    Ok(_) | Err(_) => WorkResult::Ok,
+                                },
                             };
                             (reply, result)
                         }
@@ -634,5 +730,52 @@ impl AccountWorker {
 
     pub async fn mail_records(&self) -> WorkResult {
         self.call(|reply| Work::MailRecords { reply }).await
+    }
+
+    pub async fn draft_records(&self) -> WorkResult {
+        self.call(|reply| Work::DraftRecords { reply }).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_draft(
+        &self,
+        id: Option<String>,
+        thread_id: Option<String>,
+        to: &str,
+        subject: Option<String>,
+        body: &str,
+        attachments: Vec<(String, Vec<u8>)>,
+    ) -> WorkResult {
+        self.call(|reply| Work::SaveDraft {
+            id,
+            thread_id,
+            to: to.to_string(),
+            subject,
+            body: body.to_string(),
+            attachments,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn delete_draft(&self, id: &str) -> WorkResult {
+        self.call(|reply| Work::DeleteDraft {
+            id: id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn delete_mail(&self, id: &str) -> WorkResult {
+        self.call(|reply| Work::DeleteMail {
+            id: id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Flush the Outbox. Called on a timer, not by the UI.
+    pub async fn retry_outbox(&self) -> WorkResult {
+        self.call(|reply| Work::RetryOutbox { reply }).await
     }
 }

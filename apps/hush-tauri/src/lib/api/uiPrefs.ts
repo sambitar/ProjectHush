@@ -8,6 +8,11 @@ export interface UiPrefsDto {
   nick_overrides: Record<string, string>;
   /** 0 = idle auto-lock off (daemon); 5–1440 minutes otherwise */
   auto_lock_minutes: number;
+  /** Mail record ids the user has opened. */
+  mail_read: string[];
+  mail_starred: string[];
+  mail_archived: string[];
+  mail_trashed: string[];
 }
 
 const defaultPrefs = (): UiPrefsDto => ({
@@ -17,6 +22,10 @@ const defaultPrefs = (): UiPrefsDto => ({
   blocked: [],
   nick_overrides: {},
   auto_lock_minutes: 15,
+  mail_read: [],
+  mail_starred: [],
+  mail_archived: [],
+  mail_trashed: [],
 });
 
 let cache: UiPrefsDto | null = null;
@@ -51,9 +60,45 @@ export async function patchUiPrefs(
     nick_overrides: patch.nick_overrides ?? base.nick_overrides,
     muted: patch.muted ?? base.muted,
     blocked: patch.blocked ?? base.blocked,
+    mail_read: patch.mail_read ?? base.mail_read,
+    mail_starred: patch.mail_starred ?? base.mail_starred,
+    mail_archived: patch.mail_archived ?? base.mail_archived,
+    mail_trashed: patch.mail_trashed ?? base.mail_trashed,
   };
   await persistUiPrefs(merged);
   return merged;
+}
+
+/**
+ * Flip one mail flag on or off.
+ *
+ * The flags are lists in `ui-prefs.json`, so this reads the current list, adds
+ * or removes the id, and writes it back. Callers pass the id they just acted on.
+ */
+export async function setMailFlag(
+  flag: "mail_read" | "mail_starred" | "mail_archived" | "mail_trashed",
+  id: string,
+  on: boolean,
+): Promise<void> {
+  const p = uiPrefsSnapshot();
+  const next = on ? Array.from(new Set([...p[flag], id])) : p[flag].filter((x) => x !== id);
+  await patchUiPrefs({ [flag]: next });
+}
+
+/** Every mail flag in one snapshot, for deriving folder membership. */
+export function mailFlags(): {
+  read: Set<string>;
+  starred: Set<string>;
+  archived: Set<string>;
+  trashed: Set<string>;
+} {
+  const p = uiPrefsSnapshot();
+  return {
+    read: new Set(p.mail_read),
+    starred: new Set(p.mail_starred),
+    archived: new Set(p.mail_archived),
+    trashed: new Set(p.mail_trashed),
+  };
 }
 
 export async function clearContactUiPrefs(nick: string): Promise<void> {
@@ -81,6 +126,10 @@ function normalize(raw: UiPrefsDto): UiPrefsDto {
     blocked: raw.blocked ?? [],
     nick_overrides: raw.nick_overrides ?? {},
     auto_lock_minutes,
+    mail_read: raw.mail_read ?? [],
+    mail_starred: raw.mail_starred ?? [],
+    mail_archived: raw.mail_archived ?? [],
+    mail_trashed: raw.mail_trashed ?? [],
   };
 }
 

@@ -4,10 +4,15 @@ use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
 
 async fn spawn_relay() -> (String, TempDir) {
+    spawn_relay_on(0).await
+}
+
+/// Serve a relay on a specific port. `0` picks a free one.
+async fn spawn_relay_on(port: u16) -> (String, TempDir) {
     let dir = TempDir::new().unwrap();
     let db = dir.path().join("relay.db");
     let app = router(db.to_str().unwrap(), RelayConfig::default()).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{port}");
     tokio::spawn(async move {
@@ -15,6 +20,15 @@ async fn spawn_relay() -> (String, TempDir) {
     });
     sleep(Duration::from_millis(80)).await;
     (base, dir)
+}
+
+/// A port that nothing is listening on, so a relay URL pointed at it fails to
+/// connect until the test serves one there.
+async fn free_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
 }
 
 #[tokio::test]
@@ -76,7 +90,7 @@ async fn mail_arrives_while_the_recipient_is_offline() {
         "chat must still require presence"
     );
 
-    let thread = bob
+    let sent = bob
         .send_mail(
             "alice",
             None,
@@ -86,6 +100,8 @@ async fn mail_arrives_while_the_recipient_is_offline() {
         )
         .await
         .unwrap();
+    assert!(!sent.queued, "a live relay must not leave mail in the Outbox");
+    let thread = sent.thread_id;
 
     let inbox = alice.recv().await.unwrap();
     assert_eq!(inbox.messages.len(), 1);
@@ -130,7 +146,8 @@ async fn a_reply_lands_in_the_same_thread() {
     let thread = bob
         .send_mail("alice", None, Some("Lunch?"), "noon?", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .thread_id;
     alice.recv().await.unwrap();
 
     // Alice replies with the same thread id; Bob replies again.
@@ -163,4 +180,118 @@ async fn a_reply_lands_in_the_same_thread() {
     alice.heartbeat_presence().await.unwrap();
     bob.send_text("alice", "psst").await.unwrap();
     assert_eq!(bob.mail_records().len(), 2);
+}
+
+/// The Outbox exists because the relay can be down. A send must survive that:
+/// it is recorded as queued, and the next flush puts it on the wire.
+#[tokio::test]
+async fn mail_queues_while_the_relay_is_down_and_goes_out_on_retry() {
+    let port = free_port().await;
+    let relay = format!("http://127.0.0.1:{port}");
+
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let mut alice = Account::create(alice_dir.path(), "pw", &relay).await.unwrap();
+    let mut bob = Account::create(bob_dir.path(), "pw", &relay).await.unwrap();
+    let a_inv = alice.invite().await.unwrap();
+    let b_inv = bob.invite().await.unwrap();
+    bob.add_contact("alice", &a_inv).await.unwrap();
+    alice.add_contact("bob", &b_inv).await.unwrap();
+
+    // Nothing is listening on that port yet.
+    let outcome = alice
+        .send_mail("bob", None, Some("later"), "when the relay is back", &[])
+        .await
+        .unwrap();
+    assert!(outcome.queued, "a dead relay must queue, not fail the send");
+    assert_eq!(alice.queued_mail_count(), 1);
+    assert_eq!(
+        alice.mail_records().len(),
+        1,
+        "a queued message is recorded so the Outbox can show it"
+    );
+    assert_eq!(
+        alice.retry_outbox().await.unwrap(),
+        0,
+        "a retry against a dead relay delivers nothing and stays queued"
+    );
+    assert_eq!(alice.queued_mail_count(), 1);
+
+    // The relay comes up on that port; the next flush delivers.
+    let _relay_dir = spawn_relay_on(port).await;
+    assert_eq!(alice.retry_outbox().await.unwrap(), 1);
+    assert_eq!(alice.queued_mail_count(), 0);
+
+    let inbox = bob.recv().await.unwrap();
+    assert_eq!(inbox.messages.len(), 1);
+    match &inbox.messages[0].payload {
+        MessagePayload::Mail { body, .. } => assert_eq!(body, "when the relay is back"),
+        other => panic!("expected mail, got {other:?}"),
+    }
+}
+
+/// Sending to somebody who is not a contact is not a delivery problem, so it
+/// must fail loudly rather than sit in the Outbox forever.
+#[tokio::test]
+async fn mail_to_an_unknown_contact_fails_instead_of_queueing() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let dir = TempDir::new().unwrap();
+    let mut alice = Account::create(dir.path(), "pw", &relay).await.unwrap();
+
+    assert!(alice.send_mail("nobody", None, None, "hi", &[]).await.is_err());
+    assert_eq!(alice.queued_mail_count(), 0);
+    assert_eq!(alice.mail_records().len(), 0);
+}
+
+#[tokio::test]
+async fn a_draft_is_saved_edited_and_deleted() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let dir = TempDir::new().unwrap();
+    let mut alice = Account::create(dir.path(), "pw", &relay).await.unwrap();
+
+    let id = alice
+        .save_draft(None, None, "bob", Some("hi"), "first pass", &[])
+        .await
+        .unwrap();
+    assert_eq!(alice.draft_records().len(), 1);
+
+    // Saving with an id edits in place rather than piling up drafts.
+    let same = alice
+        .save_draft(Some(&id), None, "bob", Some("hi"), "second pass", &[])
+        .await
+        .unwrap();
+    assert_eq!(same, id);
+    assert_eq!(alice.draft_records().len(), 1);
+
+    // Drafts survive a reload, which is the whole reason they are in the vault.
+    let reopened = Account::open(dir.path(), "pw").await.unwrap();
+    match &reopened.draft_records()[0].payload {
+        ChatRecordPayload::Draft { body, .. } => assert_eq!(body, "second pass"),
+        other => panic!("expected a draft, got {other:?}"),
+    }
+    assert!(
+        reopened.chat_history().is_empty(),
+        "a draft must not show up as chat history"
+    );
+
+    let mut alice = reopened;
+    assert!(alice.delete_draft(&id).await.unwrap());
+    assert!(alice.draft_records().is_empty());
+}
+
+/// A draft is user text, so it may not sit on disk in the clear.
+#[tokio::test]
+async fn a_draft_body_is_not_plaintext_on_disk() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let dir = TempDir::new().unwrap();
+    let mut alice = Account::create(dir.path(), "pw", &relay).await.unwrap();
+    alice
+        .save_draft(None, None, "bob", Some("secret subject"), "swordfish body", &[])
+        .await
+        .unwrap();
+
+    let raw = std::fs::read(dir.path().join("chat.enc")).unwrap();
+    let haystack = String::from_utf8_lossy(&raw);
+    assert!(!haystack.contains("swordfish body"));
+    assert!(!haystack.contains("secret subject"));
 }

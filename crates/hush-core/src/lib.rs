@@ -20,7 +20,7 @@ mod signal_persist;
 mod vault;
 mod wire;
 
-pub use account::{Account, Contact, ContactDevice};
+pub use account::{Account, Contact, ContactDevice, MailOutcome};
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{
     ClientConfig, ConfigSource, DEFAULT_DAEMON_ADDR, DEFAULT_RELAY_URL, ENV_DAEMON_ADDR,
@@ -32,7 +32,7 @@ pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
 pub use device::DeviceKeys;
 pub use device_list::{DeviceList, DeviceRecord};
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
-pub use chat_log::{ChatRecord, ChatRecordPayload, MailAttachmentRecord};
+pub use chat_log::{ChatRecord, ChatRecordPayload, MailAttachmentRecord, MailState};
 pub use error::Error;
 pub use invite::InvitePayload;
 pub use mail::{format_address, normalize_handle, MAIL_DOMAIN, MAX_HANDLE_LEN};
