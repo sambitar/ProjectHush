@@ -5,7 +5,8 @@ import type {
 } from "./api/types";
 
 const threads = new Map<string, ChatMessage[]>();
-const unread = new Set<string>();
+/** Unread messages per contact nickname. */
+const unread = new Map<string, number>();
 let idSeq = 0;
 
 function nextId(): string {
@@ -58,6 +59,13 @@ export function markRead(nick: string): void {
 
 export function hasUnread(nick: string): boolean {
   return unread.has(nick);
+}
+
+/** Unread messages across every contact, for the rail badge. */
+export function unreadTotal(): number {
+  let total = 0;
+  for (const n of unread.values()) total += n;
+  return total;
 }
 
 export function lastPreview(nick: string): { text: string; time: number } | null {
@@ -152,7 +160,7 @@ export function ingestIncoming(from: string, dto: ReceivedDto): ChatMessage {
     reactions: [],
   };
   push(from, msg);
-  unread.add(from);
+  unread.set(from, (unread.get(from) ?? 0) + 1);
   return msg;
 }
 

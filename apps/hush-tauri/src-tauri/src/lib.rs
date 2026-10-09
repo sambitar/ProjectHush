@@ -2,6 +2,7 @@ use tauri::Manager;
 
 mod daemon_client;
 mod drops;
+mod sound;
 mod tor;
 
 use daemon_client::{ApiReply, DaemonClient, Transport};
@@ -104,7 +105,8 @@ pub fn run() {
             drops::drops_dev_enabled,
             drops::drops_tor_status,
             drops::drops_tor_start,
-            drops::drops_tor_stop
+            drops::drops_tor_stop,
+            sound::play_chat_sound
         ])
         .setup(move |app| {
             // Tor lives under the app's local data dir, not in the vault, and is

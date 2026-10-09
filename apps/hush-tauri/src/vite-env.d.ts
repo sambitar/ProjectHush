@@ -5,3 +5,8 @@ interface Window {
     | { kind: "unix"; path: string }
     | { kind: "tcp"; base: string };
 }
+
+declare module "*.wav" {
+  const src: string;
+  export default src;
+}

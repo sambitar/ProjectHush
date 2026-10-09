@@ -226,6 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(auto_lock_loop(state.clone()));
     tokio::spawn(vault_mount_watch(state.clone()));
     tokio::spawn(outbox_loop(state.clone()));
+    tokio::spawn(heartbeat_loop(state.clone()));
     suspend_lock::spawn_suspend_lock_watch(state.clone());
 
     let router = Router::new()
@@ -461,6 +462,25 @@ async fn auto_lock_loop(state: Arc<App>) {
 /// message is already written, and the only thing missing is a relay that will
 /// take it. Retrying here means a message composed while the relay was down goes
 /// out on its own. A tick with nothing queued touches no network at all.
+/// Keep this vault's relay presence live while the vault is unlocked.
+///
+/// Presence is "heartbeat seen in the last 90 s" at the relay, and without this
+/// loop the only heartbeats come from the UI's poll. A backgrounded or
+/// throttled webview (an unfocused WebKitGTK window slows its timers) lets the
+/// heartbeat go stale, the peer's presence check starts failing mid-chat, and
+/// sends bounce with "offline" even though both people are at their desks. The
+/// daemon owns the session, so it owns the heartbeat; the UI heartbeat stays
+/// and is harmless.
+async fn heartbeat_loop(state: Arc<App>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        if !*state.unlocked.lock().await {
+            continue;
+        }
+        let _ = state.worker.heartbeat_presence().await;
+    }
+}
+
 async fn outbox_loop(state: Arc<App>) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;

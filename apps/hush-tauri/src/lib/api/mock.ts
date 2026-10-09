@@ -41,6 +41,31 @@ export async function setMuted(nick: string, v: boolean): Promise<void> {
   await patchUiPrefs({ muted: [...muted] });
 }
 
+/** Whether this contact's chat arrival sound is off (the chat menu's toggle). */
+export function isChatSoundMuted(nick: string): boolean {
+  return uiPrefsSnapshot().chat_sound_muted.includes(nick);
+}
+
+export async function setChatSoundMuted(
+  nick: string,
+  v: boolean,
+): Promise<void> {
+  const p = uiPrefsSnapshot();
+  const muted = new Set(p.chat_sound_muted);
+  if (v) muted.add(nick);
+  else muted.delete(nick);
+  await patchUiPrefs({ chat_sound_muted: [...muted] });
+}
+
+/** The global chat-sound switch, from Settings → Notifications. */
+export function chatSoundEnabled(): boolean {
+  return uiPrefsSnapshot().chat_sound;
+}
+
+export async function setChatSoundEnabled(v: boolean): Promise<void> {
+  await patchUiPrefs({ chat_sound: v });
+}
+
 export function isBlocked(nick: string): boolean {
   return uiPrefsSnapshot().blocked.includes(nick);
 }

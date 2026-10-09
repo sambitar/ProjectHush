@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use libsignal_protocol::{IdentityKeyStore, SessionStore};
 use serde::{Deserialize, Serialize};
@@ -1822,9 +1823,26 @@ impl Account {
         }
 
         let plain = payload.encode()?;
-        self.deliver(&contact, &plain).await?;
-        self.save().await?;
-        Ok(())
+        // One relay POST is not a delivery guarantee over a real network — the
+        // relay may be restarting or a packet may die mid-TLS. Retry the
+        // delivery a couple of times before reporting failure, so a transient
+        // blip does not turn into "sometimes messages just don't arrive".
+        // "Offline" never reaches here: it is rejected above, and a peer who
+        // is genuinely away should hear about it, not wait out a retry.
+        let mut last_err: Option<Error> = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+            }
+            match self.deliver(&contact, &plain).await {
+                Ok(()) => {
+                    self.save().await?;
+                    return Ok(());
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or(Error::ContactNotFound))
     }
 
     /// Encrypt to a contact and put the ciphertext in the right queue.

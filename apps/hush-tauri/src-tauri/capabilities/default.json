@@ -7,6 +7,7 @@
     "core:default",
     "allow-hush-files",
     "allow-hush-api",
-    "allow-drops"
+    "allow-drops",
+    "allow-chat-sound"
   ]
 }

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiPrefs {
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -33,6 +33,35 @@ pub struct UiPrefs {
     pub mail_archived: Vec<String>,
     #[serde(default)]
     pub mail_trashed: Vec<String>,
+    /// Whether arriving chat messages play a sound (global switch).
+    #[serde(default = "default_true")]
+    pub chat_sound: bool,
+    /// Contacts whose arrival sound is off, set from the chat's own menu.
+    #[serde(default)]
+    pub chat_sound_muted: Vec<String>,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+            avatars: HashMap::new(),
+            muted: Vec::new(),
+            blocked: Vec::new(),
+            nick_overrides: HashMap::new(),
+            auto_lock_minutes: default_auto_lock_minutes(),
+            mail_read: Vec::new(),
+            mail_starred: Vec::new(),
+            mail_archived: Vec::new(),
+            mail_trashed: Vec::new(),
+            chat_sound: true,
+            chat_sound_muted: Vec::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_theme() -> String {

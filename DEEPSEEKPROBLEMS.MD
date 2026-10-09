@@ -13,6 +13,152 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-08 — Chat notifications: rail badges + arrival sound
+
+Slice goal: unread-count pill on the Chats and Mail rail buttons, a native arrival
+sound for chat messages (not while the chat is open), global and per-contact sound
+toggles.
+
+### [FIXED] unread badge stays after re-entering the chat via the rail button
+
+- **Attempted:** clear the unread count on every path into an open conversation;
+  initially only row clicks (`conv row onclick`) and the Trusts card "Chat" action
+  (`openChat`) called `markRead`.
+- **Symptom:** user reports the Chats pill "does not go when I am in the chat
+  window; it only goes away when I press on the chat session button". Reproduced
+  the mechanism from the code: `selectedNick` survives rail switches, so leaving
+  Chats for Mail and coming back via the **rail button** re-opens the last
+  conversation through `render()` with no `markRead` anywhere on that path.
+- **Resolution:** `render()` now marks the open conversation read before painting
+  (`if this.rail === "chats" && this.selectedNick markRead(...)`), so every entry
+  path — click, rail re-entry, in-chat arrival — clears the pill. Verified in the
+  browser: away-arrival shows pill "1", clicking the Chats rail button clears it
+  with no row click.
+- **Lesson:** state that a view mutates as a side effect of *clicks* will miss the
+  paths that reach the same view without a click. Put the invariant in the render
+  pipeline, not in the handlers.
+
+### [WORKED AROUND] WebKitGTK plays no audio in the Tauri shell
+
+- **Attempted:** play the notification WAV with `new Audio()` (Vite asset URL).
+- **Symptom:** silent in the desktop shell; the same page in a normal browser
+  plays fine. WebKitGTK media needs host GStreamer plugins that are not installed.
+- **Resolution:** added a `rodio`-based `play_chat_sound` Tauri command
+  (`src-tauri/src/sound.rs`, WAV embedded with `include_bytes!`) that talks to
+  ALSA/Pulse directly; `chatSound.ts` uses it in the Tauri shell and keeps
+  `new Audio()` as the dev-browser fallback. Required `libasound2-dev` to build
+  (`alsa-sys` failed without it). Sound itself not yet confirmed by ear on the
+  desktop instance.
+- **Lesson:** browser-side media in a WebKitGTK shell depends on host multimedia
+  packages; for anything that must be heard, go native.
+
+### [OPEN] hush-cli recv exits 0 without unlocking the daemon session
+
+- **Attempted:** unlock Bob's vault headless for testing via
+  `HUSH_DAEMON_SOCKET=… HUSH_PASSPHRASE=… hush-cli --dir instances/peer-b recv`.
+- **Symptom:** CLI exits 0 (prints nothing), but the daemon's HTTP API still
+  answers `{"error":"locked"}` (401) on `POST /api/send` immediately after. There
+  is no `--socket` flag on the CLI (unexpected-argument error).
+- **Resolution needed:** either the CLI speaks to a different socket than the env
+  var suggests, or its unlock handshake does not persist in the daemon's session
+  state. Test path for now: `curl -X POST …/api/unlock -d '{"passphrase":…}'`
+  against the daemon's TCP port, which works (204).
+- **Lesson:** a CLI that succeeds silently tells you nothing about which
+  service it actually talked to; verify with the target service's own status.
+
+### [OPEN] run-two-ui.sh tears the whole stack down when its UI windows die
+
+- **Attempted:** `pkill` only the two `hush-tauri` windows to stop them from
+  draining the shared daemon queue during a browser-side test, expecting the
+  daemons to stay up.
+- **Symptom:** relay and both daemons disappeared seconds later — the launcher
+  waits on its children and its cleanup trap kills everything when the windows
+  exit ("Press Ctrl+C here to stop the relay, daemons, and UI this run started").
+- **Resolution:** none (by design). For window-free testing, start the relay and
+  daemons standalone (`hush-relay`, `hush-daemon --dir … --socket … --addr …`)
+  and reopen the windows later; `run-two-ui.sh` reuses live daemons.
+- **Lesson:** launcher scripts that own the process group make "restart just the
+  UI" impossible; the daemons need a standalone start path for headless work.
+
+### [WORKED AROUND] pkill -f matches the invoking shell's own command line
+
+- **Attempted:** one-shot restart commands chaining `pkill -f "run-two-ui.sh"`
+  (and similar `-f` patterns) before relaunching.
+- **Symptom:** the command silently died after the first `pkill` — the shell's
+  own `bash -c` command line contains the pattern, so pkill killed the shell
+  running it. Happened twice; the second time it looked like "the launcher never
+  started" because the log file never appeared.
+- **Resolution:** bracket-trick patterns (`pkill -f "run-two-ui[.]sh"`) or kill by
+  exact PID; verify with `ps` before assuming a launch failed.
+- **Lesson:** with `pkill -f`, the pattern is matched against *your* command line
+  too; any restart one-liner that does not account for that can kill itself
+  mid-sequence.
+
+### [WORKED AROUND] accessibility snapshots cannot see the rail count pills
+
+- **Attempted:** verify the badge via the browser accessibility snapshot
+  (button accessible names).
+- **Symptom:** the pill's `aria-label` on a role-less span removes its text from
+  the accessible name; the snapshot shows "Chats" even when the DOM has
+  `<span class="rail-count">2</span>`.
+- **Resolution:** read the DOM directly via CDP `Runtime.evaluate`
+  (`querySelectorAll('.rail-count')`) for badge assertions.
+- **Lesson:** `aria-label` on an element without a role hides its content from
+  the a11y tree; give count pills `role="status"` (or check the DOM) when
+  asserting on them.
+
+---
+
+## 2026-10-08 — Chat notifications: rail badges + arrival sound (cont.)
+
+### [FIXED] Tauri v2 ACL silently denied the sound command
+
+- **Attempted:** user clicks "Play test sound" (and every arrival sound before
+  it) — nothing plays. The Rust command `sound::play_chat_sound` is registered
+  in `generate_handler!`, the rodio device probe passes, and other commands
+  (`hush_api`) work in the same window.
+- **Symptom:** no sound, no error anywhere. `alice-ui.log` (tauri stderr) has no
+  "chat sound requested" line after a click, so the command never executed; the
+  JS `.catch(() => {})` swallowed the rejection, which is Tauri's
+  "command not allowed" IPC denial.
+- **Root cause:** Tauri v2 denies every app command that is not allowed by a
+  capability. `capabilities/default.json` listed `allow-hush-files`,
+  `allow-hush-api`, `allow-drops` — custom permission groups defined under
+  `src-tauri/permissions/*.toml` — but nothing for the new command.
+- **Resolution:** added `permissions/hush-sound.toml`
+  (`allow-chat-sound` → `commands.allow = ["play_chat_sound"]`) and listed
+  `allow-chat-sound` in the capability. Rebuilt, windows relaunched.
+- **Lesson:** in Tauri v2 a new `#[tauri::command]` needs three things — the
+  command fn, the `generate_handler!` entry, and a capability permission. The
+  second is easy to remember; the third denies silently at the IPC boundary.
+  Log rejections in dev instead of `.catch(() => {})`.
+
+### [FIXED] chat delivery flaky: presence died with a throttled webview and sends never retried
+
+- **Attempted:** user reports "sometimes messages are delivered, sometimes
+  not" between two live desktop windows.
+- **Symptom/mechanism (three stacked causes):** chat is live-only
+  (`send_payload_inner` with `require_online = true`): (1) presence is
+  "heartbeat in the last 90 s" at the relay, and heartbeats came only from the
+  UI poll loop — an unfocused WebKitGTK window throttles its timers, the
+  heartbeat goes stale, and the sender's `contact_is_online` check fails with
+  `ContactOffline`; (2) a failed delivery had zero retries — one relay blip
+  (the VPS relay over the internet) lost the message; (3) the UI correctly
+  removes the optimistic bubble and announces the failure, which the user
+  experiences as "sometimes delivered, sometimes not".
+- **Resolution:** (1) the daemon now heartbeats presence itself —
+  `heartbeat_loop` in `hush-daemon/src/main.rs` ticks every 30 s while the
+  vault is unlocked, so presence follows the session, not the webview timers;
+  (2) `send_payload_inner` retries delivery up to three times (400 ms, 800 ms
+  backoff) for transient relay errors; `ContactOffline` still fails immediately
+  by design; (3) no UI change needed. `cargo test -p hush-core` (21) and
+  `-p hush-daemon` (2) pass.
+- **Lesson:** a webview is not a reliable scheduler. Anything the protocol
+  needs continuously (presence, outbox drains, retries) belongs in the daemon's
+  tokio loops, which never get background-throttled.
+
+---
+
 ## 2026-10-08 — Relay-on-onion: lab service + client SOCKS seam
 
 Slice goal: expose the lab relay as a v3 onion service and give the client a strict SOCKS seam

@@ -19,9 +19,11 @@ import {
   setSendProgress,
   allFileMessages,
   toggleReaction,
+  unreadTotal,
 } from "./lib/chatStore";
 import { MAX_FILE_BYTES, RECV_POLL_MS } from "./lib/constants";
 import { isTauriShell } from "./lib/tauriEnv";
+import { playChatSound } from "./lib/chatSound";
 import {
   clearMailStore,
   draftById,
@@ -50,7 +52,7 @@ import {
   patchUiPrefs,
   setMailFlag,
 } from "./lib/api/uiPrefs";
-import { displayNick, getMockSettings, setMuted, setNickOverride, clearMockLocal, isMuted, refreshContactPrefs } from "./lib/api/mock";
+import { displayNick, getMockSettings, setNickOverride, clearMockLocal, chatSoundEnabled, isChatSoundMuted, setChatSoundMuted, setChatSoundEnabled, refreshContactPrefs } from "./lib/api/mock";
 import { clearContactUiPrefs } from "./lib/api/uiPrefs";
 import { fileToBase64, formatAbsolute, formatBytes, formatRelative, formatUntil } from "./lib/format";
 import {
@@ -116,6 +118,7 @@ type Rail =
 type SettingsSection =
   | "appearance"
   | "profile"
+  | "notifications"
   | "security"
   | "recovery"
   | "backup"
@@ -178,6 +181,8 @@ export class App {
   private contacts: ContactDto[] = [];
   private rail: Rail = "chats";
   private selectedNick: string | null = null;
+  /** Scroll state of the thread pane from the render that is being replaced. */
+  private chatScrollPos: { atBottom: boolean; top: number } | null = null;
   private pollTimer: number | null = null;
   private unlockedAt = 0;
   private search = "";
@@ -440,6 +445,14 @@ export class App {
         } else {
           ingestIncoming(m.from, m);
           this.announce(`New message from ${m.from}`);
+          // A chat that is on screen is read as it arrives: no unread badge,
+          // no sound. Otherwise the sound plays unless the user turned it off
+          // globally or for this contact. Mail is silent: its badge is enough.
+          if (this.rail === "chats" && this.selectedNick === m.from) {
+            markRead(m.from);
+          } else if (chatSoundEnabled() && !isChatSoundMuted(m.from)) {
+            playChatSound();
+          }
         }
       }
       // Mail also changes without an incoming message reaching this poll: the
@@ -497,11 +510,30 @@ export class App {
   }
 
   private render(): void {
+    // The thread pane is rebuilt from scratch on every render, so the reader's
+    // place in it has to be carried across. Captured before the wipe: whether
+    // the thread was scrolled to the bottom (pinned to new messages) or the
+    // user had moved away to read history (leave them there).
+    const prevMsgs = this.root.querySelector<HTMLElement>(".chat-messages");
+    this.chatScrollPos = prevMsgs
+      ? {
+          atBottom:
+            prevMsgs.scrollHeight - prevMsgs.scrollTop - prevMsgs.clientHeight < 48,
+          top: prevMsgs.scrollTop,
+        }
+      : null;
     this.root.innerHTML = "";
     if (!this.status || this.status.locked) {
       this.stopDropsPoll();
       this.root.appendChild(this.renderUnlock());
       return;
+    }
+    // An open conversation is a conversation being read: whatever unread
+    // count it carried goes away the moment its pane paints, however the pane
+    // was reached — a click, the rail button re-opening the last chat, or an
+    // arrival while the chat was already up.
+    if (this.rail === "chats" && this.selectedNick) {
+      markRead(this.selectedNick);
     }
     const shell = document.createElement("div");
     shell.className = "shell";
@@ -649,14 +681,25 @@ export class App {
     return wrap;
   }
 
-  private railBtn(id: Rail, label: string, ic: IconName, badge = false): HTMLElement {
+  /**
+   * A left-rail button. `badge` is either a plain unread dot (`true`) or, when
+   * a number, a pill carrying the unread count — chats and mail show how many
+   * messages wait, the other rails stay quiet.
+   */
+  private railBtn(id: Rail, label: string, ic: IconName, badge: boolean | number = false): HTMLElement {
     const b = document.createElement("button");
     b.className = `rail-btn pressable${this.rail === id ? " active" : ""}`;
     b.appendChild(icon(ic));
     const span = document.createElement("span");
     span.textContent = label;
     b.appendChild(span);
-    if (badge) {
+    if (typeof badge === "number" && badge > 0) {
+      const pill = document.createElement("span");
+      pill.className = "rail-count";
+      pill.textContent = badge > 99 ? "99+" : String(badge);
+      pill.setAttribute("aria-label", `${badge} unread`);
+      b.appendChild(pill);
+    } else if (badge) {
       const dot = document.createElement("span");
       dot.className = "rail-badge";
       dot.setAttribute("aria-label", "Unread");
@@ -698,10 +741,10 @@ export class App {
     logo.style.height = "40px";
     logo.appendChild(icon("vault"));
     rail.appendChild(logo);
-    rail.appendChild(this.railBtn("chats", "Chats", "chats"));
+    rail.appendChild(this.railBtn("chats", "Chats", "chats", unreadTotal()));
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
     rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
-    rail.appendChild(this.railBtn("mail", "Mail", "mail", hasUnreadMail(this.mailPrefs())));
+    rail.appendChild(this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())));
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
@@ -941,7 +984,15 @@ export class App {
       });
       scroll.appendChild(gEl);
     }
-    scroll.scrollTop = scroll.scrollHeight;
+    // Follow new messages only while the reader is already at the bottom;
+    // someone scrolled up reading history stays where they are.
+    const prev = this.chatScrollPos;
+    this.chatScrollPos = null;
+    if (!prev || prev.atBottom) {
+      scroll.scrollTop = scroll.scrollHeight;
+    } else {
+      scroll.scrollTop = Math.min(prev.top, scroll.scrollHeight);
+    }
 
     const composer = this.renderComposer(nick, contact.online);
     pane.append(header, scroll, composer);
@@ -4011,6 +4062,7 @@ export class App {
     const sections: { id: SettingsSection; label: string }[] = [
       { id: "appearance", label: "Appearance" },
       { id: "profile", label: "Profile" },
+      { id: "notifications", label: "Notifications" },
       { id: "security", label: "Security" },
       { id: "recovery", label: "Recovery" },
       { id: "backup", label: "Backup" },
@@ -4097,6 +4149,44 @@ export class App {
         }
       };
       body.append(current, label, row, err, save);
+    } else if (this.settingsSection === "notifications") {
+      body.innerHTML = `<h2 class="text-22">Notifications</h2><p class="muted text-13">The arrival sound plays for chats only, and only while that conversation is not on screen. Mail is silent — its unread count on the rail is the notice.</p>`;
+      const soundRow = document.createElement("label");
+      soundRow.className = "text-15";
+      soundRow.style.display = "flex";
+      soundRow.style.alignItems = "center";
+      soundRow.style.gap = "var(--space-3)";
+      soundRow.style.marginTop = "var(--space-4)";
+      const soundCb = document.createElement("input");
+      soundCb.type = "checkbox";
+      soundCb.checked = chatSoundEnabled();
+      soundCb.onchange = () => {
+        void setChatSoundEnabled(soundCb.checked);
+      };
+      soundRow.append(
+        soundCb,
+        document.createTextNode("Play a sound when a chat message arrives"),
+      );
+      body.appendChild(soundRow);
+      // Play the clip on demand: the arrival path depends on which pane is
+      // open, so a test button is the only way to hear the output chain
+      // (webview → Tauri command → rodio → device) on its own.
+      const testBtn = document.createElement("button");
+      testBtn.type = "button";
+      testBtn.className = "btn ghost";
+      testBtn.style.marginTop = "var(--space-3)";
+      testBtn.textContent = "Play test sound";
+      testBtn.onclick = () => {
+        playChatSound();
+        this.announce("Test sound requested");
+      };
+      body.appendChild(testBtn);
+      const hint = document.createElement("p");
+      hint.className = "muted text-13";
+      hint.style.marginTop = "var(--space-2)";
+      hint.textContent =
+        "Per contact, the sound can be turned off from the chat's menu (the … button).";
+      body.appendChild(hint);
     } else if (this.settingsSection === "security") {
       body.innerHTML = `<h2 class="text-22">Security</h2><p class="muted text-13">Idle auto-lock is enforced by the daemon. Suspend / sleep also locks the vault on Linux when logind is available.</p>`;
       const label = document.createElement("p");
@@ -4418,9 +4508,13 @@ export class App {
     };
     const mute = document.createElement("button");
     mute.className = "btn-secondary pressable";
-    mute.textContent = isMuted(nick) ? "Unmute" : "Mute";
+    mute.textContent = isChatSoundMuted(nick)
+      ? "Unmute sounds"
+      : "Mute sounds";
     mute.onclick = () => {
-      void setMuted(nick, !isMuted(nick)).then(() => this.render());
+      void setChatSoundMuted(nick, !isChatSoundMuted(nick)).then(() =>
+        this.render(),
+      );
     };
     // Deletion lives in Trusts only. This button is a pointer to it, not a
     // second implementation, so there is one place that decides what removing

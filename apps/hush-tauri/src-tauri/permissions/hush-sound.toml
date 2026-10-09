@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-chat-sound"
+description = "Play the chat arrival sound through the host audio device"
+commands.allow = ["play_chat_sound"]

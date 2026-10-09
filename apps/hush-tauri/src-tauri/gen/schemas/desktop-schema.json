@@ -177,6 +177,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Play the chat arrival sound through the host audio device",
+          "type": "string",
+          "const": "allow-chat-sound",
+          "markdownDescription": "Play the chat arrival sound through the host audio device"
+        },
+        {
           "description": "Open isolated Tor-backed Drop windows and manage the local Tor process",
           "type": "string",
           "const": "allow-drops",

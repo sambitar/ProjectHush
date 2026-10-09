@@ -13,6 +13,10 @@ export interface UiPrefsDto {
   mail_starred: string[];
   mail_archived: string[];
   mail_trashed: string[];
+  /** Play a sound when a chat message arrives (global switch). */
+  chat_sound: boolean;
+  /** Contacts whose arrival sound is off, from the chat's own menu. */
+  chat_sound_muted: string[];
 }
 
 const defaultPrefs = (): UiPrefsDto => ({
@@ -26,6 +30,8 @@ const defaultPrefs = (): UiPrefsDto => ({
   mail_starred: [],
   mail_archived: [],
   mail_trashed: [],
+  chat_sound: true,
+  chat_sound_muted: [],
 });
 
 let cache: UiPrefsDto | null = null;
@@ -64,6 +70,8 @@ export async function patchUiPrefs(
     mail_starred: patch.mail_starred ?? base.mail_starred,
     mail_archived: patch.mail_archived ?? base.mail_archived,
     mail_trashed: patch.mail_trashed ?? base.mail_trashed,
+    chat_sound: patch.chat_sound ?? base.chat_sound,
+    chat_sound_muted: patch.chat_sound_muted ?? base.chat_sound_muted,
   };
   await persistUiPrefs(merged);
   return merged;
@@ -108,6 +116,7 @@ export async function clearContactUiPrefs(nick: string): Promise<void> {
   await patchUiPrefs({
     muted: p.muted.filter((n) => n !== nick),
     blocked: p.blocked.filter((n) => n !== nick),
+    chat_sound_muted: p.chat_sound_muted.filter((n) => n !== nick),
     nick_overrides,
   });
 }
@@ -130,6 +139,8 @@ function normalize(raw: UiPrefsDto): UiPrefsDto {
     mail_starred: raw.mail_starred ?? [],
     mail_archived: raw.mail_archived ?? [],
     mail_trashed: raw.mail_trashed ?? [],
+    chat_sound: raw.chat_sound ?? true,
+    chat_sound_muted: raw.chat_sound_muted ?? [],
   };
 }
 
