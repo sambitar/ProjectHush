@@ -25,6 +25,14 @@ enum Commands {
         /// Relay URL for this vault. Defaults to HUSH_RELAY_URL, then client-config.json.
         #[arg(long)]
         relay: Option<String>,
+        /// The relay's v3 onion address. Recorded alongside the clearnet base
+        /// so the Tor switch can move between them; with `--tor`, the vault
+        /// starts on the onion.
+        #[arg(long)]
+        onion: Option<String>,
+        /// Start this vault with the relay path through Tor. Needs `--onion`.
+        #[arg(long)]
+        tor: bool,
         /// The vault's name. It becomes the suffix of this member's mail
         /// address (`name@vaultname`) and travels in the invite.
         #[arg(long)]
@@ -50,6 +58,19 @@ enum Commands {
         save_dir: Option<StdPathBuf>,
     },
     Contacts,
+    /// The Tor relay switch: `on` (with `--onion` to attach first), `off`, `show`.
+    /// `set --url <url>` moves the vault's clearnet relay (contacts on the old
+    /// relay must move too — the mailbox lives on the relay).
+    Relay {
+        #[arg(default_value = "show")]
+        action: String,
+        /// With `on`: the relay's v3 onion address, if none is on file yet.
+        #[arg(long)]
+        onion: Option<String>,
+        /// With `set`: the new clearnet relay base.
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// Read or change the central client config (DR-14).
     Config {
         #[command(subcommand)]
@@ -85,15 +106,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Init {
             passphrase,
             relay,
+            onion,
+            tor,
             name,
         } => {
+            if tor && onion.is_none() {
+                return Err("--tor needs --onion: Tor relay mode moves the relay path to the \
+                            onion address, so there must be one on file."
+                    .into());
+            }
             let relay = config::resolve_relay_url(&dir, relay.as_deref());
             let mut account = Account::create(&dir, &passphrase, &relay).await?;
+            if let Some(onion) = onion.as_deref() {
+                account.set_relay_tor(tor, Some(onion)).await?;
+            }
             if let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                 account.set_vault_name(name).await?;
             }
             println!("vault ready at {}", dir.display());
-            println!("relay: {}", relay);
+            println!("relay: {}", account.relay());
+            if let Some(onion) = account.onion_relay() {
+                println!("onion relay: {}", onion);
+            }
             println!("vault name: {}", account.vault_name());
             if let Some(code) = account.take_pending_recovery_code() {
                 println!("SAVE THIS RECOVERY CODE (shown once): {}", code);
@@ -102,6 +136,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Invite => {
             let mut account = open(&dir, &passphrase).await?;
             println!("{}", account.invite().await?);
+        }
+        Commands::Relay { action, onion, url } => {
+            let mut account = open(&dir, &passphrase).await?;
+            match action.as_str() {
+                "on" => {
+                    account.set_relay_tor(true, onion.as_deref()).await?;
+                    println!("relay: {} (through tor)", account.relay());
+                }
+                "off" => {
+                    account.set_relay_tor(false, None).await?;
+                    println!("relay: {} (direct)", account.relay());
+                }
+                "show" => {
+                    println!("switch: {}", if account.relay_tor_mode() { "tor" } else { "direct" });
+                    println!("relay: {}", account.relay());
+                    match account.onion_relay() {
+                        Some(onion) => println!("onion: {}", onion),
+                        None => println!("onion: (none on file)"),
+                    }
+                }
+                "set" => {
+                    let url = url.as_deref().ok_or(
+                        "relay set needs --url <http(s)://host:port>",
+                    )?;
+                    account.set_relay_clearnet(url).await?;
+                    println!("relay: {} (direct base updated)", account.relay());
+                }
+                other => {
+                    return Err(format!(
+                        "unknown relay action {:?}; use on, off, show, or set",
+                        other
+                    )
+                    .into());
+                }
+            }
         }
         Commands::AddContact { nickname, invite } => {
             let mut account = open(&dir, &passphrase).await?;

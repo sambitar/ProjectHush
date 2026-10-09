@@ -31,17 +31,19 @@ use crate::tor::{TorManager, TorPhase, DEFAULT_BOOTSTRAP_TIMEOUT};
 pub const DROP_WINDOW_LABEL: &str = "drop-view";
 
 /// State managed by Tauri for the Drops feature.
+///
+/// The Tor process is *not* here: it is managed at the app level so the relay
+/// switch can keep it alive for the whole session and Drops share the same
+/// process. This state only tracks which Drop is open.
 pub struct DropsState {
-    pub tor: TorManager,
     /// The `(id, name)` of the Drop currently open, so the UI can restore which
     /// card to mark after a re-render. Not persisted: it is session-only.
     pub open: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl DropsState {
-    pub fn new(tor: TorManager) -> Self {
+    pub fn new() -> Self {
         Self {
-            tor,
             open: Arc::new(Mutex::new(None)),
         }
     }
@@ -214,6 +216,7 @@ fn build_drop_window(
 pub async fn drops_open(
     app: AppHandle,
     state: State<'_, DropsState>,
+    tor: State<'_, TorManager>,
     req: OpenDropRequest,
 ) -> Result<(), String> {
     let dev = req.dev && dev_enabled();
@@ -222,7 +225,7 @@ pub async fn drops_open(
     let proxy_port = if dev {
         None
     } else {
-        let tor = state.tor.clone();
+        let tor = tor.inner().clone();
         let status = tauri::async_runtime::spawn_blocking(move || {
             tor.ensure_blocking(DEFAULT_BOOTSTRAP_TIMEOUT)
         })
@@ -310,17 +313,17 @@ pub fn drops_dev_enabled() -> bool {
 
 /// Current Tor status, for the indicator and the open flow.
 #[tauri::command]
-pub fn drops_tor_status(state: State<'_, DropsState>) -> crate::tor::TorStatus {
-    state.tor.status()
+pub fn drops_tor_status(tor: State<'_, TorManager>) -> crate::tor::TorStatus {
+    tor.status()
 }
 
 /// Bring Tor up (idempotent) and wait until it is ready or the timeout elapses.
 #[tauri::command]
 pub async fn drops_tor_start(
-    state: State<'_, DropsState>,
+    tor: State<'_, TorManager>,
     timeout_ms: Option<u64>,
 ) -> Result<crate::tor::TorStatus, String> {
-    let tor = state.tor.clone();
+    let tor = tor.inner().clone();
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(90_000).min(180_000));
     tauri::async_runtime::spawn_blocking(move || tor.ensure_blocking(timeout))
         .await
@@ -329,9 +332,9 @@ pub async fn drops_tor_start(
 
 /// Stop Tor and report the resulting status.
 #[tauri::command]
-pub fn drops_tor_stop(state: State<'_, DropsState>) -> crate::tor::TorStatus {
-    state.tor.stop();
-    state.tor.status()
+pub fn drops_tor_stop(tor: State<'_, TorManager>) -> crate::tor::TorStatus {
+    tor.stop();
+    tor.status()
 }
 
 #[cfg(test)]

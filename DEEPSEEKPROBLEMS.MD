@@ -13,6 +13,137 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-09 — Client Tor switch (relay over onion, fail-closed)
+
+Slice goal: a per-vault relay switch — pre-login toggle and top-bar pill in the UI,
+`hush-cli init --onion/--tor` and a `relay on/off/show` subcommand, daemon
+`/api/relay*` endpoints, TorManager promoted to app-level state. New onion state on
+`AccountState` (`onion_relay`, `use_tor_relay`) with a fail-closed `relay_client()`
+at every former `RelayClient::try_new(&self.state.relay)` call site.
+
+### [OPEN] connection light showed "connected" with the laptop offline (2nd report: fix never reached the wire)
+
+- **Attempted:** make the rail shield reflect whether the relay is actually
+  reachable (first pass: `RelayClient::ping`, `Account::relay_ping`, daemon
+  cache + background probe, `reachable` in `GET /api/relay`).
+- **Symptom (user, live build):** "still not changing the color indicator when
+  no internet.. i waited 30 s or more it didn't change .. outbox worked fine …
+  send mail after connected again". The outbox result proves fail-closed and
+  the queue both work; only the light lied.
+- **Root cause found:** `run-one-ui.sh` **reused an already-running daemon**
+  ("Daemon already up on $SOCK"). The daemon serving `/api/relay` predated the
+  `reachable` field, so the new UI read `undefined` → treated as unknown →
+  green forever. The rebuild produced a new binary that the script then never
+  started. A dev-loop script that reuses long-lived processes must restart
+  them when the code changes, or changes silently never ship.
+- **Resolution (implemented, unverified):** (1) the script now restarts the
+  daemon on every run (kill the stale one on the socket first; state lives in
+  the vault, so a restart is free); (2) defense in depth — the daemon's
+  heartbeat loop already round-trips the relay every 30 s and discarded the
+  result; its outcome now feeds the reachability cache, so the light converges
+  within ≤30 s even if poll-triggered probes were somehow not running.
+- **Needed to resolve:** re-run the script (it will say "Stopping the stale
+  daemon…"), then pull the network: red within ~5 s from a probe, worst case
+  ~30 s from the heartbeat; restore and confirm green.
+- **Lesson:** when a fix "doesn't work", first verify it is running. A reused
+  process serving old code makes every subsequent theory wrong. The heartbeat
+  was already paying the round trip and throwing away the only signal that
+  mattered — wire results to the state that needs them.
+
+### [OPEN] connection light showed "connected" with the laptop offline (first pass)
+
+### [OPEN] pill stuck on "Set relay address"; settings told the user to toggle Tor off and on
+
+- **Attempted:** ship the redesign so the switch alone is the whole flow: flip on →
+  Tor boots, the daemon learns the SOCKS port, the vault carries the mode, pill goes
+  "Tor on".
+- **Symptom (user, live build):** "while its connected to Tor it shows Set relay
+  address" and "asking me to turn it on and off and still not working". The pill's
+  `pending` state fired for *any* `mode && !applied`, and `applied` required the
+  daemon to hold the shell Tor's SOCKS port in daemon memory — which a daemon
+  restart wipes and nothing ever re-posted. The settings note then literally
+  instructed "turn the switch off and on", which re-posted the port but was
+  unprincipled and still left the fresh-restart case broken.
+- **Evidence found on disk (second report):** `instances/peer-a/ui-prefs.json` had
+  `relay_tor: true` and the onion **staged but never consumed** — the vault never
+  received the address, so `applied` could never be true. Also: the user runs
+  their own Tor, while the app unconditionally spawns a second bundled Tor and
+  competes with it; and the vault itself was born on the loopback relay
+  (`setup-two-peers.sh` passes `--relay http://127.0.0.1:8787` explicitly), so
+  clearnet traffic was going to "the local one" the user does not want.
+- **Resolution (implemented, unverified):** (1) self-healing in
+  `refreshTorPill()` — the poller re-posts the live SOCKS port whenever the
+  daemon's copy differs and auto-starts the shell Tor when it is stopped;
+  (2) the shell now **adopts a live system Tor** (SOCKS5-greeting probe on
+  9050/9150) instead of always spawning its own, and re-probes an adopted Tor
+  on the next explicit start; (3) Tor's stdout is teed to `tor.log` in the
+  private data dir so a failure is diagnosable; (4) the rail's existing top
+  shield is now the single indicator — no second icon, no badge — filled green
+  when connected (clearnet or Tor), orange while Tor comes up, red when not
+  reachable, with the accessible name/tooltip carrying the words; (5) the
+  relay-address UI is removed (operator config carries `onion_relay`), and
+  `hush-cli relay set --url` can move an existing vault off the loopback relay;
+  (6) `run-one-ui.sh` no longer starts a local relay by default
+  (`WITH_LOCAL_RELAY=1` opts back in).
+- **Needed to resolve:** rebuild + `scripts/run-one-ui.sh`; check the shield
+  goes green through Tor without any manual step; `relay show` on both peers
+  after `relay set` to confirm the VPS relay.
+- **Lesson:** three separate assumptions compounded into "not working": state
+  that dies with a process restart (SOCKS port), a second Tor where the user
+  already had one, and a vault pinned to a relay the user never chose. Diagnose
+  from on-disk state before theorizing; every layer here was provable from
+  files alone.
+
+### [FIXED] cached invite defeated every negative control in the live Tor E2E
+
+- **Attempted:** prove the client Tor path by running `hush-cli invite` against the
+  lab VPS onion with (a) SOCKS env unset and (b) tor dead; both must fail.
+- **Symptom:** both controls *passed* — identical invite bytes, ~0.5 s even with tor
+  killed. `invite()` returns the minted invite from `invite_cache` in vault state and
+  never touches the relay on repeats, so the probes exercised no network path at all.
+- **Resolution:** switched the probe to `recv`, which always hits the relay. With the
+  corrected probe: SOCKS unset → `Relay("Tor relay mode is on, but Tor is not
+  connected yet…")`; tor dead → connection error naming the **onion** URL (no
+  clearnet fallback); tor up → success with `Got RENDEZVOUS2 cell from hidden
+  service` in tor's info log. All captured in `scripts/smoke-tor-relay.sh`.
+- **Lesson:** before trusting a negative control, check whether the code path under
+  test has a cache. A control that passes must fail is not evidence.
+
+### [WORKED AROUND] bundled tor cannot be launched bare from a shell
+
+- **Attempted:** start the sidecar binary
+  (`resources/tor/tor --SocksPort 9150`) directly for the E2E, same as the app does.
+- **Symptom:** process dies instantly, no log file created.
+  `error while loading shared libraries: libevent-2.1.so.7`.
+- **Resolution:** usage issue, not a repo bug — the sidecar's libraries live beside it
+  and the app's `TorManager` points `LD_LIBRARY_PATH` there. Launching outside the
+  app needs `env LD_LIBRARY_PATH=resources/tor tor …`; the smoke script does this.
+- **Lesson:** a bundled sidecar is only self-contained when its launcher sets its
+  library path; document the invocation, do not assume the binary is portable.
+
+### [OPEN] shell execution environment died mid-session; last two batches of work not compiled
+
+- **Attempted:** keep building and verifying across the session; the shell stopped
+  returning exit codes partway through and never recovered (retried across ~90
+  minutes, including `echo` and `true`).
+- **Symptom:** every shell call returns "no exit status"; file tools keep working.
+  An agent-environment failure, not a repo problem.
+- **Unverified work behind it:** (1) the `hush-cli` `Relay` subcommand and
+  `scripts/smoke-tor-relay.sh` from the first slice; (2) the user's redesign —
+  relay address moved out of the login card into a Settings → Relay section, the
+  login control now a slide switch, the pill reframed to Tor on/off with a
+  `pending` state, `GET /api/relay` returning `{tor_mode, applied, onion_url,
+  socks}` with the mode choice accepted even when no address is on file yet, and
+  `Work::RelayAttach` deleted in favour of `RelayApply`. All statically
+  self-reviewed; none of it compiled or type-checked. (3) the stuck-pending fix
+  below — poller self-heal, pill state machine rework, and the config-level
+  `onion_relay` fallback in `hush-core` and `hush-daemon`.
+- **Needed to resolve:** `cargo build -p hush-cli -p hush-daemon -p hush-tauri`,
+  `npx tsc --noEmit` + `npx vite build` in `apps/hush-tauri`, then
+  `scripts/smoke-tor-relay.sh`.
+
+---
+
 ## 2026-10-08 — Chat notifications: rail badges + arrival sound
 
 Slice goal: unread-count pill on the Chats and Mail rail buttons, a native arrival

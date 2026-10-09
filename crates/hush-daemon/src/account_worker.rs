@@ -169,6 +169,23 @@ enum Work {
         conclave_id: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Flip the Tor relay switch on the live vault. A no-op while locked:
+    /// the prefs file carries the intent and unlock applies it.
+    RelayApply {
+        use_tor: bool,
+        onion: Option<String>,
+        socks: Option<String>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// The vault's applied switch state. Errors while locked; callers fall
+    /// back to the prefs values.
+    RelayInfo {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Probe whether the relay answers right now, along the selected path.
+    RelayProbe {
+        reply: oneshot::Sender<WorkResult>,
+    },
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -205,7 +222,17 @@ pub enum WorkResult {
         relay: String,
         mail_handle: Option<String>,
         vault_name: String,
+        /// Whether the relay path is switched to Tor.
+        relay_tor: bool,
     },
+    /// The vault's applied Tor relay switch state.
+    RelayInfo {
+        relay_tor: bool,
+        onion_url: Option<String>,
+    },
+    /// Whether the relay answered a health probe. `false` is a real answer
+    /// (unreachable), distinct from `Err("locked")`.
+    Reachable(bool),
     Backup(Vec<u8>),
     RecoveryCode(String),
     Messages(Vec<ChatRecord>),
@@ -390,7 +417,43 @@ impl AccountWorker {
                                     relay: a.relay().to_string(),
                                     mail_handle: a.mail_handle().map(|h| h.to_string()),
                                     vault_name: a.vault_name().to_string(),
+                                    relay_tor: a.relay_tor_mode(),
                                 },
+                            };
+                            (reply, result)
+                        }
+                        Work::RelayApply { use_tor, onion, socks, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Ok,
+                                Some(a) => {
+                                    a.set_relay_socks(socks);
+                                    match a.set_relay_tor(use_tor, onion.as_deref()).await {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::RelayInfo { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::RelayInfo {
+                                    relay_tor: a.relay_tor_mode(),
+                                    onion_url: a.onion_relay().map(|s| s.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RelayProbe { reply } => {
+                            // Short timeout: this feeds a status light the UI
+                            // polls, so a dead network must resolve quickly to
+                            // "unreachable" rather than tie up the worker.
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::Reachable(
+                                    a.relay_ping(std::time::Duration::from_secs(4)).await,
+                                ),
                             };
                             (reply, result)
                         }
@@ -825,6 +888,32 @@ impl AccountWorker {
 
     pub async fn meta(&self) -> WorkResult {
         self.call(|reply| Work::Meta { reply }).await
+    }
+
+    /// Flip the Tor relay switch on the live vault. See [`Work::RelayApply`].
+    pub async fn relay_apply(
+        &self,
+        use_tor: bool,
+        onion: Option<String>,
+        socks: Option<String>,
+    ) -> WorkResult {
+        self.call(|reply| Work::RelayApply {
+            use_tor,
+            onion,
+            socks,
+            reply,
+        })
+        .await
+    }
+
+    /// The vault's applied switch state. See [`Work::RelayInfo`].
+    pub async fn relay_info(&self) -> WorkResult {
+        self.call(|reply| Work::RelayInfo { reply }).await
+    }
+
+    /// Whether the relay answers right now. See [`Work::RelayProbe`].
+    pub async fn relay_probe(&self) -> WorkResult {
+        self.call(|reply| Work::RelayProbe { reply }).await
     }
 
     pub async fn messages(&self) -> WorkResult {

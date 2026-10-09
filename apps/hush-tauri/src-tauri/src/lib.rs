@@ -110,14 +110,17 @@ pub fn run() {
         ])
         .setup(move |app| {
             // Tor lives under the app's local data dir, not in the vault, and is
-            // owned by this process. The drop view is the only consumer.
+            // owned by this process. It is managed at the app level: the relay
+            // switch keeps it alive for the whole session, and the Drop view
+            // shares the same process rather than owning it.
             let data_dir = app
                 .path()
                 .app_local_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir().join("hush-tauri"))
                 .join("tor");
             let resource_dir = app.path().resource_dir().ok();
-            app.manage(DropsState::new(TorManager::new(data_dir, resource_dir)));
+            app.manage(TorManager::new(data_dir, resource_dir));
+            app.manage(DropsState::new());
 
             if let Some(window) = app.get_webview_window("main") {
                 window.set_title(&window_title)?;
@@ -130,8 +133,8 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            if let Some(state) = app_handle.try_state::<DropsState>() {
-                state.tor.stop();
+            if let Some(tor) = app_handle.try_state::<TorManager>() {
+                tor.stop();
             }
         }
     });

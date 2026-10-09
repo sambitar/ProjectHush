@@ -18,7 +18,7 @@ use crate::error::Error;
 use crate::invite::InvitePayload;
 use crate::message::{InboxResult, ReceivedAttachment, ReceivedMessage};
 use crate::payload::{MailAttachment, MessagePayload, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS};
-use crate::relay_client::{normalize_relay_base, RelayClient};
+use crate::relay_client::{normalize_relay_base, validate_onion_relay, RelayClient};
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
     process_contact_bundle, protocol_address, protocol_name_from_identity, sign_queue_grant,
@@ -294,7 +294,21 @@ pub struct PendingInvite {
 
 #[derive(Serialize, Deserialize)]
 struct AccountState {
+    /// The relay this vault was created with: the clearnet canonical base.
+    /// Never rewritten by the Tor switch — flipping modes selects between
+    /// this and [`AccountState::onion_relay`], so a flip back is always
+    /// possible even if the onion address is the only one that still works.
     relay: String,
+    /// The same relay's onion address, when one is on file: recorded at vault
+    /// creation (`hush-cli init --onion`) or attached later through the
+    /// daemon's relay endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    onion_relay: Option<String>,
+    /// Whether the relay path currently goes through Tor. The daemon applies
+    /// the user's switch here (directly when unlocked, from staged prefs at
+    /// unlock), so the vault's traffic follows the switch across restarts.
+    #[serde(default)]
+    use_tor_relay: bool,
     protocol_name: String,
     contacts: Vec<Contact>,
     /// Stable invite string so "Copy my invite" does not rotate keys every click.
@@ -347,6 +361,10 @@ pub struct Account {
     dir: PathBuf,
     chat_log: ChatLog,
     pending_recovery_code: Option<String>,
+    /// The SOCKS proxy the daemon was told the local Tor listens on, when Tor
+    /// relay mode is on. Runtime-only: the daemon re-applies it after every
+    /// unlock and whenever the mode changes, so it is never persisted.
+    relay_socks: Option<String>,
 }
 
 impl Account {
@@ -365,6 +383,8 @@ impl Account {
         );
         let state = AccountState {
             relay,
+            onion_relay: None,
+            use_tor_relay: false,
             protocol_name,
             contacts: Vec::new(),
             invite_cache: None,
@@ -387,6 +407,7 @@ impl Account {
             dir: dir.to_path_buf(),
             chat_log,
             pending_recovery_code: Some(recovery_code),
+            relay_socks: None,
         };
         account.save().await?;
         Ok(account)
@@ -468,6 +489,7 @@ impl Account {
             dir: dir.to_path_buf(),
             chat_log,
             pending_recovery_code,
+            relay_socks: None,
         };
         if needs_save {
             account.save().await?;
@@ -531,8 +553,113 @@ impl Account {
         &self.dir
     }
 
+    /// The relay base this vault is using right now: the onion address when
+    /// Tor relay mode is on, the clearnet base otherwise.
     pub fn relay(&self) -> &str {
-        &self.state.relay
+        if self.state.use_tor_relay {
+            self.state
+                .onion_relay
+                .as_deref()
+                .unwrap_or(&self.state.relay)
+        } else {
+            &self.state.relay
+        }
+    }
+
+    /// Whether the relay path is currently switched to Tor.
+    pub fn relay_tor_mode(&self) -> bool {
+        self.state.use_tor_relay
+    }
+
+    /// Whether this account can reach its relay right now, along the path the
+    /// switch currently selects.
+    ///
+    /// Fail-closed by construction: it reuses [`Account::relay_client`], so a
+    /// Tor-mode account with no live SOCKS proxy reports unreachable rather
+    /// than silently probing over clearnet. The UI's connection light is only
+    /// as honest as this answer.
+    pub async fn relay_ping(&self, timeout: std::time::Duration) -> bool {
+        match self.relay_client() {
+            Ok(client) => client.ping(timeout).await,
+            Err(_) => false,
+        }
+    }
+
+    /// Point this vault at a different clearnet relay.
+    ///
+    /// This is an escape hatch for moving a vault that was created against
+    /// another relay (a loopback dogfood relay, say) to the real one. It is
+    /// deliberately not part of the app: the mailbox lives on the relay, so
+    /// mail from contacts still pointed at the old relay stops meeting this
+    /// vault until they move too. The clearnet base only — the Tor switch and
+    /// the onion address on file are left exactly as they were.
+    pub async fn set_relay_clearnet(&mut self, url: &str) -> Result<(), Error> {
+        self.state.relay = normalize_relay_base(url)?;
+        self.save().await
+    }
+
+    /// The onion address on file, if any.
+    pub fn onion_relay(&self) -> Option<&str> {
+        self.state.onion_relay.as_deref()
+    }
+
+    /// Apply the Tor relay switch: record the address when given, then pick
+    /// which base the relay path uses. Persisted, so the mode survives a
+    /// restart. Turning the mode on with no address on file is refused — the
+    /// alternative would be silently choosing which network the user's
+    /// traffic takes, and that choice is the user's.
+    pub async fn set_relay_tor(&mut self, use_tor: bool, onion: Option<&str>) -> Result<(), Error> {
+        if let Some(raw) = onion {
+            self.state.onion_relay = Some(validate_onion_relay(raw)?);
+        }
+        if use_tor && self.state.onion_relay.is_none() {
+            return Err(Error::Relay(
+                "cannot turn on Tor relay mode before an onion address is on file".into(),
+            ));
+        }
+        self.state.use_tor_relay = use_tor;
+        self.save().await
+    }
+
+    /// The SOCKS proxy the daemon was told the local Tor listens on. Runtime
+    /// state only: the daemon re-applies it after unlock and on every mode
+    /// change, so it is never persisted and never stale.
+    pub fn set_relay_socks(&mut self, socks: Option<String>) {
+        self.relay_socks = socks;
+    }
+
+    /// Build the relay client this account must use right now.
+    ///
+    /// Tor mode is fail-closed by design: with the switch on, every request
+    /// goes to the onion base through the SOCKS proxy, and a missing half —
+    /// no onion address on file, no live Tor SOCKS port — is an error rather
+    /// than a silent fall back to clearnet. Only the switch turning the mode
+    /// off sends traffic directly.
+    fn relay_client(&self) -> Result<RelayClient, Error> {
+        if self.state.use_tor_relay {
+            let base = self.state.onion_relay.as_deref().ok_or_else(|| {
+                Error::Relay(
+                    "Tor relay mode is on, but no onion address is on file for this vault."
+                        .into(),
+                )
+            })?;
+            // The daemon carries the shell-reported port in memory; the CLI
+            // (which never gets one posted) falls back to the documented env
+            // seam. Neither present means fail closed, never direct.
+            let socks = self
+                .relay_socks
+                .clone()
+                .or_else(|| std::env::var(crate::relay_client::ENV_RELAY_SOCKS_PROXY).ok())
+                .ok_or_else(|| {
+                    Error::Relay(
+                        "Tor relay mode is on, but Tor is not connected yet. Mail waits in the outbox and sends when it connects."
+                            .into(),
+                    )
+                })?;
+            RelayClient::try_new_with_proxy(base, Some(&socks))
+        } else {
+            RelayClient::try_new_with_proxy(&self.state.relay, None)
+        }
     }
 
     pub fn protocol_name(&self) -> &str {
@@ -717,7 +844,7 @@ impl Account {
     /// queue. A relay failure is returned so the caller can decide; the local
     /// revocation is already recorded, so the next drain re-drives it.
     async fn burn_contact_queue(&self, account_id: &str) -> Result<(), Error> {
-        let relay = RelayClient::try_new(&self.state.relay)?;
+        let relay = self.relay_client()?;
         relay
             .burn_if_exists(
                 &self.device.contact_queue_id(account_id),
@@ -1787,7 +1914,7 @@ impl Account {
     }
 
     pub async fn heartbeat_presence(&self) -> Result<(), Error> {
-        let relay = RelayClient::try_new(&self.state.relay)?;
+        let relay = self.relay_client()?;
         relay
             .touch_presence(self.device.queue_id(), self.device.read_token())
             .await
@@ -1795,7 +1922,7 @@ impl Account {
 
     pub async fn contact_is_online(&self, nickname: &str) -> Result<bool, Error> {
         let contact = self.find_contact(nickname).ok_or(Error::ContactNotFound)?;
-        let relay = RelayClient::try_new(&self.state.relay)?;
+        let relay = self.relay_client()?;
         relay
             .contact_presence_online(&contact.queue_id, &contact.queue_token)
             .await
@@ -1887,7 +2014,7 @@ impl Account {
         )
         .await?;
         let body = encode_relay_blob(&ct);
-        let relay = RelayClient::try_new(&self.state.relay)?;
+        let relay = self.relay_client()?;
         relay.put(queue_id, queue_token, &body).await?;
         Ok(())
     }
@@ -1961,7 +2088,7 @@ impl Account {
             return Ok(());
         }
 
-        let relay = RelayClient::try_new(&self.state.relay)?;
+        let relay = self.relay_client()?;
         let bytes = relay.get_prekey_record(account_id).await?;
         let record = PreKeyRecord::decode(&bytes)?;
         record.verify(identity_key)?;
@@ -1981,7 +2108,7 @@ impl Account {
         let record = self.device.mint_prekeys(one_time_count).await?;
         self.save().await?;
         let body = record.encode()?;
-        let relay = RelayClient::try_new(&self.state.relay)?;
+        let relay = self.relay_client()?;
         relay
             .put_prekey_record(&self.state.protocol_name, &body)
             .await?;
@@ -2035,7 +2162,7 @@ impl Account {
         // already gone is a no-op.
         self.burn_revoked_queues().await?;
 
-        let relay = RelayClient::try_new(&self.state.relay)?;
+        let relay = self.relay_client()?;
         // (expected sender account, queue id, read token). `None` marks the
         // inbox, whose sender can be any contact.
         let mut queues: Vec<(Option<String>, String, String)> = Vec::new();
@@ -2508,6 +2635,8 @@ mod tests {
 
         let state = AccountState {
             relay: "http://127.0.0.1:1".into(),
+            onion_relay: None,
+            use_tor_relay: false,
             protocol_name: protocol_name.clone(),
             contacts: Vec::new(),
             invite_cache: None,

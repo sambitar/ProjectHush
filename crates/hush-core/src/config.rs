@@ -26,6 +26,8 @@ pub const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8787";
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:9876";
 /// Environment override for the relay URL.
 pub const ENV_RELAY_URL: &str = "HUSH_RELAY_URL";
+/// Environment override for the relay's onion address.
+pub const ENV_RELAY_ONION_URL: &str = "HUSH_RELAY_ONION_URL";
 /// Environment override for the daemon bind address (enables the TCP listener).
 pub const ENV_DAEMON_ADDR: &str = "HUSH_DAEMON_ADDR";
 /// Environment override for the daemon Unix socket path.
@@ -62,6 +64,10 @@ pub struct ClientConfig {
     /// Relay used when creating a new vault.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
+    /// The relay's onion address. Operator config: when present, vaults pick
+    /// it up automatically in Tor relay mode and the user never types one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onion_relay: Option<String>,
     /// TCP bind address for the daemon. Setting this opts the TCP listener back in;
     /// the default is Unix socket only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -77,12 +83,13 @@ fn default_version() -> u32 {
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        Self {
-            v: 1,
-            relay_url: None,
-            daemon_addr: None,
-            daemon_socket: None,
-        }
+            Self {
+                v: 1,
+                relay_url: None,
+                onion_relay: None,
+                daemon_addr: None,
+                daemon_socket: None,
+            }
     }
 }
 
@@ -137,6 +144,17 @@ pub fn resolve_relay_url_with_source(
 /// Effective relay URL for creating a new vault.
 pub fn resolve_relay_url(data_dir: &Path, explicit: Option<&str>) -> String {
     resolve_relay_url_with_source(data_dir, explicit).0
+}
+
+/// Effective onion address for the relay, when one is on file (env or config
+/// file). No clearnet fallback exists — an onion address is either configured
+/// or absent.
+pub fn resolve_onion_relay_url(data_dir: &Path) -> Option<String> {
+    if let Some(v) = non_empty(std::env::var(ENV_RELAY_ONION_URL).ok().as_deref()) {
+        return Some(v.to_string());
+    }
+    let file = load(data_dir);
+    non_empty(file.onion_relay.as_deref()).map(str::to_string)
 }
 
 /// Effective daemon bind address plus the source that supplied it.

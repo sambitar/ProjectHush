@@ -94,6 +94,7 @@ import {
   openState,
   torStart,
   torStatus,
+  torStop,
   type TorPhase,
   type TorStatus,
 } from "./lib/drops/tauri";
@@ -118,6 +119,7 @@ type Rail =
 type SettingsSection =
   | "appearance"
   | "profile"
+  | "relay"
   | "notifications"
   | "security"
   | "recovery"
@@ -204,6 +206,21 @@ export class App {
   private bottomOnNextChatRender = false;
   private pollTimer: number | null = null;
   private unlockedAt = 0;
+  /** Relay-switch poller and last-seen state, so the pill repaints only on change. */
+  private torPillTimer: number | null = null;
+  private torPhase: TorPhase | null = null;
+  private torMessage: string | null = null;
+  private torMode = false;
+  private torApplied = false;
+  private torOnionUrl: string | null = null;
+  /** Whether the daemon's probe last reached the relay. `null` = not yet
+   * known. This, not Tor's phase, decides the shield's colour: Tor stays
+   * "ready" long after the network is gone. */
+  private torReachable: boolean | null = null;
+  /** Guards one in-flight auto-start of the shell's Tor. */
+  private torAutoBusy = false;
+  /** The last failed action on the Tor surfaces, shown in the settings section. */
+  private torActionError: string | null = null;
   private search = "";
   private settingsSection: SettingsSection = "appearance";
   private liveRegion!: HTMLElement;
@@ -560,6 +577,7 @@ export class App {
     this.root.innerHTML = "";
     if (!this.status || this.status.locked) {
       this.stopDropsPoll();
+      this.stopTorPoll();
       this.root.appendChild(this.renderUnlock());
       return;
     }
@@ -593,6 +611,7 @@ export class App {
       shell.appendChild(this.renderSettings());
     }
     this.root.appendChild(shell);
+    this.startTorPoll();
     this.renderedNick = this.rail === "chats" ? this.selectedNick : null;
     // Now that the thread pane is in the document and has layout, put the
     // reader where the conversation should open: the newest message, or their
@@ -691,6 +710,48 @@ export class App {
       pass.type = showCb.checked ? "text" : "password";
     };
     showRow.append(showCb, document.createTextNode("Show passphrase"));
+
+    // The pre-login Tor switch. The mode lives in the daemon's prefs (readable
+    // while locked), so the choice is remembered before the vault opens and
+    // unlock applies it to traffic from the first request on. The onion
+    // address is not asked for here: it is once-per-vault setup that lives in
+    // the relay settings.
+    const torRow = document.createElement("div");
+    torRow.style.display = "flex";
+    torRow.style.gap = "10px";
+    torRow.style.alignItems = "center";
+    torRow.style.marginTop = "10px";
+    const torSw = this.makeSwitch(false);
+    const torText = document.createElement("span");
+    torText.className = "text-13";
+    torText.textContent = "Use Tor for extra security";
+    torText.title = "The relay is reached over the Tor network, so it never learns your IP.";
+    torRow.append(torSw.el, torText);
+
+    void api
+      .relayConfig()
+      .then((cfg) => {
+        if (cfg) torSw.input.checked = cfg.tor_mode;
+      })
+      .catch(() => {
+        /* the daemon may not be up yet; the switch stays off. */
+      });
+
+    torSw.input.onchange = async () => {
+      const want = torSw.input.checked;
+      err.hidden = true;
+      torSw.input.disabled = true;
+      try {
+        await this.toggleTorRelay(want);
+      } catch (e) {
+        torSw.input.checked = !want;
+        err.hidden = false;
+        err.textContent =
+          e instanceof AppError ? e.message : "The switch could not be applied.";
+      }
+      torSw.input.disabled = false;
+    };
+
     const err = document.createElement("p");
     err.className = "text-13";
     err.style.color = "var(--danger)";
@@ -725,7 +786,7 @@ export class App {
     daemon.className = "faint text-12";
     daemon.style.marginTop = "var(--space-4)";
     daemon.textContent = getApiBase();
-    card.append(logoWrap, title, hint, pass, showRow, err, btn, daemon);
+    card.append(logoWrap, title, hint, pass, showRow, torRow, err, btn, daemon);
     wrap.appendChild(card);
     return wrap;
   }
@@ -784,12 +845,21 @@ export class App {
     const rail = document.createElement("nav");
     rail.className = "rail";
     rail.setAttribute("aria-label", "Main");
-    const logo = document.createElement("div");
-    logo.className = "logo-mark";
-    logo.style.width = "40px";
-    logo.style.height = "40px";
-    logo.appendChild(icon("vault"));
-    rail.appendChild(logo);
+    // The shield is the app's mark and the connection light in one: filled
+    // green when the relay is reachable (clearnet or Tor), orange while Tor
+    // is coming up, red when it is not reachable. The words live in its
+    // accessible name. Clicking it opens the relay switch in Settings.
+    const shield = document.createElement("button");
+    shield.type = "button";
+    shield.className = "relay-shield pressable";
+    shield.onclick = () => {
+      this.rail = "settings";
+      this.settingsSection = "relay";
+      this.render();
+    };
+    shield.appendChild(icon("vault"));
+    this.updateTorPillInto(shield);
+    rail.appendChild(shield);
     rail.appendChild(this.railBtn("chats", "Chats", "chats", unreadTotal()));
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
     rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
@@ -1180,6 +1250,146 @@ export class App {
   private startDropsPoll(): void {
     if (this.dropsPollTimer !== null) return;
     this.dropsPollTimer = window.setInterval(() => void this.refreshDrops(), 2500);
+  }
+
+  /**
+   * Poll the shell's Tor while the app is unlocked. The pill repaints in
+   * place — a full render on every tick would rebuild the whole shell twice
+   * a second for a status nobody is looking at.
+   */
+  private startTorPoll(): void {
+    if (this.torPillTimer !== null) return;
+    this.torPillTimer = window.setInterval(() => void this.refreshTorPill(), 2500);
+    void this.refreshTorPill();
+  }
+
+  private stopTorPoll(): void {
+    if (this.torPillTimer !== null) clearInterval(this.torPillTimer);
+    this.torPillTimer = null;
+  }
+
+  private async refreshTorPill(): Promise<void> {
+    const [tor, cfg] = await Promise.all([
+      torStatus(),
+      api.relayConfig().catch(() => null),
+    ]);
+    const mode = cfg?.tor_mode ?? false;
+    const applied = cfg?.applied ?? false;
+    const onion = cfg?.onion_url ?? null;
+    const reachable = cfg?.reachable ?? null;
+    const changed =
+      tor.phase !== this.torPhase ||
+      tor.message !== this.torMessage ||
+      mode !== this.torMode ||
+      applied !== this.torApplied ||
+      onion !== this.torOnionUrl ||
+      reachable !== this.torReachable;
+    this.torPhase = tor.phase;
+    this.torMessage = tor.message;
+    this.torMode = mode;
+    this.torApplied = applied;
+    this.torOnionUrl = onion;
+    this.torReachable = reachable;
+    if (changed) this.updateTorPill();
+
+    // The switch being on is the whole instruction — nothing else is asked
+    // of the user, ever. Two ways that can be true while traffic is not yet
+    // protected, and both heal here on their own:
+    // - the shell's Tor is up but the daemon holds a different (or no) SOCKS
+    //   port — a daemon restart wipes it, and a fresh Tor gets a fresh port.
+    //   Post the live port; the daemon applies it to the vault.
+    // - the shell's Tor is not running at all (fresh start with the switch
+    //   already on). Boot it; the port sync lands on a later poll.
+    if (!mode || !onion) return;
+    if (tor.phase === "ready" && tor.socks_port) {
+      const live = `socks5h://127.0.0.1:${tor.socks_port}`;
+      if (cfg && cfg.socks !== live) {
+        try {
+          await api.setRelayMode(true, live);
+          // The daemon applied it synchronously; skip the pending flicker.
+          this.torApplied = true;
+          this.updateTorPill();
+        } catch {
+          /* the next poll retries */
+        }
+      }
+    } else if (tor.phase === "stopped" && !this.torAutoBusy) {
+      this.torAutoBusy = true;
+      void torStart().finally(() => {
+        this.torAutoBusy = false;
+      });
+    }
+  }
+
+  /** The shield's state and its accessible name. Green covers both
+   * connection paths — clearnet and Tor — and the name says which; orange is
+   * "coming up"; red is "not connected". Reachability, not Tor's phase, is
+   * what makes red correct: Tor stays "ready" long after the network is gone,
+   * so only the daemon's probe can tell the truth. */
+  private relayShield(): { cls: string; alt: string } {
+    if (!this.torMode) {
+      if (this.torReachable === false) {
+        return { cls: "relay-offline", alt: "Hush is disconnected." };
+      }
+      return { cls: "relay-cleartext", alt: "Hush is connected through Clearnet." };
+    }
+    if (this.torPhase === "failed" || this.torPhase === "unavailable") {
+      return { cls: "relay-offline", alt: "Hush is disconnected." };
+    }
+    if (this.torPhase !== "ready") {
+      return { cls: "relay-connecting", alt: "Hush is trying to connect." };
+    }
+    // Tor is up; the relay is only reachable if the probe says so.
+    if (this.torReachable === false) {
+      return { cls: "relay-offline", alt: "Hush is disconnected." };
+    }
+    return { cls: "relay-tor", alt: "Hush is connected through Tor." };
+  }
+
+  private updateTorPill(): void {
+    const el = this.root.querySelector<HTMLElement>(".relay-shield");
+    if (el) this.updateTorPillInto(el);
+  }
+
+  private updateTorPillInto(el: HTMLElement): void {
+    const { cls, alt } = this.relayShield();
+    el.classList.remove(
+      "relay-cleartext",
+      "relay-tor",
+      "relay-connecting",
+      "relay-offline",
+    );
+    el.classList.add(cls);
+    // The words the user asked for, as the icon's accessible name and its
+    // tooltip.
+    el.setAttribute("aria-label", alt);
+    el.title = alt;
+  }
+
+  /** Flip the relay switch. The onion address is not asked for here — it is
+   * once-per-vault setup that lives in Settings. Never falls back: with the
+   * switch on and Tor down, the UI says so and mail queues. Throws so each
+   * surface can show the failure next to its own switch. */
+  private async toggleTorRelay(on: boolean): Promise<void> {
+    this.torActionError = null;
+    if (!on) {
+      await api.setRelayMode(false, null);
+      // Tor serves the Drop window too; stop it only when nothing needs it.
+      const open = await openState();
+      if (!open.open) await torStop();
+      await this.refreshStatus();
+      this.render();
+      return;
+    }
+    const st = await torStart();
+    if (st.phase !== "ready" || !st.socks_port) {
+      throw new AppError(
+        st.message ?? "Tor could not connect. The switch is still off.",
+      );
+    }
+    await api.setRelayMode(true, `socks5h://127.0.0.1:${st.socks_port}`);
+    await this.refreshStatus();
+    this.render();
   }
 
   private stopDropsPoll(): void {
@@ -4108,6 +4318,84 @@ export class App {
     return form;
   }
 
+  /** A slide switch: hidden checkbox plus a styled track, so the switch is
+   * the control everywhere Tor is toggled (login card, relay settings). */
+  private makeSwitch(checked: boolean): { el: HTMLElement; input: HTMLInputElement } {
+    const label = document.createElement("label");
+    label.className = "hush-switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = checked;
+    const track = document.createElement("span");
+    track.className = "hush-switch-track";
+    label.append(input, track);
+    return { el: label, input };
+  }
+
+  /** The relay section: the Tor switch and the onion address, the two pieces
+   * of relay setup that outlive a login. The top-bar pill links here. */
+  private renderRelaySettings(): HTMLElement {
+    const wrap = document.createElement("div");
+    const head = document.createElement("h2");
+    head.className = "text-22";
+    head.textContent = "Relay";
+    const sub = document.createElement("p");
+    sub.className = "muted text-13";
+    sub.textContent =
+      "Your relay carries encrypted mail only. With Tor on, it reaches you through an onion address and never learns your IP.";
+    wrap.append(head, sub);
+
+    if (this.torActionError) {
+      const warn = document.createElement("p");
+      warn.className = "text-13";
+      warn.style.color = "var(--danger)";
+      warn.textContent = this.torActionError;
+      wrap.appendChild(warn);
+    }
+
+    if (this.torMode && !this.torApplied && !this.torOnionUrl) {
+      const pending = document.createElement("p");
+      pending.className = "text-13";
+      pending.style.color = "var(--warning-text)";
+      pending.textContent =
+        "Tor is on, but no onion address is configured for this relay yet, so it cannot protect traffic. Everything else connects on its own.";
+      wrap.appendChild(pending);
+    }
+
+    const switchRow = document.createElement("div");
+    switchRow.style.display = "flex";
+    switchRow.style.alignItems = "center";
+    switchRow.style.gap = "10px";
+    switchRow.style.marginTop = "var(--space-4)";
+    const sw = this.makeSwitch(this.torMode);
+    sw.input.onchange = async () => {
+      const want = sw.input.checked;
+      sw.input.disabled = true;
+      try {
+        await this.toggleTorRelay(want);
+      } catch (e) {
+        this.torActionError =
+          e instanceof AppError ? e.message : "The switch could not be applied.";
+        sw.input.checked = !want;
+        sw.input.disabled = false;
+        this.render();
+      }
+    };
+    const swLabel = document.createElement("span");
+    swLabel.className = "text-13";
+    swLabel.textContent = "Use Tor for the relay (onion)";
+    switchRow.append(sw.el, swLabel);
+    wrap.appendChild(switchRow);
+
+    const note = document.createElement("p");
+    note.className = "faint text-12";
+    note.style.marginTop = "var(--space-3)";
+    note.textContent =
+      "The relay's addresses come from this app's configuration — the switch decides which one is used. When Tor is on and it fails, nothing falls back to clearnet: mail waits in the outbox until Tor returns or you turn the switch off.";
+    wrap.appendChild(note);
+    return wrap;
+  }
+
   private renderSettings(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane settings-layout";
@@ -4116,6 +4404,7 @@ export class App {
     const sections: { id: SettingsSection; label: string }[] = [
       { id: "appearance", label: "Appearance" },
       { id: "profile", label: "Profile" },
+      { id: "relay", label: "Relay" },
       { id: "notifications", label: "Notifications" },
       { id: "security", label: "Security" },
       { id: "recovery", label: "Recovery" },
@@ -4148,6 +4437,8 @@ export class App {
         seg.appendChild(b);
       }
       body.appendChild(seg);
+    } else if (this.settingsSection === "relay") {
+      body.appendChild(this.renderRelaySettings());
     } else if (this.settingsSection === "profile") {
       body.innerHTML = `<h2 class="text-22">Profile</h2><p class="muted text-13">Your mail address is a label bound to your keys, shared inside your invite. There is no public directory — contacts learn it only when you add each other.</p>`;
       const current = document.createElement("p");

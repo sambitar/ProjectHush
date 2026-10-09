@@ -190,6 +190,97 @@ opaque container and cannot tell which version it holds or open either.
 
 TLS for transport privacy in transit to the VPS; that does **not** replace E2E.
 
+### Client transport: clearnet or Tor onion (2026-10-09)
+
+The relay is reachable both ways: clearnet (`https`/`http`) and as a v3 onion service
+(see `docs/ops/relay-lab-vps.md`). The client's relay switch chooses which path its
+traffic takes; the relay sees whichever path a given client used and cannot tell
+clients apart beyond that.
+
+- **State:** the vault carries `onion_relay` (the same relay's onion address) and
+  `use_tor_relay` (which base is active); the daemon's `ui-prefs.json` carries the
+  switch pre-unlock so the login screen can read and flip it while locked, applied
+  into the vault at unlock. The desktop shell owns a Tor process (the same one the
+  Drops feature uses) and posts its SOCKS port (`socks5h://127.0.0.1:port`) to the
+  daemon when the switch turns on.
+- **Fail-closed:** with the switch on, every relay request goes to the onion base
+  through the SOCKS proxy, and a missing half — no onion address on file, no live
+  SOCKS port — is an error, never a silent fall back to clearnet. Dead Tor means
+  sends queue in the outbox until it returns or the user flips the switch off.
+- **CLI:** `hush-cli init --onion <url> [--tor]` creates a vault born on the onion;
+  `hush-cli relay on|off|show` moves the switch without the UI. The CLI carries the
+  SOCKS port through `HUSH_RELAY_SOCKS_PROXY`.
+- **API:** `GET /api/relay` (readable while locked), `POST /api/relay/mode`
+  `{onion, socks}`, `POST /api/relay/onion` `{onion}` (validated v3, staged while
+  locked, applied live otherwise). `GET /api/status` adds `relay_tor`.
+
+### Many relays: clients route, relays never talk (2026-10-09, design not built)
+
+Today every vault points at one relay, so a queue id alone is a complete address.
+Scaling past one relay does not turn the fleet into a federation. The rule:
+**relays never talk to each other; the client is the routing layer.** More
+capacity means more home relays, each vault homing on one at creation, and a
+cross-relay send is simply the sender's client doing the `PUT` it already knows
+how to do, against the recipient's relay.
+
+**Queue references are addresses.** Every reference to a queue — the inbox named
+in an invite, a per-contact queue in a grant, a drop container link — is fully
+qualified: the relay's clearnet base, its v3 onion base, the queue id, and the
+delivery token. Whoever hands out a queue reference has handed over everything
+needed to write to it, wherever it lives. Discovery does not change: references
+still travel out-of-band or inside sessions, and there is still no directory.
+Missing bases on an old invite or grant mean "the reader's own vault relay",
+which is exactly today's behavior (`#[serde(default)]` keeps old payloads
+decodable).
+
+**The back invite (accept receipt).** Contact setup stays one out-of-band
+artifact:
+
+1. Alice's invite carries her identity, prekey bundle, inbox queue reference and
+   version. Bob accepts; the session opens from the inline prekeys, so no relay
+   is involved and `GET /k/` is still never fetched.
+2. Bob's accept receipt is his first message into Alice's inbox: a
+   `MessagePayload::QueueGrant` naming the per-contact queue he minted for her
+   (derivable at accept time, since her account id is in her invite) plus his
+   relay bases. Prose calls it the **back invite**; on the wire it is the grant,
+   now fully self-locating.
+3. From then on a send is one `PUT /q/{id}` to the recipient's relay and a drain
+   is always from the home relay. Blocking burns the per-contact queue on the
+   burner's own home relay, exactly as today.
+
+Minting the per-contact queue at accept, instead of after a first grant cycle,
+makes a contact revocable from the first message. The inbox remains the grant
+channel it always was (pre-acceptance stragglers, contacts grandfathered under
+the migration limit above). Identity pinning is unchanged: Alice pins Bob's
+identity key from his first message — the X3DH initiator, as in Signal — so the
+back invite adds no trust step and carries no identity field of its own.
+
+**What each relay sees.** The recipient's relay sees opaque puts to its user's
+queues from a sender it knows nothing else about — not her home relay, not
+whether she has a vault anywhere. The sender's relay sees her drains and who
+writes to her queues. The social graph is split across relays; no single relay
+sees both ends of a conversation. One operator running every relay can still
+attempt timing correlation between them, as one relay can within itself today;
+Tor narrows it, and splitting relays fragments the graph for anyone who does not
+run the whole fleet.
+
+**Rejected: relay-to-relay forwarding.** Forwarding a blob to a foreign queue
+needs a routing table — which queue lives on which relay — and that table is a
+new server-side graph, valuable at seizure. It also adds server-to-server auth,
+dwell time on a second relay, and a protocol to maintain, all to save the client
+a `PUT` it already knows how to make. Forwarding would hide a sender's home
+relay from the recipient's relay and could later carry mixnet-style padding;
+both are purchasable later if community-run relays ever exist. Until then,
+relays stay dumb terminators that never egress to each other.
+
+**Ops.** Scale-out is sharding by home relay: one relay per batch of users, and
+a relay's load is only its own users' inbound queues. An onion address survives
+a hardware move by backing up the service key (see `docs/ops/relay-lab-vps.md`);
+re-invites are needed only when a relay is decommissioned, which is the existing
+rotated-inbox migration rule. Drop links carry their relay base under the same
+rule. The vault's `use_tor_relay` switch stays the user-facing Tor on/off and
+applies to every base, since each queue reference carries both.
+
 ## Notifications
 
 - Desktop: daemon polls or holds a connection.

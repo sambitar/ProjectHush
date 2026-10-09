@@ -67,6 +67,114 @@
   gap: var(--space-2);
 }
 
+/* The connection shield at the top of the rail. It is the app's mark and the
+ * connection light in one: the shield is filled green when the relay is
+ * reachable (clearnet or Tor), orange while Tor is coming up, red when it is
+ * not reachable. The accessible name and tooltip carry the words. */
+.relay-shield {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  margin: 0 auto;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: #2da870;
+  cursor: pointer;
+  line-height: 0;
+  transition: color 0.2s ease;
+}
+
+.relay-shield svg {
+  width: 26px;
+  height: 26px;
+  /* Fill the shield, not just outline it: the colour is the status. */
+  fill: currentColor;
+  stroke: currentColor;
+}
+
+/* Green: connected, through clearnet or Tor alike. */
+.relay-shield.relay-cleartext,
+.relay-shield.relay-tor {
+  color: #2da870;
+}
+
+/* Orange: Tor is coming up. Fail-closed means the relay is not reachable
+ * yet, so this is a "wait", not a "connected". */
+.relay-shield.relay-connecting {
+  color: #e8930c;
+  animation: relay-pulse 1.6s ease-in-out infinite;
+}
+
+/* Red: not connected. With Tor on, fail-closed means no Tor means no relay,
+ * full stop. */
+.relay-shield.relay-offline {
+  color: var(--danger);
+}
+
+@keyframes relay-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* The slide switch used by the relay surfaces (login card, relay settings). */
+.hush-switch {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.hush-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.hush-switch-track {
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--border);
+  position: relative;
+  transition: background 0.2s ease;
+}
+
+.hush-switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+  transition: transform 0.2s ease;
+}
+
+.hush-switch input:checked + .hush-switch-track {
+  background: #3ecf8e;
+}
+
+.hush-switch input:checked + .hush-switch-track::after {
+  transform: translateX(18px);
+}
+
+.hush-switch input:disabled + .hush-switch-track {
+  opacity: 0.5;
+  cursor: wait;
+}
+
 .rail-spacer {
   flex: 1;
 }

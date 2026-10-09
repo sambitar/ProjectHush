@@ -5,7 +5,10 @@ mod suspend_lock;
 mod ui_prefs;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use account_worker::{AccountWorker, ContactDto, WorkResult};
@@ -49,6 +52,18 @@ struct App {
     worker: AccountWorker,
     unlocked: Mutex<bool>,
     unlocked_at: Mutex<Option<Instant>>,
+    /// The SOCKS proxy the desktop shell reported its Tor to be listening on,
+    /// when the relay switch is on. Runtime-only: the shell posts it after
+    /// starting Tor and the daemon hands it to the account's relay client.
+    relay_socks: Mutex<Option<String>>,
+    /// The last relay reachability probe: `(reachable, when)`. The UI's
+    /// connection light is only honest if it reflects this rather than Tor's
+    /// bootstrap phase, which stays "ready" long after the network is gone.
+    relay_health: Mutex<Option<(bool, Instant)>>,
+    /// Guards against stacking probes: the worker is a single-threaded actor,
+    /// so overlapping probes would queue behind each other and starve real
+    /// work (heartbeats, mail).
+    relay_probe_inflight: AtomicBool,
 }
 
 #[derive(Serialize)]
@@ -73,6 +88,10 @@ struct StatusResponse {
     /// The vault's own name — the suffix of this member's mail address, so the
     /// UI never hardcodes it. The default stands in while locked.
     vault_name: String,
+    /// Whether the relay path is switched to Tor (onion address + SOCKS
+    /// proxy). The prefs value while locked, the vault's applied value when
+    /// unlocked.
+    relay_tor: bool,
 }
 
 #[derive(Deserialize)]
@@ -220,6 +239,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker: AccountWorker::spawn(),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
+        relay_socks: Mutex::new(None),
+        relay_health: Mutex::new(None),
+        relay_probe_inflight: AtomicBool::new(false),
     };
     let state = Arc::new(app);
 
@@ -265,6 +287,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/backup/import", post(backup_import))
         .route("/api/recovery/pending", get(recovery_pending))
         .route("/api/recovery/acknowledge", post(recovery_acknowledge))
+        .route("/api/relay", get(get_relay))
+        .route("/api/relay/mode", post(put_relay_mode))
+        .route("/api/relay/onion", post(put_relay_onion))
         .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs))
         .layer(local_ui_cors())
         .with_state(state.clone());
@@ -477,7 +502,20 @@ async fn heartbeat_loop(state: Arc<App>) {
         if !*state.unlocked.lock().await {
             continue;
         }
-        let _ = state.worker.heartbeat_presence().await;
+        let result = state.worker.heartbeat_presence().await;
+        // The heartbeat is a real round trip along the selected relay path —
+        // its outcome is ground truth for the connection light, independent
+        // of the poll-triggered probes. A "locked" error is not a network
+        // fact; anything else is.
+        match result {
+            WorkResult::Ok => {
+                *state.relay_health.lock().await = Some((true, Instant::now()));
+            }
+            WorkResult::Err(e) if e != "locked" => {
+                *state.relay_health.lock().await = Some((false, Instant::now()));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -515,8 +553,9 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
         relay,
         mail_handle,
         vault_name,
+        relay_tor,
     ) = if locked {
-        (None, 0, 0, true, 0, None, None, None)
+        (None, 0, 0, true, 0, None, None, None, None)
     } else {
         match state.worker.meta().await {
             WorkResult::Meta {
@@ -528,6 +567,7 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
                 relay,
                 mail_handle,
                 vault_name,
+                relay_tor,
             } => (
                 Some(protocol_name),
                 vault_bytes,
@@ -537,8 +577,9 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
                 Some(relay),
                 mail_handle,
                 Some(vault_name),
+                Some(relay_tor),
             ),
-            _ => (None, 0, 0, true, 0, None, None, None),
+            _ => (None, 0, 0, true, 0, None, None, None, None),
         }
     };
     let (relay, relay_source) = match relay {
@@ -549,6 +590,9 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
             (value, source.as_str().to_string())
         }
     };
+    // The mode the user set. While unlocked the vault's applied value is the
+    // truth; while locked the prefs value is all there is.
+    let relay_tor = relay_tor.unwrap_or_else(|| ui_prefs::load(&state.dir).relay_tor);
     Json(StatusResponse {
         locked,
         vault_dir: state.dir.display().to_string(),
@@ -559,6 +603,7 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
         last_backup_unix,
         relay,
         relay_source,
+        relay_tor,
         socket: state.socket.as_ref().map(|p| p.display().to_string()),
         tcp_addr: state.tcp_addr.clone(),
         mail_handle,
@@ -574,9 +619,41 @@ async fn unlock(
         WorkResult::Ok => {
             *state.unlocked.lock().await = true;
             touch(&state).await;
+            apply_relay_prefs(&state).await;
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Apply the relay switch the user set before unlocking.
+///
+/// While the vault is locked the switch lives in the (plaintext) prefs file —
+/// the pre-login toggle reads and flips it there, and an onion address typed
+/// on that screen is staged beside it. Unlock is the first moment the vault
+/// can carry the mode, so it is applied here: traffic follows the switch from
+/// the very first request. A failure to apply (no address on file for a
+/// switch that is on) is not an unlock failure; the relay endpoints surface
+/// the state and the fail-closed relay client holds the line.
+async fn apply_relay_prefs(state: &Arc<App>) {
+    let prefs = ui_prefs::load(&state.dir);
+    let socks = state.relay_socks.lock().await.clone();
+    let onion = prefs
+        .relay_onion_staged
+        .clone()
+        .or_else(|| hush_core::config::resolve_onion_relay_url(&state.dir));
+    let result = state
+        .worker
+        .relay_apply(prefs.relay_tor, onion, socks)
+        .await;
+    // The path may have just changed; a reachability answer from the old path
+    // would be a lie about the new one.
+    *state.relay_health.lock().await = None;
+    if prefs.relay_tor && matches!(result, WorkResult::Ok) {
+        // The staged address now lives in the vault; the handoff is done.
+        let mut prefs = ui_prefs::load(&state.dir);
+        prefs.relay_onion_staged = None;
+        let _ = ui_prefs::save(&state.dir, &prefs);
     }
 }
 
@@ -1367,6 +1444,226 @@ async fn recovery_acknowledge(
 
 async fn get_ui_prefs(State(state): State<Arc<App>>) -> Json<ui_prefs::UiPrefs> {
     Json(ui_prefs::load(&state.dir))
+}
+
+/// The relay switch's state as the UI should render it: readable while the
+/// vault is locked (the pre-login switch's first paint) and while unlocked.
+#[derive(Serialize)]
+struct RelayResponse {
+    /// The user's choice for the switch, from the prefs file — the same value
+    /// whether the vault is locked or not. The login card and the settings
+    /// switch both render this, so the UI never argues with the user about
+    /// what they asked for.
+    tor_mode: bool,
+    /// Whether that choice is actually in effect on the vault's traffic:
+    /// applied to the unlocked vault, an onion address on file, and a SOCKS
+    /// port known. The pill's "needs attention" state comes from this being
+    /// false while `tor_mode` is true.
+    applied: bool,
+    /// The onion address on file (the vault's when unlocked, the staged one
+    /// otherwise).
+    onion_url: Option<String>,
+    /// The SOCKS proxy currently applied in the daemon, when the shell has
+    /// reported its Tor.
+    socks: Option<String>,
+    /// Whether the relay answered a health probe: `true` reachable, `false`
+    /// unreachable, `null` not yet known (locked, or the first probe still
+    /// pending). This is what makes the connection light honest — Tor can be
+    /// "ready" with the network gone, and only a real probe notices.
+    reachable: Option<bool>,
+}
+
+/// Whether the relay is reachable right now, from a briefly cached probe.
+///
+/// A probe is a real round trip (through Tor when the switch is on), so it
+/// never blocks this request: a stale cache returns its last answer and kicks
+/// off a background refresh, guarded so probes never stack on the worker. The
+/// UI polls faster than the cache lives, so a change of state shows within a
+/// poll or two.
+async fn relay_reachability(state: &Arc<App>) -> Option<bool> {
+    let cached = *state.relay_health.lock().await;
+    if !*state.unlocked.lock().await {
+        return None;
+    }
+    let fresh = cached
+        .map(|(_, at)| at.elapsed() < Duration::from_secs(4))
+        .unwrap_or(false);
+    if !fresh && !state.relay_probe_inflight.swap(true, Ordering::AcqRel) {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let WorkResult::Reachable(reachable) = state.worker.relay_probe().await {
+                *state.relay_health.lock().await = Some((reachable, Instant::now()));
+            }
+            state.relay_probe_inflight.store(false, Ordering::Release);
+        });
+    }
+    cached.map(|(reachable, _)| reachable)
+}
+
+async fn get_relay(State(state): State<Arc<App>>) -> Json<RelayResponse> {
+    let locked = !*state.unlocked.lock().await;
+    let prefs = ui_prefs::load(&state.dir);
+    let socks = state.relay_socks.lock().await.clone();
+    let reachable = relay_reachability(&state).await;
+    if locked {
+        Json(RelayResponse {
+            tor_mode: prefs.relay_tor,
+            applied: false,
+            onion_url: prefs
+                .relay_onion_staged
+                .or_else(|| hush_core::config::resolve_onion_relay_url(&state.dir)),
+            socks,
+            reachable,
+        })
+    } else {
+        match state.worker.relay_info().await {
+            WorkResult::RelayInfo {
+                relay_tor,
+                onion_url,
+            } => {
+                let onion_url = onion_url
+                    .or(prefs.relay_onion_staged)
+                    .or_else(|| hush_core::config::resolve_onion_relay_url(&state.dir));
+                let applied =
+                    relay_tor && onion_url.is_some() && socks.is_some();
+                Json(RelayResponse {
+                    tor_mode: prefs.relay_tor,
+                    applied,
+                    onion_url,
+                    socks,
+                    reachable,
+                })
+            }
+            _ => Json(RelayResponse {
+                tor_mode: prefs.relay_tor,
+                applied: false,
+                onion_url: prefs
+                    .relay_onion_staged
+                    .or_else(|| hush_core::config::resolve_onion_relay_url(&state.dir)),
+                socks,
+                reachable,
+            }),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RelayModeRequest {
+    /// Whether the relay path goes through Tor.
+    onion: bool,
+    /// The SOCKS proxy the shell's Tor is listening on, reported when the
+    /// switch is turned on. Optional and validated: a bad value is refused
+    /// rather than silently producing direct traffic.
+    #[serde(default)]
+    socks: Option<String>,
+}
+
+/// Flip the relay switch. Persists the mode (effective across restarts),
+/// records the SOCKS proxy, and applies both to the live vault when it is
+/// unlocked — while locked, unlock applies them.
+///
+/// There is no automatic fall back to clearnet anywhere in this path: with
+/// the switch on and Tor down, requests fail (and mail queues in the outbox)
+/// until Tor connects or the user turns the switch off.
+async fn put_relay_mode(
+    State(state): State<Arc<App>>,
+    Json(body): Json<RelayModeRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    if let Some(socks) = &body.socks {
+        if let Err(e) = hush_core::validate_socks_proxy(socks) {
+            return Err((StatusCode::BAD_REQUEST, Json(ApiError { error: e.to_string() })));
+        }
+    }
+    let prefs = ui_prefs::load(&state.dir);
+    if let Err(e) = ui_prefs::save(
+        &state.dir,
+        &ui_prefs::UiPrefs {
+            relay_tor: body.onion,
+            ..prefs
+        },
+    ) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: e }),
+        ));
+    }
+    if body.onion {
+        if let Some(socks) = body.socks.clone() {
+            *state.relay_socks.lock().await = Some(socks);
+        }
+    } else {
+        *state.relay_socks.lock().await = None;
+    }
+    // Apply the choice to the live vault, but do not fail the request when
+    // that cannot happen yet (no onion address on file): the switch is a
+    // preference, and whether it is in effect is what `applied` in
+    // `GET /api/relay` reports — the UI's pending state, not a 400.
+    let onion = if body.onion {
+        ui_prefs::load(&state.dir)
+            .relay_onion_staged
+            .or_else(|| hush_core::config::resolve_onion_relay_url(&state.dir))
+    } else {
+        None
+    };
+    let _ = state.worker.relay_apply(body.onion, onion, body.socks).await;
+    // The path may have just changed; drop any cached reachability so the
+    // next poll probes the new route rather than reporting the old one.
+    *state.relay_health.lock().await = None;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct RelayOnionRequest {
+    /// A v3 onion address for this vault's relay, validated before staging.
+    onion: String,
+}
+
+/// Attach the onion address of this vault's relay.
+///
+/// While the vault is locked the address is staged in prefs and applied at
+/// unlock; while unlocked it is written straight into the vault together with
+/// the user's current switch choice — so attaching completes a switch that
+/// was waiting for an address, rather than leaving it pending. Either way the
+/// clearnet base is never overwritten: the switch stays able to flip back.
+async fn put_relay_onion(
+    State(state): State<Arc<App>>,
+    Json(body): Json<RelayOnionRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let normalized = hush_core::validate_onion_relay(&body.onion).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    let unlocked = !*state.unlocked.lock().await;
+    let prefs = ui_prefs::load(&state.dir);
+    if unlocked {
+        let socks = state.relay_socks.lock().await.clone();
+        map_err(
+            state
+                .worker
+                .relay_apply(prefs.relay_tor, Some(normalized.clone()), socks)
+                .await,
+        )?;
+        // Applied into the vault; clear any stale stage.
+        let mut prefs = ui_prefs::load(&state.dir);
+        prefs.relay_onion_staged = None;
+        let _ = ui_prefs::save(&state.dir, &prefs);
+    } else {
+        let prefs = ui_prefs::UiPrefs {
+            relay_onion_staged: Some(normalized),
+            ..prefs
+        };
+        ui_prefs::save(&state.dir, &prefs).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError { error: e }),
+            )
+        })?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn put_ui_prefs(

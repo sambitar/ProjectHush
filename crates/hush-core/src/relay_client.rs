@@ -92,7 +92,7 @@ fn http_url_allowed(url: &str, policy: HttpPolicy) -> bool {
         HttpPolicy::LoopbackOnly => reqwest::Url::parse(url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_owned))
-            .is_some_and(|host| host_is_loopback(&host) || host_is_v3_onion(&host)),
+            .is_some_and(|host| host_is_loopback(&host) || is_v3_onion_host(&host)),
     }
 }
 
@@ -123,7 +123,7 @@ fn host_is_loopback(host: &str) -> bool {
 /// `evil.onion.attacker.com` fails the suffix strip. The same rule lives in
 /// the Tauri app's `drops` module for webview targets; the app does not depend
 /// on this crate, so the two validate their own surfaces.
-fn host_is_v3_onion(host: &str) -> bool {
+pub fn is_v3_onion_host(host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     match host.strip_suffix(".onion") {
         Some(label) => {
@@ -134,6 +134,33 @@ fn host_is_v3_onion(host: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// Validate a relay onion address and return it normalized.
+///
+/// The host must be a v3 onion and the scheme `http` or `https`. Plain `http`
+/// is fine even in a release build — the onion layer authenticates the
+/// address and Tor encrypts the link end to end, the same rule the Drops
+/// feature applies — but anything that is not an onion is rejected outright:
+/// this seam exists to attach the Tor form of a relay, not to point the relay
+/// path at arbitrary hosts.
+pub fn validate_onion_relay(raw: &str) -> Result<String, Error> {
+    let base = normalize_relay_base_with(raw, HttpPolicy::LoopbackOnly)?;
+    let host = reqwest::Url::parse(&base)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    if !is_v3_onion_host(&host) {
+        return Err(Error::Relay(format!("not a v3 onion address: {raw}")));
+    }
+    Ok(base)
+}
+
+/// Validate a SOCKS proxy value for [`ENV_RELAY_SOCKS_PROXY`]-style use: the
+/// same strictness [`RelayClient::try_new_with_proxy`] applies, exposed for
+/// callers that want to reject a bad value before handing it to a client.
+pub fn validate_socks_proxy(value: &str) -> Result<(), Error> {
+    socks_proxy(value).map(|_| ())
 }
 
 /// The configured SOCKS proxy, if any. Whitespace-only counts as unset so a
@@ -202,6 +229,20 @@ impl RelayClient {
 
     fn auth(token: &str) -> String {
         format!("Bearer {token}")
+    }
+
+    /// Whether the relay answers a health check within `timeout`.
+    ///
+    /// The probe takes the same path as real traffic — the SOCKS proxy when
+    /// one is set — so it answers the one question the UI must never lie
+    /// about: can this vault reach its relay *right now*? Never errors; a
+    /// failure to connect is simply `false`.
+    pub async fn ping(&self, timeout: std::time::Duration) -> bool {
+        let request = self.http.get(format!("{}/health", self.base)).send();
+        matches!(
+            tokio::time::timeout(timeout, request).await,
+            Ok(Ok(res)) if res.status().is_success()
+        )
     }
 
     pub async fn touch_presence(&self, queue_id: &str, token: &str) -> Result<(), Error> {
@@ -419,7 +460,7 @@ impl RelayClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        host_is_v3_onion, normalize_relay_base, normalize_relay_base_with,
+        is_v3_onion_host, normalize_relay_base, normalize_relay_base_with,
         ENV_RELAY_SOCKS_PROXY, HttpPolicy, RelayClient,
     };
     use std::sync::Mutex;
@@ -549,9 +590,9 @@ mod tests {
                 "{url} must be refused in a release build"
             );
         }
-        assert!(!host_is_v3_onion(&format!("{LAB_ONION}.evil.com")));
+        assert!(!is_v3_onion_host(&format!("{LAB_ONION}.evil.com")));
         // And the real one passes, so the refusals above are not vacuous.
-        assert!(host_is_v3_onion(LAB_ONION));
+        assert!(is_v3_onion_host(LAB_ONION));
     }
 
     /// An explicitly supplied proxy must parse, and a bad one must fail the

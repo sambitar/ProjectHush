@@ -39,6 +39,17 @@ pub struct UiPrefs {
     /// Contacts whose arrival sound is off, set from the chat's own menu.
     #[serde(default)]
     pub chat_sound_muted: Vec<String>,
+    /// The relay switch: the relay path should use the onion address through
+    /// Tor. Lives here rather than only in the vault so the pre-login screen
+    /// can read and flip it while the vault is locked; the vault's own copy
+    /// (which decides actual traffic) is applied from this at unlock.
+    #[serde(default)]
+    pub relay_tor: bool,
+    /// An onion address staged while the vault was locked (the pre-login
+    /// attach field). Written into the vault at unlock, then cleared, so
+    /// this stays a handoff and never a second source of truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_onion_staged: Option<String>,
 }
 
 impl Default for UiPrefs {
@@ -56,6 +67,8 @@ impl Default for UiPrefs {
             mail_trashed: Vec::new(),
             chat_sound: true,
             chat_sound_muted: Vec::new(),
+            relay_tor: false,
+            relay_onion_staged: None,
         }
     }
 }

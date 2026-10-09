@@ -45,7 +45,10 @@ pub use payload::{
     MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS,
 };
 pub use prekey::{OneTimePreKey, PreKeyRecord};
-pub use relay_client::{normalize_relay_base, normalize_relay_base_with, HttpPolicy, RelayClient};
+pub use relay_client::{
+    is_v3_onion_host, normalize_relay_base, normalize_relay_base_with, validate_onion_relay,
+    validate_socks_proxy, HttpPolicy, RelayClient,
+};
 pub use vault::{BlobId, IdentityPub, Vault};
 
 /// Queue credential derivation, shared by the client and the relay.

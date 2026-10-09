@@ -5,9 +5,11 @@
 //! the main window, the daemon proxy, or anything else. That is the whole point:
 //! the Hush relay is not in the path, and neither is any other part of Hush.
 //!
-//! Nothing in this module records a destination. Tor's own log is scanned in
-//! memory for the bootstrap marker and then dropped; it is never written to disk
-//! and never surfaced to the UI.
+//! Nothing in this module records a destination. Tor's log is scanned in
+//! memory for the bootstrap marker (and teed to `tor.log` in Tor's private
+//! data directory so a connection failure is diagnosable; SafeLogging is on
+//! and scrubs addresses) — no destination, circuit, or timestamp is surfaced
+//! to the UI.
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -50,6 +52,10 @@ struct Inner {
     binary: Option<PathBuf>,
     message: Option<String>,
     child: Option<Child>,
+    /// True when this manager spawned the Tor it talks to, and so must stop
+    /// it. False when it adopted a Tor that was already running (the user's
+    /// system Tor): that one is never killed, only used.
+    owned: bool,
 }
 
 /// Owns the Tor child process and the state the UI polls.
@@ -74,6 +80,7 @@ impl TorManager {
                 binary: None,
                 message: None,
                 child: None,
+                owned: true,
             })),
             data_dir,
             resource_dir,
@@ -100,13 +107,30 @@ impl TorManager {
             inner.phase
         };
         match phase {
-            TorPhase::Ready => return self.status(),
+            TorPhase::Ready => {
+                // An adopted Tor can go away (its owner closed it); a cheap
+                // probe on this explicit start path notices. A Tor we own is
+                // our own child and trusted without a probe.
+                if self.adopted_tor_still_live() {
+                    return self.status();
+                }
+                if let Err(status) = self.spawn() {
+                    return status;
+                }
+            }
             // A hard failure (no binary, unusable data dir) is not retried on
             // every click; the user sees the reason and can fix it.
             TorPhase::Unavailable => return self.status(),
             // Another caller is already bringing it up; just wait below.
             TorPhase::Starting => {}
             TorPhase::Stopped | TorPhase::Failed => {
+                // Prefer a Tor the user already runs: if their system Tor (or
+                // Tor Browser's) is live on the usual loopback SOCKS ports,
+                // use it as-is — instant, no second process, no second
+                // bootstrap. Spawn our own only when none answers.
+                if self.adopt_system_tor_if_live() {
+                    return self.status();
+                }
                 if let Err(status) = self.spawn() {
                     return status;
                 }
@@ -250,6 +274,65 @@ impl TorManager {
         cmdline.contains(&self.data_dir.display().to_string())
     }
 
+    /// Adopt a Tor that is already running, when one is live on the usual
+    /// loopback SOCKS ports (system Tor's 9050, Tor Browser's 9150).
+    ///
+    /// The probe is a real SOCKS5 greeting: a bare TCP connect could be any
+    /// service that happens to hold the port. Returns true when a live Tor
+    /// was found and adopted; the manager then reports Ready with its port
+    /// and never touches that process. If an adopted Tor later disappears,
+    /// `adopted_tor_still_live` notices on the next explicit start and a
+    /// replacement is spawned.
+    fn adopt_system_tor_if_live(&self) -> bool {
+        for port in [9050u16, 9150u16] {
+            if !probe_socks5(port) {
+                continue;
+            }
+            let mut inner = self.inner.lock().expect("tor state poisoned");
+            // Re-check under the lock: a concurrent ensure may have moved
+            // the state while the probe ran. Never switch away from our
+            // own running Tor.
+            if inner.phase == TorPhase::Ready && inner.owned {
+                return true;
+            }
+            if matches!(inner.phase, TorPhase::Starting | TorPhase::Unavailable) {
+                return false;
+            }
+            inner.owned = false;
+            inner.phase = TorPhase::Ready;
+            inner.socks_port = Some(port);
+            inner.child = None;
+            inner.message = None;
+            return true;
+        }
+        false
+    }
+
+    /// On an explicit start with Tor already marked Ready: confirm an adopted
+    /// Tor is still alive (its owner may have closed it). A Tor we spawned is
+    /// our own child and trusted without a probe. Returns false only when an
+    /// adopted Tor has died — the state is reset so the caller can spawn a
+    /// replacement.
+    fn adopted_tor_still_live(&self) -> bool {
+        let mut inner = self.inner.lock().expect("tor state poisoned");
+        if inner.owned {
+            return true;
+        }
+        let Some(port) = inner.socks_port else {
+            inner.owned = true;
+            inner.phase = TorPhase::Stopped;
+            return false;
+        };
+        if probe_socks5(port) {
+            return true;
+        }
+        inner.owned = true;
+        inner.phase = TorPhase::Stopped;
+        inner.socks_port = None;
+        inner.message = Some("The Tor we adopted went away; starting our own.".into());
+        false
+    }
+
     /// Spawn Tor and wire up log scanning. Returns a status when it could not
     /// even be started.
     fn spawn(&self) -> Result<(), TorStatus> {
@@ -388,10 +471,22 @@ impl TorManager {
 
     fn watch_stream<R: std::io::Read + Send + 'static>(&self, stream: R) {
         let inner = self.inner.clone();
+        let log_path = self.data_dir.join("tor.log");
         thread::spawn(move || {
             let reader = BufReader::new(stream);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
+                // Tee to the private data directory: when Tor does not
+                // connect, this file is the only evidence of why. SafeLogging
+                // is on, so the lines carry no addresses.
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = writeln!(f, "{line}");
+                }
                 if line.contains("Bootstrapped 100%") {
                     if let Ok(mut state) = inner.lock() {
                         if state.phase == TorPhase::Starting {
@@ -467,6 +562,31 @@ pub fn pick_free_loopback_port() -> Option<u16> {
         .ok()
         .and_then(|l| l.local_addr().ok())
         .map(|addr| addr.port())
+}
+
+/// Whether a Tor SOCKS proxy is live on `127.0.0.1:{port}`.
+///
+/// Sends a SOCKS5 greeting and checks the reply, so a random service holding
+/// the port does not pass as Tor. Bounded timeouts keep the probe off any
+/// caller's hot path.
+fn probe_socks5(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(Duration::from_millis(300))).is_err()
+        || stream.set_write_timeout(Some(Duration::from_millis(300))).is_err()
+    {
+        return false;
+    }
+    // Greet: SOCKS5, one method, no auth. A Tor replies "5 0" (no auth needed).
+    if stream.write_all(&[0x05, 0x01, 0x00]).is_err() {
+        return false;
+    }
+    let mut reply = [0u8; 2];
+    stream.read_exact(&mut reply).is_ok() && reply == [0x05, 0x00]
 }
 
 /// Whether a process exists. `kill` with signal 0 performs the existence and

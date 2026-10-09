@@ -8,6 +8,7 @@ import type {
   ConclaveDto,
   PendingInviteDto,
   RecvResponse,
+  RelayConfigResponse,
   StatusResponse,
 } from "./types";
 
@@ -278,5 +279,23 @@ export const api = {
     request<null>("/api/ui-prefs", {
       method: "PUT",
       body: JSON.stringify(prefs),
+    }),
+  /** The relay switch's state; readable while the vault is locked. */
+  relayConfig: () => request<RelayConfigResponse>("/api/relay"),
+  /**
+   * Flip the relay switch. `socks` is the shell Tor's SOCKS port, reported
+   * when switching on; the daemon refuses to fall back to clearnet on its
+   * own, so with the switch on and Tor down, requests fail until it connects.
+   */
+  setRelayMode: (onion: boolean, socks: string | null) =>
+    request<null>("/api/relay/mode", {
+      method: "POST",
+      body: JSON.stringify({ onion, socks }),
+    }),
+  /** Attach the relay's v3 onion address; applied live, or staged while locked. */
+  attachOnion: (onion: string) =>
+    request<null>("/api/relay/onion", {
+      method: "POST",
+      body: JSON.stringify({ onion }),
     }),
 };

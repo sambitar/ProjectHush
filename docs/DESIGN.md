@@ -57,6 +57,7 @@ Living record. Reasons and rejected alternatives. Not a marketing doc.
 - **Relay must not see:** names, a first-class social graph, plaintext.
 - **Not v1:** User-hosted relays as the only option; no store-and-forward.
 - **Later:** Optional self-hosted relay as a checkbox. Push tokens must not be the messaging identity (spec).
+- **Many relays (2026-10-09):** Relays never talk to each other; clients route across relays using self-locating queue references (base + id + delivery token) carried in invites and grants. Scaling means more home relays, not federation. Detail: `docs/PROTOCOL.md`.
 - **Rejected:** One inbox per person (A) — leaks the graph.
 
 ### Multiple recipients

@@ -14,6 +14,22 @@ export interface StatusResponse {
   mail_handle: string | null;
   /** This vault's mail suffix — the vault name chosen at first start. */
   vault_name: string | null;
+  /** Whether the relay path is switched to Tor (onion + SOCKS). */
+  relay_tor: boolean;
+}
+
+/** `GET /api/relay` — the relay switch's state, readable while locked.
+ * `tor_mode` is the user's choice (prefs); `applied` is whether it is in
+ * effect on the vault's traffic right now. */
+export interface RelayConfigResponse {
+  tor_mode: boolean;
+  applied: boolean;
+  onion_url: string | null;
+  socks: string | null;
+  /** Whether the relay answered a health probe: true reachable, false not,
+   * null not yet known. The connection light must reflect this, not Tor's
+   * bootstrap phase. */
+  reachable: boolean | null;
 }
 
 export interface ContactDto {
