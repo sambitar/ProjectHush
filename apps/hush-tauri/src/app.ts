@@ -191,6 +191,17 @@ export class App {
   } | null = null;
   /** The conversation the thread pane currently shows, for that keying. */
   private renderedNick: string | null = null;
+  /** Where the freshly built thread pane should be scrolled once it is in the
+   * document. Decided while the pane is still detached — a detached element
+   * has no layout, so setting scrollTop before attachment silently clamps to
+   * zero and the reader lands on the first message. */
+  private pendingChatScroll:
+    | { nick: string; mode: "bottom" }
+    | { nick: string; mode: "restore"; top: number }
+    | null = null;
+  /** Set when the window becomes visible again: the next thread paint opens
+   * on the newest message, because returning to the window is a fresh read. */
+  private bottomOnNextChatRender = false;
   private pollTimer: number | null = null;
   private unlockedAt = 0;
   private search = "";
@@ -376,6 +387,11 @@ export class App {
       if (!this.selectedNick && this.contacts[0]) {
         this.selectedNick = this.contacts[0].nickname;
       }
+      // The unlock screen is not the only door into a running vault: a page
+      // reload (or a dev hot reload) lands here with the daemon already
+      // unlocked, and the thread must have its history just the same.
+      const history = await api.messages();
+      if (history) loadHistory(history);
       this.mailHandle = status.mail_handle ?? null;
       this.vaultName = status.vault_name ?? DEFAULT_VAULT_NAME;
       await this.reloadMailbox();
@@ -391,6 +407,16 @@ export class App {
   private startPoll(): void {
     if (this.pollTimer) return;
     this.pollTimer = window.setInterval(() => this.pollRecv(), RECV_POLL_MS);
+    // Coming back to the window is a fresh read: the conversation on screen
+    // opens on its newest message instead of where the window happened to be
+    // left, so arriving messages are where the reader looks for them.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      if (this.rail === "chats" && this.selectedNick) {
+        this.bottomOnNextChatRender = true;
+        this.render();
+      }
+    });
   }
 
   /** Pull the whole mailbox: messages and drafts arrive together so the two
@@ -568,6 +594,19 @@ export class App {
     }
     this.root.appendChild(shell);
     this.renderedNick = this.rail === "chats" ? this.selectedNick : null;
+    // Now that the thread pane is in the document and has layout, put the
+    // reader where the conversation should open: the newest message, or their
+    // place in the history of this same conversation.
+    const liveMsgs = this.root.querySelector<HTMLElement>(".chat-messages");
+    const pending = this.pendingChatScroll;
+    this.pendingChatScroll = null;
+    if (liveMsgs && pending && pending.nick === this.renderedNick) {
+      if (pending.mode === "bottom") {
+        liveMsgs.scrollTop = liveMsgs.scrollHeight;
+      } else {
+        liveMsgs.scrollTop = Math.min(pending.top, liveMsgs.scrollHeight);
+      }
+    }
     if (this.paletteOpen) this.root.appendChild(this.renderPalette());
     if (this.addFriendOpen) this.root.appendChild(this.renderAddFriend());
     if (this.profileNick) this.root.appendChild(this.renderProfile());
@@ -997,13 +1036,16 @@ export class App {
     // Follow new messages only while the reader is already at the bottom;
     // someone scrolled up reading history stays where they are. A position
     // from a DIFFERENT conversation is not restored: opening a chat always
-    // lands on the latest message.
+    // lands on the latest message. Applied after attachment (see render).
     const prev = this.chatScrollPos;
     this.chatScrollPos = null;
-    if (!prev || prev.nick !== nick || prev.atBottom) {
-      scroll.scrollTop = scroll.scrollHeight;
+    if (this.bottomOnNextChatRender) {
+      this.bottomOnNextChatRender = false;
+      this.pendingChatScroll = { nick, mode: "bottom" };
+    } else if (!prev || prev.nick !== nick || prev.atBottom) {
+      this.pendingChatScroll = { nick, mode: "bottom" };
     } else {
-      scroll.scrollTop = Math.min(prev.top, scroll.scrollHeight);
+      this.pendingChatScroll = { nick, mode: "restore", top: prev.top };
     }
 
     const composer = this.renderComposer(nick, contact.online);
