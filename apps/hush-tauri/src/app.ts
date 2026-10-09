@@ -181,8 +181,16 @@ export class App {
   private contacts: ContactDto[] = [];
   private rail: Rail = "chats";
   private selectedNick: string | null = null;
-  /** Scroll state of the thread pane from the render that is being replaced. */
-  private chatScrollPos: { atBottom: boolean; top: number } | null = null;
+  /** Scroll state of the thread pane from the render that is being replaced.
+   * Keyed by the conversation the old DOM was showing: a position only makes
+   * sense within one conversation. */
+  private chatScrollPos: {
+    nick: string | null;
+    atBottom: boolean;
+    top: number;
+  } | null = null;
+  /** The conversation the thread pane currently shows, for that keying. */
+  private renderedNick: string | null = null;
   private pollTimer: number | null = null;
   private unlockedAt = 0;
   private search = "";
@@ -517,6 +525,7 @@ export class App {
     const prevMsgs = this.root.querySelector<HTMLElement>(".chat-messages");
     this.chatScrollPos = prevMsgs
       ? {
+          nick: this.renderedNick,
           atBottom:
             prevMsgs.scrollHeight - prevMsgs.scrollTop - prevMsgs.clientHeight < 48,
           top: prevMsgs.scrollTop,
@@ -558,6 +567,7 @@ export class App {
       shell.appendChild(this.renderSettings());
     }
     this.root.appendChild(shell);
+    this.renderedNick = this.rail === "chats" ? this.selectedNick : null;
     if (this.paletteOpen) this.root.appendChild(this.renderPalette());
     if (this.addFriendOpen) this.root.appendChild(this.renderAddFriend());
     if (this.profileNick) this.root.appendChild(this.renderProfile());
@@ -985,10 +995,12 @@ export class App {
       scroll.appendChild(gEl);
     }
     // Follow new messages only while the reader is already at the bottom;
-    // someone scrolled up reading history stays where they are.
+    // someone scrolled up reading history stays where they are. A position
+    // from a DIFFERENT conversation is not restored: opening a chat always
+    // lands on the latest message.
     const prev = this.chatScrollPos;
     this.chatScrollPos = null;
-    if (!prev || prev.atBottom) {
+    if (!prev || prev.nick !== nick || prev.atBottom) {
       scroll.scrollTop = scroll.scrollHeight;
     } else {
       scroll.scrollTop = Math.min(prev.top, scroll.scrollHeight);
