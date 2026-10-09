@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use libsignal_protocol::{IdentityKeyStore, SessionStore};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
@@ -25,7 +27,7 @@ use crate::signal::{
     verify_queue_grant,
 };
 use crate::signal_persist::import_store;
-use crate::vault::{BlobId, Vault};
+use crate::vault::{BlobId, DropDrainKey, Vault};
 use crate::wire::{decode_relay_blob, encode_relay_blob};
 
 /// What happened to a mail send: which thread it belongs to, and whether the
@@ -60,6 +62,50 @@ struct QueuedMail {
 /// in the Outbox) and fixable in Settings, which beats discarding the mail.
 fn is_worth_retrying(e: &Error) -> bool {
     matches!(e, Error::Relay(_) | Error::Io(_))
+}
+
+/// What one drain pass over the drop slots did.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct DropInboxReport {
+    /// Rendezvous slots a container was actually found on this pass.
+    pub hit_slots: Vec<String>,
+    /// Containers still parked after the pass — the ones that could not be
+    /// opened or filed stay on the relay for the next pass to retry.
+    pub remaining: usize,
+}
+
+/// Longest subject line kept from a drop; anything longer is cut.
+const MAX_DROP_SUBJECT_CHARS: usize = 256;
+/// Longest body kept from a drop, in characters. The container already caps
+/// the whole package at 8 MiB; this keeps one text blob from dominating the
+/// chat log when the 8 MiB is all body.
+const MAX_DROP_BODY_CHARS: usize = 1 << 20;
+
+/// Clamp free text from a drop: control characters out (newlines and tabs are
+/// body content), length capped. Used on everything a hostile dropper
+/// controls that is rendered back to the member.
+fn clamp_drop_text(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .take(max_chars)
+        .collect()
+}
+
+/// Reduce an attachment name to a bare, safe display name.
+///
+/// Paths are stripped (`/` and `\` both), control characters dropped, length
+/// capped — an attachment is only ever *saved* by the member to a path they
+/// choose, so the name must survive being shown and being used as a filename
+/// suggestion without smuggling a directory component.
+fn sanitize_drop_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = last.chars().filter(|c| !c.is_control()).take(255).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn blob_id_from_hex(s: &str) -> Option<BlobId> {
@@ -939,6 +985,159 @@ impl Account {
     /// openable after a restart.
     /// Send an internal mail message.
     ///
+    /// The account's published drop key, if one has been created.
+    pub fn drop_public_key(&self) -> Option<String> {
+        self.vault.drop_public_key()
+    }
+
+    /// Create the account's drop keypair when it does not have one yet.
+    ///
+    /// Returns the published form of the current key either way — the string a
+    /// member pastes into a forum bio or a profile page. For a "generate"
+    /// button that must fail loudly on a second press, use [`Account::
+    /// create_drop_keys`], which keeps the vault's strict semantics.
+    pub fn ensure_drop_keys(&mut self) -> Result<String, Error> {
+        if let Some(pk) = self.vault.drop_public_key() {
+            return Ok(pk);
+        }
+        self.vault.create_drop_keypair()?;
+        self.vault.drop_public_key().ok_or(Error::DropKeyMissing)
+    }
+
+    /// Create the account's drop keypair, erroring when one already exists.
+    ///
+    /// This is the API/CLI "generate" behavior: a second call is a mistake the
+    /// caller needs to know about, not something to quietly absorb — a key
+    /// that silently stays the same means someone thinks they rotated when
+    /// they did not.
+    pub fn create_drop_keys(&mut self) -> Result<String, Error> {
+        self.vault.create_drop_keypair()
+    }
+
+    /// Rotate the drop keypair: the old key is retired, not deleted.
+    ///
+    /// In-flight drops sealed to the published key before the rotation drain
+    /// until the relay's TTL expires them, so publishing the new string never
+    /// orphans a drop that was already sent.
+    pub fn rotate_drop_keys(&mut self) -> Result<String, Error> {
+        self.vault.rotate_drop_keypair()
+    }
+
+    /// Drain every drop slot this account still holds a key for.
+    ///
+    /// One pass: for each drain key — current first, then retired ones — fetch
+    /// the container parked on its rendezvous slot, open it, file it into the
+    /// chat log, then consume it. A container that will not open stays parked:
+    /// deleting on failure would let a hostile dropper destroy evidence by
+    /// sealing garbage, and the slot only ever holds one container, so a bad
+    /// one cannot wedge later drops either. The daemon decides when the next
+    /// pass runs.
+    pub async fn drain_drops(&mut self) -> Result<DropInboxReport, Error> {
+        let relay = self.relay_client()?;
+        let keys = self.vault.drop_keys_for_drain();
+        let mut report = DropInboxReport::default();
+        for key in &keys {
+            let slot = crate::rendezvous_id(&key.pk);
+            let Some(body) = relay.get_drop(&slot).await? else {
+                continue;
+            };
+            report.hit_slots.push(slot.clone());
+            if self.open_drop(key, &slot, &body)? {
+                relay.delete_drop(&slot).await?;
+            } else {
+                report.remaining += 1;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Open a drop container and file it as a quarantined `Drop` record.
+    ///
+    /// Returns `Ok(false)` when the container is not for this key or is
+    /// malformed: nothing is filed, nothing is deleted, the container stays
+    /// parked. Content problems *inside* an opened container are clamped
+    /// rather than rejected — an oversized attachment is skipped with a note,
+    /// never a drain failure — so one crafted drop cannot park itself in the
+    /// member's drain forever by refusing to parse.
+    fn open_drop(
+        &mut self,
+        key: &DropDrainKey,
+        slot: &str,
+        body: &[u8],
+    ) -> Result<bool, Error> {
+        let pair = key.keypair();
+        let pkg = match crate::open_with_key(body, &pair) {
+            Ok(pkg) => pkg,
+            Err(
+                Error::DropNotForThisKey | Error::BadDrop | Error::UnsupportedDrop,
+            ) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        let subject_raw = clamp_drop_text(pkg.subject.trim(), MAX_DROP_SUBJECT_CHARS);
+        let subject = if subject_raw.is_empty() {
+            None
+        } else {
+            Some(subject_raw)
+        };
+        let mut body_text = clamp_drop_text(&pkg.body, MAX_DROP_BODY_CHARS);
+
+        let master = *self.vault.master_key();
+        let mut records = Vec::new();
+        let mut notes = Vec::new();
+        for (i, attachment) in pkg.attachments.iter().enumerate() {
+            if records.len() == MAX_MAIL_ATTACHMENTS {
+                notes.push(format!(
+                    "{} more file(s) skipped: a drop carries at most {MAX_MAIL_ATTACHMENTS}",
+                    pkg.attachments.len() - i,
+                ));
+                break;
+            }
+            let data = match BASE64_STANDARD.decode(&attachment.data) {
+                Ok(data) => data,
+                Err(_) => {
+                    notes.push(format!(
+                        "file {} skipped: not decodable",
+                        sanitize_drop_name(&attachment.name),
+                    ));
+                    continue;
+                }
+            };
+            if data.len() > MAX_INLINE_FILE_BYTES {
+                notes.push(format!(
+                    "{} skipped: larger than the {} KiB inline cap",
+                    sanitize_drop_name(&attachment.name),
+                    MAX_INLINE_FILE_BYTES / 1024,
+                ));
+                continue;
+            }
+            let name = sanitize_drop_name(&attachment.name);
+            let blob_id = self.vault.put_blob(&data)?;
+            records.push(MailAttachmentRecord {
+                blob_id_hex: hex::encode(blob_id.0),
+                name,
+                size: data.len() as u64,
+            });
+        }
+        if !notes.is_empty() {
+            if !body_text.is_empty() {
+                body_text.push_str("\n\n");
+            }
+            body_text.push_str("[attachments]\n");
+            body_text.push_str(&notes.join("\n"));
+        }
+
+        self.chat_log.append_drop(
+            &master,
+            slot,
+            subject.as_deref(),
+            &body_text,
+            &records,
+            pkg.created_unix,
+        )?;
+        Ok(true)
+    }
+
     /// Mail is async by design: unlike `send_text`, this does not check whether
     /// the contact is online. When the relay refuses the ciphertext the message
     /// is recorded as `Queued` and reported as such rather than failing, so the
@@ -1191,14 +1390,20 @@ impl Account {
         self.chat_log.mail_records().cloned().collect()
     }
 
+    /// Every filed outsider drop, oldest first.
+    pub fn drop_records(&self) -> Vec<crate::chat_log::ChatRecord> {
+        self.chat_log.drop_records().cloned().collect()
+    }
+
     pub fn draft_records(&self) -> Vec<crate::chat_log::ChatRecord> {
         self.chat_log.draft_records().cloned().collect()
     }
 
-    /// The active conclaves this vault holds, in creation order.
+    /// Every conclave this vault holds, in creation order.
     ///
-    /// An ended conclave is filtered out here but kept in the encrypted log, so
-    /// its message history is not lost and a restart still shows it gone.
+    /// Ended conclaves are returned too: they are read-only rather than hidden,
+    /// so a peer that received the creator's end broadcast still sees the record
+    /// and its history.
     pub fn conclaves(&self) -> Vec<ConclaveRecord> {
         // Ended conclaves are returned too: they are read-only rather than
         // hidden, so a peer that received the creator's end broadcast still sees
@@ -1678,6 +1883,38 @@ impl Account {
         }
         self.save().await?;
         Ok(())
+    }
+
+    /// Delete an ended conclave and its whole message log from this vault.
+    ///
+    /// Local only: nothing is sent to the other trustees, who keep their own
+    /// copies — a conclave has no shared history to delete, only per-vault ones.
+    /// Ended only: an active conclave still has people in it, and leaving or
+    /// ending is how membership ends. The record and its messages leave the
+    /// encrypted log, but the vault blobs its shared files referenced stay: the
+    /// blob store has no collection pass, the same trade
+    /// [`delete_mail`](Self::delete_mail) already makes, and a blob is
+    /// content-addressed so the same bytes may be referenced from a 1:1 chat or
+    /// a mail draft too.
+    ///
+    /// Returns whether the record existed and was removed. An unknown id is a
+    /// quiet no-op rather than an error, matching
+    /// [`delete_mail`](Self::delete_mail): the second of two racing deletes, or
+    /// a retry after the first went through, must not fail.
+    pub async fn delete_conclave(&mut self, conclave_id: &str) -> Result<bool, Error> {
+        let ended = match self.chat_log.conclave(conclave_id) {
+            None => return Ok(false),
+            Some(conclave) => conclave.ended,
+        };
+        if !ended {
+            return Err(Error::ConclaveNotEnded);
+        }
+        let master = *self.vault.master_key();
+        let deleted = self.chat_log.remove_conclave(&master, conclave_id)?;
+        if deleted {
+            self.save().await?;
+        }
+        Ok(deleted)
     }
 
     /// Send the convener's authoritative roster to every joined trustee.

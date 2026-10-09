@@ -194,6 +194,60 @@ fn local_ui_cors() -> CorsLayer {
         .allow_headers([header::CONTENT_TYPE])
 }
 
+/// The daemon's whole HTTP surface, extracted so tests can exercise the real
+/// routes against a worker without binding a socket.
+fn api_router(state: Arc<App>) -> Router {
+    Router::new()
+        .route("/api/status", get(status))
+        .route("/api/unlock", post(unlock))
+        .route("/api/lock", post(lock))
+        .route("/api/change-passphrase", post(change_passphrase))
+        .route("/api/mail/handle", post(set_mail_handle))
+        .route("/api/mail/send", post(send_mail))
+        .route("/api/mail/draft", post(save_draft))
+        .route("/api/mail/draft/{id}", delete(delete_draft))
+        .route("/api/mail/{id}", delete(delete_mail))
+        .route("/api/mail", get(mail))
+        .route(
+            "/api/drops/key",
+            get(drops_key).post(drops_key_create),
+        )
+        .route("/api/drops/rotate", post(drops_rotate))
+        .route("/api/drops/drain", post(drops_drain))
+        .route("/api/conclaves", get(conclaves).post(create_conclave))
+        .route("/api/conclaves/message", post(send_conclave_message))
+        .route("/api/conclaves/file", post(send_conclave_file))
+        .route("/api/conclaves/trustees/invite", post(invite_conclave_trustee))
+        .route("/api/conclaves/trustees/kick", post(kick_conclave_trustee))
+        .route("/api/conclaves/trustees/accept", post(accept_conclave_invite))
+        .route("/api/conclaves/trustees/decline", post(decline_conclave_invite))
+        .route("/api/conclaves/trustees/leave", post(leave_conclave))
+        .route("/api/conclaves/invites", get(pending_invites))
+        .route("/api/conclaves/end", post(end_conclave))
+        .route("/api/conclaves/{id}", delete(delete_conclave))
+        .route("/api/invite", post(invite))
+        .route("/api/contacts", get(contacts))
+        .route("/api/contacts/add", post(add_contact))
+        .route("/api/contacts/remove", post(remove_contact))
+        .route("/api/send", post(send_text))
+        .route("/api/send-file", post(send_file))
+        .route("/api/send-file-data", post(send_file_data))
+        .route("/api/presence/heartbeat", post(presence_heartbeat))
+        .route("/api/recv", post(recv))
+        .route("/api/messages", get(messages))
+        .route("/api/blob/{id}", get(blob))
+        .route("/api/backup/export", post(backup_export))
+        .route("/api/backup/import", post(backup_import))
+        .route("/api/recovery/pending", get(recovery_pending))
+        .route("/api/recovery/acknowledge", post(recovery_acknowledge))
+        .route("/api/relay", get(get_relay))
+        .route("/api/relay/mode", post(put_relay_mode))
+        .route("/api/relay/onion", post(put_relay_onion))
+        .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs))
+        .layer(local_ui_cors())
+        .with_state(state)
+}
+
 async fn vault_mount_watch(state: Arc<App>) {
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -251,48 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(heartbeat_loop(state.clone()));
     suspend_lock::spawn_suspend_lock_watch(state.clone());
 
-    let router = Router::new()
-        .route("/api/status", get(status))
-        .route("/api/unlock", post(unlock))
-        .route("/api/lock", post(lock))
-        .route("/api/change-passphrase", post(change_passphrase))
-        .route("/api/mail/handle", post(set_mail_handle))
-        .route("/api/mail/send", post(send_mail))
-        .route("/api/mail/draft", post(save_draft))
-        .route("/api/mail/draft/{id}", delete(delete_draft))
-        .route("/api/mail/{id}", delete(delete_mail))
-        .route("/api/mail", get(mail))
-        .route("/api/conclaves", get(conclaves).post(create_conclave))
-        .route("/api/conclaves/message", post(send_conclave_message))
-        .route("/api/conclaves/file", post(send_conclave_file))
-        .route("/api/conclaves/trustees/invite", post(invite_conclave_trustee))
-        .route("/api/conclaves/trustees/kick", post(kick_conclave_trustee))
-        .route("/api/conclaves/trustees/accept", post(accept_conclave_invite))
-        .route("/api/conclaves/trustees/decline", post(decline_conclave_invite))
-        .route("/api/conclaves/trustees/leave", post(leave_conclave))
-        .route("/api/conclaves/invites", get(pending_invites))
-        .route("/api/conclaves/end", post(end_conclave))
-        .route("/api/invite", post(invite))
-        .route("/api/contacts", get(contacts))
-        .route("/api/contacts/add", post(add_contact))
-        .route("/api/contacts/remove", post(remove_contact))
-        .route("/api/send", post(send_text))
-        .route("/api/send-file", post(send_file))
-        .route("/api/send-file-data", post(send_file_data))
-        .route("/api/presence/heartbeat", post(presence_heartbeat))
-        .route("/api/recv", post(recv))
-        .route("/api/messages", get(messages))
-        .route("/api/blob/{id}", get(blob))
-        .route("/api/backup/export", post(backup_export))
-        .route("/api/backup/import", post(backup_import))
-        .route("/api/recovery/pending", get(recovery_pending))
-        .route("/api/recovery/acknowledge", post(recovery_acknowledge))
-        .route("/api/relay", get(get_relay))
-        .route("/api/relay/mode", post(put_relay_mode))
-        .route("/api/relay/onion", post(put_relay_onion))
-        .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs))
-        .layer(local_ui_cors())
-        .with_state(state.clone());
+    let router = api_router(state.clone());
 
     let socket_listener = if args.no_socket {
         None
@@ -794,6 +807,9 @@ async fn send_mail(
 struct MailboxResponse {
     mail: Vec<ChatRecord>,
     drafts: Vec<ChatRecord>,
+    /// Filed outsider drops — the Drops folder's contents. Kept out of `mail`
+    /// so the ordinary inbox rendering never has to know the variant exists.
+    drops: Vec<ChatRecord>,
 }
 
 async fn mail(
@@ -808,7 +824,107 @@ async fn mail(
         WorkResult::Drafts(list) => list,
         _ => return Err(unexpected_worker_response()),
     };
-    Ok(Json(MailboxResponse { mail, drafts }))
+    let drops = match map_err(state.worker.drop_records().await)? {
+        WorkResult::Drops(list) => list,
+        _ => return Err(unexpected_worker_response()),
+    };
+    Ok(Json(MailboxResponse { mail, drafts, drops }))
+}
+
+#[derive(Serialize)]
+struct DropsKeyResponse {
+    /// Whether the account has a drop key yet.
+    exists: bool,
+    /// The pasteable public key, `hush-drop-pk-v1:…` — what a member publishes.
+    /// `None` when no key exists yet.
+    public_key: Option<String>,
+    /// The drop page's URL on the vault's preferred relay base (onion when
+    /// staged, clearnet otherwise). Published beside the key.
+    page_url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DropsDrainResponse {
+    /// Rendezvous slots a container was found on this pass.
+    hit_slots: Vec<String>,
+    /// Containers left parked (unopenable), for the next pass to retry.
+    remaining: usize,
+}
+
+/// `GET /api/drops/key` — the published drop key and page URL, or `exists:
+/// false` while the account has none.
+async fn drops_key(
+    State(state): State<Arc<App>>,
+) -> Result<Json<DropsKeyResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    match map_err(state.worker.drop_key().await)? {
+        WorkResult::DropKey {
+            exists,
+            public_key,
+            page_url,
+        } => Ok(Json(DropsKeyResponse {
+            exists,
+            public_key,
+            page_url,
+        })),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// `POST /api/drops/key` — create the drop keypair. An error (400) when one
+/// already exists: rotation is the deliberate act.
+async fn drops_key_create(
+    State(state): State<Arc<App>>,
+) -> Result<Json<DropsKeyResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    match map_err(state.worker.drop_key_create().await)? {
+        WorkResult::DropKey {
+            exists,
+            public_key,
+            page_url,
+        } => Ok(Json(DropsKeyResponse {
+            exists,
+            public_key,
+            page_url,
+        })),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// `POST /api/drops/rotate` — new drop key; the retired one keeps draining
+/// until the relay's TTL expires the drops still in flight on it.
+async fn drops_rotate(
+    State(state): State<Arc<App>>,
+) -> Result<Json<DropsKeyResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    match map_err(state.worker.drop_key_rotate().await)? {
+        WorkResult::DropKey {
+            exists,
+            public_key,
+            page_url,
+        } => Ok(Json(DropsKeyResponse {
+            exists,
+            public_key,
+            page_url,
+        })),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// `POST /api/drops/drain` — one drain pass now. The worker also drains after
+/// every poll of `/api/recv`; this endpoint lets the UI force one (the
+/// Settings → Drops pane does, right after key generation).
+async fn drops_drain(
+    State(state): State<Arc<App>>,
+) -> Result<Json<DropsDrainResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    match map_err(state.worker.drain_drops().await)? {
+        WorkResult::Drain(report) => Ok(Json(DropsDrainResponse {
+            hit_slots: report.hit_slots,
+            remaining: report.remaining,
+        })),
+        _ => Err(unexpected_worker_response()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -994,6 +1110,19 @@ async fn end_conclave(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(state.worker.end_conclave(&body.conclave_id).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete an ended conclave and its message log from this vault. Local only:
+/// the other trustees keep their own copies, and the vault blobs the shared
+/// files referenced stay — there is no blob collection pass, the same trade
+/// `DELETE /api/mail/{id}` makes for attachments.
+async fn delete_conclave(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.delete_conclave(&id).await)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1718,5 +1847,187 @@ async fn blob(
                 error: "unexpected worker response".into(),
             }),
         )),
+    }
+}
+
+/// The drops API, against a real (in-process) relay: key creation, an
+/// outsider's sealed container parked on the rendezvous slot, a forced drain,
+/// and the drop record surfacing through `GET /api/mail`.
+///
+/// This is also the daemon's first test of any kind — the router now lives in
+/// `api_router` so it can be driven without binding a socket.
+#[cfg(test)]
+mod drops_api_tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use hush_core::{DropAttachment, DropPackage, RelayClient};
+    use hush_relay::{RelayConfig, router};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    async fn spawn_relay() -> (String, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("relay.db");
+        let app = router(db.to_str().unwrap(), RelayConfig::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        (base, dir)
+    }
+
+    fn test_app(dir: &std::path::Path) -> Arc<App> {
+        Arc::new(App {
+            dir: dir.to_path_buf(),
+            socket: None,
+            tcp_addr: None,
+            worker: AccountWorker::spawn(),
+            unlocked: Mutex::new(false),
+            unlocked_at: Mutex::new(None),
+            relay_socks: Mutex::new(None),
+            relay_health: Mutex::new(None),
+            relay_probe_inflight: AtomicBool::new(false),
+        })
+    }
+
+    async fn post_json(
+        app: &axum::Router,
+        uri: &str,
+        body: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, json)
+    }
+
+    async fn get_json(app: &axum::Router, uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_drops_api_creates_drains_and_files_a_drop() {
+        let (relay, _relay_dir) = spawn_relay().await;
+
+        // The vault is created directly, then opened through the daemon's API
+        // — the same unlock path the UI drives.
+        let vault_dir = TempDir::new().unwrap();
+        {
+            hush_core::Account::create(vault_dir.path(), "member-pass", &relay)
+                .await
+                .unwrap();
+        }
+
+        let state = test_app(vault_dir.path());
+        let app = api_router(state);
+
+        let (status, _) = post_json(&app, "/api/unlock", r#"{"passphrase":"member-pass"}"#).await;
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+
+        // No key yet, then create one.
+        let (status, key) = get_json(&app, "/api/drops/key").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(key["exists"], false);
+        let (status, key) = post_json(&app, "/api/drops/key", "{}").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(key["exists"], true);
+        let pk = key["public_key"].as_str().unwrap();
+        assert!(pk.starts_with("hush-drop-pk-v1:"), "{pk}");
+        let page_url = key["page_url"].as_str().unwrap();
+        assert!(page_url.ends_with("/drop"), "{page_url}");
+        assert!(page_url.starts_with(&relay), "page_url follows the vault's relay: {page_url}");
+
+        // Creating again is refused — rotation is the deliberate act.
+        let (status, _) = post_json(&app, "/api/drops/key", "{}").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+        // The outsider seals to the published key and parks it on the
+        // rendezvous id.
+        let recipient_pk = hush_core::decode_drop_pk(pk).unwrap();
+        let slot = hush_core::rendezvous_id(&recipient_pk);
+        let container = hush_core::seal_to_key(
+            &DropPackage {
+                v: 2,
+                subject: "through the daemon".into(),
+                body: "plain text".into(),
+                attachments: vec![DropAttachment {
+                    name: "evidence.txt".into(),
+                    data: STANDARD.encode(b"attached bytes"),
+                }],
+                created_unix: 1_750_000_000,
+            },
+            &recipient_pk,
+        )
+        .unwrap();
+        RelayClient::new(&relay).put_drop(&slot, &container).await.unwrap();
+
+        // A forced drain files it and consumes the slot.
+        let (status, report) = post_json(&app, "/api/drops/drain", "{}").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(report["hit_slots"].as_array().unwrap().len(), 1);
+        assert_eq!(report["remaining"], 0);
+
+        // The drop record surfaces through the mail listing, in its own
+        // `drops` array — never inside the ordinary inbox `mail`.
+        let (status, mailbox) = get_json(&app, "/api/mail").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(mailbox["mail"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["payload"]["t"] != "drop"));
+        let drops: Vec<&serde_json::Value> = mailbox["drops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["payload"]["t"] == "drop")
+            .collect();
+        assert_eq!(drops.len(), 1);
+        let record = drops[0];
+        assert_eq!(record["payload"]["rendezvous_id"], slot.as_str());
+        assert_eq!(record["payload"]["subject"], "through the daemon");
+        assert_eq!(record["payload"]["body"], "plain text");
+        assert_eq!(record["payload"]["attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            record["payload"]["attachments"][0]["name"],
+            "evidence.txt"
+        );
+
+        // A second drain finds nothing.
+        let (_, report) = post_json(&app, "/api/drops/drain", "{}").await;
+        assert_eq!(report["hit_slots"].as_array().unwrap().len(), 0);
     }
 }

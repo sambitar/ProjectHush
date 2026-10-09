@@ -128,7 +128,14 @@ impl TorManager {
                 // Tor Browser's) is live on the usual loopback SOCKS ports,
                 // use it as-is — instant, no second process, no second
                 // bootstrap. Spawn our own only when none answers.
-                if self.adopt_system_tor_if_live() {
+                //
+                // Not when the operator pinned HUSH_TOR_BIN: an explicit
+                // override means "use this binary", and silently adopting a
+                // live system Tor instead would hide a broken override (a
+                // wrong path, a stale install) with a different Tor the
+                // operator does not control. Leaving the override unresolvable
+                // must stay a visible failure, not a fallback.
+                if std::env::var_os("HUSH_TOR_BIN").is_none() && self.adopt_system_tor_if_live() {
                     return self.status();
                 }
                 if let Err(status) = self.spawn() {

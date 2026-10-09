@@ -64,6 +64,20 @@ pub enum ChatRecordPayload {    Text {
         #[serde(default)]
         state: MailState,
     },
+    /// An outsider drop, opened and filed. Unlike mail there is no peer and no
+    /// thread: provenance is the rendezvous slot the container was parked on,
+    /// and the only place it appears is the member's own Drops folder.
+    Drop {
+        /// The slot it arrived on — which published drop key claimed it.
+        rendezvous_id: String,
+        #[serde(default)]
+        subject: Option<String>,
+        body: String,
+        attachments: Vec<MailAttachmentRecord>,
+        /// When the dropper sealed it, which is not when it arrived.
+        #[serde(default)]
+        created_unix: u64,
+    },
     /// A composed message that has not been sent. Unlike mail this is mutable:
     /// it is edited and deleted in place, which is why the log grew
     /// `replace_payload`/`remove_record` alongside it.
@@ -322,6 +336,42 @@ impl ChatLog {
                     body: body.to_string(),
                     attachments: attachments.to_vec(),
                     state,
+                },
+            },
+        )?;
+        Ok(id)
+    }
+
+    /// Append an opened outsider drop to the Drops folder, returning its id.
+    ///
+    /// `subject` is `None` when the dropper left it empty — the folder renders
+    /// the difference between no subject and one that was left blank. There is
+    /// no contact: the record's provenance is the rendezvous slot alone.
+    pub fn append_drop(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        rendezvous_id: &str,
+        subject: Option<&str>,
+        body: &str,
+        attachments: &[MailAttachmentRecord],
+        created_unix: u64,
+    ) -> Result<String, Error> {
+        let id = Uuid::new_v4().to_string();
+        self.push(
+            master,
+            ChatRecord {
+                id: id.clone(),
+                // No peer exists to name. Mail drafts already leave the contact
+                // column empty until they are addressed; a drop never gets one.
+                contact_nick: String::new(),
+                outgoing: false,
+                ts_ms: now_ms(),
+                payload: ChatRecordPayload::Drop {
+                    rendezvous_id: rendezvous_id.to_string(),
+                    subject: subject.map(|s| s.to_string()),
+                    body: body.to_string(),
+                    attachments: attachments.to_vec(),
+                    created_unix,
                 },
             },
         )?;
@@ -640,6 +690,28 @@ impl ChatLog {
         Ok(true)
     }
 
+    /// Drop a conclave and its whole message log. Returns `false` when the id
+    /// is unknown.
+    ///
+    /// Only the log entries go. The vault blobs the messages' files referenced
+    /// stay exactly where they were: the blob store has no collection pass, the
+    /// same trade [`remove_record`](Self::remove_record) already makes for mail
+    /// attachments, and a blob is content-addressed so the same bytes may be
+    /// referenced from a 1:1 chat or a mail draft too.
+    pub fn remove_conclave(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        conclave_id: &str,
+    ) -> Result<bool, Error> {
+        let before = self.file.conclaves.len();
+        self.file.conclaves.retain(|m| m.id != conclave_id);
+        if self.file.conclaves.len() == before {
+            return Ok(false);
+        }
+        self.save(master)?;
+        Ok(true)
+    }
+
     /// Mark a conclave as ended. Returns `false` when the id is unknown or it was
     /// already ended.
     ///
@@ -668,6 +740,14 @@ impl ChatLog {
             .messages
             .iter()
             .filter(|r| matches!(r.payload, ChatRecordPayload::Mail { .. }))
+    }
+
+    /// Filed outsider drops, oldest first.
+    pub fn drop_records(&self) -> impl Iterator<Item = &ChatRecord> {
+        self.file
+            .messages
+            .iter()
+            .filter(|r| matches!(r.payload, ChatRecordPayload::Drop { .. }))
     }
 
     /// Drafts only, newest first.
@@ -1177,6 +1257,41 @@ mod tests {
         assert!(record.ended, "the record is marked ended");
         assert_eq!(record.messages.len(), 1, "the message log is kept");
         assert_eq!(record.messages[0].body, "we leave at six");
+    }
+
+    #[test]
+    fn deleting_a_conclave_drops_its_log_but_keeps_the_list_shape() {
+        let dir = std::env::temp_dir().join(format!("hush-conclave-delete-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        let id = log
+            .create_conclave(
+                &master,
+                "Trip",
+                "alice",
+                &[trustee("alice", "alice", TrusteeState::Joined)],
+            )
+            .unwrap();
+        log.append_conclave_message(&master, &id, true, None, "we leave at six")
+            .unwrap();
+        log.append_conclave_message(&master, &id, false, Some("bob"), "see you there")
+            .unwrap();
+
+        assert!(log.remove_conclave(&master, &id).unwrap());
+        assert!(
+            !log.remove_conclave(&master, &id).unwrap(),
+            "deleting an unknown id reports \"nothing to do\" rather than erroring"
+        );
+
+        // The whole record — messages included — is gone, and it stays gone
+        // after a reload.
+        let reloaded = ChatLog::load(&dir, &master).unwrap();
+        assert!(reloaded.conclave(&id).is_none(), "the record does not survive a reload");
+        assert_eq!(reloaded.conclaves().len(), 0);
+        assert_eq!(reloaded.chat_records().count(), 0);
     }
 
     /// A log written by the build that keyed the list as `meetings` must still

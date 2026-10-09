@@ -375,6 +375,67 @@ impl RelayClient {
         Ok(())
     }
 
+    /// Park a sealed drop under its rendezvous id.
+    ///
+    /// No token, by design: the id is the capability and the body is ciphertext
+    /// the dropper already sealed to the recipient's published key. The relay
+    /// rate-limits and size-caps per id; the response is only a status.
+    pub async fn put_drop(&self, id: &str, body: &[u8]) -> Result<(), Error> {
+        let res = self
+            .http
+            .put(format!("{}/drop/{}", self.base, id))
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("drop put failed: {}", res.status())));
+        }
+        Ok(())
+    }
+
+    /// Fetch the drop parked on a rendezvous slot.
+    ///
+    /// `None` when the slot is empty — the common case on every drain pass, so
+    /// a 404 is an answer, not an error. Non-consuming by design: the member
+    /// deletes only after the container opened and filed, so a drain that dies
+    /// mid-flight finds the drop still there.
+    pub async fn get_drop(&self, id: &str) -> Result<Option<Vec<u8>>, Error> {
+        let res = self
+            .http
+            .get(format!("{}/drop/{}", self.base, id))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("drop get failed: {}", res.status())));
+        }
+        res.bytes()
+            .await
+            .map(|b| Some(b.to_vec()))
+            .map_err(|e| Error::Relay(e.to_string()))
+    }
+
+    /// Consume a drained drop.
+    ///
+    /// Idempotent on purpose: two of the member's devices may drain together,
+    /// and the second delete finding an empty slot is success, not failure.
+    pub async fn delete_drop(&self, id: &str) -> Result<(), Error> {
+        let res = self
+            .http
+            .delete(format!("{}/drop/{}", self.base, id))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("drop delete failed: {}", res.status())));
+        }
+        Ok(())
+    }
+
     /// Burn a queue so nothing more can be delivered to it.
     ///
     /// Used on revocation: the contact's inbox is destroyed and its token stops

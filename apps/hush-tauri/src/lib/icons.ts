@@ -47,6 +47,7 @@ import {
   ShieldCheck,
   AlertTriangle,
   RotateCw,
+  Droplet,
   type IconNode,
 } from "lucide";
 
@@ -98,6 +99,7 @@ const ICONS: Record<string, IconNode> = {
   shieldCheck: ShieldCheck,
   alert: AlertTriangle,
   refresh: RotateCw,
+  drop: Droplet,
 };
 
 export type IconName = keyof typeof ICONS;

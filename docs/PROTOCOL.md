@@ -166,6 +166,10 @@ two-party chat, just repeated. Nothing on the relay changes.
   stays `meetings` (`#[serde(rename = "meetings", alias = "conclaves")]`).
 - **Ending is shared.** The convener broadcasts a `ConclaveEnd` descriptor; every peer marks the record
   `ended` and renders it read-only. The record and its message log stay in every vault.
+- **Deleting is local.** An ended conclave can be deleted — record and message log together — from one
+  vault only, and nothing is broadcast: the other trustees keep their own copies. The vault blobs behind
+  the files shared in the conclave are left in place, the same no-collection-pass trade
+  `delete_mail` makes; there is no shared history, only per-vault ones to delete.
 - **Not a directory:** `trustees[].nick` is the sender's local nickname; `trustees[].account_id` is the
   stable identity. The relay never sees either.
 

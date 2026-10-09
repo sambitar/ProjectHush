@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Send an encrypted drop</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem;
+    font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
+    background: #16161d; color: #e8e8ef;
+    display: flex; justify-content: center;
+  }
+  main { width: 100%; max-width: 40rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  .lede { color: #a0a0b0; margin: 0 0 1.5rem; }
+  label { display: block; font-weight: 600; margin: 1rem 0 .25rem; }
+  .hint { display: block; font-weight: 400; color: #a0a0b0; font-size: .85rem; }
+  input[type=text], textarea {
+    width: 100%; padding: .55rem .7rem; border-radius: 8px;
+    border: 1px solid #3a3a4a; background: #1f1f28; color: #e8e8ef;
+    font: inherit;
+  }
+  textarea { min-height: 7rem; resize: vertical; }
+  input[type=file] { margin-top: .35rem; }
+  #size-line { font-size: .85rem; color: #a0a0b0; margin-top: .35rem; }
+  #size-line.over { color: #ff8f8f; }
+  button {
+    margin-top: 1.25rem; padding: .6rem 1.4rem; border-radius: 8px; border: 0;
+    background: #6d5ae0; color: #fff; font: inherit; font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: wait; }
+  #status { margin-left: .75rem; color: #ffb46f; }
+  #result { margin-top: 1.25rem; padding: .9rem 1rem; border-radius: 8px;
+    background: #1d3326; border: 1px solid #2e5c3e; color: #b9e6c6; }
+  footer { margin-top: 2.5rem; color: #7d7d8d; font-size: .85rem; }
+  code { background: #1f1f28; padding: .1rem .35rem; border-radius: 5px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Send an encrypted drop</h1>
+  <p class="lede">
+    Your message is sealed on this device and uploaded as ciphertext.
+    Only the holder of the matching private key can open it — not the server,
+    not anyone in between.
+  </p>
+
+  <label for="key">Recipient's drop key
+    <span class="hint">Paste the key the recipient published — it starts with
+      <code>hush-drop-pk-v1:</code>. You cannot send without it.</span>
+  </label>
+  <input type="text" id="key" autocomplete="off" spellcheck="false" placeholder="hush-drop-pk-v1:…">
+
+  <label for="subject">Subject</label>
+  <input type="text" id="subject" autocomplete="off" placeholder="optional">
+
+  <label for="body">Message</label>
+  <textarea id="body" placeholder="Plain text — formatting is not preserved."></textarea>
+
+  <label for="files">Files
+    <span class="hint">Total budget for everything sealed: 8&nbsp;MiB.</span>
+  </label>
+  <input type="file" id="files" multiple>
+  <div id="size-line"></div>
+
+  <button type="button" id="send">Seal and upload</button>
+  <span id="status" role="status"></span>
+
+  <div id="result" hidden>
+    <p id="result-link" style="margin:0"></p>
+  </div>
+
+  <footer>
+    <p>For your own protection, open this page in Tor Browser — the address you
+      used is an onion address by design. The upload carries no information
+      about you: no name, no reply address, no sender key. The recipient cannot
+      answer you through it.</p>
+  </footer>
+</main>
+<!--__DROP_JS__-->
+</body>
+</html>

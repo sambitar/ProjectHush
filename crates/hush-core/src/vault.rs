@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
@@ -213,6 +214,152 @@ impl Vault {
     fn blob_path(&self, id: &BlobId) -> PathBuf {
         self.dir.join("blobs").join(hex::encode(id.0))
     }
+
+    /// Mint the vault's published drop key.
+    ///
+    /// The published string is the address outsiders hold, so creation is a
+    /// deliberate act and a second create is refused rather than rotating
+    /// silently — rotation is its own operation, with the old key archived.
+    pub fn create_drop_keypair(&self) -> Result<String, Error> {
+        if self.read_drop_keys()?.is_some() {
+            return Err(Error::DropKeyExists);
+        }
+        let kp = crate::drop::drop_keypair();
+        self.write_drop_keys(&DropKeysFile {
+            current: DropKeyEntry::from(&kp),
+            retired: Vec::new(),
+        })?;
+        Ok(crate::drop::encode_drop_pk(&kp.pk))
+    }
+
+    /// Rotate: the current key retires — the daemon keeps draining its
+    /// rendezvous slot until the relay TTL expires it, so drops sealed in
+    /// flight are never lost — a new key takes its place, and the retired list
+    /// is capped at the three newest.
+    pub fn rotate_drop_keypair(&self) -> Result<String, Error> {
+        let mut keys = self.read_drop_keys()?.ok_or(Error::DropKeyMissing)?;
+        // Clone, not move: the file type zeroizes on drop.
+        let mut retired = keys.current.clone();
+        retired.retired_unix = now_secs();
+        keys.retired.insert(0, retired);
+        keys.retired.truncate(RETIRED_DROP_KEYS);
+        let kp = crate::drop::drop_keypair();
+        keys.current = DropKeyEntry::from(&kp);
+        self.write_drop_keys(&keys)?;
+        Ok(crate::drop::encode_drop_pk(&kp.pk))
+    }
+
+    /// The pasteable public drop key, when one exists. This is the string a
+    /// member publishes; nothing else identifies the drop address.
+    pub fn drop_public_key(&self) -> Option<String> {
+        let file = self.read_drop_keys().ok()??;
+        let pk = hex::decode(&file.current.pk_hex).ok()?;
+        let pk: [u8; 32] = pk.try_into().ok()?;
+        Some(crate::drop::encode_drop_pk(&pk))
+    }
+
+    /// Every drop key still worth draining: the current one first, then the
+    /// retired ones, newest first.
+    pub(crate) fn drop_keys_for_drain(&self) -> Vec<DropDrainKey> {
+        let file = match self.read_drop_keys() {
+            Ok(Some(file)) => file,
+            _ => return Vec::new(),
+        };
+        let mut keys = Vec::with_capacity(file.retired.len() + 1);
+        if let Some(k) = file.current.to_drain_key() {
+            keys.push(k);
+        }
+        for entry in &file.retired {
+            if let Some(k) = entry.to_drain_key() {
+                keys.push(k);
+            }
+        }
+        keys
+    }
+
+    fn read_drop_keys(&self) -> Result<Option<DropKeysFile>, Error> {
+        let path = self.dir.join(DROP_KEYS_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let plain = decrypt(&self.master, &fs::read(path)?)?;
+        serde_json::from_slice(&plain)
+            .map(Some)
+            .map_err(|_| Error::Corrupt)
+    }
+
+    fn write_drop_keys(&self, keys: &DropKeysFile) -> Result<(), Error> {
+        let plain = serde_json::to_vec(keys).map_err(|_| Error::Corrupt)?;
+        let packed = encrypt(&self.master, &plain)?;
+        fs::write(self.dir.join(DROP_KEYS_FILE), packed)?;
+        Ok(())
+    }
+}
+
+/// How many retired drop keys keep draining after a rotation. The relay's TTL
+/// bounds a drop's lifetime, so anything older than that cannot carry a drop
+/// in flight anyway.
+const RETIRED_DROP_KEYS: usize = 3;
+
+const DROP_KEYS_FILE: &str = "drop-keys.enc";
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+struct DropKeyEntry {
+    sk_hex: String,
+    pk_hex: String,
+    #[serde(default)]
+    retired_unix: u64,
+}
+
+impl From<&crate::drop::DropKeyPair> for DropKeyEntry {
+    fn from(kp: &crate::drop::DropKeyPair) -> Self {
+        Self {
+            sk_hex: hex::encode(kp.sk),
+            pk_hex: hex::encode(kp.pk),
+            retired_unix: 0,
+        }
+    }
+}
+
+impl DropKeyEntry {
+    fn to_drain_key(&self) -> Option<DropDrainKey> {
+        let sk: [u8; 32] = hex::decode(&self.sk_hex).ok()?.try_into().ok()?;
+        let pk: [u8; 32] = hex::decode(&self.pk_hex).ok()?.try_into().ok()?;
+        Some(DropDrainKey {
+            public_key: crate::drop::encode_drop_pk(&pk),
+            sk,
+            pk,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+struct DropKeysFile {
+    current: DropKeyEntry,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired: Vec<DropKeyEntry>,
+}
+
+/// One drop key the daemon drains: raw key bytes for [`crate::drop`], plus the
+/// pasteable public string for logs and provenance.
+#[derive(Clone, Debug)]
+pub struct DropDrainKey {
+    pub public_key: String,
+    pub pk: [u8; 32],
+    pub sk: [u8; 32],
+}
+
+impl DropDrainKey {
+    pub fn keypair(&self) -> crate::drop::DropKeyPair {
+        crate::drop::DropKeyPair { sk: self.sk, pk: self.pk }
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +448,61 @@ mod tests {
             vault.change_passphrase("old-pw", "").unwrap_err(),
             Error::EmptyPassphrase
         ));
+    }
+
+    #[test]
+    fn the_drop_key_survives_a_reload() {
+        let d = scratch("drop-key");
+        let vault = Vault::create(&d, "pw").unwrap();
+        assert!(vault.drop_public_key().is_none(), "a fresh vault has no drop key");
+        let pk = vault.create_drop_keypair().unwrap();
+        assert!(pk.starts_with("hush-drop-pk-v1:"));
+        assert_eq!(
+            vault.drop_public_key().unwrap(),
+            pk,
+            "the minted key is the published one"
+        );
+        assert!(matches!(
+            vault.create_drop_keypair().unwrap_err(),
+            Error::DropKeyExists
+        ));
+
+        let reloaded = Vault::open(&d, "pw").unwrap();
+        assert_eq!(reloaded.drop_public_key().unwrap(), pk);
+        assert_eq!(reloaded.drop_keys_for_drain().len(), 1);
+        assert_eq!(reloaded.drop_keys_for_drain()[0].public_key, pk);
+    }
+
+    #[test]
+    fn rotating_the_drop_key_archives_the_old_one_and_caps_the_history() {
+        let d = scratch("drop-rotate");
+        let vault = Vault::create(&d, "pw").unwrap();
+        assert!(matches!(
+            vault.rotate_drop_keypair().unwrap_err(),
+            Error::DropKeyMissing
+        ));
+
+        let first = vault.create_drop_keypair().unwrap();
+        let second = vault.rotate_drop_keypair().unwrap();
+        assert_ne!(first, second);
+        let keys = vault.drop_keys_for_drain();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].public_key, second, "the current key drains first");
+        assert_eq!(keys[1].public_key, first, "the retired key still drains");
+
+        // Three more rotations: the retired list stays capped at three.
+        for _ in 0..3 {
+            vault.rotate_drop_keypair().unwrap();
+        }
+        let keys = vault.drop_keys_for_drain();
+        assert_eq!(keys.len(), 4, "current plus the three newest retired");
+        assert!(
+            !keys.iter().any(|k| k.public_key == first),
+            "the oldest retired key has fallen off and is no longer drained"
+        );
+
+        let reloaded = Vault::open(&d, "pw").unwrap();
+        assert_eq!(reloaded.drop_public_key().unwrap(), vault.drop_public_key().unwrap());
     }
 
     /// Vaults written before format v2 derived the master key from the

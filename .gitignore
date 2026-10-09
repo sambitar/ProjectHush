@@ -10,4 +10,5 @@ alice-vault/
 bob-vault/
 instances/
 apps/hush-tauri/node_modules/
+crates/hush-relay/node_modules/
 .cursor/

@@ -13,6 +13,139 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-09 — Incoming drops (sealed box, vault key storage)
+
+Slice goal: rebuild the inbound outsider-drop path per `docs/plans/2026-10-09-incoming-drops.md` —
+published drop key as the address, rendezvous id, relay drop page, Mail "Drops" folder.
+All seven tasks done this session (Tasks 1–5 earlier, 6–7 and the live browser pass now).
+
+### [FIXED] `tor::tests::missing_binary_reports_unavailable` fails on any host running Tor
+
+- **Attempted:** full `cargo test --workspace` at slice close; every crate passed except
+  `hush-tauri --lib`, in a file the drops slice never touched (`tor.rs`).
+- **Symptom:** `assertion left == right failed / left: Ready / right: Unavailable` at
+  `tor.rs:640`. `ss -tlnp` showed a live `tor` (pid 91698) on `127.0.0.1:9150` on this
+  machine. `ensure_blocking` probes the usual loopback SOCKS ports (9050/9150) and
+  adopts a live system Tor *before* consulting any binary, so the test's
+  `HUSH_TOR_BIN=/nonexistent` override was never reached and the manager went `Ready`.
+- **Resolution:** when `HUSH_TOR_BIN` is set at all, skip `adopt_system_tor_if_live` —
+  an explicit override means "use this binary", and adopting a different Tor behind the
+  operator's back would silently mask a broken override (wrong path, stale install).
+  Test green afterwards; also a real behavior fix, not test appeasement.
+- **Residual (not fixed):** the test still is not hermetic on hosts with a system Tor
+  at a candidate path (`/usr/bin/tor` etc.) — the locator would find and spawn it. A
+  fully hermetic fix needs injectable search paths; none of this repo's dev hosts has
+  one, so left alone.
+- **Lesson:** an "adopt whatever's live" fast path silently changes what a failing
+  locator means. Tests that force the not-found path need that path to be reachable.
+
+### [WORKED AROUND] drop page has no `#key` hash prefill — my browser-pass flow was wrong, not the page
+
+- **Attempted:** opened `http://relay/drop#hush-drop-pk-v1:…` in the browser pass and
+  expected the key textarea to prefill from the URL fragment.
+- **Symptom:** `#key` stayed empty; clicking "Seal and upload" said "Fix the size or the
+  key first." Reading `main.js` confirmed there is no `location.hash` handling at all.
+- **Resolution:** design intent, not a gap — Settings publishes the page URL and the key
+  as two separate strings ("publish both of these together"), and the key is pasted into
+  the textarea. Keeping the key out of the URL is deliberate: a URL that silently carries
+  the key makes accidental publication easier, and the hash would also linger in the
+  dropper's history/session logs. Pasted the key manually; the seal worked first try.
+- **Lesson:** before reading page behavior as a bug, read the publishing-side UI that
+  produces the inputs — the two-string design was in `app.ts` the whole time.
+
+### [WORKED AROUND] piping a server into `head` kills it (SIGPIPE) — tooling
+
+- **Attempted:** started the scratch relay with `cargo run -p hush-relay 2>&1 | head -3`
+  to bound startup noise.
+- **Symptom:** the pipeline exited 0 after ~14 s and nothing listened on 8799 — `head`
+  left as soon as it had three lines and the relay died writing to the closed pipe.
+  Cost one confused curl round.
+- **Resolution:** tooling error, not a repo bug — run the built binary
+  (`./target/debug/hush-relay`) unpiped in the background terminal instead.
+- **Lesson:** never pipe a long-running server; `head` is a termination mechanism.
+
+### [FIXED] The 2026-10-07 plan's libsignal X25519 API does not match the pinned checkout
+
+- **Attempted:** implement `hush-drop-v2` from the removed plan's crypto section
+  (`pair.public` / `pair.private`, "libsignal's calculate_agreement rejects the all-zero
+  shared secret").
+- **Symptom:** none of it compiles against the pinned libsignal (`257105c`). `KeyPair`
+  fields are `public_key`/`private_key`; `PublicKey::serialize()` returns the
+  type-prefixed 33-byte form (raw point is `public_key_bytes()`, raw reconstruction is
+  `from_djb_public_key_bytes`); the inner `curve25519::PrivateKey::calculate_agreement`
+  is infallible and explicitly does not validate output — the all-zero rejection lives
+  in the `curve.rs` wrapper, which is what `libsignal_protocol::PrivateKey` re-exports.
+- **Resolution:** used the wrapper (`calculate_agreement` → `Result`, all-zero →
+  `CurveError::InvalidKeyAgreement`), raw bytes in/out at the drop boundary. The
+  round-trip, wrong-key, and tamper tests all pass, so the claim is now true at the
+  level the code actually uses.
+- **Lesson:** trust the removed plan's *decisions*, not its API prose — it described a
+  different libsignal than `Cargo.lock` pins. Check the checkout before writing crypto
+  glue from an old plan.
+
+### [FIXED] @noble/curves 1.9 has no `./x25519` subpath export
+
+- **Attempted:** `require("@noble/curves/x25519.js")` in `scripts/drops-vector.mjs`.
+- **Symptom:** `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+- **Resolution:** in noble/curves 1.x, `x25519` is exported from the `ed25519` module
+  (`require("@noble/curves/ed25519").x25519`). The page bundle in Task 3 must import it
+  the same way.
+
+### [FIXED] RFC 5869 vector in the plan was written from memory and garbled
+
+- **Attempted:** the plan's Task 1 test asserted a half-fabricated hex string.
+- **Symptom:** caught in self-review before execution; the string was not the RFC value.
+- **Resolution:** computed Test Cases 1 and 3 with Python's independent
+  `hashlib`/`hmac` (`3cb25f25…`, `8da4e775…`), wrote those into plan and test; the
+  hand-rolled `hkdf_sha256` agrees on both, including the empty-salt multi-block case.
+- **Lesson:** crypto vectors come from a second implementation or the RFC text, never
+  from recall.
+
+### [FIXED] `ZeroizeOnDrop` struct fields cannot be moved out
+
+- **Attempted:** `let mut retired = keys.current;` in `Vault::rotate_drop_keypair`.
+- **Symptom:** E0509, cannot move out of a type implementing `Drop`.
+- **Resolution:** `keys.current.clone()` — each clone zeroizes on its own drop.
+
+---
+
+## 2026-10-09 — Delete ended conclave (history gone, files kept)
+
+Slice goal: a delete option for ended conclaves in the Conclaves rail — `DELETE /api/conclaves/{id}`
+removes the record and its whole message log from this vault only, nothing broadcast, vault blobs
+behind shared files kept.
+
+### [FIXED] delete_conclave turned the idempotent retry into a hard error
+
+- **Attempted:** `Account::delete_conclave` looked the record up with
+  `ok_or(Error::ConclaveNotFound)` before the ended-check, so an unknown id errored instead of
+  returning the quiet `Ok(false)` no-op that `remove_conclave` (and `delete_mail` before it) promise.
+- **Symptom:** the new integration test `deleting_an_ended_conclave_drops_its_history_but_keeps_the_files_and_the_peers_copy`
+  failed on its second delete — `panicked ... called Result::unwrap() on an Err value: ConclaveNotFound`
+  at `tests/conclaves.rs:550`. The first delete succeeds and makes the id unknown; the second delete
+  then hit the `ConclaveNotFound` guard and errored, so any retry/double-submit after a successful
+  delete would surface a spurious error.
+- **Resolution:** look the record up first and return `Ok(false)` when it is absent; only an existing,
+  not-ended conclave yields `Err(ConclaveNotEnded)`. Test now passes, and the no-op contract matches
+  `delete_mail`.
+- **Lesson:** a guard that keys on a record's state must decide what an absent record means before it
+  errors; "delete twice = one delete, no error" and "refuse deleting an active record" are separate
+  cases, and only the test that deletes twice catches the difference.
+
+### [FIXED] Account::conclaves() doc comment claimed ended conclaves were filtered out — code returns them
+
+- **Attempted:** reading `account.rs` before extending it; the doc comment said "An ended conclave is
+  filtered out here ... a restart still shows it gone" while the body and its own inline comment
+  return ended conclaves as read-only.
+- **Symptom:** no runtime symptom; contradictory documentation on the exact function the slice builds
+  next to. Trusting the comment would have suggested hiding deleted/ended records is already handled.
+- **Resolution:** rewrote the doc comment to match the code ("Ended conclaves are returned too: they
+  are read-only rather than hidden"). No behaviour change.
+- **Lesson:** when a doc comment and the code under it disagree, the inline comment explaining the
+  code is usually the newer of the two; fix the stale one in passing rather than leaving a trap.
+
+---
+
 ## 2026-10-09 — Client Tor switch (relay over onion, fail-closed)
 
 Slice goal: a per-vault relay switch — pre-login toggle and top-bar pill in the UI,

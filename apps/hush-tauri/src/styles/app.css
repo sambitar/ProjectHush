@@ -1046,6 +1046,55 @@
 }
 
 /*
+ * Quarantined drop rendering. The banner states what makes a drop different
+ * from mail: no sender, no reply, no trust inherited from the contact list.
+ * The body is plain text by construction — the renderer never runs it through
+ * the rich pipeline — so it wraps literally, like a text file, with URLs left
+ * inert (copyable, not clickable).
+ */
+.drop-banner {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--warning, #d9a13c) 55%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--warning, #d9a13c) 10%, transparent);
+  color: var(--text);
+}
+.drop-banner svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.drop-body {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 13px;
+}
+
+.drop-attachment {
+  display: block;
+}
+.drop-attachment-line {
+  display: flex;
+  gap: var(--space-3);
+  align-items: baseline;
+  justify-content: space-between;
+}
+.drop-attachment-hash {
+  display: block;
+  margin-top: 2px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: all;
+}
+
+/*
  * The message you clicked, so a thread shows where you came in. A rule in the
  * gutter beside the avatar — the same way a mail client marks a quoted or
  * current message. It is not a highlight box, because a box is a bubble.

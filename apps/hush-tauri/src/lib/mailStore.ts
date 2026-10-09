@@ -4,6 +4,7 @@ import { htmlToText } from "./richText";
 /** The Mail sidebar. Order is display order. */
 export type MailFolder =
   | "inbox"
+  | "drops"
   | "sent"
   | "outbox"
   | "drafts"
@@ -41,6 +42,25 @@ export interface MailDraft {
   updatedAt: number;
 }
 
+/**
+ * An outsider drop, opened by the daemon and filed here. There is no sender
+ * and no thread: the only provenance is the rendezvous slot it arrived on,
+ * and rendering is quarantined (plain text, save-only attachments) no matter
+ * what the body looks like.
+ */
+export interface DropMessage {
+  id: string;
+  /** The rendezvous slot — 32 hex chars, which published key claimed it. */
+  rendezvousId: string;
+  subject?: string;
+  body: string;
+  attachments: MailAttachmentRef[];
+  /** When the dropper sealed it. */
+  createdAt: number;
+  /** When the daemon drained it. */
+  receivedAt: number;
+}
+
 /** Read/star/archive/trash, straight out of `ui-prefs.json`. */
 export interface MailFlags {
   read: Set<string>;
@@ -65,6 +85,7 @@ export function emptyFlags(): MailFlags {
  */
 let messages: MailMessage[] = [];
 let drafts: MailDraft[] = [];
+let drops: DropMessage[] = [];
 
 /**
  * Contact nicknames currently in the vault's contact list.
@@ -94,6 +115,7 @@ function draftToKnownContact(d: MailDraft): boolean {
 export function clearMailStore(): void {
   messages = [];
   drafts = [];
+  drops = [];
   knownContacts = null;
 }
 
@@ -115,6 +137,7 @@ function attachmentsOf(
 export function loadMailbox(
   mail: ChatRecordDto[],
   draftRecords: ChatRecordDto[],
+  dropRecords: ChatRecordDto[] = [],
 ): boolean {
   const nextMessages: MailMessage[] = [];
   for (const r of mail) {
@@ -146,9 +169,24 @@ export function loadMailbox(
     });
   }
 
+  const nextDrops: DropMessage[] = [];
+  for (const r of dropRecords) {
+    if (r.payload.t !== "drop") continue;
+    nextDrops.push({
+      id: r.id,
+      rendezvousId: r.payload.rendezvous_id,
+      subject: r.payload.subject ?? undefined,
+      body: r.payload.body,
+      attachments: attachmentsOf(r.payload.attachments),
+      createdAt: (r.payload.created_unix || 0) * 1000,
+      receivedAt: r.ts_ms,
+    });
+  }
+
   const before = mailboxSignature();
   messages = nextMessages;
   drafts = nextDrafts;
+  drops = nextDrops;
   return before !== mailboxSignature();
 }
 
@@ -160,7 +198,10 @@ function mailboxSignature(): string {
   const draft = drafts
     .map((d) => `${d.id}:${d.updatedAt}:${d.attachments.length}`)
     .join("|");
-  return `${mail}#${draft}`;
+  const drop = drops
+    .map((d) => `${d.id}:${d.receivedAt}:${d.attachments.length}`)
+    .join("|");
+  return `${mail}#${draft}#${drop}`;
 }
 
 export function isUnread(m: MailMessage, flags: MailFlags): boolean {
@@ -183,6 +224,10 @@ export function inFolder(
   if (flags.trashed.has(m.id)) return folder === "trash";
   switch (folder) {
     case "trash":
+      return false;
+    // Drops are their own records with their own listing; a mail message is
+    // never in the Drops folder.
+    case "drops":
       return false;
     case "starred":
       return flags.starred.has(m.id);
@@ -263,8 +308,23 @@ export function draftById(id: string): MailDraft | undefined {
   return drafts.find((d) => d.id === id);
 }
 
+/** Filed drops, newest arrival first. Drops have no sender to filter on. */
+export function listDrops(): DropMessage[] {
+  return [...drops].sort((a, b) => b.receivedAt - a.receivedAt);
+}
+
+export function getDropById(id: string): DropMessage | undefined {
+  return drops.find((d) => d.id === id);
+}
+
+/** A drop you have not opened yet. Same read set the mail flags use. */
+export function isDropUnread(d: DropMessage, flags: MailFlags): boolean {
+  return !flags.read.has(d.id);
+}
+
 export function folderCount(folder: MailFolder, flags: MailFlags): number {
   if (folder === "drafts") return listDrafts().length;
+  if (folder === "drops") return listDrops().length;
   return listFolder(folder, flags).length;
 }
 

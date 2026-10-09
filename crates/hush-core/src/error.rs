@@ -52,12 +52,26 @@ pub enum Error {
     NotConclaveConvener,
     #[error("this conclave has ended")]
     ConclaveEnded,
+    #[error("only an ended conclave can be deleted")]
+    ConclaveNotEnded,
     #[error("you are not a trustee of this conclave")]
     NotConclaveTrustee,
     #[error("no pending invite for that conclave")]
     InviteNotFound,
     #[error("that person is already a trustee of this conclave")]
     AlreadyConclaveTrustee,
+    #[error("malformed drop container")]
+    BadDrop,
+    #[error("unsupported drop container version")]
+    UnsupportedDrop,
+    #[error("this drop was not sealed to this drop key")]
+    DropNotForThisKey,
+    #[error("not a valid drop key (expected hush-drop-pk-v1: or hush-drop-sk-v1:)")]
+    InvalidDropKey,
+    #[error("a drop key already exists — rotate it instead")]
+    DropKeyExists,
+    #[error("no drop key exists yet")]
+    DropKeyMissing,
 }
 
 impl From<argon2::Error> for Error {

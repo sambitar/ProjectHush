@@ -76,6 +76,13 @@ enum Commands {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Print the published drop key and the drop page's URL.
+    DropKeyShow,
+    /// Generate the drop keypair. Fails when one already exists.
+    DropKeygen,
+    /// Rotate the drop keypair; the retired key keeps draining until drops
+    /// still in flight on it expire at the relay.
+    DropRotate,
 }
 
 #[derive(Subcommand)]
@@ -260,6 +267,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::DropKeyShow => {
+            let printed = drop_key_show(&dir, &passphrase).await?;
+            println!("{printed}");
+        }
+        Commands::DropKeygen => {
+            let printed = drop_keygen(&dir, &passphrase).await?;
+            println!("{printed}");
+        }
+        Commands::DropRotate => {
+            let printed = drop_rotate(&dir, &passphrase).await?;
+            println!("{printed}");
+        }
         Commands::Contacts => {
             let account = open(&dir, &passphrase).await?;
             for c in account.contacts() {
@@ -324,9 +343,106 @@ fn normalize_optional(v: &str) -> Option<String> {
     }
 }
 
+// ------------------------------------------------------------- drop keys
+
+/// The two strings a member publishes together: the drop key and the page URL
+/// that posts to it.
+async fn drop_key_show(
+    dir: &PathBuf,
+    passphrase: &Option<String>,
+) -> Result<String, String> {
+    let account = open(dir, passphrase).await.map_err(|e| e.to_string())?;
+    match account.drop_public_key() {
+        Some(pk) => {
+            let base = account
+                .onion_relay()
+                .map(str::to_string)
+                .unwrap_or_else(|| account.relay().to_string());
+            Ok(format!("{pk}\ndrop page: {base}/drop"))
+        }
+        None => Err("no drop key yet — run: hush-cli drop-keygen".into()),
+    }
+}
+
+/// Generate the drop keypair, strictly: a second call is an error, because
+/// quietly returning the same key means someone thinks they rotated when they
+/// did not.
+async fn drop_keygen(
+    dir: &PathBuf,
+    passphrase: &Option<String>,
+) -> Result<String, String> {
+    let mut account = open(dir, passphrase).await.map_err(|e| e.to_string())?;
+    match account.create_drop_keys() {
+        Ok(pk) => Ok(format!(
+            "drop key (publish this next to the drop page URL):\n{pk}"
+        )),
+        Err(hush_core::Error::DropKeyExists) => Err(
+            "a drop key already exists — show it with: hush-cli drop-key-show\n\
+             (to replace it, rotate with: hush-cli drop-rotate)"
+                .into(),
+        ),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Rotate: the old key is retired, not deleted, so drops sealed to it before
+/// the rotation still drain until the relay's TTL expires them.
+async fn drop_rotate(
+    dir: &PathBuf,
+    passphrase: &Option<String>,
+) -> Result<String, String> {
+    let mut account = open(dir, passphrase).await.map_err(|e| e.to_string())?;
+    let pk = account.rotate_drop_keys().map_err(|e| e.to_string())?;
+    Ok(format!(
+        "new drop key (publish this):\n{pk}\n\
+         the retired key keeps draining until drops in flight on it expire"
+    ))
+}
+
 async fn open(dir: &PathBuf, passphrase: &Option<String>) -> Result<Account, hush_core::Error> {
     let passphrase = passphrase
         .as_deref()
         .ok_or(hush_core::Error::PassphraseRequired)?;
     Account::open(dir, passphrase).await
+}
+
+#[cfg(test)]
+mod drop_command_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A fresh vault on disk, plus its passphrase. The TempDir is leaked on
+    /// purpose: the vault has to outlive the test's calls, and each test
+    /// creates exactly one.
+    async fn temp_vault() -> (PathBuf, Option<String>) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        // Never dialed: the key commands are purely local vault work.
+        Account::create(&path, "test-pass", "http://127.0.0.1:1")
+            .await
+            .unwrap();
+        (path, Some("test-pass".to_string()))
+    }
+
+    #[tokio::test]
+    async fn keygen_is_strict_and_rotate_replaces() {
+        let (dir, pass) = temp_vault().await;
+
+        // No key yet: show says so rather than printing an empty line.
+        assert!(drop_key_show(&dir, &pass).await.is_err());
+
+        let first = drop_keygen(&dir, &pass).await.unwrap();
+        assert!(first.contains("hush-drop-pk-v1:"), "{first}");
+
+        // A second keygen is the mistake it should look like.
+        let err = drop_keygen(&dir, &pass).await.unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+
+        // Rotate replaces, and show reports the new one.
+        let second = drop_rotate(&dir, &pass).await.unwrap();
+        assert!(second.contains("hush-drop-pk-v1:"), "{second}");
+        let shown = drop_key_show(&dir, &pass).await.unwrap();
+        assert!(shown.contains("hush-drop-pk-v1:"));
+    }
 }

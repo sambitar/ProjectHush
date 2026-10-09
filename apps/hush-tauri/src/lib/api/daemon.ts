@@ -259,8 +259,37 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ conclave_id: conclaveId }),
     }),
+  /**
+   * Delete an ended conclave and its whole message history from this vault.
+   * Local only: the other trustees keep their own copies, and the vault blobs
+   * behind the shared files stay.
+   */
+  deleteConclave: (conclaveId: string) =>
+    request<null>(`/api/conclaves/${encodeURIComponent(conclaveId)}`, {
+      method: "DELETE",
+    }),
   blob: (id: string) =>
     request<{ data_base64: string }>(`/api/blob/${encodeURIComponent(id)}`),
+  /** The account's drop key and the page outsiders post to. */
+  dropsKey: () => request<import("./types").DropsKeyDto>("/api/drops/key"),
+  /** Create the drop keypair. Fails when one exists; rotate instead. */
+  dropsKeyCreate: () =>
+    request<import("./types").DropsKeyDto>("/api/drops/key", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  /** Rotate: the retired key keeps draining until the relay TTL expires it. */
+  dropsKeyRotate: () =>
+    request<import("./types").DropsKeyDto>("/api/drops/rotate", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  /** One drain pass now. The daemon also drains after every poll. */
+  dropsDrain: () =>
+    request<import("./types").DropsDrainDto>("/api/drops/drain", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
   backupExport: () =>
     request<{ filename: string; data_base64: string }>("/api/backup/export", {
       method: "POST",

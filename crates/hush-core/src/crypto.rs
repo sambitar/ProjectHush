@@ -134,7 +134,7 @@ pub fn contact_queue_read_token(read_token: &str, account_id: &str) -> String {
 /// Implemented here rather than pulled in as a dependency: the tree already has
 /// `sha2` at the version this needs, and the crate's other candidate (`hmac`)
 /// would arrive on a second `sha2` major and duplicate the hash implementation.
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     const BLOCK: usize = 64;
 
     // A key longer than the block is hashed down; a shorter one is zero-padded.
@@ -161,6 +161,38 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.update(opad);
     outer.update(inner);
     outer.finalize().into()
+}
+
+/// HKDF-SHA256 (RFC 5869), extract-then-expand, filling `out` from `ikm`,
+/// `salt` and `info`.
+///
+/// Hand-rolled for the same reason HMAC is: no new dependency for one call
+/// site. An empty salt means HMAC with a 32-byte zero block, per the RFC.
+/// Checked against the RFC 5869 vectors in [`crate::drop`]'s tests.
+pub(crate) fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
+    // extract
+    let mut salt_block = [0u8; 32];
+    if !salt.is_empty() {
+        let take = salt.len().min(32);
+        salt_block[..take].copy_from_slice(&salt[..take]);
+    }
+    let prk = hmac_sha256(&salt_block, ikm);
+
+    // expand: block i = HMAC(prk, previous block || info || i)
+    let mut t = [0u8; 32];
+    let mut done = 0usize;
+    let mut counter = 1u8;
+    while done < out.len() {
+        let mut input = Vec::with_capacity(32 + info.len() + 1);
+        input.extend_from_slice(&t[..done.min(32)]);
+        input.extend_from_slice(info);
+        input.push(counter);
+        t = hmac_sha256(&prk, &input);
+        let take = (out.len() - done).min(32);
+        out[done..done + take].copy_from_slice(&t[..take]);
+        done += take;
+        counter += 1;
+    }
 }
 
 #[cfg(test)]

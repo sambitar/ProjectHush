@@ -173,15 +173,96 @@ async fn report_queue(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The drop page: a static, committed bundle. It seals client-side and uploads
+/// once — the relay serves bytes it compiled in and never learns anything.
+///
+/// The lock-down headers are the point of serving it from here: no external
+/// origin may be fetched, nothing is cached or referrer-leaked, and the body is
+/// marked un-sniffable.
+const DROP_PAGE: &str = include_str!("../assets/drop/page.built.html");
+
+async fn drop_page() -> Response {
+    let mut response = Response::new(Body::from(DROP_PAGE));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+             connect-src 'self'; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+/// Park a sealed drop under its rendezvous id.
+///
+/// No bearer token on purpose: the id is the capability, the body is already
+/// ciphertext, and the dropper holds nothing else. The store rate-limits per id
+/// and refuses oversize bodies; the id shape is validated there too.
+async fn put_drop(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, RelayError> {
+    state.store.put_drop(&id, &body)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Fetch a sealed drop for draining. Non-consuming by design — the member
+/// deletes only after the container opened and filed — so a crashed drain
+/// never loses a drop.
+async fn get_drop(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, RelayError> {
+    let Some(body) = state.store.get_drop(&id)? else {
+        return Err(RelayError::NotFound);
+    };
+    // Opaque ciphertext, like a queue blob: never renderable, never sniffed.
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok(response)
+}
+
+/// Consume a drained drop. Idempotent on purpose: a second device draining the
+/// same rendezvous slot must not error because the first got there first.
+async fn delete_drop(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, RelayError> {
+    state.store.delete_drop(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The dumb queue relay: blob stores per queue, prekey records, presence.
 ///
-/// Mail is members-only, so there is no outsider delivery surface here: every
-/// route requires a queue token or is a signed prekey record.
+/// The one outsider surface is the drop family: a sealed container parked by
+/// rendezvous id (`/drop/{id}`), addressed to a published drop key the relay
+/// never sees, plus the static page that seals it (`/drop`). Everything else
+/// requires a queue token or is a signed prekey record.
 pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> {
     let store = Store::open(db_path, config)?;
     let state = Arc::new(AppState { store });
     Ok(Router::new()
         .route("/health", get(health))
+        .route("/drop", get(drop_page))
+        .route(
+            "/drop/{id}",
+            put(put_drop).get(get_drop).delete(delete_drop),
+        )
         .route(
             "/k/{account_id}",
             put(put_prekey_record).get(get_prekey_record),

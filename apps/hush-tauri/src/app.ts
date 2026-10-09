@@ -1,5 +1,5 @@
 import { api, AppError, getApiBase } from "./lib/api/daemon";
-import type { ContactDto, StatusResponse } from "./lib/api/types";
+import type { ContactDto, DropsKeyDto, StatusResponse } from "./lib/api/types";
 import {
   addOutgoingFile,
   addOutgoingText,
@@ -29,17 +29,22 @@ import {
   draftById,
   draftPreview,
   folderCount,
+  getDropById,
   getThread as getMailThread,
   hasUnreadMail,
+  isDropUnread,
   isUnread,
   listDrafts,
+  listDrops,
   listFolder,
   loadMailbox,
   preview,
+  previewText,
   searchMessages,
   setKnownContacts,
   threadSubject,
   unreadCount,
+  type DropMessage,
   type MailAttachmentRef,
   type MailFlags,
   type MailFolder,
@@ -120,6 +125,7 @@ type SettingsSection =
   | "appearance"
   | "profile"
   | "relay"
+  | "drops"
   | "notifications"
   | "security"
   | "recovery"
@@ -138,6 +144,7 @@ const DEFAULT_VAULT_NAME = "hush";
 
 const MAIL_FOLDER_LABEL: Record<MailFolder, string> = {
   inbox: "Inbox",
+  drops: "Drops",
   sent: "Sent",
   outbox: "Outbox",
   drafts: "Drafts",
@@ -148,6 +155,7 @@ const MAIL_FOLDER_LABEL: Record<MailFolder, string> = {
 
 const MAIL_EMPTY: Record<MailFolder, string> = {
   inbox: "No mail yet — write to a contact.",
+  drops: "No drops yet. Anything sealed to your published drop key lands here.",
   sent: "Nothing sent yet.",
   outbox: "Nothing waiting. Mail the relay could not take would queue here.",
   drafts: "No drafts.",
@@ -235,6 +243,10 @@ export class App {
   private mailThreadId: string | null = null;
   /** The message the user clicked, highlighted inside its conversation. */
   private mailOpenId: string | null = null;
+  /** The incoming drop open in the reading pane, when the folder is Drops. */
+  private dropInboxOpenId: string | null = null;
+  /** The account's drop key status, loaded when the Drops folder opens. */
+  private dropInboxKey: DropsKeyDto | null = null;
   private mailSearch = "";
   private mailComposeOpen = false;
   /** Set when compose is editing an existing draft rather than a new message. */
@@ -335,6 +347,17 @@ export class App {
   private conclaveEndId: string | null = null;
   private conclaveEndConfirm = "";
 
+  /**
+   * The conclave the delete dialog is open for, and what the user has typed
+   * into its confirmation field.
+   *
+   * Held here for the same reason the end dialog's field is: a background
+   * re-render must not wipe the typing mid-entry, and opening always clears it
+   * so a previous confirmation can never carry over to the next conclave.
+   */
+  private conclaveDeleteId: string | null = null;
+  private conclaveDeleteConfirm = "";
+
   /** Read/star/archive/trash, straight from `ui-prefs.json`. */
   private mailPrefs(): MailFlags {
     return mailFlags();
@@ -371,6 +394,7 @@ export class App {
         this.conclaveCreateOpen = false;
         this.conclaveInviteOpen = false;
         this.closeConclaveEnd();
+        this.closeConclaveDelete();
         if (this.filesContactNick) this.filesContactNick = null;
         this.render();
       }
@@ -441,7 +465,7 @@ export class App {
   private async reloadMailbox(): Promise<boolean> {
     const box = await api.mail();
     if (!box) return false;
-    return loadMailbox(box.mail ?? [], box.drafts ?? []);
+    return loadMailbox(box.mail ?? [], box.drafts ?? [], box.drops ?? []);
   }
 
   /** Re-read the conclave list. Returns whether it changed, so the poll can
@@ -554,6 +578,8 @@ export class App {
     this.conclaveInviteTrustees = [];
     this.conclaveEndId = null;
     this.conclaveEndConfirm = "";
+    this.conclaveDeleteId = null;
+    this.conclaveDeleteConfirm = "";
     this.unlockedAt = 0;
     this.stopPoll();
     await this.refreshStatus();
@@ -634,6 +660,7 @@ export class App {
     if (this.conclaveCreateOpen) this.root.appendChild(this.renderConclaveCreateModal());
     if (this.conclaveInviteOpen) this.root.appendChild(this.renderConclaveInviteModal());
     if (this.conclaveEndId) this.root.appendChild(this.renderConclaveEndModal());
+    if (this.conclaveDeleteId) this.root.appendChild(this.renderConclaveDeleteModal());
   }
 
   private async maybeShowRecoveryCode(): Promise<void> {
@@ -2140,7 +2167,16 @@ export class App {
     const actions = document.createElement("div");
     actions.className = "conclave-header-actions";
     if (conclave.ended) {
-      // Read-only everywhere: no invite, no leave, no send.
+      // Read-only everywhere: no invite, no leave, no send. Deleting the
+      // ended record and its history is the one thing left to do, and it is
+      // only this vault's copy.
+      const deleteBtn = document.createElement("button");
+      deleteBtn.type = "button";
+      deleteBtn.className = "btn-secondary pressable conclave-delete";
+      deleteBtn.textContent = "Delete conclave";
+      deleteBtn.title = "Delete this conclave and its history from your vault";
+      deleteBtn.onclick = () => this.openConclaveDelete(conclave.id);
+      actions.appendChild(deleteBtn);
     } else if (isConvener) {
       // The convener is the only authority for inviting and ending.
       const inviteBtn = document.createElement("button");
@@ -2817,6 +2853,136 @@ export class App {
     }
   }
 
+  /** Open the delete dialog for an ended conclave, always with an empty confirmation. */
+  private openConclaveDelete(id: string): void {
+    this.conclaveDeleteId = id;
+    this.conclaveDeleteConfirm = "";
+    this.render();
+  }
+
+  /** Close the delete dialog and forget anything typed into it. */
+  private closeConclaveDelete(): void {
+    this.conclaveDeleteId = null;
+    this.conclaveDeleteConfirm = "";
+  }
+
+  /**
+   * The delete-conclave dialog, for an ended conclave.
+   *
+   * Mirrors the end dialog: a typed confirmation, focused on the field rather
+   * than the destructive button, so deleting is never one click. The copy says
+   * plainly what goes and what stays — this vault's copy of the conclave and
+   * its message log are destroyed, the other trustees keep theirs, and the
+   * files shared in the conclave stay in the vault.
+   */
+  private renderConclaveDeleteModal(): HTMLElement {
+    const id = this.conclaveDeleteId!;
+    const conclave = conclaveById(id);
+    const name = conclave ? conclave.name : "this conclave";
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal conclave-delete-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `Delete ${name}`);
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = `Delete ${name}?`;
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-3)";
+    p.textContent =
+      "This deletes the conclave and its entire message history from your vault. Nothing is sent to the other trustees, who keep their own copies.";
+    const kept = document.createElement("p");
+    kept.className = "muted text-13";
+    kept.style.marginTop = "var(--space-2)";
+    kept.textContent =
+      "The files shared in this conclave stay in your vault — only the messages about them are deleted.";
+    const note = document.createElement("p");
+    note.className = "faint text-12";
+    note.style.marginTop = "var(--space-2)";
+    note.textContent = "Deleting cannot be undone.";
+
+    const label = document.createElement("label");
+    label.className = "trust-delete-field";
+    const labelText = document.createElement("span");
+    labelText.className = "text-13";
+    labelText.textContent = "Type DELETE to confirm";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "input-field";
+    input.setAttribute("autocomplete", "off");
+    input.setAttribute("autocapitalize", "characters");
+    input.setAttribute("spellcheck", "false");
+    input.value = this.conclaveDeleteConfirm;
+    label.append(labelText, input);
+
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.closeConclaveDelete();
+      this.render();
+    };
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "btn-primary pressable conclave-delete-confirm";
+    del.style.background = "var(--danger)";
+    del.textContent = "Delete conclave";
+    // One rule, checked by the button, the Enter key, and the click handler,
+    // so there is no way to delete a conclave without typing the word.
+    const confirmed = () => input.value.trim().toUpperCase() === "DELETE";
+    const sync = () => {
+      this.conclaveDeleteConfirm = input.value;
+      del.disabled = !confirmed();
+    };
+    input.oninput = sync;
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (confirmed()) void this.deleteConclave(id);
+      }
+    };
+    sync();
+    del.onclick = () => {
+      if (confirmed()) void this.deleteConclave(id);
+    };
+
+    row.append(cancel, del);
+    modal.append(h, p, kept, note, label, row);
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.closeConclaveDelete();
+        this.render();
+      }
+    };
+    // Focus the field, not the destructive button, so a stray Enter cannot
+    // delete the conclave.
+    queueMicrotask(() => input.focus());
+    return back;
+  }
+
+  private async deleteConclave(id: string): Promise<void> {
+    try {
+      await api.deleteConclave(id);
+      this.closeConclaveDelete();
+      if (this.conclaveId === id) this.conclaveId = null;
+      await this.reloadConclaves();
+      this.announce("Conclave deleted. Files it shared stay in your vault.");
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't delete the conclave.",
+      );
+    }
+  }
+
   /** Open the delete dialog for a contact, always with an empty confirmation. */
   private openTrustDelete(nick: string): void {
     this.trustDeleteNick = nick;
@@ -3216,6 +3382,7 @@ export class App {
     const flags = this.mailPrefs();
     const folders: { id: MailFolder; ic: IconName }[] = [
       { id: "inbox", ic: "inbox" },
+      { id: "drops", ic: "drop" },
       { id: "sent", ic: "send" },
       { id: "outbox", ic: "outbox" },
       { id: "drafts", ic: "drafts" },
@@ -3236,8 +3403,14 @@ export class App {
       label.textContent = MAIL_FOLDER_LABEL[f.id];
       btn.appendChild(label);
 
-      // Inbox shows how much is unread; the rest show how much is in them.
-      const unread = f.id === "inbox" ? unreadCount(flags) : 0;
+      // Inbox shows how much is unread; Drops likewise (unopened); the rest
+      // show how much is in them.
+      const unread =
+        f.id === "inbox"
+          ? unreadCount(flags)
+          : f.id === "drops"
+            ? listDrops().filter((d) => isDropUnread(d, flags)).length
+            : 0;
       const count = unread > 0 ? unread : folderCount(f.id, flags);
       if (count > 0) {
         const badge = document.createElement("span");
@@ -3256,8 +3429,17 @@ export class App {
     this.mailFolder = folder;
     this.mailThreadId = null;
     this.mailOpenId = null;
+    this.dropInboxOpenId = null;
     this.mailComposeOpen = false;
     this.mailDraftId = null;
+    if (folder === "drops" && !this.dropInboxKey) {
+      // First visit: learn whether a drop key exists at all, so the empty
+      // state can say the useful thing ("publish one") rather than a shrug.
+      void api.dropsKey().then((k) => {
+        this.dropInboxKey = k;
+        if (this.mailFolder === "drops") this.render();
+      });
+    }
     this.render();
   }
 
@@ -3265,6 +3447,11 @@ export class App {
 
   private renderMailMain(): HTMLElement {
     if (this.mailComposeOpen) return this.renderMailCompose();
+    if (this.mailFolder === "drops") {
+      return this.dropInboxOpenId
+        ? this.renderDropView(this.dropInboxOpenId)
+        : this.renderDropList();
+    }
     if (this.mailThreadId) return this.renderMailThread(this.mailThreadId);
     return this.renderMailList();
   }
@@ -3693,6 +3880,252 @@ export class App {
     await this.reloadMailbox();
     this.announce("Message deleted");
     this.render();
+  }
+
+  // ------------------------------------------------------ incoming drops
+
+  private dropInboxSearch = "";
+
+  /** Open a filed drop: show it quarantined, and mark it seen. */
+  private openDrop(id: string): void {
+    this.dropInboxOpenId = id;
+    this.render();
+    const drop = dropById(id);
+    if (!drop) return;
+    const flags = this.mailPrefs();
+    if (flags.read.has(id)) return;
+    const read = new Set(flags.read);
+    read.add(id);
+    void patchUiPrefs({ mail_read: [...read] }).then(() => {
+      if (this.dropInboxOpenId === id) this.render();
+    });
+  }
+
+  /** The Drops folder's list: one row per filed drop, newest first. */
+  private renderDropList(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+
+    const bar = document.createElement("div");
+    bar.className = "mail-toolbar";
+    const title = document.createElement("h1");
+    title.className = "text-17";
+    title.textContent = MAIL_FOLDER_LABEL.drops;
+    const search = document.createElement("div");
+    search.className = "search-pill";
+    search.appendChild(icon("search"));
+    const inp = document.createElement("input");
+    inp.placeholder = "Search drops";
+    inp.value = this.dropInboxSearch;
+    inp.oninput = () => {
+      this.dropInboxSearch = inp.value;
+      this.render();
+    };
+    search.appendChild(inp);
+    bar.append(title, search);
+    pane.appendChild(bar);
+
+    const flags = this.mailPrefs();
+    const needle = this.dropInboxSearch.trim().toLowerCase();
+    const rows = listDrops().filter(
+      (d) =>
+        !needle ||
+        (d.subject ?? "").toLowerCase().includes(needle) ||
+        d.body.toLowerCase().includes(needle),
+    );
+
+    if (!rows.length) {
+      const empty = document.createElement("div");
+      empty.className = "mail-empty";
+      if (!needle && this.dropInboxKey && !this.dropInboxKey.exists) {
+        // The one thing a fresh vault needs is the key — offer it here rather
+        // than sending the user hunting through Settings first.
+        empty.textContent =
+          "No drop key yet — generate one, publish it anywhere, and drops sealed to it land here.";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn-primary pressable";
+        btn.textContent = "Generate drop key";
+        btn.onclick = () => {
+          btn.disabled = true;
+          void api
+            .dropsKeyCreate()
+            .then((k) => {
+              this.dropInboxKey = k;
+              this.render();
+            })
+            .catch((e) => {
+              this.announce(
+                e instanceof AppError ? e.message : "Could not generate the drop key.",
+              );
+              this.render();
+            });
+        };
+        empty.appendChild(btn);
+      } else {
+        empty.textContent = MAIL_EMPTY.drops;
+      }
+      pane.appendChild(empty);
+      return pane;
+    }
+
+    const list = document.createElement("div");
+    list.className = "mail-list";
+    for (const d of rows) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `mail-row${this.dropInboxOpenId === d.id ? " active" : ""}`;
+      if (isDropUnread(d, flags)) row.classList.add("unread");
+
+      const dot = document.createElement("span");
+      dot.className = "mail-row-unread";
+      const main = document.createElement("div");
+      main.className = "mail-row-main";
+      const top = document.createElement("div");
+      top.className = "mail-row-top";
+      const from = document.createElement("span");
+      from.className = "mail-row-from";
+      from.textContent = "Anonymous";
+      const date = document.createElement("span");
+      date.className = "mail-row-date";
+      date.textContent = formatRelative(d.receivedAt);
+      const subject = document.createElement("span");
+      subject.className = "mail-row-subject";
+      subject.textContent = d.subject || "(no subject)";
+      const snippet = document.createElement("span");
+      snippet.className = "mail-row-preview";
+      snippet.textContent = previewText(d.body, d.attachments.length);
+      top.append(from, date);
+      main.append(top, subject, snippet);
+      row.append(dot, main);
+      row.onclick = () => this.openDrop(d.id);
+      list.appendChild(row);
+    }
+    pane.appendChild(list);
+    return pane;
+  }
+
+  /**
+   * The quarantined reading view for one filed drop.
+   *
+   * Every difference from `renderMailThread` here is a hardening decision:
+   * the body is escaped plain text (never `bodyToDisplayHtml`), links are not
+   * made clickable, attachments are save-only chips carrying their SHA-256,
+   * and there is no Reply — the sender does not exist to reply to.
+   */
+  private renderDropView(id: string): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+    const drop = getDropById(id);
+    if (!drop) {
+      // Filed away by a refresh? Back to the list rather than a dead pane.
+      this.dropInboxOpenId = null;
+      return this.renderDropList();
+    }
+
+    const head = document.createElement("div");
+    head.className = "mail-read-head";
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-icon-round pressable";
+    back.appendChild(icon("back"));
+    back.setAttribute("aria-label", "Back to Drops");
+    back.onclick = () => {
+      this.dropInboxOpenId = null;
+      this.render();
+    };
+    const titles = document.createElement("div");
+    titles.className = "mail-read-titles";
+    const h = document.createElement("h1");
+    h.className = "text-17";
+    h.textContent = drop.subject || "(no subject)";
+    titles.appendChild(h);
+    head.append(back, titles);
+    pane.appendChild(head);
+
+    // Provenance, in the reader's face: this came from outside Hush, with no
+    // sender, and nothing here can be replied to or trusted like contact mail.
+    const banner = document.createElement("div");
+    banner.className = "drop-banner";
+    banner.append(icon("alert"));
+    const bannerText = document.createElement("div");
+    bannerText.className = "text-13";
+    bannerText.textContent =
+      "From outside Hush — an anonymous sender via your drop key. This cannot be replied to, and the sender is not a verified contact. Open attachments with care.";
+    banner.appendChild(bannerText);
+    pane.appendChild(banner);
+
+    const card = document.createElement("article");
+    card.className = "mail-message";
+
+    const msgHead = document.createElement("dl");
+    msgHead.className = "mail-message-head";
+    msgHead.append(
+      ...this.mailHeaderField("From", "Anonymous (via drop)"),
+      ...this.mailHeaderField("To", this.mailAddress() ?? "you"),
+      ...this.mailHeaderField("Received", this.mailDateEl(drop.receivedAt)),
+      ...this.mailHeaderField("Sealed", this.mailDateEl(drop.createdAt)),
+      ...this.mailHeaderField("Subject", drop.subject || "(no subject)"),
+    );
+    card.appendChild(msgHead);
+
+    const rule = document.createElement("hr");
+    rule.className = "mail-message-rule";
+    card.appendChild(rule);
+
+    const body = document.createElement("div");
+    body.className = "text-15 mail-message-body drop-body";
+    // textContent, never innerHTML: a drop body is untrusted text, so it is
+    // shown as-is, unwrapped by any sanitizer, with links left inert.
+    body.textContent = drop.body;
+    card.appendChild(body);
+
+    if (drop.attachments.length) {
+      const attachRule = document.createElement("hr");
+      attachRule.className = "mail-message-rule";
+      card.appendChild(attachRule);
+      for (const a of drop.attachments) {
+        card.appendChild(this.dropAttachmentChip(a));
+      }
+    }
+    pane.appendChild(card);
+    return pane;
+  }
+
+  /**
+   * A drop's attachment: save-only, with the SHA-256 shown before you save.
+   *
+   * The blob id *is* the SHA-256 of the bytes — the vault keys blobs by it —
+   * so displaying it costs nothing and is exactly the hash a careful recipient
+   * checks after opening the file somewhere disposable. No preview is offered:
+   * a drop's attachment is untrusted input, not media.
+   */
+  private dropAttachmentChip(a: MailAttachmentRef): HTMLElement {
+    const chip = document.createElement("div");
+    chip.className = "mail-attachment drop-attachment";
+    const line = document.createElement("div");
+    line.className = "drop-attachment-line";
+    const name = document.createElement("span");
+    name.className = "text-13";
+    name.textContent = a.name;
+    const size = document.createElement("span");
+    size.className = "text-12 faint";
+    size.textContent = formatBytes(a.size);
+    line.append(name, size);
+    const hash = document.createElement("code");
+    hash.className = "text-11 faint drop-attachment-hash";
+    hash.textContent = `SHA-256 ${a.blobId}`;
+    hash.title = "The attachment's SHA-256, as saved in the vault";
+    chip.append(line, hash);
+    attachFileActions(chip, a.name, async () => {
+      const r = await api.blob(a.blobId);
+      if (!r?.data_base64) throw new Error("Could not load attachment from the vault");
+      const bin = atob(r.data_base64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    });
+    return chip;
   }
 
   private mailAttachmentChip(a: MailAttachmentRef): HTMLElement {
@@ -4405,6 +4838,7 @@ export class App {
       { id: "appearance", label: "Appearance" },
       { id: "profile", label: "Profile" },
       { id: "relay", label: "Relay" },
+      { id: "drops", label: "Drops" },
       { id: "notifications", label: "Notifications" },
       { id: "security", label: "Security" },
       { id: "recovery", label: "Recovery" },
@@ -4642,11 +5076,200 @@ export class App {
       hint.textContent =
         "Change the default with: hush-cli config set --relay <url>. Existing vaults keep the relay they were created with.";
       body.append(list, hint);
+    } else if (this.settingsSection === "drops") {
+      this.renderDropsSettingsInto(body);
     } else {
       body.innerHTML = `<h2 class="text-22">${this.settingsSection}</h2><p class="muted">More options coming soon.</p>`;
     }
     pane.append(nav, body);
     return pane;
+  }
+
+  /** Two-state rotate button: the confirm states what rotation preserves. */
+  private dropRotateArmed = false;
+  /** The last forced drain's outcome line, shown in Settings → Drops. */
+  private dropDrainNote: string | null = null;
+
+  /**
+   * Settings → Drops: publish the drop key and the page URL, rotate, force a
+   * drain.
+   *
+   * The two strings that travel together are shown together, because that is
+   * how they are published: the key says who can receive, the URL says where
+   * to compose. The key is rendered as selectable text, not an input — it is
+   * a value to copy, never to edit.
+   */
+  private renderDropsSettingsInto(body: HTMLElement): void {
+    body.innerHTML = `<h2 class="text-22">Drops</h2><p class="muted text-13">An anonymous drop is a message sealed to your drop key by someone who does not use Hush — a source, a whistleblower, a stranger. They learn nothing about you; the relay cannot open what they send. Drops arrive in the Mail sidebar's Drops folder.</p>`;
+
+    if (!this.dropInboxKey) {
+      // First open of the pane: ask the daemon, then re-render.
+      void api.dropsKey().then((k) => {
+        this.dropInboxKey = k;
+        if (this.settingsSection === "drops") this.render();
+      });
+      const loading = document.createElement("p");
+      loading.className = "muted text-13";
+      loading.textContent = "Loading…";
+      body.appendChild(loading);
+      return;
+    }
+
+    if (!this.dropInboxKey.exists) {
+      const gen = document.createElement("button");
+      gen.type = "button";
+      gen.className = "btn-primary pressable";
+      gen.textContent = "Generate drop key";
+      gen.onclick = () => {
+        gen.disabled = true;
+        void api
+          .dropsKeyCreate()
+          .then((k) => {
+            this.dropInboxKey = k;
+            this.announce("Drop key generated");
+            this.render();
+          })
+          .catch((e) => {
+            this.announce(
+              e instanceof AppError ? e.message : "Could not generate the drop key.",
+            );
+            gen.disabled = false;
+          });
+      };
+      body.appendChild(gen);
+      return;
+    }
+
+    const pk = this.dropInboxKey.public_key ?? "";
+    const keyLabel = document.createElement("p");
+    keyLabel.className = "muted text-13";
+    keyLabel.style.marginTop = "var(--space-4)";
+    keyLabel.textContent = "Your drop key (publish this):";
+    const keyRow = document.createElement("div");
+    keyRow.className = "drop-key-row";
+    const keyText = document.createElement("code");
+    keyText.className = "drop-key-value text-12";
+    keyText.textContent = pk;
+    keyText.title = pk;
+    const copyKey = document.createElement("button");
+    copyKey.type = "button";
+    copyKey.className = "btn-secondary pressable";
+    copyKey.textContent = "Copy";
+    copyKey.onclick = () =>
+      void navigator.clipboard
+        .writeText(pk)
+        .then(() => this.announce("Drop key copied"))
+        .catch(() => this.announce(pk));
+    keyRow.append(keyText, copyKey);
+    body.appendChild(keyLabel);
+    body.appendChild(keyRow);
+
+    const pageUrl = this.dropInboxKey.page_url ?? "";
+    const urlLabel = document.createElement("p");
+    urlLabel.className = "muted text-13";
+    urlLabel.style.marginTop = "var(--space-3)";
+    urlLabel.textContent = "The page outsiders open to send:";
+    const urlRow = document.createElement("div");
+    urlRow.className = "drop-key-row";
+    const urlText = document.createElement("code");
+    urlText.className = "drop-key-value text-12";
+    urlText.textContent = pageUrl;
+    const copyUrl = document.createElement("button");
+    copyUrl.type = "button";
+    copyUrl.className = "btn-secondary pressable";
+    copyUrl.textContent = "Copy";
+    copyUrl.onclick = () =>
+      void navigator.clipboard
+        .writeText(pageUrl)
+        .then(() => this.announce("Drop page URL copied"))
+        .catch(() => this.announce(pageUrl));
+    urlRow.append(urlText, copyUrl);
+    body.appendChild(urlLabel);
+    body.appendChild(urlRow);
+
+    const publishHint = document.createElement("p");
+    publishHint.className = "faint text-12";
+    publishHint.style.marginTop = "var(--space-3)";
+    publishHint.textContent =
+      "Publish both of these together — the key alone has nowhere to point. Put them anywhere you are already reachable: a profile page, a forum bio, a contact section.";
+    body.appendChild(publishHint);
+
+    // Rotate, in two steps: the confirm says what rotation does and does not
+    // lose, because that asymmetry is the whole point of the design.
+    const rotate = document.createElement("button");
+    rotate.type = "button";
+    rotate.className = this.dropRotateArmed ? "btn-primary pressable" : "btn-secondary pressable";
+    rotate.style.marginTop = "var(--space-5)";
+    rotate.textContent = this.dropRotateArmed
+      ? "Confirm rotation"
+      : "Rotate drop key";
+    rotate.onclick = () => {
+      if (!this.dropRotateArmed) {
+        this.dropRotateArmed = true;
+        this.render();
+        return;
+      }
+      rotate.disabled = true;
+      void api
+        .dropsKeyRotate()
+        .then((k) => {
+          this.dropInboxKey = k;
+          this.dropRotateArmed = false;
+          this.announce("Drop key rotated");
+          this.render();
+        })
+        .catch((e) => {
+          this.announce(
+            e instanceof AppError ? e.message : "Could not rotate the drop key.",
+          );
+          this.dropRotateArmed = false;
+          this.render();
+        });
+    };
+    body.appendChild(rotate);
+    if (this.dropRotateArmed) {
+      const warn = document.createElement("p");
+      warn.className = "faint text-12";
+      warn.style.marginTop = "var(--space-2)";
+      warn.textContent =
+        "The new key takes effect immediately. Drops already sealed to the old key still arrive until they expire at the relay — publish the new key where you published the old one.";
+      body.appendChild(warn);
+    }
+
+    // A forced drain, for the moment a member publishes a key and wants to
+    // see it work without waiting for the next poll.
+    const drain = document.createElement("button");
+    drain.type = "button";
+    drain.className = "btn-secondary pressable";
+    drain.style.marginTop = "var(--space-3)";
+    drain.textContent = "Check for drops now";
+    drain.onclick = () => {
+      drain.disabled = true;
+      void api
+        .dropsDrain()
+        .then((r) => {
+          const report = r ?? { hit_slots: [], remaining: 0 };
+          this.dropDrainNote = report.hit_slots.length
+            ? `Delivered ${report.hit_slots.length} drop${report.hit_slots.length === 1 ? "" : "s"} to the Drops folder.`
+            : report.remaining
+              ? `${report.remaining} drop${report.remaining === 1 ? "" : "s"} could not be opened; left in place.`
+              : "No drops waiting.";
+          this.render();
+        })
+        .catch((e) => {
+          this.dropDrainNote =
+            e instanceof AppError ? e.message : "Could not reach the relay.";
+          this.render();
+        });
+    };
+    body.appendChild(drain);
+    if (this.dropDrainNote) {
+      const note = document.createElement("p");
+      note.className = "muted text-13";
+      note.style.marginTop = "var(--space-2)";
+      note.textContent = this.dropDrainNote;
+      body.appendChild(note);
+    }
   }
 
   private renderPalette(): HTMLElement {

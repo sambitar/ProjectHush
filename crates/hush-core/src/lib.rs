@@ -5,6 +5,7 @@ mod chat_log;
 pub mod config;
 mod crypto;
 mod device;
+mod drop;
 mod error;
 mod invite;
 mod lockfile;
@@ -19,7 +20,7 @@ mod signal_persist;
 mod vault;
 mod wire;
 
-pub use account::{Account, Contact, MailOutcome, PendingInvite};
+pub use account::{Account, Contact, DropInboxReport, MailOutcome, PendingInvite};
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{
     ClientConfig, ConfigSource, DEFAULT_DAEMON_ADDR, DEFAULT_RELAY_URL, ENV_DAEMON_ADDR,
@@ -28,6 +29,11 @@ pub use config::{
     resolve_daemon_socket_with_source, resolve_relay_url, resolve_relay_url_with_source,
 };
 pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
+pub use drop::{
+    decode_drop_pk, decode_drop_sk, drop_keypair, encode_drop_pk, encode_drop_sk,
+    open_with_key, rendezvous_id, seal_to_key, is_drop_container, DropAttachment, DropKeyPair,
+    DropPackage, MAX_DROP_BYTES,
+};
 pub use device::{DeviceKeys, DEVICE_ID};
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
 pub use chat_log::{
@@ -49,7 +55,7 @@ pub use relay_client::{
     is_v3_onion_host, normalize_relay_base, normalize_relay_base_with, validate_onion_relay,
     validate_socks_proxy, HttpPolicy, RelayClient,
 };
-pub use vault::{BlobId, IdentityPub, Vault};
+pub use vault::{BlobId, DropDrainKey, IdentityPub, Vault};
 
 /// Queue credential derivation, shared by the client and the relay.
 ///

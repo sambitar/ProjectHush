@@ -164,13 +164,46 @@ export interface ChatRecordDto {
         body: string;
         attachments: { name: string; blob_id_hex: string; size: number }[];
         updated_ms: number;
+      }
+    | {
+        t: "drop";
+        /** The rendezvous slot it arrived on — which published key claimed it. */
+        rendezvous_id: string;
+        subject?: string | null;
+        body: string;
+        attachments: { name: string; blob_id_hex: string; size: number }[];
+        /** When the dropper sealed it, which is not when it arrived. */
+        created_unix: number;
       };
 }
 
-/** `GET /api/mail`: messages and drafts together, so the two cannot disagree. */
+/**
+ * `GET /api/mail`: messages, drafts and drops together, so the three cannot
+ * disagree. Drops are kept out of `mail` so ordinary inbox rendering never has
+ * to know the variant exists.
+ */
 export interface MailboxDto {
   mail: ChatRecordDto[];
   drafts: ChatRecordDto[];
+  drops: ChatRecordDto[];
+}
+
+/** `GET`/`POST /api/drops/key` and `POST /api/drops/rotate`. */
+export interface DropsKeyDto {
+  /** Whether the account has a drop key yet. */
+  exists: boolean;
+  /** The pasteable public key, `hush-drop-pk-v1:…`; null when none. */
+  public_key: string | null;
+  /** The drop page's URL on the vault's preferred relay base. */
+  page_url: string | null;
+}
+
+/** `POST /api/drops/drain` — what one pass did. */
+export interface DropsDrainDto {
+  /** Rendezvous slots a container was found on this pass. */
+  hit_slots: string[];
+  /** Containers left parked (unopenable), for the next pass to retry. */
+  remaining: number;
 }
 
 export interface RecvResponse {

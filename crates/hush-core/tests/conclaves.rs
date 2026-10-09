@@ -502,6 +502,71 @@ async fn the_convener_leaving_ends_the_conclave_for_everyone() {
     assert_eq!(reopened.conclaves()[0].messages.len(), 1);
 }
 
+/// Deleting an ended conclave destroys this vault's copy — record and message
+/// log together — and nothing else. The other trustees keep their own copies,
+/// the files shared in the conclave stay readable from the blob store, and
+/// nothing a peer still sends can resurrect the deleted record.
+#[tokio::test]
+async fn deleting_an_ended_conclave_drops_its_history_but_keeps_the_files_and_the_peers_copy() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    // A shared file, so deletion can be shown to keep the blob it pointed at.
+    let blob = alice
+        .send_conclave_file_bytes(&conclave.id, "notes.txt", b"trip notes")
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    assert_eq!(bob.conclaves()[0].messages.len(), 1, "bob holds the file message");
+
+    // A conclave that has not ended cannot be deleted: ending or leaving is
+    // how an active one concludes.
+    assert!(matches!(
+        alice.delete_conclave(&conclave.id).await,
+        Err(Error::ConclaveNotEnded)
+    ));
+
+    // End it for everyone, then delete alice's copy.
+    alice.leave_conclave(&conclave.id).await.unwrap();
+    bob.recv().await.unwrap();
+    assert!(bob.conclaves()[0].ended);
+
+    assert!(alice.delete_conclave(&conclave.id).await.unwrap());
+    assert!(
+        alice.conclaves().is_empty(),
+        "the record and its history leave alice's vault"
+    );
+    // An unknown id is a quiet no-op, matching delete-mail's idempotence.
+    assert!(!alice.delete_conclave(&conclave.id).await.unwrap());
+
+    // The file the deleted messages referenced is still in alice's vault.
+    assert_eq!(
+        alice.read_blob(&blob).unwrap(),
+        b"trip notes",
+        "the shared file outlives the conclave"
+    );
+
+    // Nothing was sent to bob: his copy, history and file all stay.
+    assert_eq!(bob.conclaves().len(), 1);
+    assert_eq!(bob.conclaves()[0].messages.len(), 1);
+    assert_eq!(bob.conclaves()[0].messages[0].file.as_ref().unwrap().name, "notes.txt");
+    assert_eq!(bob.read_blob(&blob).unwrap(), b"trip notes");
+
+    // The deletion is written, so a reopen does not bring the record back.
+    let reopened = Account::open(alice_dir.path(), "alice-pass").await.unwrap();
+    assert!(reopened.conclaves().is_empty());
+}
+
 /// A conclave needs a name and at least one known contact to invite, and an
 /// unknown contact is refused before anything is written.
 #[tokio::test]

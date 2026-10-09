@@ -53,6 +53,15 @@ impl Store {
             -- members-only now, so the table is gone; the rows were ciphertext
             -- with a TTL, so nothing durable is lost.
             DROP TABLE IF EXISTS deliveries;
+            -- Incoming drops: sealed containers keyed by a rendezvous id the
+            -- member derives from their published drop key. No token, no
+            -- directory: the id is the capability and the body is ciphertext.
+            CREATE TABLE IF NOT EXISTS drops (
+                id TEXT PRIMARY KEY,
+                body BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_drops_created ON drops(created_at);
             ",
         )
         .map_err(|_| RelayError::Internal)?;
@@ -408,7 +417,72 @@ impl Store {
         let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
         conn.execute("DELETE FROM blobs WHERE created_at < ?1", params![cutoff])
             .map_err(|_| RelayError::Internal)?;
+        conn.execute("DELETE FROM drops WHERE created_at < ?1", params![cutoff])
+            .map_err(|_| RelayError::Internal)?;
         Ok(())
+    }
+
+    /// Park a sealed drop under its rendezvous id.
+    ///
+    /// The body is ciphertext and opaque — the relay cannot tell one container
+    /// version from another, only its size. The id is the whole capability:
+    /// whoever knows it can put here, which is what makes the drop mailbox
+    /// work, and the per-id rate limit is what keeps that from being free.
+    pub fn put_drop(&self, id: &str, body: &[u8]) -> Result<(), RelayError> {
+        validate_drop_id(id)?;
+        if body.len() > hush_core::MAX_DROP_BYTES {
+            return Err(RelayError::TooLarge);
+        }
+        self.check_rate(&format!("drop:{id}"))?;
+        self.purge_expired()?;
+        let created = Self::now_secs() as i64;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO drops (id, body, created_at) VALUES (?1, ?2, ?3)",
+            params![id, body, created],
+        )
+        .map_err(|_| RelayError::Internal)?;
+        Ok(())
+    }
+
+    /// Fetch a sealed drop. Deliberately non-consuming: a member's drain that
+    /// crashes between fetch and open must find the drop still there, so the
+    /// client deletes only after it has opened and filed the container.
+    pub fn get_drop(&self, id: &str) -> Result<Option<Vec<u8>>, RelayError> {
+        validate_drop_id(id)?;
+        self.check_rate(&format!("drop:{id}"))?;
+        self.purge_expired()?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let mut stmt = conn
+            .prepare("SELECT body FROM drops WHERE id = ?1")
+            .map_err(|_| RelayError::Internal)?;
+        let mut rows = stmt.query(params![id]).map_err(|_| RelayError::Internal)?;
+        match rows.next().map_err(|_| RelayError::Internal)? {
+            Some(row) => Ok(Some(row.get(0).map_err(|_| RelayError::Internal)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Consume a drained drop. Idempotent: two of the member's devices may
+    /// drain together, and the second delete finding an empty slot is success.
+    pub fn delete_drop(&self, id: &str) -> Result<(), RelayError> {
+        validate_drop_id(id)?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        conn.execute("DELETE FROM drops WHERE id = ?1", params![id])
+            .map_err(|_| RelayError::Internal)?;
+        Ok(())
+    }
+}
+
+/// A drop id is exactly 32 lowercase hex characters — the hex of a 16-byte
+/// HMAC truncation. Anything else is not an address this relay handed out.
+fn validate_drop_id(id: &str) -> Result<(), RelayError> {
+    let ok = id.len() == 32
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if ok {
+        Ok(())
+    } else {
+        Err(RelayError::BadRequest)
     }
 }
 

@@ -98,6 +98,9 @@ enum Work {
     MailRecords {
         reply: oneshot::Sender<WorkResult>,
     },
+    DropRecords {
+        reply: oneshot::Sender<WorkResult>,
+    },
     DraftRecords {
         reply: oneshot::Sender<WorkResult>,
     },
@@ -169,6 +172,12 @@ enum Work {
         conclave_id: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Delete an ended conclave and its message log from this vault. Local
+    /// only: nothing is broadcast, and shared-file blobs stay in the vault.
+    DeleteConclave {
+        conclave_id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// Flip the Tor relay switch on the live vault. A no-op while locked:
     /// the prefs file carries the intent and unlock applies it.
     RelayApply {
@@ -186,6 +195,33 @@ enum Work {
     RelayProbe {
         reply: oneshot::Sender<WorkResult>,
     },
+    /// The account's drop key, with the drop-page URL built on the same relay
+    /// base the vault already prefers (onion when staged, clearnet otherwise).
+    DropKey {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Create the drop keypair. An error when one exists; rotate instead.
+    DropKeyCreate {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Rotate the drop keypair; the retired one keeps draining.
+    DropKeyRotate {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// One drain pass over the drop slots.
+    DrainDrops {
+        reply: oneshot::Sender<WorkResult>,
+    },
+}
+
+/// The drop page's URL on the relay base this vault already prefers: the
+/// staged onion address when there is one, the clearnet base otherwise. This
+/// is the string a member publishes next to their drop key.
+fn drop_page_url(account: &Account) -> String {
+    match account.onion_relay() {
+        Some(base) => format!("{base}/drop"),
+        None => format!("{}/drop", account.relay()),
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -240,6 +276,8 @@ pub enum WorkResult {
     MailSent { thread_id: String, queued: bool },
     Mail(Vec<ChatRecord>),
     Drafts(Vec<ChatRecord>),
+    /// Every filed outsider drop.
+    Drops(Vec<ChatRecord>),
     /// The record id of the saved draft.
     DraftSaved(String),
     Blob(Vec<u8>),
@@ -254,6 +292,14 @@ pub enum WorkResult {
     PendingInvites(Vec<PendingInvite>),
     /// The supplied current passphrase did not match the vault.
     WrongPassphrase,
+    /// The account's drop key and the URL outsiders post to.
+    DropKey {
+        exists: bool,
+        public_key: Option<String>,
+        page_url: Option<String>,
+    },
+    /// What one drop-drain pass did.
+    Drain(hush_core::DropInboxReport),
     Err(String),
 }
 
@@ -399,7 +445,18 @@ impl AccountWorker {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => match a.recv().await {
-                                    Ok(inbox) => WorkResult::Inbox(inbox),
+                                    Ok(inbox) => {
+                                        // Drops ride the normal poll: one drain
+                                        // pass right after the mailbox pull, so
+                                        // arrival needs no extra timer. A failed
+                                        // pass is logged, not surfaced — the next
+                                        // poll retries it, and mail receipt must
+                                        // not depend on drop health.
+                                        if let Err(e) = a.drain_drops().await {
+                                            eprintln!("hush-daemon: drop drain failed: {e}");
+                                        }
+                                        WorkResult::Inbox(inbox)
+                                    }
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
@@ -573,6 +630,13 @@ impl AccountWorker {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => WorkResult::Drafts(a.draft_records()),
+                            };
+                            (reply, result)
+                        }
+                        Work::DropRecords { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::Drops(a.drop_records()),
                             };
                             (reply, result)
                         }
@@ -770,6 +834,16 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::DeleteConclave { conclave_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.delete_conclave(&conclave_id).await {
+                                    Ok(_) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::Blob { id_hex, reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
@@ -792,6 +866,58 @@ impl AccountWorker {
                                         }
                                     }
                                 }
+                            };
+                            (reply, result)
+                        }
+                        Work::DropKey { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    let pk = a.drop_public_key();
+                                    WorkResult::DropKey {
+                                        exists: pk.is_some(),
+                                        page_url: Some(drop_page_url(a)),
+                                        public_key: pk,
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::DropKeyCreate { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.create_drop_keys() {
+                                    Ok(pk) => WorkResult::DropKey {
+                                        exists: true,
+                                        public_key: Some(pk.clone()),
+                                        page_url: Some(drop_page_url(a)),
+                                    },
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::DropKeyRotate { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.rotate_drop_keys() {
+                                    Ok(pk) => WorkResult::DropKey {
+                                        exists: true,
+                                        public_key: Some(pk.clone()),
+                                        page_url: Some(drop_page_url(a)),
+                                    },
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::DrainDrops { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.drain_drops().await {
+                                    Ok(report) => WorkResult::Drain(report),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
                             };
                             (reply, result)
                         }
@@ -998,6 +1124,11 @@ impl AccountWorker {
         self.call(|reply| Work::DraftRecords { reply }).await
     }
 
+    /// Every filed outsider drop. See [`Work::DropRecords`].
+    pub async fn drop_records(&self) -> WorkResult {
+        self.call(|reply| Work::DropRecords { reply }).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn save_draft(
         &self,
@@ -1130,5 +1261,33 @@ impl AccountWorker {
             reply,
         })
         .await
+    }
+
+    pub async fn delete_conclave(&self, conclave_id: &str) -> WorkResult {
+        self.call(|reply| Work::DeleteConclave {
+            conclave_id: conclave_id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// The account's drop key and the page outsiders post to.
+    pub async fn drop_key(&self) -> WorkResult {
+        self.call(|reply| Work::DropKey { reply }).await
+    }
+
+    /// Create the drop keypair. See [`Work::DropKeyCreate`].
+    pub async fn drop_key_create(&self) -> WorkResult {
+        self.call(|reply| Work::DropKeyCreate { reply }).await
+    }
+
+    /// Rotate the drop keypair. See [`Work::DropKeyRotate`].
+    pub async fn drop_key_rotate(&self) -> WorkResult {
+        self.call(|reply| Work::DropKeyRotate { reply }).await
+    }
+
+    /// One drain pass over the drop slots. See [`Work::DrainDrops`].
+    pub async fn drain_drops(&self) -> WorkResult {
+        self.call(|reply| Work::DrainDrops { reply }).await
     }
 }
