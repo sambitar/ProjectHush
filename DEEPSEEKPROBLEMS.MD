@@ -13,6 +13,1465 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-08 — Relay-on-onion: lab service + client SOCKS seam
+
+Slice goal: expose the lab relay as a v3 onion service and give the client a strict SOCKS seam
+so relay traffic can go through Tor (the relay never sees the member's IP).
+
+### [FIXED] internal_mail `a_handle_round_trips_through_an_invite` fails on the working tree (predates this slice)
+
+- **Attempted:** ran the full `hush-core` suite to verify the onion/policy/proxy changes.
+- **Symptom:** `bob.contacts()[0].mail_vault` is `Some("quiet-harbor")` — the vault name carried
+  on the invite — while the test expects `Some("alice's-vault")`, the local default.
+  `left: Some("quiet-harbor")`, `right: Some("alice's-vault")`.
+- **Evidence it predates this slice:** the four assertion/comment lines naming
+  `"alice's-vault"` are all `+` lines in the uncommitted diff of
+  `crates/hush-core/tests/internal_mail.rs` (in-flight internal-mail work). This slice touched
+  only `relay_client.rs` (onion policy + SOCKS seam), the `socks` cargo feature, and a
+  `cfg(test)` initializer fix in `account.rs`; none of those are in the failing path.
+- **Resolution (2026-10-08, internal-mail slice):** semantics decided — a contact's
+  `mail_vault` is the vault name carried in their invite, not the local default; the local
+  default only stands in for *this* vault's own address. Test updated to assert
+  `Some("quiet-harbor")` for the contact and `sandy@hush` / `sandy@quiet-harbor` for the
+  local address; passes (`cargo test -p hush-core --test internal_mail`, 8/8).
+- **Lesson:** a red test left mid-slice fails every later full `cargo test -p hush-core` run
+  and buries real failures under known noise. Land the semantics or mark the test `#[ignore]`
+  with the reason until the slice resolves them.
+
+---
+
+## 2026-10-08 — Internal-only mail + vault-name addresses
+
+Slice goal: remove all external/outsider mailing; mail addresses become
+`handle@vault-name` with the vault named at creation (`hush-cli init --name`); mail thread
+UI goes classic email (newest reply on top, no bubbles); profile address editor made compact.
+
+### [FIXED] Relay `opener.rs` survived its own removal and referenced deleted assets
+
+- **Attempted:** the removal pass reported `crates/hush-relay/src/opener.rs` and the
+  `opener/` asset directory as deleted.
+- **Symptom:** both were still on disk afterwards. `opener.rs` was already orphaned —
+  no `mod opener;` in `lib.rs` — and its `include_str!("opener/drop.js")` pointed at a
+  file that *had* been deleted, so the crate would not compile if the module were ever
+  re-declared. Found by a post-removal grep, not by a build error.
+- **Resolution:** deleted `opener.rs` and `opener/` (`open.html`,
+  `vendor/hush-noble-chacha.js`); `cargo test -p hush-relay` green.
+- **Lesson:** after a "deleted X" claim, verify with a glob of the paths, not memory —
+  a partial deletion (some includes removed, the module left behind) is invisible until
+  someone re-adds the `mod` line.
+
+### [FIXED] Daemon test module survived the removal of `pickup_link`
+
+- **Attempted:** removing the outsider drop path from the daemon (route, handler, helper).
+- **Symptom:** `cargo test -p hush-daemon` did not compile — `error[E0425]: cannot find
+  function `pickup_link` in this scope`, twice, in a `#[cfg(test)]` module at the bottom of
+  `crates/hush-daemon/src/main.rs` asserting `pickup_link(base, id) == "{base}/open/{id}"`.
+  The earlier removal pass deleted the function and the `/open/` route but missed the test
+  module dedicated to that contract.
+- **Resolution:** deleted the dead test module (its subject no longer exists; a route that
+  is gone needs no unit test). `cargo test -p hush-daemon` then passed.
+- **Lesson:** when removing a public helper, grep the crate for its *name* after removal,
+  not just for callers — `#[cfg(test)]` modules at the bottom of a large file are easy to
+  miss and are caught only by a test compile.
+
+### [FIXED] internal_mail test still asserted the removed `myserver.com` domain
+
+- **Attempted:** updating `a_handle_round_trips_through_an_invite` for vault-name addresses.
+- **Symptom:** `assertion left == right failed: left: Some("sandy@hush"),
+  right: Some("sandy@myserver.com")` at `internal_mail.rs:45` — the test kept the old
+  `MAIL_DOMAIN` constant's output in its expectations.
+- **Resolution:** rewrote the expectations to the new contract: default address `sandy@hush`,
+  after `set_vault_name("Quiet-Harbor")` the address is `sandy@quiet-harbor`, the invite
+  payload carries `vault: Some("quiet-harbor")`, and the contact records `mail_vault`.
+- **Sub-mistake inside the fix:** my first edit asserted
+  `set_vault_name("Alice's Vault")` would normalize to a slug (`alice's-vault`). Wrong:
+  `normalize_vault_name` is `normalize_handle` — it *rejects* spaces and apostrophes rather
+  than transliterating them, and the test panicked on the `unwrap`. Re-checking `mail.rs`
+  gave the correct shape and the test uses a valid slug.
+- **Lesson:** normalization functions either canonicalize or reject; do not assume
+  transliteration. Read the validator before writing its expectations into a test.
+
+### [WORKED AROUND] `cargo test --all` collides with a live two-peer dev session
+
+- **Attempted:** plain `cargo test --all` to verify the whole workspace.
+- **Symptom:** build fails with `Text file busy (os error 26)` on the `hush-tauri` build
+  script binary — a running `hush-tauri` app and vite dev server from the two-peer session
+  (`scripts/run-two-ui.sh`) hold the artifacts, and the tauri build script cannot be
+  replaced while in use. Tooling/environment, not a repo problem.
+- **Workaround:** tested the packages this slice touched explicitly —
+  `cargo test -p hush-core -p hush-relay -p hush-daemon -p hush-cli` — all green; and
+  `npx tsc --noEmit` for the UI (exit 0). The tauri shell's Rust side was not modified by
+  this slice, so it stays unverified here; a full `--all` run needs the dev session stopped.
+- **Lesson:** on this machine, full-workspace verification and the running dev instance
+  share `target/`; scope test runs to changed packages while a dev session is live, and run
+  `cargo test --all` only when the session is stopped.
+
+### [FIXED] Test target did not compile: `AccountState` initializer missing `vault_name`
+
+- **Attempted:** first `cargo test -p hush-core --lib relay_client` run.
+- **Symptom:** `error[E0063]: missing field 'vault_name' in initializer of 'account::AccountState'`
+  at `crates/hush-core/src/account.rs:2491` (`write_legacy_vault` under `cfg(test)`).
+- **Cause:** `vault_name` was added to `AccountState` in the internal-mail slice; the
+  legacy-vault test helper was not updated. Not caused by this slice, but it blocked the
+  whole test target.
+- **Resolution:** added `vault_name: None` to the initializer, matching the production
+  initializer in `Account::create`. The lib suite then passes 72/72.
+- **Lesson:** adding a required struct field breaks every hand-written initializer of it;
+  the test target only finds out when someone runs it.
+
+### [FIXED] `reqwest::Proxy::all` silently accepts garbage proxy values
+
+- **Attempted:** validate the `HUSH_RELAY_SOCKS_PROXY` seam by passing the raw string to
+  `reqwest::Proxy::all` and relying on it to reject bad values.
+- **Symptom:** `Proxy::all("garbage")` and `Proxy::all("ftp://proxy.invalid")` both construct
+  fine; scheme matching is deferred to request time, so a typo'd env value silently produces
+  a client whose proxy never matches — i.e. direct, un-Tor'd relay traffic.
+- **Resolution:** strict validation before handing the value to reqwest
+  (`relay_client::socks_proxy`): `Url::parse` must succeed, scheme must be `socks5`/`socks5h`,
+  host must be present, anything else is `Error::Relay` at construction. Tests cover
+  `garbage`, `ftp://`, and a valid `socks5h://`.
+- **Lesson:** validate anything that routes traffic at construction time. A proxy that
+  "never matches" fails open in exactly the way a privacy seam must not.
+
+### [FIXED] Onion `/health` verification read `$?` after `echo`, not after `curl`
+
+- **Attempted:** first end-to-end check of the new onion service over SSH.
+- **Symptom:** empty body and `exit=0` that belonged to the `echo` following the curl, not to
+  curl; the check proved nothing.
+- **Resolution:** re-ran capturing `-w "%{http_code}"` into a variable before any other
+  command: `curl_rc=0 http_code=200`.
+- **Lesson:** in a compound remote shell, capture `$?` immediately or use `-w`; the next
+  command resets it.
+
+---
+
+## 2026-10-08 — Drops: card name truncation
+
+Slice goal: fix a UI defect reported by the user after seeing the Drops page.
+
+### [FIXED] Drop names were cut off with an ellipsis next to the avatar
+
+- **Attempted:** the user reported that Drop names in the Drops grid render as truncated text
+  ("the name of the channels in the drops is cut with periods"); the user could not read the full
+  name.
+- **Symptom:** every name longer than the space between the 44 px avatar and the "Verified" badge
+  rendered as, for example, "Bloomberg Industry Gro…".
+- **Cause:** `.drop-card-name, .drop-card-org` carried `white-space: nowrap` plus
+  `text-overflow: ellipsis`, and the name was squeezed into the middle of the `.drop-card-top`
+  flex row between avatar and badge.
+- **Resolution:** first attempt only removed the ellipsis and let the name wrap inside that row,
+  which still buried the name beside the icon. Second attempt, per the user's direction, moved the
+  name and organization out of the row onto their own full-width lines under the avatar row:
+  `dropCard()` now appends `meta` after `top`, the badge shares the avatar row, and the CSS rules
+  were reduced to `overflow-wrap: anywhere` with no nowrap or ellipsis. Verified in the running app
+  at 1024 px and 1400 px widths: all 24 names render in full.
+- **Lesson:** a two-line clamp or wrap inside a flex row is not a substitute for layout that gives
+  the content its own line. When the fix is "the user cannot read X", verify the actual render, not
+  just that the CSS property changed.
+
+---
+
+## 2026-10-08 — Drops: bundled-Tor path and build-order verification
+
+Slice goal: confirm that the shipped app runs Drops on the *bundled* Tor binary rather than on
+whatever happened to be on the machine. Problems hit:
+
+### [FIXED] A leaked `HUSH_TOR_BIN` hid the bundled-Tor path and pointed the app at a deleted binary
+
+- **Attempted:** audit leftover processes from the earlier verification tasks.
+- **Symptom:** the running app's Tor was `/tmp/tor-test/root/usr/bin/tor (deleted)` — a Tor I had
+  unpacked from a distro package for manual probing, not the bundled resource. `HUSH_TOR_BIN` was
+  exported in the shell from that probing and had never been unset, so every app launched in the
+  session inherited it. The `/tmp/tor-test` tree was later deleted during cleanup, so the live Tor
+  was executing a deleted binary.
+- **Cause:** `locate_binary()` deliberately prefers `HUSH_TOR_BIN` over the bundled resource. The
+  variable was set for a one-off probe and silently re-pointed every subsequent launch.
+- **Resolution:** unset the variable. Verified the shipped `resources/tor/tor` directly — it
+  bootstraps with its own bundled `libevent` (`ldd` reports zero unresolved libraries) and
+  `check.torproject.org` returns `{"IsTor":true}`. Then ran the app with `HUSH_TOR_BIN` unset and
+  confirmed from instrumented output that `locate_binary` selects `target/debug/tor/tor` and that
+  ProPublica's SecureDrop page renders through it (the screenshot contains 37,986 pixels of
+  ProPublica's `#813A81`). The app is now running on the bundled binary.
+- **Lesson:** "Tor works" is not the same claim as "the bundled Tor works". An env var set for a
+  throwaway probe leaks into every later launch, and a verification run that does not state which
+  binary it exercised is not evidence for the shipped path.
+
+### [FIXED] Frontend edits were invisible because Tauri embeds `frontendDist` at `cargo build` time
+
+- **Attempted:** add a temporary probe to `src/main.ts` that opens a Drop at startup, then
+  `cargo build -p hush-tauri` and launch the binary.
+- **Symptom:** three consecutive runs produced no Drop window and no diagnostics from the probe,
+  even though the running process was the freshly built binary. This was misread twice as "the
+  probe is broken" and "the bundled Tor is not found".
+- **Cause:** `tauri.conf.json` sets `build.frontendDist` to `../ui/dist` and defines no `devUrl`, so
+  `tauri::generate_context!()` bakes the built UI into the binary during `cargo build`. A plain
+  `cargo build` does not rebuild the TypeScript, so the probe was never in the running binary.
+  Ordering is what matters: `npm run build` must complete before `cargo build`.
+- **Resolution:** rebuilt with `npm run build && cargo build`; the probe ran on the first attempt and
+  produced the expected output. Probe and temporary logging have been removed and the tree rebuilt
+  clean.
+- **Lesson:** in this repo the Rust build is what snapshots the frontend. A frontend edit that
+  "does nothing" after `cargo build` means the embedded copy is stale, not that the edit is wrong.
+  Instrument with a channel that is guaranteed to be in the running process (a Rust `eprintln!`
+  reaches the captured log) before concluding anything about the frontend.
+
+### [OPEN] SIGTERM to the app still leaves the child Tor running
+
+- **Attempted:** stop the app with `pkill -x hush-tauri` (SIGTERM) before relaunching it.
+- **Symptom:** the bundled Tor child survived the app and kept running; `tor.pid` still pointed at
+  it. The next launch recovered correctly, but only because recovery exists.
+- **Cause:** `TorManager::stop()` runs from the `RunEvent::Exit` handler, which a signal or a crash
+  never reaches. No SIGTERM/SIGINT handler is installed.
+- **Resolution needed:** this is contained, not fixed. `clear_stale()` releases the orphan on the
+  next start, and that path is what keeps the feature working. Handling SIGTERM would remove the
+  window entirely and is the cleaner fix if the orphan ever causes a user-visible delay.
+- **Lesson:** recovery is not the same as prevention. The stale-PID logic makes the orphan
+  survivable, so the gap is easy to stop seeing.
+
+---
+
+## 2026-10-08 — Drops: live directory entries + stale-Tor recovery
+
+Slice goal: find live SecureDrop instances and add them to the registry, then make the feature
+survive being killed. Problems hit:
+
+### [FIXED] A `bash -c` argument slip made the 24-target probe silently probe nothing
+
+- **Attempted:** probe all 24 directory onions for liveness with
+  `xargs -P 8 -n 2 bash -c '<script>'`, reading `slug="$1"; host="$2"`.
+- **Symptom:** all 24 returned `http_code=000`, and the whole command finished in 1.2 seconds. A real
+  24-target Tor probe with a 45s timeout cannot finish in 1.2s. The output also showed the *slug* in
+  the host column and an empty third field.
+- **Cause:** `bash -c 'script' a b` binds `a` to `$0`, not `$1`. So `slug` received the onion and
+  `host` was empty; every `curl "http://"` failed instantly.
+- **Resolution:** added the `_` placeholder (`bash -c 'script' _`) so `$1`/`$2` land correctly.
+  Re-run: 18 × `200`, 2 × `302`, 4 × `000`, in 54s.
+- **Lesson:** a uniform result across every input is a symptom of a broken harness, not of a
+  uniform world. The impossible runtime (1.2s for 45s timeouts) was the tell, and it was visible in
+  the output that was already on screen.
+
+### [FIXED] A Tor orphan from a killed app blocked every later start, silently
+
+- **Attempted:** verify a real Drop by opening one at startup. The first run produced no Drop window
+  and no error.
+- **Symptom:** the bundled Tor from an *earlier* app instance was still running (I had stopped that
+  app with SIGTERM). The new launch's Tor exited immediately — it could not take the data-directory
+  lock — so `drops_open` failed. The failure was invisible because the probe swallowed it.
+- **Cause:** `stop()` runs from the `RunEvent::Exit` handler, which a SIGTERM, a SIGKILL, or a crash
+  never reaches. The orphan held `/home/sam/.local/share/com.hush.capsule/tor` and kept running.
+- **Resolution:** `TorManager` now records its child's pid in `tor.pid` inside the data directory and
+  clears any stale record on start (`clear_stale`), after confirming via the process command line
+  that the pid really is a Tor naming *our* data directory — that path is unique and mode 0700, so a
+  recycled pid cannot match it. Verified end to end: launch, SIGKILL the app, relaunch — the orphan
+  is gone, a new Tor starts, the Drop opens. Before the fix that exact sequence opened nothing.
+  Unix only; elsewhere the record is cleared but no process is signalled, which is recorded in
+  `DESIGN.md` rather than left implied.
+- **Lesson:** an exit handler is not a guarantee. Anything a process spawns must be recoverable from
+  the *next* run, because "we clean up on exit" only covers the exits that run it.
+
+### [FIXED] `picks_a_bindable_loopback_port` was a latent flake the new tests surfaced
+
+- **Attempted:** run the suite after adding two Tor tests.
+- **Symptom:** `assertion failed: listener.is_ok()` — but only about 1 run in 4, and never in
+  isolation (5/5 passes alone).
+- **Cause:** pre-existing. The picker deliberately releases the port for Tor to claim, so the test's
+  rebind races anything else the kernel hands that port to. The extra tests changed the timing
+  enough to expose it. The race is documented in the function's own comment; the assertion was
+  stronger than the design promises.
+- **Resolution:** the test retries the rebind up to 20 times. A picker that returned an already-bound
+  port would still fail, because every attempt would lose rather than one.
+- **Lesson:** an intermittently failing test is not "flaky, ignore it" — here it was pointing at an
+  assertion that never matched the contract. Retrying is only honest when the design really does
+  permit the failure, and when a genuine regression still fails the test.
+
+### [OPEN] Could not confirm the rendered Drops rail by driving the UI, so it was verified another way
+
+- **Attempted:** click the Drops rail in the running app under XWayland and read the cards off a
+  screenshot, to confirm the 24 new entries actually render.
+- **Symptom:** synthetic clicks appeared to do nothing — the capture was byte-identical before and
+  after. `xdotool getmouselocation` confirmed the pointer was over the window, and the click did land
+  eventually, but only after several attempts, and the resulting views could not be identified from
+  the captures. I cannot read text out of a screenshot in this environment (no OCR available), so
+  "the page looks right" was not something I could establish this way.
+- **Workaround:** verified the layer I actually changed instead — ran the real `registry.ts` and the
+  real `verification.ts` through esbuild and node: 25 entries, 24 verified, 24 in the rail, 24
+  distinct onion hosts, and `onionHost()`/`isValidOnionHost()` reject none of them. The rendering path
+  (`visibleDrops()` into `dropCard()`) is unchanged pre-existing code, so the open question is only
+  cosmetic.
+- **Still open:** nobody has looked at the rail with the new entries in it. This is a tooling
+  limitation of this environment, not a repo problem. A human should click Drops once.
+- **Lesson:** when a claim can only be checked through a channel I cannot read, say so and verify the
+  part I own rather than implying the whole thing was seen working.
+
+### [FIXED] The generated splice emitted `// //` on the two https entries
+
+- **Attempted:** rewrite the comment on the New York Times and Washington Post entries while
+  switching them to `https`, using a regex whose capture groups included the `// ` prefix.
+- **Symptom:** both entries read `// // This instance serves https …`. Valid TypeScript, but sloppy,
+  and it hid that the replacement had been done by pattern rather than deliberately.
+- **Resolution:** replaced both with the intended two-line comment. Caught by reading the seam
+  rather than by a test, which is the only thing that would have caught it.
+- **Lesson:** when a transform is regex-driven, read the *result* at every seam, not just the exit
+  code.
+
+## 2026-10-08 — Drops: scheme rule was wrong (https-only refused every real SecureDrop)
+
+### [FIXED] The Drop validator required `https`, which no real SecureDrop serves
+
+- **Attempted:** the user pasted the Al Jazeera address as `http://…onion`; the entry was stored as
+  `https://…onion` because the validator only accepted `https` for onions, and that rule was assumed
+  to be correct.
+- **Symptom:** the user's `http://` was silently rewritten, and `onionHost()` returned `null` for it.
+  The earlier probe against Al Jazeera had tried both schemes and both timed out, so the outage hid
+  the fact that one of them was *structurally* wrong.
+- **Reality:** measured against two live instances taken from the official SecureDrop API
+  (`https://securedrop.org/api/v1/directory/`) through Tor:
+  `https://<onion>/` -> `http_code=000` (failed) on both, `http://<onion>/` -> `http_code=200` on both.
+  SecureDrop serves its onion over plain `http`; the onion service layer provides the encryption and
+  authenticates the address, so there is no TLS layer. The `https`-only rule would have refused every
+  real instance while passing unit tests that used a fabricated `https://<onion>` fixture.
+- **Resolution:** `validate_target` and `allowed_navigation` in `drops.rs` accept `http` or `https` on
+  a v3 onion; `onionHost()` in `verification.ts` likewise; the Al Jazeera entry now stores the
+  published `http://` form verbatim; `rejects_http_onion_in_production` became
+  `accepts_http_onion_in_production`; `DESIGN.md` records the scheme rule.
+- **Lesson:** a hand-written fixture (`v3_https()`) can encode the same wrong assumption as the code it
+  tests, so it passes and proves nothing. Test a rule against a real instance from the source of
+  record before trusting it. A timeout is not evidence that a scheme is right — it hides the
+  difference between "the service is down" and "the request was malformed".
+
+### [FIXED] Verified the Drop window renders external `http` content (CSP could have blocked it)
+
+- **Attempted:** the app sets a CSP (`default-src 'self' …`) and the Drop window navigates to a
+  third-party `http` page. If Tauri injected that CSP into the Drop document, subresources would be
+  blocked and the page would render blank — the feature would look broken for reasons unrelated to
+  Tor.
+- **Symptom:** none observed yet; this was an untested integration risk, not a failure.
+- **Resolution:** opened the development Drop (an `http` page) in the real app under Xvfb and captured
+  the window: the capture is 93.2% `rgb(18,18,24)` and 0.4% `rgb(242,242,247)`, exactly the mock
+  page's declared background and text colours. The external `http` page renders fully styled, so the
+  app CSP does not apply to the Drop window. `drops_open` also succeeded, confirming the capability
+  fix from the previous slice holds.
+
+## 2026-10-08 — Drops: Al Jazeera entry + bundled Tor
+
+Slice goal: add the Al Jazeera Drop the user supplied, and ship Tor as an app resource so the feature
+works with no system install. Problems hit:
+
+### [FIXED] A web-search summary gave the wrong answer about the Al Jazeera address
+
+- **Attempted:** verify the address the user supplied against a trusted source before marking it
+  `verified`.
+- **Symptom:** the search synthesis said the address appeared only on unofficial mirror sites and that
+  the official page listed `aljazeerafo4sau2.onion` (a 16-character v2 onion, dead since v2 was
+  removed). It looked like the user had been handed a bogus address.
+- **Reality:** fetching `https://www.aljazeera.com/tips` directly showed the exact address from the
+  user's message, listed as Al Jazeera's SecureDrop address. The other `ajiunit.com` pages are stale.
+- **Resolution:** marked the entry `verified: true` with `verificationSource` set to the tips page.
+- **Lesson:** a search synthesis is a lead, not evidence. Fetch the organisation's own page before
+  concluding an address is unverified — and before telling the user their address is wrong.
+
+### [OPEN] The Al Jazeera address is authentic but the service does not answer
+
+- **Attempted:** reach the address through Tor to confirm the Drop actually opens.
+- **Symptom:** `https://<address>.onion/` and `http://<address>.onion/` both timed out
+  (`http_code=000` after 90s and 60s). A control onion (DuckDuckGo) returned 200 in under 7s on the
+  same Tor instance, so onion routing itself was fine. The SecureDrop directory reports the instance
+  as under maintenance with an extended outage.
+- **Resolution:** none needed in code — the address is correct, the destination is down. The entry
+  stays (authentic address) rather than being removed.
+- **Lesson:** verification and availability are different claims. The "Verified" badge is about
+  authenticity and does not promise the service answers.
+
+### [FIXED] Bundled Tor needs its own libevent, and `bundle.resources` remaps paths
+
+- **Attempted:** ship Tor as a Tauri resource so no system install is needed.
+- **Symptom:** Tor links `libevent-2.1.so.7`, which is absent on this machine. Copying only the binary
+  would have produced a silent "Could not start Tor" at runtime.
+- **Resolution:** copied the binary and the library into `src-tauri/resources/tor/`, mapped them with
+  the object form of `bundle.resources` so they land at `<resource_dir>/tor/`, and set
+  `LD_LIBRARY_PATH` on the child only when the located binary lives under the resource directory.
+  Verified with no `HUSH_TOR_BIN` and no `LD_LIBRARY_PATH`: the app spawned `target/debug/tor/tor`,
+  and `curl --socks5-hostname` through it returned `{"IsTor":true,...}` plus a 200 from a control
+  onion.
+- **Lesson:** `tauri-build` copies `bundle.resources` into `target/debug/` for dev runs even with
+  `bundle.active: false`, so the bundled path is testable without producing a bundle. A bundled native
+  binary is only as portable as its shared libraries.
+
+### [WORKED AROUND] A running app blocks `cargo test` with "Text file busy"
+
+- **Symptom:** `cargo test -p hush-tauri` failed to link with `Text file busy (os error 26)` while an
+  app built from the same profile was running.
+- **Resolution:** stop the app before rebuilding or testing that profile.
+- **Lesson:** the dev binary is the same file the test harness links.
+
+---
+
+## 2026-10-08 — Drops: "Tor Unavailable" in the desktop app (ACL permission missing)
+
+Slice goal: diagnose why the Drops rail reported Tor as unavailable in the running desktop window.
+The answer was not in the Tor code at all. Problems hit:
+
+### [FIXED] Every `drops_*` command was denied by the Tauri ACL
+
+- **Attempted:** ship the Drops commands by registering them in `tauri::generate_handler!` and
+  adding a `capabilities/default.json` entry.
+- **Symptom:** the Drops rail always showed the red "Tor Unavailable" chip, in the desktop app, with
+  a working Tor binary and `HUSH_TOR_BIN` set. `torStatus()` swallows invoke rejections and returns
+  the `NO_SHELL` fallback (`phase: "unavailable"`), so an ACL denial and "no Tor installed" were
+  indistinguishable in the UI.
+- **Root cause:** `capabilities/default.json` listed only `core:default`, `allow-hush-files`,
+  `allow-hush-api`. Tauri v2 gates app-defined commands through the same ACL as plugin commands
+  (`gen/schemas/acl-manifests.json` had `__app-acl__` = only the two existing permissions), so all
+  seven `drops_*` commands were rejected.
+- **Resolution:** added `src-tauri/permissions/drops.toml` (`allow-drops`, the seven commands) and
+  added `allow-drops` to the main-window capability. The capability stays scoped to
+  `windows: ["main"]`, so the `drop-view` window still has no capability and cannot call any Hush
+  command.
+- **Evidence:** a temporary startup probe calling the same `torStart()` the button calls spawned a
+  real Tor process (`--SocksPort 127.0.0.1:33171`), and `curl --socks5-hostname` against it returned
+  `{"IsTor":true,"IP":"171.25.193.82"}`. The probe was reverted (`git diff` on `main.ts` empty).
+- **Lesson:** an ACL denial reaches the frontend as a rejected promise, which is easy to swallow
+  into a benign-looking fallback. When a capability-gated command appears to do nothing, read
+  `__app-acl__` before debugging the feature.
+
+### [FIXED] A prior claim that the Drops permissions existed was wrong
+
+- **What was claimed:** earlier notes stated the Drops commands had `permissions/*.toml` files and a
+  capability scoped to `windows: ["main"]`.
+- **Reality:** `src-tauri/permissions/` held only `hush-api.toml` and `hush-files.toml`; no Drops
+  permission existed and the capability did not reference one.
+- **Resolution:** created the permission and wired the capability (above).
+- **Lesson:** a security-relevant claim (isolation by capability scoping) must be verified by reading
+  the capability file, not asserted from the design intent.
+
+### [FIXED] Tauri embeds `ui/dist` at compile time, so a UI rebuild alone does not reach the binary
+
+- **Attempted:** `npm run build` and relaunch the existing binary to pick up new UI strings.
+- **Symptom:** the new strings were in `ui/dist/assets/*.js` but absent from the running app; a probe
+  added to `main.ts` never executed.
+- **Resolution:** run `cargo build -p hush-tauri` after `npm run build`; `tauri-build` embeds the
+  frontend assets into the binary. `scripts/run-two-ui.sh` already does both.
+- **Lesson:** for this app, "the UI changed" means two builds, not one.
+
+### [FIXED] Relaunching the desktop window by hand dropped `HUSH_API_URL`
+
+- **Attempted:** relaunch `./target/debug/hush-tauri` directly to test the Drops changes.
+- **Symptom:** `Can't reach the Hush daemon at unix:///run/user/1000/hush/hush-daemon.sock`. The
+  daemons were on their own sockets under `HUSH_RUNTIME_DIR=/run/user/1000/hush-two-peers`, but the
+  app fell back to the compiled-in default socket.
+- **Resolution:** launch with `HUSH_API_URL=unix://<socket>` and `HUSH_WINDOW_TITLE=...`, as
+  `scripts/run-two-ui.sh` does.
+- **Lesson:** the socket path is injected per window by the run script; the binary default is not the
+  dev stack's socket.
+
+### [WORKED AROUND] `pkill -f <pattern>` killed the shell issuing it
+
+- **Attempted:** `pkill -f 'target/debug/hush-tauri'`, then `pkill -f '/tmp/tor-test/root/usr/bin/tor'`.
+- **Symptom:** the command returned exit 0 with no output and appeared to do nothing; follow-up
+  checks showed the app and the target process still alive. The invoking shell's own command line
+  contains the pattern, so `pkill -f` matched and killed the shell before the rest of the line ran.
+- **Resolution:** resolve the PID first (`pgrep -x hush-tauri`) and `kill <pid>`.
+- **Lesson:** `pkill -f` matches the command string of the process running it. Tooling behaviour, not
+  a repo problem, but it silently produced false "nothing to do" results.
+
+### [WORKED AROUND] The native window could not be scripted; evidence came from Xvfb + xdotool + ffmpeg
+
+- **Attempted:** inspect the live webview via `WEBKIT_INSPECTOR_SERVER=127.0.0.1:9222`, then drive it
+  with `wmctrl`/`xdotool` on the session display.
+- **Symptom:** the WebKit inspector server listened on 9222 but closed every WebSocket handshake
+  (with and without `Origin`, with and without a subprotocol) and never answered HTTP; `wmctrl`
+  returned nothing and no screenshot tool was installed, because the session is Wayland-native.
+- **Resolution:** started `Xvfb :99`, ran the app with `GDK_BACKEND=x11`, drove it with `xdotool`, and
+  captured frames with `ffmpeg -f x11grab`.
+- **Also:** `document.title` does not update the OS window title in this Tauri setup, so it is not a
+  usable output channel; the Tor process tree was.
+- **Lesson:** on a Wayland box with no inspector access, a virtual X display is the working route to
+  real UI evidence.
+
+---
+
+## 2026-10-08 — Drops feature (SecureDrop directory + isolated Tor webview)
+
+Slice goal: add a Drops rail that discovers SecureDrop-style destinations and opens each one in a
+dedicated, capability-less Tauri webview whose traffic is routed through a local Tor process, with
+the Hush relay deliberately out of the path. Problems hit:
+
+### [FIXED] Tor refuses to start when `--defaults-torrc` points at `/dev/null`
+
+- **Attempted:** keep Tor hermetic (ignore the system torrc) by passing `/dev/null` as its config
+  file, matching a common command-line idiom.
+- **Symptom:** `[warn] Unable to open configuration file "/dev/null".` followed by
+  `[err] Reading config failed--see warnings above.` Tor exited immediately and never bootstrapped.
+- **Resolution:** the manager writes two real, empty files in the Tor data directory (`torrc` and
+  `defaults-torrc`) and passes those paths. Re-verified with the same args: Tor logs
+  `Bootstrapped 100% (done): Done` and binds `127.0.0.1:<port>` only. The Rust live test
+  (`tor::tests::bootstraps_with_a_real_tor`) passes.
+- **Lesson:** Tor opens its config path with normal file semantics; `/dev/null` is not a torrc. The
+  code was already correct — the failure was in a manual reproduction using `/dev/null`, which is
+  exactly the kind of divergence that would have shipped as a mystery if it had been copied into the
+  code.
+
+### [OPEN] Real Tor cannot be installed in this environment; verification used a downloaded binary
+
+- **Attempted:** `sudo apt install tor` to exercise the bundled-Tor path against a packaged Tor.
+- **Symptom:** `sudo: a password is required` (no passwordless sudo); `tor` is not on `PATH`.
+- **Resolution:** `apt-get download tor libevent-2.1-7t64` (no sudo needed), extracted the debs into
+  `/tmp`, and set `HUSH_TOR_BIN` to the extracted binary with `LD_LIBRARY_PATH` pointing at the
+  extracted `libevent`. This exercised the real manager: it resolved the binary, picked a loopback
+  port, bootstrapped, and stopped cleanly. It is not the shipped configuration — the product still
+  needs a bundled or system Tor.
+- **Needed to close:** bundle a Tor binary as a Tauri resource (or document a system-Tor
+  requirement) and re-run `tor::tests::bootstraps_with_a_real_tor` against the shipped layout.
+- **Lesson:** the locator (`HUSH_TOR_BIN` -> resource dir -> `PATH` -> common paths) means the
+  feature degrades to "Tor Unavailable" with a clear message rather than crashing when Tor is
+  absent, but that path was only unit-tested, not product-tested.
+
+### [OPEN] The full Drops rail interaction was not driven end to end
+
+- **Attempted:** click through the rail, toggle the filters, and press Open Drop on the test card.
+- **Symptom:** the native Tauri webview cannot be scripted here, and reaching the rail needs a
+  running daemon plus manual unlock. The pieces were verified separately instead: the window builds
+  with `incognito(true)` + `proxy_url` (temporary probe, now removed) and loads through Tor
+  (`check.torproject.org/api/ip` returned `{"IsTor":true,...}`), Tor lifecycle (ignored live test),
+  onion validation (unit tests), frontend compile (`tsc && vite build`), and app startup
+  (`xvfb-run` smoke, no panic).
+- **Needed to close:** a manual pass on a machine with a display and a real daemon, opening both the
+  development Drop and (once one exists) a verified `.onion` Drop.
+- **Lesson:** "it builds and the parts pass" is not "the button works"; the button wiring is covered
+  by the type-checker only until a human clicks it.
+
+### [OPEN] WebKit's proxy is per web context, so the Drop window is Tor-routed but not Tor-Browser-grade
+
+- **Attempted:** route only the Drop window through Tor and leave the rest of Hush direct.
+- **Symptom:** wry applies `proxy_url` by setting `NetworkProxySettings` on the webview's WebKit
+  context. That is sufficient to route the Drop window through Tor — proved by loading a Tor check
+  page inside the webview and getting `IsTor:true` — but every request in that window shares one
+  circuit set, and there is no fingerprinting or per-site circuit isolation.
+- **Resolution:** accepted and stated honestly in the UI ("Traffic to this Drop is routed through
+  Tor. Hush relay is not used.") and in code comments. The main window and the daemon path are not
+  proxied, so Tor is not a generic proxy for Hush.
+- **Needed to close:** nothing for this slice; it is a known ceiling. Stream isolation would require
+  a SOCKS-auth-per-request setup WebKit does not expose.
+- **Lesson:** do not let "uses Tor" drift into "anonymous"; the copy says what is actually true.
+
+### [WORKED AROUND] `pkill -f` matched the invoking shell and killed the test command
+
+- **Attempted:** clean up a stray Tor process with `pkill -f 'tor-live'`.
+- **Symptom:** the command produced no output at all — `-f` matched the shell whose command text
+  contained `tor-live`, so the shell killed itself before printing anything.
+- **Resolution:** used `pkill -x tor` (exact process name). Tooling issue, not a repo problem.
+- **Lesson:** `pkill -f` matches the caller's own command line; scope the pattern or use `-x`.
+
+### [FIXED] Cold Rust builds of the Tauri/webkit graph cost multiple minutes per cycle
+
+- **Attempted:** iterate on `cargo check` / `cargo test -p hush-tauri` while editing the shell.
+- **Symptom:** first `cargo check` took ~6m11s and the first `cargo test` ~3m40s of compile time;
+  two live-Tor runs added ~2m each of recompilation for a one-line test addition.
+- **Resolution:** none needed — incremental rebuilds after the first are seconds. Noted so the cost
+  is expected rather than mistaken for a hang. Tooling observation, not a repo problem.
+- **Lesson:** batch shell edits before running the Rust test cycle; the compile graph, not the tests,
+  is the bottleneck.
+
+---
+
+## 2026-10-08 — HTTPS origin for the drop opener on the lab relay (Cloudflare tunnel + nginx path ingress)
+
+Slice goal: give the lab relay an HTTPS origin so `GET /open/{id}` is a secure context and a real
+recipient's browser can decrypt; redeploy the current build to the VPS first, then point the relay's
+pickup-link base at the HTTPS origin and prove decryption in a real browser. Problems hit:
+
+### [FIXED] The offered tunnel hostname was already the medical app's origin
+
+- **Attempted:** use `https://citations-stuffed-bulletin-shade.trycloudflare.com/` as the relay's HTTPS origin.
+- **Symptom:** that hostname is the VPS's `cloudflared-quick.service` (`cloudflared tunnel --url
+  http://127.0.0.1:80`), and nginx's `location /` proxies to the alhakim medical Next.js app
+  (`127.0.0.1:3000`). Repointing the quick tunnel at the relay would have silently broken the
+  medical app, exactly as warned.
+- **Resolution:** left the tunnel alone and added path-based ingress in nginx: `location /open/` and
+  `location /drop/` proxy to `http://127.0.0.1:8790`, everything else falls through to the app. The
+  alhakim app has no `/open` or `/drop` routes (checked its `src/app` tree and `middleware.ts`), so
+  the prefixes are disjoint. Verified after reload: the medical app's `/` still 307s to `/login` and
+  `/login` is 200, while `https://<host>/open/{id}` serves the opener.
+- **Lesson:** "the user offered this hostname" is not the same as "this hostname is free"; find out
+  what its origin serves before assuming it can be repointed.
+
+### [FIXED] The VPS ran an older relay build with no opener or notify routes
+
+- **Attempted:** exercise `/open/{id}` and `POST /drop/{id}/notify` on `http://137.184.129.205:8790`.
+- **Symptom:** `/health` returned 200 but `/open/{id}` returned 404, and the deployed binary's
+  strings contained `/drop/{id}` but neither `/drop/{id}/notify` nor `/open/{id}`.
+- **Resolution:** built `cargo build --release --locked -p hush-relay` from this tree (sha256
+  `beaf4fe3f5ba3ea90e9e8b6c1b0200f530bdcc8c05c6590765b24d47a371200b`), scp'd it, installed to
+  `/usr/local/bin/hush-relay`, and restarted. `/open/{id}` now 200 with the opener HTML and
+  `/drop/{unknown}` is 404. A concurrent worker had restarted the service at 20:03 UTC; state was
+  recorded before (pid 362753, hash `5702f401...`) and after (pid 364470).
+- **Lesson:** verify the route, not just `/health`; a 200 health check says nothing about which
+  routes the running binary actually has.
+
+### [WORKED AROUND] The daemon refuses a dotless recipient, so the loopback-sink notify test calls the relay directly
+
+- **Attempted:** use `hushmail@localhost` (the OpenSMTPD local mailbox) as the notify recipient
+  through the daemon's `POST /api/mail/outsider`.
+- **Symptom:** the daemon returned 400 `{"error":"that does not look like an email address"}`.
+  `hush_core::normalize_external_address` requires the domain to contain a dot and be at least three
+  characters; `localhost` fails.
+- **Resolution:** for the loopback-sink proof, called `POST /drop/{id}/notify` directly on the relay
+  (whose `validate_recipient` has no dot rule) with `to=hushmail@localhost`. OpenSMTPD delivered it
+  locally (`mda delivery ... user=hushmail result=Ok stat=Delivered`) and the message carried the
+  HTTPS link and the `message.hushdrop` attachment, with no PIN. No real outbound mail was sent.
+- **Lesson:** the daemon's address rule and the relay's are deliberately different; a local-only sink
+  address can only be driven at the relay.
+
+### [OPEN] The HTTPS origin is an ephemeral quick-tunnel hostname
+
+- **Attempted:** pin `HUSH_RELAY_DROP_BASE_URL` to `https://citations-stuffed-bulletin-shade.trycloudflare.com`.
+- **Symptom:** this is a `trycloudflare.com` quick tunnel. Its hostname is assigned at startup and
+  changes whenever `cloudflared-quick.service` restarts (the unit is `Restart=always`). nginx routing
+  is host-agnostic, so the page keeps working on whatever hostname the tunnel currently has, but the
+  configured `drop_base_url` (and any link already emailed) would then point at a dead hostname.
+- **Resolution:** none in this task. The offered hostname was the one available; a named tunnel with a
+  stable DNS record would be needed to make the origin durable.
+- **Lesson:** an HTTPS origin is only as stable as the tunnel that fronts it; record the hostname's
+  lifecycle, not just its current value.
+
+### [WORKED AROUND] Real email delivery from the VPS is still impossible
+
+- **Attempted:** confirm the notification path including outbound mail.
+- **Symptom:** the provider blocks outbound TCP 25/587 (pre-existing, documented). `POST /drop/{id}/notify`
+  to an external address is accepted by the relay and handed to loopback OpenSMTPD, which cannot relay
+  it and bounces; the request itself took about 33s before returning 202.
+- **Resolution:** proved the notify contract (202, `sent:true`, `attachment_bytes:328`, `link` pointing
+  at the HTTPS origin) and used loopback local delivery as the sink. Did not claim a real email reached
+  anyone.
+- **Lesson:** separate "the notification path works" from "mail was delivered"; only the former is
+  testable on this box.
+
+### [OPEN] Workstation mail ports noted, not used
+
+- **Attempted:** nothing; recording the lead as instructed.
+- **Observation:** this workstation listens on 25/587/465 via the mailcow `postfix-mailcow` container
+  (`ghcr.io/mailcow/postfix:3.10.12-1`), so unlike the VPS it may be able to submit mail. The egress
+  blocker is specific to the VPS droplet, which has no MTA egress.
+- **Resolution:** not built around in this task; relevance unverified.
+- **Lesson:** the blocked-egress problem is a property of the droplet, not of the project.
+
+---
+
+## 2026-10-08 — Dev stack repointed at the lab VPS relay (137.184.129.205:8790)
+
+Slice goal: run the two-peer dev stack (Vite 5173, alice 9876, bob 9877) with both vaults using
+the lab relay instead of a local one, set the relay's own pickup-link base on the box, and prove
+a real message crosses the VPS. Problems hit:
+
+### [FIXED] An existing vault's relay cannot be changed; only `init --relay` sets it
+
+- **Attempted:** repoint `instances/peer-a` and `instances/peer-b` at the VPS by writing
+  `client-config.json` (`hush-cli config set --relay …`), the "supported way" the config surface
+  exposes.
+- **Symptom:** `config show` reports the new URL from the config file, but the running daemon keeps
+  the old relay: `AccountState.relay` is written by `Account::create` and read-only afterwards, and
+  `/api/status` reports `relay_source: "vault"` with the old value. The CLI prints the same caveat
+  ("an existing vault keeps the relay it was created with"). There is no `set-relay` command, no
+  daemon endpoint, and `add_contact` refuses an invite whose relay differs (`Error::RelayMismatch`),
+  so a mismatched pair cannot be patched up at runtime.
+- **Resolution:** recreated both vaults with
+  `hush-cli --dir instances/peer-{a,b} init --passphrase … --relay http://137.184.129.205:8790` and
+  additionally wrote `client-config.json` with `config set --relay`. Destructive: the previous
+  contacts and chat history are gone. Acceptable for a hand-test stack, but it is the only supported
+  way to move an existing vault to a new relay.
+- **Lesson:** the config file is advisory for *new* vaults; the vault is the runtime source of truth.
+  Repointing a live vault needs a migration path that does not exist yet.
+
+### [WORKED AROUND] `scripts/setup-two-peers.sh` now fails its final smoke with `ContactOffline`
+
+- **Attempted:** run the documented two-peer setup (`HUSH_RELAY_URL=http://137.184.129.205:8790
+  ./scripts/setup-two-peers.sh`) to create the vaults, exchange invites, and smoke a send.
+- **Symptom:** vaults and contacts are created (`vault ready … relay: http://137.184.129.205:8790`,
+  `added contact alice`, `added contact bob`), then the script's `send alice --text "hello from bob"`
+  exits 1 with `Error: ContactOffline`. `Account::send_text` routes through
+  `send_payload_inner(..., require_online = true)`, and `contact_is_online` reads relay presence that
+  nothing heartbeated because the script starts no daemons. The script predates the live-only-chat
+  presence rule.
+- **Resolution:** left the script alone (dev helper; a concurrent worker owns the smoke scripts) and
+  completed the proof through the running daemons instead: heartbeat presence on both, then
+  `POST /api/send` on alice and `POST /api/recv` on bob. The vaults it created are valid and usable.
+- **Lesson:** the setup script's final assertion is stale; it should use mail (store-and-forward) or
+  start daemons before the chat send. Flagged, not fixed, to avoid a concurrent-worker clash.
+
+### [WORKED AROUND] `run-two-ui.sh --dev` couples the stack to a local relay
+
+- **Attempted:** start the documented dev stack with the script.
+- **Symptom:** with `HUSH_RELAY_URL` unset the script starts its own relay on `127.0.0.1:8787`, and
+  its final `wait -n` tears the whole stack down if any child exits — including that relay. That is
+  exactly the dependency the task forbids (a concurrent worker may stop 8787); it also leaves
+  `HUSH_RELAY_URL` in the daemons' environment, muddying "the vault is the source of truth".
+- **Resolution:** started the two daemons and Vite directly with the vault-stored VPS relay and
+  `env -u HUSH_RELAY_URL`, matching the script's socket paths
+  (`/run/user/1000/hush-two-peers/peer-{a,b}.sock`) and ports. `/api/status` then reports
+  `relay_source: "vault"` with the VPS URL, and no local relay exists to fall back to.
+- **Lesson:** a dev launcher that owns a relay cannot be used to test "no local relay"; start the
+  components individually.
+
+### [FIXED] `A && B & C && D` put the variable assignment in the background
+
+- **Attempted:** start three detached processes in one command chain.
+- **Symptom:** `--: line 3: /logs/bob.log: No such file or directory`; bob and Vite never started
+  because `RUN_DIR=…` was part of the backgrounded `&&` list, so later commands saw an empty
+  `$RUN_DIR`. Tooling/quoting mistake, not a repo problem.
+- **Resolution:** set variables on their own line, then launch each process.
+
+### [FIXED] `pkill -f 'run-two-ui.sh --dev'` killed the shell that ran it
+
+- **Attempted:** stop the script-managed stack before restarting the daemons without the relay env.
+- **Symptom:** the invoking shell died mid-command (output stopped right after "sent TERM to
+  launcher") because `pkill -f` matched the shell's own command line, which contained the pattern.
+  Same class as the earlier `pkill -f` entry in this log.
+- **Resolution:** relied on the script's own EXIT trap (it stopped the daemons and Vite) and verified
+  by pid/port afterwards. Tooling problem, not a repo problem.
+
+### [OPEN] A concurrent worker sent an outsider mail from bob's vault
+
+- **Observed:** bob's `/api/mail` contains an outgoing outsider mail to `rushd.bitar@gmail.com`
+  (subject/body `test`, delivery_id `a2df307ca8de88cd0f54f7419a51c2cd`) that this worker did not
+  send. The bob daemon log shows its notify failing: `drop notify failed: 404 Not Found`. A
+  concurrent worker is running `hush-daemon --dir /tmp/hushlab/dropvault` and
+  `cargo test -p hush-relay`, with no TCP listener of its own, so it used the stack's daemons.
+- **Impact:** cosmetic — an unexplained Sent item in bob's vault that the user may notice while
+  hand-testing. Left in place rather than deleted, because deleting it could break the other
+  worker's in-flight test.
+- **Resolution needed:** none for this slice; flagged so the user is not surprised.
+
+### [WORKED AROUND] Proving the daemons' environment is tooling-limited
+
+- **Attempted:** read `/proc/<pid>/environ` to show the daemons had no `HUSH_RELAY_URL`.
+- **Symptom:** `Permission denied` (the Cursor shell sandbox does not share the daemons' namespace).
+- **Resolution:** proved the same thing through the API instead: `/api/status` reports
+  `relay_source: "vault"`, meaning the stored vault value was used, not the environment. Tooling
+  limitation, not a repo problem.
+
+### [FIXED] Lab pickup links cannot decrypt in a browser (correct behaviour, verified)
+
+- **Observed:** opening `http://137.184.129.205:8790/open/<id>` in a real browser gives
+  `window.isSecureContext === false`, `typeof crypto.subtle === "undefined"`, the `#insecure`
+  section visible and the PIN form hidden — the page states it "must be served over HTTPS".
+- **Resolution:** none; this is correct and was not weakened. Verified the workaround works: the
+  same container served from a temporary localhost relay (`http://127.0.0.1:8788/open/<id>`) has
+  `isSecureContext === true`, shows the PIN form, and decrypts to the real subject/body with the
+  PIN. The temp relay was stopped and removed.
+- **Lesson:** the lab box can exercise the send side of the outsider flow; the browser-open side
+  only works from `https://` or a `localhost` relay.
+
+### [WORKED AROUND] A concurrent worker superseded the VPS `drop_base_url` with an HTTPS tunnel
+
+- **Attempted:** set `HUSH_RELAY_DROP_BASE_URL=http://137.184.129.205:8790` on the lab box via a new
+  drop-in (`/etc/systemd/system/hush-relay.service.d/20-lab-drop-base.conf`) and restart the relay;
+  confirmed `/health` 200 from off-box and that an outsider drop's link came back as
+  `http://137.184.129.205:8790/open/<id>`.
+- **Symptom:** minutes later the same drop-in (mtime 20:14, mine was 20:08) contains a Cloudflare
+  quick-tunnel URL (`https://citations-stuffed-bulletin-shade.trycloudflare.com`), with a comment
+  stating it supersedes the IP because a plain-HTTP link is not a secure context. `systemctl show`
+  confirms the tunnel URL is live, and a fresh outsider drop now returns a tunnel link.
+- **Resolution:** left the concurrent worker's change in place rather than reverting it. Reverting
+  would thrash the shared drop-in and undo a real improvement: the tunnel origin is HTTPS, so the
+  browser opener's WebCrypto check passes there. Verified both realities: over
+  `http://137.184.129.205:8790` the opener shows the HTTPS-required notice; over the tunnel the same
+  container decrypts to the real subject/body. The task's raw-IP requirement and the concurrent
+  worker's HTTPS change conflict; reported, not fought.
+- **Lesson:** the VPS drop-in is shared mutable state; two workers editing it race. A single owner or
+  a checked-in config would avoid it.
+
+### [OPEN] Outsider sends take ~38s to return
+
+- **Observed:** `POST /api/mail/outsider` consistently takes ~35-40s to answer. A 25s client timeout
+  returned `http_code=000` (empty body), which reads as a hang; a 90s timeout returned 200 with the
+  link. The drop PUT and the relay notify both eventually succeed (the relay journal shows
+  `smtp: delivered drop notification … via smtp://127.0.0.1:25`).
+- **Impact:** a hand-tester clicking "send to outsider" will see a ~38s stall with no feedback and may
+  assume it failed. Not diagnosed in this slice.
+- **Resolution needed:** profile the daemon→relay PUT/notify path and the relay's SMTP handoff (the
+  box has no external egress, so an MX connect timeout is a plausible cause). Flagged, not fixed.
+
+---
+
+## 2026-10-08 — hush-relay notify prose no longer names the deleted mailer types
+
+The relay owns drop notification now. Its `notify.rs` module and item prose still described the
+removed `hush_core` mailer, so it was rewritten to describe the module as it is. Problems hit:
+
+### [FIXED] crates/hush-relay/src/notify.rs prose named types deleted with hush-core's mailer
+
+- **Attempted:** close the OPEN entry from "Clearing outsider-mail fallout after relay-owned
+  notification" now that `crates/hush-relay/**` is free.
+- **Symptom:** the module doc carried a whole "# Why a local SMTP client rather than
+  `hush_core::SmtpMailer`" section and named `hush_core::Mailer` (lines 9, 11, 18); the trait doc
+  said "Unlike `hush_core::Mailer`" (line 68); `parse_smtp_spec` claimed to mirror
+  `hush_core::SmtpMailer::from_spec` (line 299); and `DEFAULT_SMTP_TIMEOUT` referred to "the core
+  mailer" (line 50). None of those types exist; the surviving transport is `SmtpNotifier` here.
+- **Resolution:** prose-only rewrite of `notify.rs`. The module doc now says the relay owns
+  notification and names the real transports (`Notifier`, `SmtpNotifier`, `file:`, `null`) and the
+  `multipart/mixed` container attachment. The trait doc, `DEFAULT_SMTP_TIMEOUT`, `parse_smtp_spec`,
+  `NOTIFICATION_SUBJECT` and `compose_message` no longer compare against the deleted mailer. No
+  behavior changed. The config prose on `build_notifier` was aligned with `main.rs`: an unset
+  `HUSH_RELAY_MAILER` defaults to `smtp://127.0.0.1:25`, while an empty spec is `null`.
+- **Evidence:** `cargo check -p hush-relay` exit 0; `cargo test -p hush-relay` exit 0, 38 passed
+  (4 lib + 5 deliveries + 7 notify + 5 opener + 1 opener_crypto + 8 prekey_records + 3
+  queue_credentials + 5 relay_queues), 0 failed. `rg` for the five names under
+  `crates/hush-relay/**` returns no code or comment hits.
+- **Lesson:** a type deleted in one crate leaves prose behind in another; grep the type name, not
+  just the symbol, and close the OPEN entry when the later pass lands.
+
+### [OPEN] Two "the daemon's" references in hush-relay remain, outside the requested pattern set
+
+- **Attempted:** sweep `crates/hush-relay/**` for stale references to the daemon's removed mailer.
+- **Symptom:** `crates/hush-relay/src/app.rs:328` says the shared copy is "so the wording cannot
+  drift from the daemon's", and `crates/hush-relay/src/config.rs:12` says the base URL is "the
+  relay's deployment identity rather than the daemon's". The daemon no longer has a mailer or a
+  `drop_base_url`, so both contrasts are historical. Neither names a deleted type, so neither
+  matched the five-name grep this slice was scoped to.
+- **Resolution:** left as-is. `app.rs`'s clause is now inaccurate; `config.rs`'s is an explanatory
+  "why" that still reads correctly. Flagged for a later prose pass rather than edited outside this
+  task's stated boundary.
+- **Lesson:** scope the grep to the named symbols and stale prose survives one level out; decide
+  explicitly whether to widen the sweep.
+
+---
+
+## 2026-10-08 — Opener follow-up: attachment download, offline flow, scanner and origin probes
+
+Closed the two open items from the opener slice and probed two claims that had only been reasoned
+about. Problems hit:
+
+### [FIXED] Attachment download was asserted, not observed
+
+- **Attempted:** confirm a recipient can actually get the attached files, not just read the body.
+- **Symptom:** the previous worker saw a `blob:` URL created but never clicked it through to disk,
+  so it was unknown whether `default-src 'none'` blocked the `<a href="blob:..." download>`
+  navigation.
+- **Resolution:** drove the served page in two real browsers (the Cursor browser and a headless
+  Chrome over raw CDP). Clicking `Download note.txt` wrote `/home/sam/Downloads/note.txt`, 27 bytes,
+  sha256 `74cc295497f993f7adc5f190e4dcc61af1a2dc893270d98fe012137fa184ac21` — byte-identical to the
+  sealed attachment; `Download data.bin` wrote 256 bytes, sha256
+  `40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880`, matching bytes 0x00..0xFF. No
+  CSP change was needed: the policy is unchanged from the previous slice (`default-src 'none';
+  script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' blob:; img-src data:;
+  base-uri 'none'; form-action 'none'`). A `download` anchor navigation is not governed by
+  `default-src`, so `'none'` never blocked it.
+- **Lesson:** "a blob URL was created" is not "a file was written"; click the link and hash the bytes.
+
+### [FIXED] The offline flow was asserted by test, not observed
+
+- **Attempted:** prove the page is self-contained and usable later, offline.
+- **Symptom:** only a Rust assertion that the HTML has no `<script src=` / `<link `; nobody had
+  opened the saved page from `file://` with the network down.
+- **Resolution:** saved the served page, stopped the relay, opened `file:///tmp/offline/opener.html`
+  in a real headless Chrome, set the tab offline (`navigator.onLine === false`), and opened the
+  on-disk container. `window.isSecureContext` was `true` and `crypto.subtle.deriveBits` a function on
+  `file://`; decryption produced the right subject, body and two attachments; a download landed with
+  the right sha256. The only network request the tab made was the `file://` document itself.
+- **Lesson:** `file://` is a secure context in Chromium; verify it rather than assume it.
+
+### [WORKED AROUND] The Cursor browser tool cannot open `file://` or set a download directory
+
+- **Attempted:** load the saved page from `file://` and redirect downloads in the Cursor browser.
+- **Symptom:** `browser_navigate` refused with "file:// URLs are not allowed"; CDP `Page.navigate`
+  was denied ("not allowed"); CDP `Browser.setDownloadBehavior` was denied ("not allowed"). The
+  default download directory (`~/Downloads`) could still be watched, which is how the first
+  attachment proof was done.
+- **Resolution:** drove the locally installed `/usr/bin/google-chrome` (`--headless=new
+  --remote-debugging-port=0`) over raw CDP from a throwaway Node script using Node 24's global
+  `WebSocket`, which allows `file://`, `Network.emulateNetworkConditions`, and
+  `Browser.setDownloadBehavior`. Tooling limitation, not a repo problem.
+- **Lesson:** when the bundled browser tool denies the exact capability a claim needs, a raw CDP
+  session against the same Chrome gives the observation instead of an assertion.
+
+### [WORKED AROUND] The offline container was injected as a synthesized `File`, not the OS picker
+
+- **Attempted:** open `/tmp/offline/message.hushdrop` through the page's file input.
+- **Symptom:** the file input is a native OS dialog that cannot be driven; CDP
+  `DOM.setFileInputFiles` (filesystem-backed file-input) is denied by the browser tool.
+- **Resolution:** read the real 631-byte container from disk in Node, then built a `File` from those
+  exact bytes and assigned it to `input.files` via `DataTransfer`, dispatching the real `change`
+  event. This runs the page's actual `readFile` -> `FileReader` -> `acceptContainer` path; the only
+  thing not exercised is the OS file chooser itself.
+- **Lesson:** state the substitution; "opened a local file" here means the bytes, not the dialog.
+
+### [OPEN] No real mail-provider scanner was run
+
+- **Attempted:** confirm that a fetcher which never decrypts cannot burn a drop.
+- **Symptom:** the claim rested on wrong-PIN vs correct-PIN observations; no actual mail-provider
+  link scanner was ever pointed at a drop.
+- **Resolution:** simulated the strongest stand-in available — a real headless Chrome rendered
+  `/open/{id}` fully (HTML + JS, auto-fetch of the container) and never entered a PIN. Observed
+  requests were exactly `GET /open/{id}` and `GET /drop/{id}`; no `DELETE` was issued and a follow-up
+  `GET /drop/{id}` returned 200. An explicit `DELETE` then returned 204 and the next GET 404. So the
+  mechanism is confirmed: only the post-decrypt `DELETE` consumes the drop. What is still unverified
+  is the behaviour of any specific real scanner (some fetch with unusual methods or user agents).
+  Remains OPEN until a real scanner is run.
+- **Lesson:** a simulated client can confirm the mechanism; it cannot certify a third party's.
+
+### [OPEN] The lab host runs an older relay, so the opener page was not exercised there
+
+- **Attempted:** compare `http://137.184.129.205:8790` with the `http://lvh.me:8791` origin that was
+  tested.
+- **Symptom:** the lab host answers `/health` with 200 but `/open/{id}` with 404, so it does not run
+  this slice's code and the opener page cannot be loaded there.
+- **Resolution:** observed the origin classification directly instead. In a real headless Chrome,
+  `http://lvh.me:8791/health` and `http://137.184.129.205:8790/health` both report
+  `isSecureContext: false` and `typeof crypto.subtle === "undefined"`. Secure context is per-origin,
+  so the opener served from that host would take the same insecure branch as `lvh.me`. What is not
+  verified is the page rendered *by that host*, because the host does not serve it yet. Remains OPEN
+  until the lab host is redeployed.
+- **Lesson:** an origin's secure-context status can be observed without the page under test; say
+  which of the two was actually observed.
+
+---
+
+## 2026-10-08 — Clearing outsider-mail fallout after relay-owned notification
+
+The relay now sends the drop notification (`POST /drop/{id}/notify`); the daemon mails nothing and
+`hush_core`'s `Mailer` seam is gone. This slice cleared the stale scripts/docs/tests left behind.
+
+### [FIXED] The hush-core outsider-mail test asserted the relay reports no link, but it does
+
+- **Attempted:** run `cargo test --workspace` for the baseline the brief described ("175 passed,
+  0 failed").
+- **Symptom:** `the_daemons_notify_call_reaches_the_relay_route_and_emails_the_link` FAILED at
+  `crates/hush-core/tests/outsider_mail.rs:296`:
+  `assertion left == right failed: the current relay reports no link; left:
+  Some("https://relay.example/open/<id>") right: None`. `cargo test` stopped at that binary
+  (exit 101), so the claimed baseline was not reproducible on the tree as it stood.
+- **Resolution:** the test now asserts the relay's reported link
+  (`Some("https://relay.example/open/<id>")`), matching `NotifyResponse { link }` in
+  `crates/hush-relay/src/app.rs` and `RelayClient::notify_drop`. The full suite then reported
+  175 passed, 0 failed, exit 0.
+- **Lesson:** a test that pins the "relay reports no link" fallback contradicts the relay the
+  moment it starts reporting a link. Assert the current contract, not the transitional one.
+
+### [FIXED] smoke-drop.sh / smoke-drop-key.sh drove removed daemon mail config
+
+- **Attempted:** run the repo's end-to-end harness for outsider drops.
+- **Symptom:** both scripts exported `HUSH_MAILER` and `HUSH_DROP_BASE_URL` to the daemon and
+  asserted `$LINK == "$DROP_BASE/open/$ID"`. Neither variable is read any more (grep across
+  `crates/hush-daemon` and `crates/hush-core` is empty), and the link is now composed by the
+  relay from `HUSH_RELAY_DROP_BASE_URL`, so the mail assertion could not pass.
+- **Resolution:** the relay is launched with `HUSH_RELAY_DROP_BASE_URL="$RELAY_URL"` and
+  `HUSH_RELAY_MAILER="file:$MAILER_DIR"`; the daemon gets neither variable; the link is asserted
+  against `"$RELAY_URL/open/$ID"`. Both scripts run green (output in the slice report).
+- **Lesson:** when config moves between processes, the harness that sets it has to move too.
+
+### [FIXED] crates/hush-relay/src/notify.rs prose still names the deleted hush_core mailer types
+
+- **Attempted:** clear every stale reference to the removed mailer.
+- **Symptom:** `crates/hush-relay/**` is owned by a concurrent worker, so it was left untouched.
+  Its module doc and comments still name types that no longer exist: lines 9, 11, 18, 68 and 299
+  refer to `hush_core::SmtpMailer` / `hush_core::Mailer`; line 50 says "the core mailer".
+- **Resolution:** none in this slice, by scope. A later pass should rewrite that prose.
+  Tooling/ownership, not a repo defect.
+- **Closed (2026-10-08, later pass):** the prose was rewritten; see "hush-relay notify prose no
+  longer names the deleted mailer types" above. `cargo check -p hush-relay` and
+  `cargo test -p hush-relay` are both exit 0.
+- **Lesson:** a rename/removal leaves cross-crate prose behind; grep for the type names, not just
+  the symbols.
+
+### [WORKED AROUND] Older OPEN entries about the daemon mailer are now moot but were left in place
+
+- **Attempted:** reconcile the log with the new design.
+- **Symptom:** earlier sections still carry `[OPEN]` entries such as "The daemon has no SMTP
+  client", "Two hand-rolled SMTP clients now exist in the workspace", and "The SMTP mailer is not
+  reachable from the daemon yet". The `Mailer` seam and the daemon mailer were deleted, so these
+  no longer describe a live configuration.
+- **Resolution:** left verbatim. The log rules forbid deleting an `OPEN` entry, and re-tagging
+  another slice's entries is that slice's call, not this one's. Flagged here for a later pass.
+- **Lesson:** a removal slice should also retire the OPEN entries it invalidates.
+
+---
+
+## 2026-10-08 — Browser opener page for outsider drops (`GET /open/{id}`)
+
+Served the pickup link the notification emails. The relay now has `GET /open/{id}` returning a
+self-contained page that decrypts a `hush-drop-v1` container in the browser, plus
+`DELETE /drop/{id}` and an expiry header on `GET /drop/{id}`. Problems hit:
+
+### [FIXED] CSP `connect-src` blocked reading an attachment blob URL
+
+- **Attempted:** confirm the attachment bytes the page hands the recipient.
+- **Symptom:** `fetch(a.href)` on the `blob:` URL created by `URL.createObjectURL` failed with
+  `TypeError: Failed to fetch`. The page's CSP is `default-src 'none'; connect-src 'self'`, and
+  `blob:` was not in `connect-src`. The anchor's `download` navigation still worked, so this was
+  not a user-visible break, but any script read of the blob was blocked.
+- **Resolution:** added `blob:` to `connect-src` in `open.html`. Re-verified in the browser:
+  `fetch` of the blob URL now returns 200 and the decoded bytes equal the attachment payload.
+- **Lesson:** `connect-src` governs `fetch()` of `blob:` URLs; a download anchor does not need it,
+  so the gap hides until something tries to read the blob.
+
+### [WORKED AROUND] A throwaway cargo project cannot build `hush-core` because `protoc` is absent
+
+- **Attempted:** generate a fresh known-PIN container from a scratch crate in `/tmp` that depends
+  on `hush-core` by path.
+- **Symptom:** `thread 'main' panicked at sparsepostquantumratchet-.../build.rs:9:10: Protobufs in
+  src are valid: ... Could not find 'protoc'`. `libsignal-protocol` pulls
+  `sparsepostquantumratchet`, whose build script needs `protoc`; it is not installed
+  (`which protoc` is empty, no `protobuf-compiler` package). The workspace itself still builds
+  only because `target/` already holds that build script's cached output, so it never re-runs.
+- **Resolution:** generated the fixture from a temporary `examples/seal_fixture.rs` inside the
+  workspace (which reuses the cached target dir), then deleted the file. The underlying gap
+  remains: a clean `cargo build` of the workspace from an empty `target/` would fail without
+  `protoc`. That is an environment gap, not a repo defect.
+- **Lesson:** a cached `target/` hides missing build-time tools; a scratch project that shares no
+  target dir is the fastest way to find out what a fresh clone would need.
+
+### [WORKED AROUND] `Page.addScriptToEvaluateOnNewDocument` injections never ran in the browser tool
+
+- **Attempted:** force the insecure branch by stubbing `crypto` (or `Crypto.prototype.subtle`)
+  before page load, then reloading.
+- **Symptom:** the injected marker `window.__injectRan` was `undefined` after reload and
+  `crypto.subtle` was still present, on two different injection bodies. The CDP command returned
+  an identifier and `Runtime.evaluate` worked in the same view, so the call was accepted but the
+  script did not run in this Electron webview.
+- **Resolution:** abandoned the stub and used a genuinely non-secure origin
+  (`http://lvh.me:8791`) instead, which exercises the real code path. Tooling problem, not a repo
+  problem.
+- **Lesson:** prefer a real environment over a mocked one when the mock's own machinery is
+  unverified.
+
+### [FIXED] The pickup link was dead: no route served `/open/{id}`
+
+- **Attempted:** open the link the notification email carries.
+- **Symptom:** the relay's routes were `/health`, `/k/...`, `/q/...`, `/drop/{id}`,
+  `/drop/{id}/notify`; `{drop_base_url}/open/{id}` (composed in `app.rs`) 404'd. Every
+  notification carried a working attachment next to a dead link.
+- **Resolution:** added `GET /open/{id}` serving the page from `crates/hush-relay/src/opener/`,
+  inlined into one HTML document by `src/opener.rs`.
+- **Lesson:** a link the sender composes is a contract; grep for the route before shipping the
+  copy that prints it.
+
+### [FIXED] "Destroys itself after the download" was not true, and a consuming GET would be unsafe
+
+- **Attempted:** make the pickup link one-shot, as the marketing copy implied.
+- **Symptom:** `store.get_delivery` has no fetch count and
+  `tests/deliveries.rs::fetching_the_same_delivery_twice_still_works` deliberately asserts a
+  second fetch succeeds (a mistyped PIN, a refresh, or a second device must not destroy the
+  message). A GET that consumed the row would burn the drop on a mail scanner's fetch.
+- **Resolution:** added `DELETE /drop/{id}` and had the page call it only after a successful
+  decrypt and render. The scanner fetches the URL but never runs the decrypt, so it cannot
+  consume the drop. Verified in a real browser: a wrong PIN left the server copy in place
+  (`GET` still 200), a correct PIN removed it (`GET` 404). The page copy states the server
+  ciphertext is deleted, not the page or the recipient's copy.
+- **Lesson:** "self-destructs" belongs to the server's copy, not the recipient's; write the copy
+  to the thing that actually dies.
+
+### [FIXED] XChaCha20-Poly1305 is not in WebCrypto; vendored @noble/ciphers and bundled it
+
+- **Attempted:** use a browser AEAD for XChaCha20-Poly1305.
+- **Symptom:** WebCrypto has no XChaCha20-Poly1305. Fetching a JS library from a CDN would leak
+  one request per open and break the "save the page, open later drops offline" case.
+- **Resolution:** vendored the audited `@noble/ciphers` v1.3.0 chacha modules
+  (`src/opener/vendor/hush-noble-chacha.js`, MIT, Cure53-audited) and flattened its four CJS
+  modules into one file so `src/opener.rs` can inline it. PBKDF2-HMAC-SHA256 stays native
+  (`crypto.subtle.deriveBits`).
+- **Lesson:** vendoring plus a tiny module shim is cheaper than re-deriving a subtle AEAD.
+
+### [FIXED] The browser found a stale lifetime copy the Rust tests could not
+
+- **Attempted:** verify the page in a real browser against a locally run relay.
+- **Symptom:** after opening a server-fetched drop (which deletes the server copy and rewrites
+  the lifetime text) and then opening a dropped file, the page still said "The server's copy has
+  been deleted" for the file path. `updateServerLifetime` returned early when `expiresUnix` was
+  null (always the case for a file) and left the previous text in place.
+- **Resolution:** `updateServerLifetime` now branches on the source: file-sourced content gets
+  its own true copy, server-sourced content shows the real expiry, and `acceptContainer` clears
+  stale status.
+- **Lesson:** copy that depends on prior state is state, not a constant; drive the sequence, not
+  just the first screen.
+
+### [FIXED] `pkill -f 'target/debug/hush-relay'` killed the shell that ran it (tooling)
+
+- **Attempted:** stop the background relay before restarting it.
+- **Symptom:** the background shell exited immediately with status `failed`; `pkill -f` matched
+  the shell's own command line, which contained the pattern string.
+- **Resolution:** used `pkill -x hush-relay` (exact process name). Tooling problem, not a repo
+  problem.
+- **Lesson:** `pkill -f` matches the invoking command line too; anchor it or use `-x`.
+
+### [FIXED] The insecure-context branch was not exercised on a real non-secure origin
+
+- **Attempted:** verify the "must be served over HTTPS" path on the lab relay
+  (`http://137.184.129.205:8790`), where `crypto.subtle` is absent.
+- **Symptom:** the browser test ran against `http://127.0.0.1:8791`, and loopback is a secure
+  context, so `crypto.subtle` WAS present and the insecure branch never ran. The branch was
+  verified by reading `hasWebCrypto()` and by a served-HTML assertion only.
+- **Resolution:** re-ran against `http://lvh.me:8791`, a hostname that resolves to 127.0.0.1 but
+  is not treated as trustworthy by the browser. There `window.isSecureContext` is `false` and
+  `crypto.subtle` is `undefined`; the page showed `#insecure` (`display: block`) with the HTTPS
+  message and hid `#source`, `#pin-form`, and `#result`. No pure-JS PBKDF2 fallback was added on
+  purpose (600k iterations would freeze a phone). An earlier attempt to force the branch by
+  stubbing `crypto` before load failed because
+  `Page.addScriptToEvaluateOnNewDocument` did not run in this browser tool (see the separate
+  `WORKED AROUND` entry).
+- **Lesson:** loopback is not a stand-in for a non-secure origin; a non-trustworthy hostname
+  mapped to the loopback address is a cheap way to exercise the branch without a real deployment.
+
+### [OPEN] The cross-check test costs ~36s because it uses the production KDF
+
+- **Attempted:** cross-verify the page's crypto against Rust with the real iteration count.
+- **Symptom:** sealing at 600,000 iterations with the hand-rolled Rust PBKDF2 dominates the test
+  (the Node side is fast). A lowered count would not prove the page reads the header.
+- **Resolution:** accepted, with a comment; the container is sealed once and the tamper cases
+  reuse it at 1,000 iterations. Not a correctness problem, a suite-time one.
+- **Lesson:** the expensive, realistic vector is worth it once; reuse it for the cheap negative
+  cases.
+
+---
+
+## 2026-10-08 — Daemon sends outsider notifications through the relay
+
+Switched the daemon off its own mailer and onto `POST /drop/{id}/notify`, deleted the mailer
+seam that became dead, and moved the pickup link toward a single source of truth. Newest
+findings first.
+
+### [OPEN] The relay's notify response does not carry the link it emailed, so the daemon and the email can still disagree
+
+- **Attempted:** make the pickup link one source of truth by having the daemon return exactly the link the relay emails.
+- **Symptom:** `POST /drop/{id}/notify` replies with `{"sent":true,"attachment_bytes":N}` (`NotifyResponse` in `crates/hush-relay/src/app.rs`); the link it composes at `crates/hush-relay/src/app.rs:320` is used only for the email body and is never returned. The daemon therefore cannot read it.
+- **Resolution (daemon side, done):** `RelayClient::notify_drop` deserializes an optional `link` and the `send_outsider` handler uses it verbatim when present. The relay-side change is not made here because `crates/hush-relay/**` is owned by a concurrent worker. Exact change needed: add a `link: String` field to `NotifyResponse` and return the `link` value already computed at `crates/hush-relay/src/app.rs:320` (currently `let link = format!("{}/open/{}", state.drop_base_url.trim_end_matches('/'), id);`).
+- **Consequence while open:** the daemon returns `{resolved_relay}/open/{id}` (on the lab box, `http://127.0.0.1:8790/open/{id}`) while the relay emails `{RelayConfig::drop_base_url}/open/{id}` (8787 by default). The daemon's link now points at the relay that actually serves `/open/{id}`, which is strictly more correct than the old independent 8788 default, but the two are not yet identical. The daemon no longer has its own `HUSH_DROP_BASE_URL` knob, so there is one base URL on the daemon side instead of two.
+- **Lesson:** a value two services must agree on has to travel with the message that needs it; a "keep these in sync" comment is not a fix.
+
+### [FIXED] The daemon still ran its own mailer and never reached the relay's notify route
+
+- **Attempted:** replace the local `state.mailer.send(...)` in `send_outsider` with a call to the relay's notify endpoint.
+- **Symptom before:** the daemon sent a link-only email through `hush_core::Mailer` and never called `POST /drop/{id}/notify`; `build_mailer` silently mapped every spec except `file:` to `NullMailer`, so an SMTP spec was a no-op with no diagnostic.
+- **Resolution:** `send_outsider` now resolves the relay through the existing `Work::Meta { relay }` path (falling back to `hush_core::config::resolve_relay_url_with_source` as `status` does), calls `RelayClient::notify_drop(&delivery_id, &to, "pin"|"key", expires_unix)`, and logs a failure with the delivery id, recipient, and relay without failing the drop. The response still carries a working link.
+- **Evidence:** `crates/hush-core/tests/outsider_mail.rs::the_daemons_notify_call_reaches_the_relay_route_and_emails_the_link` drives that exact call against a real relay with a file notifier and asserts a message is written carrying the relay's link and the container; `the_daemons_notify_call_surfaces_a_relay_refusal` asserts a 404 becomes `Err`.
+- **Lesson:** a "notification" that never touches the component that owns it is only half wired; test the call against the real route, not the compiler.
+
+### [FIXED] `hush_core::SmtpMailer` was a second SMTP implementation with no caller
+
+- **Attempted:** delete only the code the daemon switch makes dead, after grepping for consumers.
+- **Symptom / evidence:** `rg 'SmtpMailer'` matched only its own definition and tests in `crates/hush-core/src/mailer.rs` plus prose in `crates/hush-relay/src/notify.rs`; `build_mailer` never constructed it, and no other crate referenced it. It was written for this daemon path but was never wired.
+- **Resolution:** deleted `Mailer`, `NullMailer`, `FileMailer`, `SmtpMailer`, and the SMTP machinery (`Conn`, spec parsing, `normalize_data`, `rfc5322_date`, `header_safe`, and the related constants/tests) from `crates/hush-core`; the module was renamed `mailer.rs` to `notification.rs`. Kept `notification_body`/`notification_body_for_key`, which the relay uses (`crates/hush-relay/src/app.rs:324,326`). The surviving transport is `SmtpNotifier` in `crates/hush-relay/src/notify.rs`.
+- **Lesson:** a component with no caller is not a feature; grep before keeping "for later".
+
+### [FIXED] The new notify test asserted on unwrapped base64 and failed
+
+- **Attempted:** assert the relay attached the container by checking the raw base64 of the stored blob appears in the written message.
+- **Symptom:** `assertion failed: the relay must attach the stored container` at `crates/hush-core/tests/outsider_mail.rs:316`. The relay wraps the base64 body at 76 columns (RFC 2045), so the encoded string never appears contiguously.
+- **Resolution:** strip whitespace from the message before the substring check. Test passes.
+- **Lesson:** MIME base64 is line-wrapped; compare after removing whitespace, as the relay's own tests do.
+
+### [OPEN] The two smoke scripts still set the deleted `HUSH_MAILER` / `HUSH_DROP_BASE_URL` and assert the old link base
+
+- **Attempted:** confirm nothing else depended on the removed daemon config.
+- **Symptom:** `scripts/smoke-drop.sh` and `scripts/smoke-drop-key.sh` launch the daemon with `HUSH_MAILER="file:$MAILER_DIR"` and `HUSH_DROP_BASE_URL="$DROP_BASE"`, then assert `[[ "$LINK" == "$DROP_BASE/open/$ID" ]]` and read the notification from `$MAILER_DIR`. After this change the daemon ignores both env vars, the file notification is written by the relay instead, and the link is `{relay}/open/{id}`.
+- **Resolution needed (out of scope here):** run the relay with `HUSH_RELAY_MAILER="file:$MAILER_DIR"`, drop `HUSH_MAILER`/`HUSH_DROP_BASE_URL` from the daemon invocation, and change the link assertion to `$RELAY_URL/open/$ID`. Not edited because the scope boundary for this slice is `crates/hush-daemon/**` and `crates/hush-core/**`.
+- **Lesson:** removing a config knob silently breaks the scripts that set it; grep scripts, not just code.
+
+### [OPEN] The daemon's `send_outsider` axum handler itself is not integration-tested
+
+- **Attempted:** prove the daemon reaches the relay's notify route end to end.
+- **Symptom:** `hush-daemon` is a binary-only crate (no lib target), so an integration test cannot call `send_outsider`; the daemon's tests are in-file unit tests. The wiring is proven at `RelayClient::notify_drop` (the exact function the handler calls) against a real relay, not through the handler.
+- **Resolution needed:** give `hush-daemon` a lib target or extract the notify step behind a testable seam if handler-level coverage is required.
+- **Lesson:** state which layer the evidence covers; "the function it calls is tested" is not "the handler is tested".
+
+### [OPEN] Real external mail delivery still cannot be verified here
+
+- **Attempted:** exercise a real SMTP submission for the relay's notify.
+- **Symptom:** the lab VPS provider blocks outbound TCP 25 and 587, so no notification can leave the machine. Tests use loopback SMTP sinks or the file notifier, which proves the conversation and the bytes, not delivery to a real mailbox.
+- **Resolution:** needs a host with outbound submission allowed (or a relay that provides one).
+- **Lesson:** do not read "SMTP conversation completed against a local sink" as "mail was delivered".
+
+---
+
+## 2026-10-08 — Legacy-hydration fix, kick propagation, conclave file sharing
+
+Priority order: fix the legacy-hydration bug, close the Phase 1 kick-propagation gap, then add
+conclave file sharing. Problems hit, newest findings first within the section:
+
+### [FIXED] Legacy hydration left the local user's own entry holding a nickname, so the conclave was unsendable
+
+- **Attempted:** send a message in the pre-existing "Daily sync" conclave on `peer-a`.
+- **Symptom:** `HTTP 400` with `you are not a trustee of this conclave`. `GET /api/conclaves` showed
+  the trustee entry as `account_id: "alice"` — the nickname — instead of the protocol id, so
+  `is_joined(me)` was false.
+- **Cause:** `hydrate_trustees` resolved nicknames only through contacts. A vault is never a contact of
+  itself, so the local account's own nickname never resolved, and the old fallback wrote the nickname
+  into `account_id`. The old guard also returned early as soon as every trustee had a non-empty
+  `account_id`, so a vault the *previous* hydration had already touched could never self-heal.
+- **Consequence stated plainly:** the membership model was incompatible with any vault that predates
+  it. A pre-consent conclave could be listed but not used.
+- **Resolution:** `hydrate_trustees` now takes `local_account`. When exactly one entry stays unresolved
+  it is the local account's nickname and is set to `local_account` in `Joined`; when the local account
+  is absent from the legacy list it is added; and entries whose `account_id == nick` (the old fallback)
+  are re-processed. Counts now agree: `peer-a`'s copy, whose list named the local nickname, resolves to
+  two joined trustees, and `peer-b`'s copy, whose legacy list omitted the local account entirely
+  (the "2 vs 1" disagreement), is brought from one to two.
+- **Evidence:** `peer-a` sends in "Daily sync" → `HTTP 204`, and `hydration-fix-probe` appears in that
+  conclave's log. Regression tests (all in `crates/hush-core/src/chat_log.rs`):
+  `a_legacy_record_resolves_the_local_accounts_own_nickname`,
+  `an_already_hydrated_fallback_account_id_self_heals`, and
+  `both_legacy_shapes_hydrate_to_the_same_trustee_set`.
+- **Lesson:** a migration that resolves identities through a lookup must special-case the one identity
+  that is never in the lookup — the local one.
+
+### [FIXED] The acceptance test passed while the conclave was in fact unusable
+
+- **Attempted:** accept the previous slice on "lists Daily sync with its trustees and message intact".
+- **Symptom:** that assertion passed against a record whose local entry held a nickname, because it only
+  checked that the record loaded and listed — it never called `is_joined`, and never sent.
+- **Resolution:** the new regression test asserts `is_joined(local_account)` on the exact legacy shape,
+  which is the path the old test skipped. Confirmed the test fails on the pre-fix code: temporarily
+  restoring the pre-fix `hydrate_trustees` body (the pre-fix and post-fix signatures are both 4-arg, so
+  it still compiles) makes `a_legacy_record_resolves_the_local_accounts_own_nickname` panic with
+  `the local account must be joined`, and the two older hydration tests fail as well.
+- **Lesson:** an acceptance test that asserts a record *exists* does not assert it *works*. Assert on
+  the predicate the caller depends on.
+
+### [OPEN] The two legacy "Daily sync" copies still disagree on state, convener, and ended
+
+- **Attempted:** make the trustee lists agree across peers.
+- **Reality:** the trustee *set* now agrees — both vaults resolve to `{alice, bob}`, two entries each
+  (was 2 vs 1). The two copies still differ in `state` / `convener` / `ended`: `peer-a` shows
+  `[alice joined, bob joined]`, `peer-b` shows `[alice kicked, bob joined]` with `ended: true`.
+- **Cause:** (a) a pre-consent record stored no convener, so the load-time hydration defaults it to the
+  local account and each vault appoints *itself*; (b) `peer-b`'s copy also carries a local kick of alice
+  plus an end from earlier testing, and because the kicked account is not a fan-out target (see the
+  existing `[OPEN] A kicked trustee is not told`) `peer-a` was never told. Neither is a hydration bug:
+  hydration only ever writes `Joined`.
+- **Resolution:** none. Legacy records were never synced, so there is no shared history to reconcile
+  from, and fabricating one (un-kicking, re-picking a convener) would invent data. Reported rather than
+  papered over.
+- **Needed to close:** a decision on a convener default for records that never had one, and the
+  kicked-peer notification path.
+
+### [FIXED] Phase 1 gap closed: a kick converges on a live joined peer
+
+- **Attempted:** prove kick *propagation* to a live joined peer, not just that the daemon rejects a
+  non-convener.
+- **Method:** three live daemons — `peer-a` (alice, convener), `peer-b` (bob), and a third vault on
+  `127.0.0.1:9878` (carol2) — in a fresh conclave "Phase2 Kick" where both others accepted.
+- **Evidence:** after alice kicks bob, alice and carol2 both read `bob: kicked` immediately, while bob's
+  own copy still reads `self: joined`. Bob then sends `bob-after-kick-2`; it lands in bob's own log and
+  is dropped by both alice and carol2.
+- **Conclusion:** propagation and convergence across the remaining joined set are proven. The kicked
+  peer is not notified — the inherited `[OPEN] A kicked trustee is not told` limitation, re-confirmed
+  here rather than dropped.
+
+### [FIXED] Conclave file sharing: one encrypted copy per joined trustee
+
+- **Design choice:** an optional `file: Option<ConclaveFile>` on the existing
+  `MessagePayload::Conclave`, not a new payload variant. The fan-out, the descriptor, the recipient
+  routing, and the "only joined trustees" rule are all identical to text; a new variant would have
+  duplicated every one of those match arms for no behavioural gain. Backward compatibility is free:
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps an old message decodable and a
+  body-only message byte-identical on the wire.
+- **Why N copies:** files here are per-recipient encrypted blobs (`vault.put_blob`), so there is no
+  shared blob to point everyone at. N puts for N joined trustees is the honest implementation, exactly
+  as text already fans out.
+- **Surface changed:** `MessagePayload::Conclave` gains `file` (`payload.rs`); `ConclaveFileRecord` and
+  `append_conclave_file` in `chat_log.rs`; `Account::send_conclave_file_bytes` and the `recv` arm that
+  stores the recipient's own blob and records it in the log (`account.rs`); `POST /api/conclaves/file`
+  plus `Work::SendConclaveFile` (`main.rs`, `account_worker.rs`); the DTOs and client call
+  (`types.ts`, `daemon.ts`, `conclaveStore.ts`); the attach button and `file-card` in the conclave
+  composer and message log (`app.ts`); `resolveMessageFileBytes` generalised to take a blob id
+  (`fileBytes.ts`).
+- **Evidence:** integration test `a_conclave_file_reaches_every_joined_trustee_and_not_an_invitee`
+  (11 conclave tests green); live two-peer browser run (below); live three-peer run where the joined
+  set receives the file and the non-accepting invitee has no record, no blob, and a `blob not found`
+  on fetch.
+
+### [OPEN] A trustee who joins after a file was shared does not receive it
+
+- **Reality:** the fan-out targets the joined set at send time, and there is no shared history to
+  backfill from. A later joiner sees an empty conclave log.
+- **Consequence:** the conclave log is not complete for late joiners. The UI does not claim otherwise,
+  but this is a real limitation of the store-and-forward, no-shared-state model, not a bug to be
+  silently widened around.
+
+### [OPEN] File sharing makes the kicked-peer gap more visible
+
+- **Reality:** a kicked trustee is excluded from the fan-out, so a file sent after the kick never
+  reaches them and they are never told. With text the effect is "messages stop"; with a file it is
+  "the shared document never arrives". Same root cause, same missing notification path; reported rather
+  than fixed here.
+
+### [OPEN] `blob_id` is `sha256(plaintext)`, so identical content shares an id across peers
+
+- **Observation:** `Vault::put_blob` derives the id from the plaintext, so the same file stored on two
+  peers has the same `blob_id_hex` in both logs (each still holds its own ciphertext under its own
+  master key; the bytes were fetched and compared on both peers). This is pre-existing behaviour for
+  1:1 files and mail attachments, not introduced by conclave files, but conclave fan-out makes the
+  equality visible across peers and it leaks "these two vaults hold the same bytes". Not changed here;
+  noted so it is not mistaken for a bug in the new code.
+
+### [WORKED AROUND] The browser tools cannot drive a file picker, so the real change handler was fired over CDP
+
+- **Attempted:** click "Share a file" in the conclave composer and choose a file in the two-peer
+  browser run.
+- **Symptom:** the button opens a native picker the automation browser cannot operate, and
+  `DOM.setFileInputFiles` is denied.
+- **Resolution:** located the hidden `<input type="file">` next to the attach button and, via
+  `Runtime.evaluate`, built a `DataTransfer`, assigned `input.files`, and dispatched a real `change`
+  event. That runs the app's own `onchange` → `sendConclaveFile` → `POST /api/conclaves/file` path; the
+  file then rendered as a `file-card` with Open / Save as on both peers. The picker dialog itself is the
+  only part not exercised.
+
+### [WORKED AROUND] Proving the regression test fails pre-fix required a temporary edit to a shared file
+
+- **Attempted:** demonstrate the new regression test fails on the pre-fix code.
+- **Method:** backed up `chat_log.rs`, restored the pre-fix function body (same 4-arg arity, so it
+  compiles), ran the tests, then restored from the backup and verified the SHA-256 matched.
+- **Risk:** another agent was active in the same repo during the window, so the file was shared state.
+  The edit was short-lived and hash-verified on restore, but a concurrent write would have been
+  silently clobbered. Noted as a technique risk, not a repo problem.
+
+---
+
+## 2026-10-08 — Relay-side drop notification (`POST /drop/{id}/notify`)
+
+Moved the outsider-mail notification from the sender's daemon to the relay, which now emails the
+pickup link with the sealed container attached. Problems hit:
+
+### [WORKED AROUND] `hush_core::Mailer` cannot carry an attachment, so the relay hand-rolls a second SMTP client
+
+- **Attempted:** wire the relay's notification through the shared `Mailer` trait, per the brief's
+  "do NOT write your own SMTP client", with the container as a MIME attachment.
+- **Symptom:** the trait that landed in `crates/hush-core/src/mailer.rs` has one method,
+  `send(to, subject, body)`, and `SmtpMailer::compose` hardcodes `Content-Type: text/plain;
+  charset=utf-8`. There is no attachment parameter and no raw-message entry point. Passing a full
+  `multipart/mixed` message as `body` produces a `text/plain` email whose body happens to contain
+  MIME text — the client renders it, it does not attach it.
+- **Resolution:** the relay defines its own attachment-carrying `Notifier` trait
+  (`crates/hush-relay/src/notify.rs`) and ships a minimal SMTP submission (`SmtpNotifier`). This
+  is a deliberate deviation from the brief's instruction not to write an SMTP client: the
+  container-as-attachment is the task's core requirement, the landed mailer cannot express it, and
+  `crates/hush-core` is out of scope. The notification *copy* is still the shared
+  `hush_core::notification_body*`, so wording cannot drift; only the transport is duplicated. When
+  `Mailer` grows an attachment-capable method, `SmtpNotifier` should be deleted and replaced by an
+  adapter.
+- **Lesson:** a trait that cannot express the payload forces either a scope violation or a
+  non-functional feature. Surface the interface gap before building on the trait.
+
+### [OPEN] The relay now learns the recipient address
+
+- **Attempted:** keep the relay's documented guarantee ("the relay cannot tell who a delivery is
+  for") true while sending from the relay.
+- **Symptom:** it cannot be true for a notified drop. `POST /drop/{id}/notify` carries the
+  recipient address, which the relay must hold to address the SMTP envelope. Previously the drop
+  id was an unguessable capability and the relay never saw who a drop was for. The store still
+  holds no address (only the request does, transiently), but the guarantee as written in
+  `store.rs` and `docs/plans/2026-10-07-outsider-mail.md` is no longer true for notified drops.
+- **Resolution:** none; it is inherent to moving the send across the trust boundary. Reported
+  rather than silently accepted. If the address must not reach the relay, the daemon must send the
+  mail itself, which is the design this slice moved away from.
+- **Lesson:** moving a step across a trust boundary moves the data that step handles across the
+  boundary too.
+
+### [OPEN] Real internet mail delivery is still unverifiable
+
+- **Attempted:** prove a notification reaches a public mailbox.
+- **Symptom:** the lab VPS provider blocks outbound TCP 25 and 587 to public providers (already
+  recorded in the provisioning and mailer sections). The relay's SMTP path is verified only
+  against a local sink that speaks the protocol.
+- **Resolution:** none available here. The email path is NOT described as working end to end.
+- **Lesson:** same as the mailer slice: client-to-local-sink and client-to-internet are different
+  claims.
+
+### [FIXED] `hush-relay` had no base64 encoder for the attachment
+
+- **Attempted:** base64 the container for the MIME part.
+- **Symptom:** `hush-relay`'s dependencies had no base64 crate, and `hush-core` does not re-export
+  one.
+- **Resolution:** added `base64 = "0.22"` to `crates/hush-relay/Cargo.toml` (the same version
+  `hush-core` already uses). No new version and no edit under `crates/hush-core`.
+- **Lesson:** n/a.
+
+---
+
+## 2026-10-08 — Outsider-mail SMTP notification (hush-core mailer)
+
+Implemented `SmtpMailer` in `crates/hush-core/src/mailer.rs` (spec `smtp://host:port[?from=addr]`),
+plus additive `Mailer::describe` / `Mailer::is_noop` defaults so a silent no-op can be told apart
+from a real send. Problems hit:
+
+### [OPEN] Real external notification delivery is unverifiable from this environment
+
+- **Attempted:** prove an actual notification email leaves the machine through a real MTA, per the
+  slice's verification requirement.
+- **Symptom:** the lab VPS runs OpenSMTPD on `127.0.0.1:25`, but the provider blocks outbound TCP
+  25 and 587 (recorded above as "External mail egress is impossible from this droplet"). No
+  smarthost is configured. The only SMTP conversation that can be proven here is
+  client-to-local-sink, not client-to-internet.
+- **Resolution:** none in this slice. The client is verified against a real local SMTP sink (a
+  socket server that speaks the protocol, not a mock); external delivery is not claimed and the
+  email path is not marked done. This is the same environment limit the provisioning slice hit,
+  and it is not a repo problem.
+- **Lesson:** "the SMTP client works" and "the notification email is delivered" are different
+  claims. Only the first is verifiable on this box.
+
+### [OPEN] The SMTP mailer is not reachable from the daemon yet (owned by a concurrent worker)
+
+- **Attempted:** wire `smtp://` into `build_mailer` and surface delivery status in the
+  `/api/mail/outsider` response.
+- **Symptom:** `crates/hush-daemon/src/main.rs`, `account_worker.rs` and `apps/hush-tauri/src/app.ts`
+  are owned by a concurrent worker and are out of scope for this slice. `build_mailer` still maps
+  every non-`file:` spec, including `smtp://...`, to `NullMailer`, and
+  `the_mailer_spec_selects_a_file_mailer_or_falls_back_to_null` still asserts that.
+- **Resolution:** the exact daemon patch is written up in the slice report (import, `build_mailer`
+  arm, response field, and the updated test) but deliberately not applied. Until it lands, the new
+  mailer is selectable only from `hush-core` tests, not from a running daemon, so the end-to-end
+  notification path is NOT done.
+- **Lesson:** a `Mailer` implementation with no caller is a component, not a feature. Say so.
+
+### [WORKED AROUND] `Mailer::send` cannot distinguish a delivered message from a discarded one
+
+- **Attempted:** make the degradation observable without breaking the existing daemon.
+- **Symptom:** `NullMailer::send` returns `Ok(())`, and the daemon treats every `Ok` as success, so
+  a typo'd spec (which falls back to `NullMailer`) is indistinguishable from a real send. Changing
+  `send`'s return type would not compile against the concurrent worker's `main.rs`.
+- **Resolution:** added two defaulted trait methods, `describe() -> &'static str` and
+  `is_noop() -> bool`, which are additive and leave `main.rs` compiling. The daemon patch uses
+  `is_noop()` to report `"disabled"` vs `"sent"` and `describe()` in the failure log. Not fully
+  fixed inside `hush-core`, because the caller that reports the status is out of scope.
+- **Lesson:** a `Result<(), Error>` where one error-free path means "did nothing" cannot express
+  "did nothing" to its caller.
+
+### [OPEN] Two hand-rolled SMTP clients now exist in the workspace
+
+- **Attempted:** implement the only SMTP client in the workspace.
+- **Symptom:** while this slice ran, a concurrent worker added
+  `crates/hush-relay/src/notify.rs`, which hand-rolls its own SMTP client (`SmtpNotifier`) to send a
+  MIME message with the sealed container attached. It does not use `hush_core::SmtpMailer` because
+  the `Mailer` trait is plain-text-only, and `hush-relay` is outside this slice's scope. The two
+  clients duplicate the transport: connect, EHLO/HELO, MAIL FROM, RCPT TO, DATA, dot-stuffing and
+  timeouts.
+- **Resolution:** none. The clients are not duplicates in purpose (attachment vs plain text) but
+  they are duplicates in transport. A later slice could extract a shared transport into `hush-core`
+  and have both call it; that requires editing `hush-relay`, which a concurrent worker owns.
+- **Lesson:** when a task says the SMTP client does not exist, check whether a sibling slice is
+  about to add one before assuming you are the only author.
+
+### [FIXED] `BufReader::read` needs `Read` in scope, and `BufRead` was unused
+
+- **Attempted:** build the SMTP client.
+- **Symptom:** `error[E0599]: no method named read found for struct BufReader<R>` plus
+  `warning: unused import: BufRead`. Importing `BufRead` does not bring the supertrait `Read`
+  methods into scope.
+- **Resolution:** `use std::io::{BufReader, Read, Write};`. Build clean.
+- **Lesson:** for `BufReader`, import `Read` for `read` and `BufRead` only for `read_line`/`lines`.
+
+### [FIXED] Edit tool mis-inserted a Rust string literal containing an escape
+
+- **Attempted:** anchor a `StrReplace` on the existing line holding the expiry format string, which
+  ends in a backslash-n escape.
+- **Symptom:** two consecutive `StrReplace` calls failed with "string to replace was not found",
+  despite an apparently exact match. The tool parameter interpreted the backslash-n as a real
+  newline, so the pattern no longer matched the source. Tooling issue, not a repo problem.
+- **Resolution:** anchored the edit on a following line with no escape sequences instead. Avoid
+  backslash-bearing Rust string literals in `old_string`.
+- **Lesson:** when an exact-match edit mysteriously misses, suspect escape interpretation.
+
+---
+
 ## 2026-10-08 — Lab VPS relay provisioning (hush-relay + SMTP)
 
 Provisioned the lab VPS `137.184.129.205` as a public plain-HTTP hush relay with an SMTP submission
@@ -170,16 +1629,19 @@ existing vault readable. Problems hit while doing it:
   not depend on them being in the joined set. This supersedes the older "[NO LONGER APPLICABLE]
   Membership changes are local only" entry; that limitation is gone, this one remains.
 
-### [OPEN] The consensual conclave UI was not driven in a running app
+### [FIXED] The consensual conclave UI was not driven in a running app
 
 - **Attempted:** verify the invite banner, invite/kick/leave/end actions, the read-only ended view,
   and the convener-only button gating in a real window.
-- **Symptom / limit:** no display is available in this environment, so the UI could not be driven. The
-  protocol is verified at the integration layer with two and three live daemons plus a relay
-  (`crates/hush-core/tests/conclaves.rs`, 10 tests: invite/pending/accept/decline, fan-out exactly
-  once, convener-only invite and kick, kick convergence, leave, convener-leave-ends, backward
-  compatibility of the record shape) and the frontend is verified with `npx tsc --noEmit` (exit 0).
-- **Needed to close:** a manual pass in `scripts/run-two-ui.sh --dev` with two or three tabs.
+- **Symptom / limit (then):** no display was available in this environment, so the UI could not be
+  driven. The protocol was verified at the integration layer only.
+- **Resolution:** closed in the follow-up slice. The conclave flows were driven in a real browser
+  against `scripts/run-two-ui.sh --dev` with two peers: the pending-invite card and Accept button, the
+  convener-only chips (alice saw Invite / End / Remove; bob saw only Leave), the message log, and the
+  composer placeholder `Message conclave`. The remaining gap is the *kick control* itself being
+  clicked in the UI — the kick was driven over the daemon API (see the kick-propagation entry above)
+  and its convergence was read back through the same UI. Integration coverage grew to 11 tests
+  (`crates/hush-core/tests/conclaves.rs`, including the file fan-out) and `npx tsc --noEmit` is clean.
 
 ---
 

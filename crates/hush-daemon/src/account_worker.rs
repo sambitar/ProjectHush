@@ -8,18 +8,6 @@ pub struct AccountWorker {
     tx: mpsc::Sender<Work>,
 }
 
-/// The one credential a drop is sealed under.
-///
-/// An enum rather than two `Option`s so a caller cannot pass both, and so the
-/// worker has to say which mode it means. The HTTP layer builds this after
-/// rejecting a request that gave both or neither.
-pub enum DropSecret {
-    /// A PIN the recipient is told out of band.
-    Pin(String),
-    /// The recipient's pasteable drop public key.
-    PublicKey(String),
-}
-
 enum Work {
     Unlock {
         dir: PathBuf,
@@ -107,15 +95,6 @@ enum Work {
         attachments: Vec<(String, Vec<u8>)>,
         reply: oneshot::Sender<WorkResult>,
     },
-    /// Seal a message for someone with no Hush account.
-    SendToOutsider {
-        to: String,
-        subject: String,
-        body: String,
-        attachments: Vec<(String, Vec<u8>)>,
-        secret: DropSecret,
-        reply: oneshot::Sender<WorkResult>,
-    },
     MailRecords {
         reply: oneshot::Sender<WorkResult>,
     },
@@ -153,6 +132,12 @@ enum Work {
     SendConclaveMessage {
         conclave_id: String,
         body: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SendConclaveFile {
+        conclave_id: String,
+        name: String,
+        data: Vec<u8>,
         reply: oneshot::Sender<WorkResult>,
     },
     InviteConclaveTrustee {
@@ -199,8 +184,11 @@ pub struct ContactDto {
     pub inbound_ready: bool,
     pub online: bool,
     /// This contact's mail handle (local part only), if they published one in
-    /// their invite. The UI renders `handle@<domain>`.
+    /// their invite. The UI renders `handle@<vault>`.
     pub mail_handle: Option<String>,
+    /// The contact's vault name, from their invite — the suffix of their mail
+    /// address. `None` when their invite predates vault naming.
+    pub mail_vault: Option<String>,
 }
 
 pub enum WorkResult {
@@ -216,14 +204,13 @@ pub enum WorkResult {
         last_backup_unix: u64,
         relay: String,
         mail_handle: Option<String>,
+        vault_name: String,
     },
     Backup(Vec<u8>),
     RecoveryCode(String),
     Messages(Vec<ChatRecord>),
     /// The thread the mail was filed under, and whether the relay took it.
     MailSent { thread_id: String, queued: bool },
-    /// A drop is on the relay: its capability id, and when it expires.
-    OutsiderSent { delivery_id: String, expires_unix: u64 },
     Mail(Vec<ChatRecord>),
     Drafts(Vec<ChatRecord>),
     /// The record id of the saved draft.
@@ -304,6 +291,7 @@ impl AccountWorker {
                                             inbound_ready: c.inbound_ready,
                                             online,
                                             mail_handle: c.mail_handle.clone(),
+                                            mail_vault: c.mail_vault.clone(),
                                         });
                                     }
                                     WorkResult::Contacts(list)
@@ -401,6 +389,7 @@ impl AccountWorker {
                                     last_backup_unix: a.last_backup_unix(),
                                     relay: a.relay().to_string(),
                                     mail_handle: a.mail_handle().map(|h| h.to_string()),
+                                    vault_name: a.vault_name().to_string(),
                                 },
                             };
                             (reply, result)
@@ -511,50 +500,6 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
-                        Work::SendToOutsider {
-                            to,
-                            subject,
-                            body,
-                            attachments,
-                            secret,
-                            reply,
-                        } => {
-                            let result = match account.as_mut() {
-                                None => WorkResult::Err("locked".into()),
-                                Some(a) => {
-                                    let sent = match &secret {
-                                        DropSecret::Pin(pin) => {
-                                            a.send_to_outsider(
-                                                &to,
-                                                &subject,
-                                                &body,
-                                                &attachments,
-                                                pin,
-                                            )
-                                            .await
-                                        }
-                                        DropSecret::PublicKey(key) => {
-                                            a.send_to_outsider_with_key(
-                                                &to,
-                                                &subject,
-                                                &body,
-                                                &attachments,
-                                                key,
-                                            )
-                                            .await
-                                        }
-                                    };
-                                    match sent {
-                                        Ok(outcome) => WorkResult::OutsiderSent {
-                                            delivery_id: outcome.delivery_id,
-                                            expires_unix: outcome.expires_unix,
-                                        },
-                                        Err(e) => WorkResult::Err(e.to_string()),
-                                    }
-                                }
-                            };
-                            (reply, result)
-                        }
                         Work::MailRecords { reply } => {                            let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => WorkResult::Mail(a.mail_records()),
@@ -660,6 +605,26 @@ impl AccountWorker {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendConclaveFile {
+                            conclave_id,
+                            name,
+                            data,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a
+                                        .send_conclave_file_bytes(&conclave_id, &name, &data)
+                                        .await
+                                    {
+                                        Ok(id) => WorkResult::BlobId(hex::encode(id.0)),
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
                             };
                             (reply, result)
                         }
@@ -940,27 +905,6 @@ impl AccountWorker {
         self.call(|reply| Work::MailRecords { reply }).await
     }
 
-    /// Seal a message for an address with no Hush account and park it on the
-    /// relay. Returns the capability id and expiry, not a link: the base URL is
-    /// daemon configuration. `secret` selects the PIN or public-key mode.
-    pub async fn send_to_outsider(
-        &self,
-        to: &str,
-        subject: &str,
-        body: &str,
-        attachments: Vec<(String, Vec<u8>)>,
-        secret: DropSecret,
-    ) -> WorkResult {
-        self.call(|reply| Work::SendToOutsider {
-            to: to.to_string(),
-            subject: subject.to_string(),
-            body: body.to_string(),
-            attachments,
-            secret,
-            reply,
-        })
-        .await
-    }
     pub async fn draft_records(&self) -> WorkResult {
         self.call(|reply| Work::DraftRecords { reply }).await
     }
@@ -1025,6 +969,21 @@ impl AccountWorker {
         self.call(|reply| Work::SendConclaveMessage {
             conclave_id: conclave_id.to_string(),
             body: body.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn send_conclave_file_bytes(
+        &self,
+        conclave_id: &str,
+        name: &str,
+        data: Vec<u8>,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendConclaveFile {
+            conclave_id: conclave_id.to_string(),
+            name: name.to_string(),
+            data,
             reply,
         })
         .await

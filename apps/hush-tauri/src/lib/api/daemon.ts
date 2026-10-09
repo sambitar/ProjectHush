@@ -167,27 +167,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ to, ...body }),
     }),
-  /**
-   * Send to an address with no Hush account. The response carries the pickup
-   * link, which the sender passes on themselves — that is the product, not a
-   * fallback for a missing mailer.
-   *
-   * The drop is sealed under exactly one credential: a `pin` the recipient is
-   * told out of band, or the recipient's `public_key`. The union makes giving
-   * both (or neither) a type error here, and the daemon rejects it too.
-   */
-  sendToOutsider: (
-    body: {
-      to: string;
-      subject?: string;
-      body: string;
-      attachments: { name: string; data_base64: string }[];
-    } & ({ pin: string; public_key?: never } | { public_key: string; pin?: never }),
-  ) =>
-    request<{ delivery_id: string; link: string; expires_unix: number }>(
-      "/api/mail/outsider",
-      { method: "POST", body: JSON.stringify(body) },
-    ),
   saveDraft: (body: {
     id?: string;
     thread_id?: string;
@@ -228,6 +207,16 @@ export const api = {
     request<null>("/api/conclaves/message", {
       method: "POST",
       body: JSON.stringify({ conclave_id: conclaveId, body }),
+    }),
+  /**
+   * Share a file in a conclave. The daemon stores a local blob and fans one
+   * encrypted copy out to every joined trustee; the response carries the
+   * sender's blob id.
+   */
+  sendConclaveFileData: (conclaveId: string, name: string, data_base64: string) =>
+    request<{ blob_id: string }>("/api/conclaves/file", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId, name, data_base64 }),
     }),
   /** Invite a contact. Convener only; the invitee must accept. */
   inviteConclaveTrustee: (conclaveId: string, nickname: string) =>

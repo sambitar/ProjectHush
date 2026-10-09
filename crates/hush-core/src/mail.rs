@@ -1,12 +1,12 @@
 use crate::error::Error;
 
-/// Fixed domain suffix for internal member mail.
+/// The suffix used when a vault has no name of its own.
 ///
-/// Members-only mail never leaves Hush: this is a display convention, not an MX
-/// record. It is a constant rather than per-vault config so two members on the
-/// same relay always render the same address, and the UI reads it from
-/// `/api/status` instead of hardcoding a second copy.
-pub const MAIL_DOMAIN: &str = "myserver.com";
+/// Mail is members-only and never leaves Hush: the address is a display
+/// convention, not an MX record. The suffix is the vault's own name, chosen
+/// when the vault is created; this default keeps older vaults (and vaults
+/// created without a name) rendering a stable address.
+pub const DEFAULT_VAULT_NAME: &str = "hush";
 
 pub const MAX_HANDLE_LEN: usize = 64;
 
@@ -17,10 +17,10 @@ pub const MAX_HANDLE_LEN: usize = 64;
 /// a key, so two handles that differ only by case would be a real ambiguity.
 pub fn normalize_handle(input: &str) -> Result<String, Error> {
     let h = input.trim().to_ascii_lowercase();
-    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     if h.is_empty() || h.len() > MAX_HANDLE_LEN {
         return Err(Error::InvalidHandle);
     }
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     let allowed = h
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
@@ -34,8 +34,22 @@ pub fn normalize_handle(input: &str) -> Result<String, Error> {
     Ok(h)
 }
 
-pub fn format_address(handle: &str) -> String {
-    format!("{handle}@{MAIL_DOMAIN}")
+/// Validate and canonicalize a vault name used as the mail suffix.
+///
+/// The same shape as a handle — the suffix is the right-hand side of the same
+/// display convention, so it obeys the same rules. The vault's display name is
+/// this slug; there is deliberately no second, prettier form to keep in sync.
+pub fn normalize_vault_name(input: &str) -> Result<String, Error> {
+    normalize_handle(input)
+}
+
+/// Render the display address: the handle, at the vault's own name.
+///
+/// `name@vaultname` rather than `name@domain` on purpose — the suffix is
+/// user-chosen vault state, not infrastructure, so it must not look like a
+/// routable domain. Nothing here resolves; mail never leaves Hush.
+pub fn format_address(handle: &str, vault_name: &str) -> String {
+    format!("{handle}@{vault_name}")
 }
 
 #[cfg(test)]
@@ -57,7 +71,13 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_handle_formats_with_the_domain() {
-        assert_eq!(format_address("sandy"), "sandy@myserver.com");
+    fn a_vault_name_follows_the_same_shape_as_a_handle() {
+        assert_eq!(normalize_vault_name("  Quiet-Harbor ").unwrap(), "quiet-harbor");
+        assert!(normalize_vault_name("has space").is_err());
+    }
+
+    #[test]
+    fn an_address_is_the_handle_at_the_vault_name() {
+        assert_eq!(format_address("sandy", "quiet-harbor"), "sandy@quiet-harbor");
     }
 }

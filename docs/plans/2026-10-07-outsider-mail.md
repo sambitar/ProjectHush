@@ -1,5 +1,11 @@
 # Outsider Mail — Outbound Delivery Implementation Plan
 
+> **Removed 2026-10-08.** Mail is internal-only now, and this whole slice — the drop
+> container, the relay `/drop` and `/open` routes, the notification egress, and the
+> compose-to-external UI — was taken back out. The plan is kept as a record of what was
+> built and why it was undone: the pickup-link handoff assumed recipients outside Hush,
+> which is no longer a product goal.
+
 **Goal:** A member can compose to a typed external address (`user@server.com`), seal the message
 under a delivery credential, and hand the recipient a link that opens it. There are two
 credentials: a **PIN** the sender chooses and shares out of band, or the recipient's **public key**,
@@ -18,6 +24,16 @@ server can be dropped in later without touching the send path.
 `sha2` / `serde` deps, Tauri + TypeScript UI, a static web page for pickup.
 
 **Spec:** this conversation, plus `docs/plans/2026-10-04-v1-milestones.md` Tasks **5e**/**5f**.
+
+> **Superseded (2026-10-08) — notification moved to the relay.** The `Mailer` seam described
+> below (`crates/hush-core/src/mailer.rs`, `HUSH_MAILER`, and the daemon's `drop_base_url`
+> config) was removed. The relay now owns the notification: after the daemon parks the drop it
+> calls `POST /drop/{id}/notify` on the relay, which composes the pickup link from its own
+> `HUSH_RELAY_DROP_BASE_URL` and emails it with the sealed container attached, selected by
+> `HUSH_RELAY_MAILER` (see `crates/hush-relay/src/notify.rs`). The body below is the plan as it
+> stood on 2026-10-07 and is kept verbatim as the decision record; read the mailer-specific
+> steps (Task 4, Task 5's config, and the `drop_base_url` risk) as history, not as the current
+> design.
 
 ## Settled decisions (design round, 2026-10-07)
 

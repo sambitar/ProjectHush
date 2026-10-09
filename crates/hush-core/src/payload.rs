@@ -15,6 +15,16 @@ pub struct MailAttachment {
     pub data: Vec<u8>,
 }
 
+/// One file attached to a conclave message, inlined base64 like the 1:1 `File`
+/// payload. The bytes are encrypted separately to each joined trustee, so a
+/// fan-out of N trustees puts N copies on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConclaveFile {
+    pub name: String,
+    #[serde(with = "b64_bytes")]
+    pub data: Vec<u8>,
+}
+
 /// A trustee's standing in a conclave.
 ///
 /// The state is per trustee and converges across peers: every change is
@@ -155,6 +165,14 @@ pub enum MessagePayload {
         #[serde(default, alias = "members")]
         trustees: Vec<String>,
         body: String,
+        /// A file shared into the conclave, absent for a text message.
+        ///
+        /// This is an optional field on the existing payload rather than a new
+        /// variant: a file is just a conclave message with an attachment, so it
+        /// rides the same descriptor and fan-out, and a message written before
+        /// files existed still decodes (the field defaults to `None`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<ConclaveFile>,
     },
     /// An invitation to join a conclave.
     ///
@@ -302,8 +320,36 @@ mod tests {
             name: "Standup".into(),
             trustees: vec!["bob".into(), "carol".into()],
             body: "morning".into(),
+            file: None,
         };
         assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn a_conclave_payload_round_trips_with_a_file() {
+        let p = MessagePayload::Conclave {
+            conclave_id: "m-1".into(),
+            name: "Standup".into(),
+            trustees: vec!["bob".into()],
+            body: String::new(),
+            file: Some(ConclaveFile {
+                name: "notes.txt".into(),
+                data: vec![9, 8, 7],
+            }),
+        };
+        assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    /// A conclave message written before files existed has no `file` field and
+    /// must still decode.
+    #[test]
+    fn a_conclave_payload_without_a_file_decodes_as_none() {
+        let json = r#"{"t":"conclave","conclave_id":"m-1","name":"Standup","body":"hi"}"#;
+        let p: MessagePayload = serde_json::from_str(json).unwrap();
+        match p {
+            MessagePayload::Conclave { file, .. } => assert!(file.is_none()),
+            other => panic!("expected a conclave, got {other:?}"),
+        }
     }
 
     /// The wire tag is now `conclave` and the id field `conclave_id`.
@@ -314,6 +360,7 @@ mod tests {
             name: "Standup".into(),
             trustees: vec!["bob".into()],
             body: "hi".into(),
+            file: None,
         };
         let json = String::from_utf8(p.encode().unwrap()).unwrap();
         assert!(json.contains(r#""t":"conclave""#), "json was {json}");

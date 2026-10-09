@@ -209,6 +209,25 @@
   background: var(--surface);
 }
 
+/* Profile → address: compact `handle @ vault` editor on one row. */
+.handle-edit {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  flex-wrap: wrap;
+}
+.handle-edit .input-field {
+  width: 14rem;
+  padding: var(--space-2) var(--space-3);
+}
+.handle-suffix {
+  white-space: nowrap;
+}
+.handle-edit .btn-primary {
+  padding: var(--space-2) var(--space-4);
+}
+
 .chat-header {
   padding: var(--space-4);
   border-bottom: 1px solid var(--border);
@@ -1021,65 +1040,6 @@
   min-width: 0;
 }
 
-/* ------------------------------------------------- two-mode recipient field */
-
-/*
- * The To row holds a mode switch and a field. The switch is a segmented control
- * rather than a checkbox: neither Internal nor External is the "off" state, and
- * the two behave differently enough that the choice has to be visible before the
- * recipient is read, not after.
- */
-.mail-compose-to-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  flex: 1;
-  min-width: 0;
-}
-
-.mail-to-mode,
-/* The credential switch for an external drop — PIN or the recipient's public
-   key. The same segmented control as the To switch, one row below it, because
-   it is the same kind of choice: which of two modes this send is in. */
-.mail-drop-mode {
-  display: inline-flex;
-  align-self: flex-start;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  overflow: hidden;
-}
-
-.mail-to-mode-btn {
-  padding: 4px 12px;
-  font: inherit;
-  font-size: 12px;
-  background: transparent;
-  border: 0;
-  color: var(--text-dim);
-  cursor: pointer;
-}
-
-.mail-to-mode-btn + .mail-to-mode-btn {
-  border-left: 1px solid var(--border);
-}
-
-.mail-to-mode-btn[aria-pressed="true"] {
-  background: var(--surface-raised, var(--surface));
-  color: var(--text);
-  font-weight: 600;
-}
-
-.mail-to-mode-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-/* The PIN hint sits under the field it explains, not beside it. */
-.mail-compose-hint {
-  margin: 0;
-  line-height: 1.45;
-}
-
 /* --------------------------------------- keyboard-typeable contact picker */
 
 /*
@@ -1151,30 +1111,6 @@
 .contact-picker-empty {
   margin: 0;
   padding: var(--space-2) var(--space-3);
-}
-
-/* ------------------------------------------------------------ drop result */
-
-.mail-drop-result {
-  max-width: 640px;
-}
-
-.mail-drop-link {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-.mail-drop-link-input {
-  flex: 1;
-  min-width: 0;
-  font-family: var(--font-mono, monospace);
-  font-size: 13px;
-}
-
-/* A hint that is a warning: the expiry and the no-recall are not small print. */
-.mail-drop-result .mail-compose-hint {
-  color: var(--text-dim);
 }
 
 /* ------------------------------------------------------------ rich editor */
@@ -1773,3 +1709,270 @@
 }
 
 
+
+/* ---------------------------------------------------------------- drops */
+
+.drops-pane {
+  overflow: auto;
+}
+
+.drops-head {
+  align-items: center;
+}
+
+.drops-head-status {
+  flex-shrink: 0;
+}
+
+.drops-tor-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.drops-tor-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.drops-tor-chip.ready {
+  color: var(--success-text);
+  background: var(--success-soft);
+  border-color: transparent;
+}
+.drops-tor-chip.ready .drops-tor-dot {
+  background: #3ecf8e;
+  box-shadow: 0 0 8px rgba(62, 207, 142, 0.6);
+}
+
+.drops-tor-chip.starting {
+  color: var(--warning-text);
+  background: var(--warning-soft);
+  border-color: transparent;
+}
+.drops-tor-chip.starting .drops-tor-dot {
+  background: #e0a93e;
+  animation: drops-pulse 1.2s ease-in-out infinite;
+}
+
+.drops-tor-chip.failed,
+.drops-tor-chip.unavailable {
+  color: var(--danger);
+}
+.drops-tor-chip.failed .drops-tor-dot,
+.drops-tor-chip.unavailable .drops-tor-dot {
+  background: var(--danger);
+}
+
+@keyframes drops-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.drops-open-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-4) var(--space-5) 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+}
+.drops-open-banner .drops-tor-dot {
+  width: 10px;
+  height: 10px;
+}
+.drops-open-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.drops-error {
+  margin: var(--space-4) var(--space-5) 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.drops-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5) 0;
+  flex-wrap: wrap;
+}
+
+.drops-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-dim);
+}
+.drops-toggle input {
+  accent-color: var(--accent);
+}
+
+.drops-dev-note {
+  color: var(--warning-text);
+  background: var(--warning-soft);
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+}
+
+.drops-refresh {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  margin-left: auto;
+}
+.drops-refresh:hover {
+  color: var(--text);
+}
+
+.drops-grid {
+  align-content: start;
+}
+
+.drop-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.drop-card.is-dev {
+  border-style: dashed;
+}
+
+.drop-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.drop-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 600;
+  font-size: 16px;
+  letter-spacing: 0.5px;
+}
+
+.drop-card-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.drop-card-name,
+.drop-card-org {
+  /* Wrap long names (e.g. "Bloomberg Industry Group") instead of cutting
+     them off with an ellipsis — the user must be able to read the name. */
+  overflow-wrap: anywhere;
+}
+
+.drop-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+.drop-badge.verified {
+  color: var(--success-text);
+  background: var(--success-soft);
+}
+.drop-badge.unverified {
+  color: var(--warning-text);
+  background: var(--warning-soft);
+}
+.drop-badge.dev {
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
+}
+
+.drop-card-desc {
+  margin: 0;
+  min-height: 36px;
+}
+
+.drop-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  color: var(--text-dim);
+}
+.drop-fact {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.drop-fact svg {
+  width: 14px;
+  height: 14px;
+}
+
+.drop-verify {
+  color: var(--text-faint);
+}
+
+.drop-tor-row {
+  margin-top: auto;
+}
+
+.drop-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+.drop-open svg {
+  width: 16px;
+  height: 16px;
+}
+.drop-open:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.drops-footnote {
+  padding: var(--space-4) var(--space-5) var(--space-6);
+  max-width: 720px;
+  line-height: 1.5;
+}

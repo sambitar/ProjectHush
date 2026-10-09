@@ -26,6 +26,13 @@ struct BlobMeta {
     id: String,
 }
 
+/// Environment override for a SOCKS proxy placed in front of every relay
+/// request, e.g. a local Tor instance: `socks5h://127.0.0.1:9050`. The `h`
+/// in `socks5h` sends DNS through the proxy too, which is what makes `.onion`
+/// hosts resolvable. Read by [`RelayClient::try_new`]; unset means connect
+/// directly.
+pub const ENV_RELAY_SOCKS_PROXY: &str = "HUSH_RELAY_SOCKS_PROXY";
+
 /// Whether plain HTTP may be used for a relay that is not on loopback.
 ///
 /// This is an explicit parameter rather than an inline `cfg!(debug_assertions)`
@@ -36,7 +43,11 @@ struct BlobMeta {
 pub enum HttpPolicy {
     /// Debug builds: HTTP anywhere, for local dogfood and tests.
     Allow,
-    /// Release builds: HTTPS required unless the relay is on loopback.
+    /// Release builds: HTTPS required unless the relay is on loopback or the
+    /// host is a v3 `.onion`. An onion address authenticates itself (the host
+    /// name is the service's public key) and Tor encrypts the link end to end,
+    /// so there is no certificate layer to demand — the same rule the Drops
+    /// feature applies to webview targets.
     LoopbackOnly,
 }
 
@@ -81,7 +92,7 @@ fn http_url_allowed(url: &str, policy: HttpPolicy) -> bool {
         HttpPolicy::LoopbackOnly => reqwest::Url::parse(url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_owned))
-            .is_some_and(|host| host_is_loopback(&host)),
+            .is_some_and(|host| host_is_loopback(&host) || host_is_v3_onion(&host)),
     }
 }
 
@@ -104,6 +115,56 @@ fn host_is_loopback(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a parsed URL host is a v3 onion address: exactly 56 base32
+/// characters (a-z, 2-7) followed by `.onion`.
+///
+/// Matching the host alone cannot be fooled by userinfo (`http://x@<onion>`)
+/// because `Url::host_str` excludes userinfo, and a lookalike like
+/// `evil.onion.attacker.com` fails the suffix strip. The same rule lives in
+/// the Tauri app's `drops` module for webview targets; the app does not depend
+/// on this crate, so the two validate their own surfaces.
+fn host_is_v3_onion(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    match host.strip_suffix(".onion") {
+        Some(label) => {
+            label.len() == 56
+                && label
+                    .bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+        }
+        None => false,
+    }
+}
+
+/// The configured SOCKS proxy, if any. Whitespace-only counts as unset so a
+/// half-edited env line does not become a broken client.
+fn proxy_from_env() -> Option<String> {
+    std::env::var(ENV_RELAY_SOCKS_PROXY)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Build a SOCKS proxy from a validated value.
+///
+/// Strict on purpose. `reqwest::Proxy::all` accepts schemeless strings and
+/// foreign schemes without complaint (scheme matching is deferred to request
+/// time), so a typo in the environment could silently produce a proxy that
+/// never matches — i.e. direct, un-Tor'd traffic — or an `http://` proxy where
+/// SOCKS was intended. This seam exists to put Tor in the path or fail loudly;
+/// only `socks5` / `socks5h` with a host qualify.
+fn socks_proxy(value: &str) -> Result<reqwest::Proxy, Error> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|e| Error::Relay(format!("bad relay SOCKS proxy URL: {e}")))?;
+    let scheme = url.scheme();
+    if !matches!(scheme, "socks5" | "socks5h") || url.host_str().is_none() {
+        return Err(Error::Relay(format!(
+            "relay SOCKS proxy must be socks5h://host:port (e.g. a local Tor), got {value:?}"
+        )));
+    }
+    reqwest::Proxy::all(url).map_err(|e| Error::Relay(format!("bad relay SOCKS proxy URL: {e}")))
+}
+
 impl RelayClient {
     pub fn new(base: &str) -> Self {
         Self::try_new(base).unwrap_or_else(|_| Self {
@@ -116,13 +177,26 @@ impl RelayClient {
     }
 
     pub fn try_new(base: &str) -> Result<Self, Error> {
+        Self::try_new_with_proxy(base, proxy_from_env().as_deref())
+    }
+
+    /// [`RelayClient::try_new`] with the SOCKS proxy supplied explicitly
+    /// instead of read from [`ENV_RELAY_SOCKS_PROXY`]. `None` means connect
+    /// directly — and *only* directly: ambient proxy environment variables
+    /// (`ALL_PROXY` and friends) are deliberately ignored so the relay path
+    /// goes through Tor exactly when this seam says it should.
+    pub fn try_new_with_proxy(base: &str, proxy: Option<&str>) -> Result<Self, Error> {
         let base = normalize_relay_base(base)?;
+        let mut builder = Client::builder().timeout(REQUEST_TIMEOUT);
+        match proxy {
+            Some(proxy) => {
+                builder = builder.proxy(socks_proxy(proxy)?);
+            }
+            None => builder = builder.no_proxy(),
+        }
         Ok(Self {
             base,
-            http: Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .build()
-                .expect("http client"),
+            http: builder.build().expect("http client"),
         })
     }
 
@@ -304,42 +378,6 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Park an outsider delivery container on the relay.
-    ///
-    /// No credential: the id is a capability the sender chose, and the body is
-    /// already ciphertext under a PIN the relay never sees.
-    pub async fn put_drop(&self, delivery_id: &str, body: &[u8]) -> Result<(), Error> {
-        let res = self
-            .http
-            .put(format!("{}/drop/{}", self.base, delivery_id))
-            .body(body.to_vec())
-            .send()
-            .await
-            .map_err(|e| Error::Relay(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(Error::Relay(format!("drop put failed: {}", res.status())));
-        }
-        Ok(())
-    }
-
-    /// Fetch a delivery container. Used by the pickup page and by tests; the
-    /// member's own client does not read its own outgoing drops back.
-    pub async fn get_drop(&self, delivery_id: &str) -> Result<Vec<u8>, Error> {
-        let res = self
-            .http
-            .get(format!("{}/drop/{}", self.base, delivery_id))
-            .send()
-            .await
-            .map_err(|e| Error::Relay(e.to_string()))?;
-        if !res.status().is_success() {
-            return Err(Error::Relay(format!("drop get failed: {}", res.status())));
-        }
-        res.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| Error::Relay(e.to_string()))
-    }
-
     /// Publish this account's prekey record so peers can open a session without
     /// an invite.
     ///
@@ -380,7 +418,19 @@ impl RelayClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_relay_base, normalize_relay_base_with, HttpPolicy};
+    use super::{
+        host_is_v3_onion, normalize_relay_base, normalize_relay_base_with,
+        ENV_RELAY_SOCKS_PROXY, HttpPolicy, RelayClient,
+    };
+    use std::sync::Mutex;
+
+    /// `try_new` reads process-global env; serialize tests that touch it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The hostname of the lab relay's onion service (docs/ops/relay-lab-vps.md).
+    /// Doubling as a test vector keeps the deployed address and the validator
+    /// honest against each other.
+    const LAB_ONION: &str = "ogkf745dfn32pdbvsk6e52uqski7mudadowosi5cbyif4yglhzuqlsad.onion";
 
     #[test]
     fn https_relay_ok() {
@@ -457,6 +507,85 @@ mod tests {
             assert!(normalize_relay_base_with("ftp://relay.example", policy).is_err());
             assert!(normalize_relay_base_with("relay.example", policy).is_err());
         }
+    }
+
+    /// A plain-HTTP onion relay is legitimate in release builds: the v3
+    /// hostname authenticates the service and Tor encrypts the link, so there
+    /// is no TLS layer to require.
+    #[test]
+    fn release_allows_http_for_v3_onion() {
+        for url in [
+            format!("http://{LAB_ONION}"),
+            // Tor onion services can publish any virtual port.
+            format!("http://{LAB_ONION}:8790"),
+            // Host matching is case-insensitive on the scheme side.
+            format!("http://{}", LAB_ONION.to_ascii_uppercase()),
+        ] {
+            assert!(
+                normalize_relay_base_with(&url, HttpPolicy::LoopbackOnly).is_ok(),
+                "{url} is a v3 onion and should be allowed in a release build"
+            );
+        }
+    }
+
+    /// The onion allowance must not become a hole: a name that merely contains
+    /// or extends `.onion`, a short label, or a label outside base32 is not a
+    /// v3 onion and keeps the HTTPS requirement.
+    #[test]
+    fn release_refuses_onion_lookalikes() {
+        let label = &LAB_ONION[..LAB_ONION.len() - ".onion".len()];
+        assert_eq!(label.len(), 56, "the lab vector must be a real v3 label");
+        let short = format!("http://{}.onion", &label[..55]);
+        let bad_char = format!("http://{}8.onion", &label[..55]); // '8' is not base32
+        for url in [
+            "http://evil.onion.attacker.com".to_string(),
+            "http://attacker.com?x=ogkf.onion".to_string(),
+            short,
+            bad_char,
+            "http://.onion".to_string(),
+        ] {
+            assert!(
+                normalize_relay_base_with(&url, HttpPolicy::LoopbackOnly).is_err(),
+                "{url} must be refused in a release build"
+            );
+        }
+        assert!(!host_is_v3_onion(&format!("{LAB_ONION}.evil.com")));
+        // And the real one passes, so the refusals above are not vacuous.
+        assert!(host_is_v3_onion(LAB_ONION));
+    }
+
+    /// An explicitly supplied proxy must parse, and a bad one must fail the
+    /// constructor rather than surfacing later as a request error.
+    #[test]
+    fn proxy_urls_are_validated_at_construction() {
+        let ok = RelayClient::try_new_with_proxy(
+            &format!("http://{LAB_ONION}"),
+            Some("socks5h://127.0.0.1:9050"),
+        );
+        assert!(matches!(ok, Ok(RelayClient { .. })));
+        assert!(RelayClient::try_new_with_proxy("http://127.0.0.1:8787", Some("not a url")).is_err());
+        // `http://` proxies are valid to reqwest, so the refusal needs a
+        // scheme it genuinely does not support.
+        assert!(
+            RelayClient::try_new_with_proxy("http://127.0.0.1:8787", Some("ftp://proxy.invalid"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn try_new_reads_the_socks_proxy_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(ENV_RELAY_SOCKS_PROXY);
+        assert!(RelayClient::try_new(&format!("http://{LAB_ONION}")).is_ok());
+
+        std::env::set_var(ENV_RELAY_SOCKS_PROXY, "garbage");
+        assert!(RelayClient::try_new("http://127.0.0.1:8787").is_err());
+
+        // Whitespace-only counts as unset, not as a broken proxy.
+        std::env::set_var(ENV_RELAY_SOCKS_PROXY, "   ");
+        assert!(RelayClient::try_new("http://127.0.0.1:8787").is_ok());
+
+        std::env::remove_var(ENV_RELAY_SOCKS_PROXY);
     }
 
     /// The production entry point must follow the build it was compiled into.

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 hush-core = { path = "../hush-core" }
 axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
 hex = "0.4"
 http-body-util = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }

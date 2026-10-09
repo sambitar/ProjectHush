@@ -127,6 +127,76 @@ async fn an_invitee_receives_no_messages_until_they_accept() {
     }
 }
 
+/// A file shared in a conclave reaches every joined trustee as its own encrypted
+/// copy and is appended to each recipient's conclave log; a named invitee who
+/// has not accepted gets nothing. Files are per-recipient blobs, so this is N
+/// copies for N trustees, and there is no backfill for a trustee who joins
+/// later.
+#[tokio::test]
+async fn a_conclave_file_reaches_every_joined_trustee_and_not_an_invitee() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let carol_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+    // Carol is a contact of alice's, invited but never accepting.
+    let mut carol = Account::create(carol_dir.path(), "carol-pass", &relay)
+        .await
+        .unwrap();
+    let carol_invite = carol.invite().await.unwrap();
+    let alice_invite = alice.invite().await.unwrap();
+    alice.add_contact("carol", &carol_invite).await.unwrap();
+    carol.add_contact("alice", &alice_invite).await.unwrap();
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string(), "carol".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap(); // invite
+    carol.recv().await.unwrap(); // invite; not accepted
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    let blob = alice
+        .send_conclave_file_bytes(&conclave.id, "notes.txt", b"hello bytes")
+        .await
+        .unwrap();
+    assert_eq!(alice.read_blob(&blob).unwrap(), b"hello bytes");
+
+    // The sender's own log records the file against its own blob.
+    let sent = &alice.conclaves()[0].messages;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].file.as_ref().unwrap().name, "notes.txt");
+
+    // Bob, joined, receives exactly one copy, with the bytes on the wire.
+    let inbox = bob.recv().await.unwrap();
+    assert_eq!(inbox.messages.len(), 1, "bob gets exactly his one copy");
+    match &inbox.messages[0].payload {
+        MessagePayload::Conclave { file, body, .. } => {
+            assert!(body.is_empty(), "a file message has no body");
+            let f = file.as_ref().expect("a file attachment");
+            assert_eq!(f.name, "notes.txt");
+            assert_eq!(f.data, b"hello bytes");
+        }
+        other => panic!("expected a conclave file, got {other:?}"),
+    }
+    let bob_msg = &bob.conclaves()[0].messages[0];
+    let bob_file = bob_msg.file.as_ref().expect("bob's log has the file");
+    assert_eq!(bob_file.name, "notes.txt");
+    assert_eq!(bob_file.size, 11);
+    // The recipient stored the bytes as its own local blob: a 32-byte id, not a
+    // reference into the sender's vault.
+    assert_eq!(bob_file.blob_id_hex.len(), 64);
+
+    // Carol, invited but not joined, receives nothing and has no conclave.
+    let carol_inbox = carol.recv().await.unwrap();
+    assert!(
+        carol_inbox.messages.is_empty(),
+        "an unaccepted invitee is not a fan-out target for files either"
+    );
+    assert!(carol.conclaves().is_empty());
+}
+
 /// A created conclave and its messages survive a reopen, and the convener is
 /// recorded.
 #[tokio::test]
@@ -223,6 +293,7 @@ async fn a_conclave_message_reaches_every_joined_trustee_exactly_once() {
             name,
             trustees,
             body,
+            ..
         } => {
             assert_eq!(conclave_id, &conclave.id);
             assert_eq!(name, "Trip");

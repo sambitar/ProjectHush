@@ -5,12 +5,10 @@ mod chat_log;
 pub mod config;
 mod crypto;
 mod device;
-mod drop;
 mod error;
 mod invite;
 mod lockfile;
 mod mail;
-mod mailer;
 mod message;
 mod payload;
 pub mod prekey;
@@ -21,9 +19,7 @@ mod signal_persist;
 mod vault;
 mod wire;
 
-pub use account::{
-    Account, Contact, MailOutcome, OutsiderOutcome, PendingInvite, DROP_TTL_SECS, MIN_DROP_PIN_LEN,
-};
+pub use account::{Account, Contact, MailOutcome, PendingInvite};
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{
     ClientConfig, ConfigSource, DEFAULT_DAEMON_ADDR, DEFAULT_RELAY_URL, ENV_DAEMON_ADDR,
@@ -33,23 +29,16 @@ pub use config::{
 };
 pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
 pub use device::{DeviceKeys, DEVICE_ID};
-pub use drop::{
-    decode_private_key as decode_drop_private_key, decode_public_key as decode_drop_public_key,
-    encode_private_key as encode_drop_private_key, encode_public_key as encode_drop_public_key,
-    generate_keypair as generate_drop_keypair, is_container, open as open_drop,
-    open_with_key as open_drop_with_key, seal as seal_drop, seal_to_key as seal_drop_to_key,
-    DropAttachment, DropKeypair, DropPackage, DROP_HEADER_LEN, DROP_PRIVATE_KEY_PREFIX,
-    DROP_PUBLIC_KEY_PREFIX, DROP_V2_HEADER_LEN, MAX_DROP_BYTES,
-};
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
 pub use chat_log::{
-    ChatRecord, ChatRecordPayload, ConclaveMessage, ConclaveRecord, ExternalMail,
-    MailAttachmentRecord, MailState,
+    ChatRecord, ChatRecordPayload, ConclaveMessage, ConclaveRecord, MailAttachmentRecord,
+    MailState,
 };
 pub use error::Error;
 pub use invite::InvitePayload;
-pub use mail::{format_address, normalize_handle, MAIL_DOMAIN, MAX_HANDLE_LEN};
-pub use mailer::{notification_body, notification_body_for_key, FileMailer, Mailer, NullMailer};
+pub use mail::{
+    format_address, normalize_handle, normalize_vault_name, DEFAULT_VAULT_NAME, MAX_HANDLE_LEN,
+};
 pub use message::{InboxResult, ReceivedAttachment, ReceivedMessage};
 pub use payload::{
     ConclaveDescriptor, ConclaveTrustee, MessagePayload, TrusteeState, MailAttachment,

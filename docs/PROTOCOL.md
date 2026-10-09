@@ -16,10 +16,10 @@ Not a crypto paper. We use **Signal protocol (`libsignal`)** for 1:1 sessions. T
 - An **invite** (QR or link) carries, at least:
   - identity public key
   - a receive **queue id** + **queue authorization secret** (so only the invited person can put blobs on that queue)
-  - an optional **mail handle** (local part only, e.g. `sandy`) — a label bound to this identity, carried inside the invite
+  - an optional **mail handle** (local part only, e.g. `sandy`) and **vault name** (e.g. `quiet-harbor`) — the label and suffix of this member's mail address, carried inside the invite
   - app/version so old clients fail clearly
 - Display names are local only.
-- The mail handle is **not** a relay directory entry. `handle@MAIL_DOMAIN` (`sandy@myserver.com`) is a human label exchanged out-of-band inside the invite; the relay never learns or resolves it, and there is no "look up a person by address" API.
+- The mail address is **not** a relay directory entry. `handle@vault-name` (`sandy@quiet-harbor`) is a human label exchanged out-of-band inside the invite; the relay never learns or resolves it, and there is no "look up a person by address" API. The suffix is the vault's own name, chosen when the vault is created (default `hush`); it is deliberately not a domain, because mail is members-only and nothing resolves it.
 
 **One device per account.** An account is a single identity with a single device. There is no device
 list, no per-device fan-out, and no way to add a second device: `DEVICE_ID` is the constant `1`
@@ -110,7 +110,7 @@ queue.
 
 ### Mail
 
-Mail is a payload **kind** on the same Signal session and the same queue — not a second transport. It is the internal member-mail feature (`handle@MAIL_DOMAIN`, members only): an email-like UX (threads, subjects, multiple attachments, address book) without SMTP or federation.
+Mail is a payload **kind** on the same Signal session and the same queue — not a second transport. It is the internal member-mail feature (`handle@vault-name`, members only): an email-like UX (threads, subjects, multiple attachments, address book) without SMTP or federation.
 
 - **Wire payload:** `MessagePayload::Mail { thread_id, subject, body, attachments[] }`. Attachments are inlined on the wire (capped at 8 files / 256 KiB total for v1) rather than referenced out-of-band.
 - **Async by design:** chat and files require the recipient to be **online** (live presence); mail deliberately skips that check, so it is queued on the recipient's relay slot while they are away and delivered on their next drain. This is the one behavioural difference from chat, and the reason mail exists.
@@ -139,8 +139,8 @@ two-party chat, just repeated. Nothing on the relay changes.
 - **Single authority.** The convener broadcasts the authoritative roster as a descriptor
   (`conclave_id`, `name`, `convener`, `trustees[]`, `ended`); peers apply it only when the sender is the
   convener named in it. This replaces the older per-message member list, which drifted.
-- **Wire payloads:** `MessagePayload::Conclave { conclave_id, name, trustees[], body }` for a message,
-  plus the control variants `ConclaveInvite`, `ConclaveAccept`, `ConclaveDecline`, `ConclaveLeave`,
+- **Wire payloads:** `MessagePayload::Conclave { conclave_id, name, trustees[], body, file? }` for a
+  message, plus the control variants `ConclaveInvite`, `ConclaveAccept`, `ConclaveDecline`, `ConclaveLeave`,
   `ConclaveUpdate`, and `ConclaveEnd`, each carrying the descriptor. Control payloads change local state
   and are never surfaced as chat messages. The message variant and the id field were renamed from
   `Meeting` / `meeting_id`; `#[serde(alias = "meeting")]` and `#[serde(alias = "meeting_id")]` keep a
@@ -148,12 +148,21 @@ two-party chat, just repeated. Nothing on the relay changes.
 - **Delivery:** store-and-forward, like mail (the fan-out uses the same `require_online: false` path), so
   an away trustee still receives the message on their next drain. There is no delivery receipt and no
   server-side membership to read.
+- **File sharing:** a file uses the same sender-side fan-out as text — one encrypted copy per joined
+  trustee, N blobs for N trustees. There is no shared blob to point everyone at, so N copies is the
+  honest implementation. The bytes ride as an optional `file { name, data }` on the same
+  `MessagePayload::Conclave` (inlined, bounded by `MAX_INLINE_FILE_BYTES`); each recipient stores them
+  as its own local encrypted blob and records a `ConclaveFileRecord` (`name`, `blob_id_hex`, `size`) in
+  its conclave log. The fan-out targets the joined set only, matching text, and a trustee who joins
+  after the file was sent does not receive it: there is no shared history to backfill from, so the log
+  is not complete for a late joiner.
 - **Local storage:** conclaves reuse the encrypted `chat.enc` log via a `ConclaveRecord` (`id`, `name`,
   `convener`, `trustees[]`, `created_ms`, `messages: ConclaveMessage[]`, `ended`). A conclave's messages
   are kept in the conclave's own log, not in the 1:1 `ChatRecord` projection. One log, one encryption
   path, one backup path. A pre-rename record stored `members` as bare nickname strings and no convener;
   `#[serde(alias = "members")]` plus a load-time hydration step (resolve the nicknames to account ids,
-  and make the local account the convener) keep an existing vault working. The on-disk key for the list
+  resolve the local account's own entry — or add it when the legacy list omitted it, since a vault is
+  never its own contact — and make the local account the convener) keep an existing vault working. The on-disk key for the list
   stays `meetings` (`#[serde(rename = "meetings", alias = "conclaves")]`).
 - **Ending is shared.** The convener broadcasts a `ConclaveEnd` descriptor; every peer marks the record
   `ended` and renders it read-only. The record and its message log stay in every vault.

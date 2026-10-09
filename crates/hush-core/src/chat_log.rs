@@ -44,23 +44,6 @@ pub enum MailState {
     Queued,
 }
 
-/// What an outgoing drop needs to be shown and re-shared.
-///
-/// A drop has no contact and no thread partner, so the address is kept here
-/// rather than inferred from the contact list. `delivery_id` is the relay
-/// capability, and the pickup link is composed from it by whoever knows the
-/// deployment's base URL — deliberately not stored here, because the base URL is
-/// configuration and this record is vault state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalMail {
-    /// The typed recipient address.
-    pub to: String,
-    /// The relay capability id the container was stored under.
-    pub delivery_id: String,
-    /// When the relay will drop it.
-    pub expires_unix: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ChatRecordPayload {    Text {
@@ -80,11 +63,6 @@ pub enum ChatRecordPayload {    Text {
         /// `Sent`, which is what they are.
         #[serde(default)]
         state: MailState,
-        /// Set when this went to a non-member address instead of a contact. The
-        /// recipient has no keys, so the record carries the capability id rather
-        /// than a session: that is the whole difference between a drop and mail.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        external: Option<ExternalMail>,
     },
     /// A composed message that has not been sent. Unlike mail this is mutable:
     /// it is edited and deleted in place, which is why the log grew
@@ -120,7 +98,23 @@ pub struct ConclaveMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     pub body: String,
+    /// The file shared with this message, if any. Only the vault blob reference
+    /// is stored: the bytes live in the blob store, exactly like a 1:1 file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<ConclaveFileRecord>,
     pub ts_ms: u64,
+}
+
+/// A file shared into a conclave, as stored in the conclave's log.
+///
+/// This is the record shape; the wire shape is `payload::ConclaveFile`, which
+/// carries the bytes. The bytes are stored as an encrypted vault blob and only
+/// this reference travels in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConclaveFileRecord {
+    pub name: String,
+    pub blob_id_hex: String,
+    pub size: u64,
 }
 
 /// A conclave: a local record, not a relay-side room.
@@ -328,50 +322,6 @@ impl ChatLog {
                     body: body.to_string(),
                     attachments: attachments.to_vec(),
                     state,
-                    external: None,
-                },
-            },
-        )?;
-        Ok(id)
-    }
-
-    /// Append an outgoing drop: a message sealed for someone with no account.
-    ///
-    /// `contact_nick` is set to the typed address so the list can render a row
-    /// without unwrapping the payload, and the `external` field carries the
-    /// capability id the link is built from. There is no `MailState`: a drop is
-    /// either on the relay or the send returned an error, so there is nothing to
-    /// retry from an Outbox.
-    #[allow(clippy::too_many_arguments)]
-    pub fn append_external_mail(
-        &mut self,
-        master: &[u8; MASTER_KEY_LEN],
-        to: &str,
-        delivery_id: &str,
-        expires_unix: u64,
-        subject: &str,
-        body: &str,
-        attachments: &[MailAttachmentRecord],
-    ) -> Result<String, Error> {
-        let id = Uuid::new_v4().to_string();
-        self.push(
-            master,
-            ChatRecord {
-                id: id.clone(),
-                contact_nick: to.to_string(),
-                outgoing: true,
-                ts_ms: now_ms(),
-                payload: ChatRecordPayload::Mail {
-                    thread_id: Uuid::new_v4().to_string(),
-                    subject: (!subject.is_empty()).then(|| subject.to_string()),
-                    body: body.to_string(),
-                    attachments: attachments.to_vec(),
-                    state: MailState::Sent,
-                    external: Some(ExternalMail {
-                        to: to.to_string(),
-                        delivery_id: delivery_id.to_string(),
-                        expires_unix,
-                    }),
                 },
             },
         )?;
@@ -530,15 +480,30 @@ impl ChatLog {
     /// nickname to an account id with `resolve`. Returns whether anything
     /// changed.
     ///
-    /// A record written before consent existed has nicknames only; without this
-    /// it would have no trustees and every membership operation would see an
-    /// empty set. A nickname that cannot be resolved keeps its nickname as the
-    /// id, so it is still one stable entry. The convener is recorded as joined.
+    /// A record written before consent existed stored bare nicknames; without
+    /// this it would have no trustees and every membership operation would see
+    /// an empty set. Two fix-ups happen here:
+    ///
+    /// - Every nickname that names a contact resolves to that contact's account
+    ///   id.
+    /// - The **local account** is made a member. A vault is never its own
+    ///   contact, so the local account can never resolve through `resolve`; it
+    ///   is always one of the entries that stays unresolved. When exactly one
+    ///   entry is unresolved it is the local account's own nickname and is
+    ///   mapped to `local_account`; when none is, the local account was absent
+    ///   from the legacy list and is added. This is what keeps a pre-consent
+    ///   record usable: without it the local user's own entry keeps a nickname
+    ///   as its account id, so `is_joined` is false and the record cannot be
+    ///   sent in.
+    ///
+    /// An entry whose account id equals its nickname is a fallback written by an
+    /// earlier hydration, not a real id, so it is re-processed rather than
+    /// trusted. That is what lets a vault hydrated by the old code self-heal.
     pub fn hydrate_trustees<F>(
         &mut self,
         master: &[u8; MASTER_KEY_LEN],
         id: &str,
-        convener: &str,
+        local_account: &str,
         mut resolve: F,
     ) -> Result<bool, Error>
     where
@@ -547,30 +512,70 @@ impl ChatLog {
         let Some(record) = self.file.conclaves.iter_mut().find(|m| m.id == id) else {
             return Ok(false);
         };
-        if record.trustees.is_empty() || record.trustees.iter().all(|t| !t.account_id.is_empty()) {
-            return Ok(false);
-        }
-        let trustees: Vec<ConclaveTrustee> = record
+        // An entry needs work when it has no account id, or has one that is only
+        // the nickname fallback. The record also needs work when the local
+        // account is missing from the roster.
+        let needs = record
             .trustees
             .iter()
-            .map(|t| {
-                // A pre-rename record stored a bare nickname, which decodes with
-                // an empty account id; resolve it through contacts. A structured
-                // entry already carries its account id.
-                if t.account_id.is_empty() {
-                    ConclaveTrustee {
-                        account_id: resolve(&t.nick).unwrap_or_else(|| t.nick.clone()),
+            .any(|t| t.account_id.is_empty() || t.account_id == t.nick);
+        let missing_self = !record
+            .trustees
+            .iter()
+            .any(|t| t.account_id == local_account);
+        if !needs && !missing_self {
+            return Ok(false);
+        }
+
+        // Resolve what we can; remember which entries stay unresolved.
+        let mut resolved: Vec<ConclaveTrustee> = Vec::with_capacity(record.trustees.len());
+        let mut unresolved: Vec<usize> = Vec::new();
+        for t in &record.trustees {
+            let account_id = if t.account_id.is_empty() || t.account_id == t.nick {
+                resolve(&t.nick)
+            } else {
+                Some(t.account_id.clone())
+            };
+            match account_id {
+                Some(account_id) => resolved.push(ConclaveTrustee {
+                    account_id,
+                    nick: t.nick.clone(),
+                    state: t.state,
+                }),
+                None => {
+                    unresolved.push(resolved.len());
+                    resolved.push(ConclaveTrustee {
+                        account_id: t.account_id.clone(),
                         nick: t.nick.clone(),
-                        state: TrusteeState::Joined,
-                    }
-                } else {
-                    t.clone()
+                        state: t.state,
+                    });
                 }
-            })
-            .collect();
-        record.trustees = trustees;
+            }
+        }
+
+        // The local account is always a member of a conclave in its own vault,
+        // and it never resolves through contacts. So one unresolved entry is the
+        // local account's nickname; zero means it was absent from the legacy
+        // list. More than one is ambiguous (the others are strangers with no
+        // contact), so the local account is added and those entries are left as
+        // they are.
+        if !resolved.iter().any(|t| t.account_id == local_account) {
+            if unresolved.len() == 1 {
+                let i = unresolved[0];
+                resolved[i].account_id = local_account.to_string();
+                resolved[i].state = TrusteeState::Joined;
+            } else {
+                resolved.push(ConclaveTrustee {
+                    account_id: local_account.to_string(),
+                    nick: String::new(),
+                    state: TrusteeState::Joined,
+                });
+            }
+        }
+
+        record.trustees = resolved;
         if record.convener.is_empty() {
-            record.convener = convener.to_string();
+            record.convener = local_account.to_string();
         }
         self.save(master)?;
         Ok(true)
@@ -594,6 +599,41 @@ impl ChatLog {
             outgoing,
             from: from.map(|f| f.to_string()),
             body: body.to_string(),
+            file: None,
+            ts_ms: now_ms(),
+        });
+        self.save(master)?;
+        Ok(true)
+    }
+
+    /// Append a file message to a conclave's log.
+    ///
+    /// The bytes are already stored as an encrypted vault blob; this records the
+    /// reference so the message can be reopened after a restart. Mirrors
+    /// [`append_file`](Self::append_file) for 1:1 chat.
+    pub fn append_conclave_file(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        conclave_id: &str,
+        outgoing: bool,
+        from: Option<&str>,
+        name: &str,
+        blob_id: &BlobId,
+        size: u64,
+    ) -> Result<bool, Error> {
+        let Some(conclave) = self.file.conclaves.iter_mut().find(|m| m.id == conclave_id) else {
+            return Ok(false);
+        };
+        conclave.messages.push(ConclaveMessage {
+            id: Uuid::new_v4().to_string(),
+            outgoing,
+            from: from.map(|f| f.to_string()),
+            body: String::new(),
+            file: Some(ConclaveFileRecord {
+                name: name.to_string(),
+                blob_id_hex: hex::encode(blob_id.0),
+                size,
+            }),
             ts_ms: now_ms(),
         });
         self.save(master)?;
@@ -937,12 +977,170 @@ mod tests {
             .unwrap();
         assert!(hydrated);
         let c = log.conclave("m-1").unwrap();
-        assert_eq!(c.trustees.len(), 1);
-        assert_eq!(c.trustees[0].account_id, "bob-id");
-        assert_eq!(c.trustees[0].state, TrusteeState::Joined);
+        // The resolved contact, plus the local account, which the legacy list
+        // never carried because it is not its own contact.
+        assert_eq!(c.trustees.len(), 2);
+        assert!(c.is_joined("self"));
+        assert_eq!(c.trustee("bob-id").unwrap().nick, "bob");
+        assert_eq!(c.trustee("bob-id").unwrap().state, TrusteeState::Joined);
         assert_eq!(c.convener, "self");
         // A second hydration is a no-op.
         assert!(!log.hydrate_trustees(&master, "m-1", "self", |_| None).unwrap());
+    }
+
+    /// The pre-existing "Daily sync" shape: the legacy nickname list names the
+    /// local account under its own nickname alongside a contact. The local
+    /// account's entry must resolve to the local account id, not keep the
+    /// nickname, or `is_joined` is false and the conclave cannot be sent in.
+    /// This is the regression that made a pre-consent vault unusable.
+    #[test]
+    fn a_legacy_record_resolves_the_local_accounts_own_nickname() {
+        let dir =
+            std::env::temp_dir().join(format!("hush-conclave-hydrate-self-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        assert!(
+            log.create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
+                .unwrap()
+        );
+        log.update_conclave(&master, "m-1", |c| {
+            c.trustees = vec![
+                trustee("", "alice", TrusteeState::Joined),
+                trustee("", "bob", TrusteeState::Joined),
+            ];
+        })
+        .unwrap();
+
+        // "alice" is the local account; it is not a contact, so `resolve` cannot
+        // place it.
+        let hydrated = log
+            .hydrate_trustees(&master, "m-1", "alice-id", |nick| {
+                (nick == "bob").then(|| "bob-id".to_string())
+            })
+            .unwrap();
+        assert!(hydrated);
+        let c = log.conclave("m-1").unwrap();
+        assert_eq!(c.trustees.len(), 2);
+        assert!(c.is_joined("alice-id"), "the local account must be joined");
+        assert!(c.is_joined("bob-id"));
+        assert_eq!(c.convener, "alice-id");
+        // The nickname is no longer masquerading as an account id.
+        assert!(c.trustee("alice").is_none());
+    }
+
+    /// A vault that the *old* hydration already touched has the local account's
+    /// nickname written into `account_id` (the old fallback). That entry must be
+    /// re-processed so the vault self-heals rather than staying unusable.
+    #[test]
+    fn an_already_hydrated_fallback_account_id_self_heals() {
+        let dir = std::env::temp_dir()
+            .join(format!("hush-conclave-hydrate-heal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let master = [7u8; MASTER_KEY_LEN];
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        assert!(
+            log.create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
+                .unwrap()
+        );
+        // The shape the old hydration left: the local account's nickname as its
+        // own account id, next to a properly resolved contact.
+        log.update_conclave(&master, "m-1", |c| {
+            c.trustees = vec![
+                trustee("alice", "alice", TrusteeState::Joined),
+                trustee("bob-id", "bob", TrusteeState::Joined),
+            ];
+        })
+        .unwrap();
+
+        let hydrated = log
+            .hydrate_trustees(&master, "m-1", "alice-id", |_| None)
+            .unwrap();
+        assert!(hydrated);
+        let c = log.conclave("m-1").unwrap();
+        assert_eq!(c.trustees.len(), 2);
+        assert!(c.is_joined("alice-id"));
+        assert!(c.is_joined("bob-id"));
+        // Now idempotent: nothing left to heal.
+        assert!(!log.hydrate_trustees(&master, "m-1", "alice-id", |_| None).unwrap());
+    }
+
+    /// The two legacy copies of one conclave disagreed: one vault's nickname list
+    /// named the local account alongside the contact, the other named only the
+    /// contact. Hydration has to bring both to the same trustee set, or the peers
+    /// still disagree (2 trustees vs 1) after the fix.
+    #[test]
+    fn both_legacy_shapes_hydrate_to_the_same_trustee_set() {
+        let dir = std::env::temp_dir().join(format!("hush-conclave-hydrate-agree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let master = [7u8; MASTER_KEY_LEN];
+
+        // Alice's copy: the legacy list named her own nickname too.
+        let alice_dir = dir.join("alice");
+        fs::create_dir_all(&alice_dir).unwrap();
+        let mut alice_log = ChatLog::load(&alice_dir, &master).unwrap();
+        assert!(
+            alice_log
+                .create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
+                .unwrap()
+        );
+        alice_log
+            .update_conclave(&master, "m-1", |c| {
+                c.trustees = vec![
+                    trustee("", "alice", TrusteeState::Joined),
+                    trustee("", "bob", TrusteeState::Joined),
+                ];
+            })
+            .unwrap();
+        alice_log
+            .hydrate_trustees(&master, "m-1", "alice-id", |nick| {
+                (nick == "bob").then(|| "bob-id".to_string())
+            })
+            .unwrap();
+
+        // Bob's copy: only alice was listed; bob's own entry was absent.
+        let bob_dir = dir.join("bob");
+        fs::create_dir_all(&bob_dir).unwrap();
+        let mut bob_log = ChatLog::load(&bob_dir, &master).unwrap();
+        assert!(
+            bob_log
+                .create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
+                .unwrap()
+        );
+        bob_log
+            .update_conclave(&master, "m-1", |c| {
+                c.trustees = vec![trustee("", "alice", TrusteeState::Joined)];
+            })
+            .unwrap();
+        bob_log
+            .hydrate_trustees(&master, "m-1", "bob-id", |nick| {
+                (nick == "alice").then(|| "alice-id".to_string())
+            })
+            .unwrap();
+
+        let roster = |log: &ChatLog| {
+            let mut v: Vec<(String, TrusteeState)> = log
+                .conclave("m-1")
+                .unwrap()
+                .trustees
+                .iter()
+                .map(|t| (t.account_id.clone(), t.state))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(
+            roster(&alice_log),
+            vec![
+                ("alice-id".to_string(), TrusteeState::Joined),
+                ("bob-id".to_string(), TrusteeState::Joined),
+            ]
+        );
+        assert_eq!(roster(&alice_log), roster(&bob_log));
     }
 
     #[test]

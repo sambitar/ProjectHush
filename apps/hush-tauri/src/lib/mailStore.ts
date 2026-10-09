@@ -28,13 +28,6 @@ export interface MailMessage {
   createdAt: number;
   /** `queued` is mail the relay refused; the daemon retries it from the Outbox. */
   state: "sent" | "queued";
-  /**
-   * Set when this went to an address with no Hush account.
-   *
-   * The delivery id is what the pickup link is rebuilt from, so a sender can
-   * re-share a link they lost without re-sending the message.
-   */
-  external?: { to: string; deliveryId: string; expiresUnix: number };
 }
 
 export interface MailDraft {
@@ -89,17 +82,12 @@ export function setKnownContacts(nicks: string[]): void {
 
 /** Whether a message belongs to someone who is still a contact. */
 function fromKnownContact(m: MailMessage): boolean {
-  // A drop goes to a typed address, not a contact, so the contact list must not
-  // hide it.
-  if (m.external) return true;
   return knownContacts === null || knownContacts.has(m.contactNick);
 }
 
 /** Whether a draft is addressed to someone who is still a contact. */
 function draftToKnownContact(d: MailDraft): boolean {
   if (knownContacts === null) return true;
-  // A typed external address is not a contact nickname, so it is never hidden.
-  if (d.to.includes("@")) return true;
   return knownContacts.has(d.to);
 }
 
@@ -141,13 +129,6 @@ export function loadMailbox(
       attachments: attachmentsOf(r.payload.attachments),
       createdAt: r.ts_ms,
       state: r.payload.state,
-      external: r.payload.external
-        ? {
-            to: r.payload.external.to,
-            deliveryId: r.payload.external.delivery_id,
-            expiresUnix: r.payload.external.expires_unix,
-          }
-        : undefined,
     });
   }
 
@@ -237,16 +218,21 @@ export function searchMessages(rows: MailMessage[], query: string): MailMessage[
   );
 }
 
-/** One conversation, oldest first — the order you read it in. */
+/**
+ * One conversation, newest first — classic email style, where a reply shows at
+ * the top of the thread above the mail it answers.
+ */
 export function getThread(threadId: string): MailMessage[] {
   return messages
     .filter((m) => m.threadId === threadId && fromKnownContact(m))
-    .sort((a, b) => a.createdAt - b.createdAt);
+    .sort((a, b) => b.createdAt - a.createdAt);
 }
 
 /** A thread's display subject: the earliest message that set one. */
 export function threadSubject(threadId: string): string {
-  return getThread(threadId).find((m) => m.subject)?.subject || "(no subject)";
+  // The thread is newest first, so the earliest subject sits at the end.
+  const msgs = getThread(threadId).filter((m) => m.subject);
+  return msgs[msgs.length - 1]?.subject || "(no subject)";
 }
 
 /** The one-line summary shown under the subject in the list. */

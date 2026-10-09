@@ -274,6 +274,7 @@ pub fn invite_from_bundle(
     queue_id: &str,
     queue_token: &str,
     handle: Option<&str>,
+    vault_name: Option<&str>,
     bundle: &PreKeyBundle,
 ) -> Result<InvitePayload, Error> {
     let pre_key_id = bundle.pre_key_id().map_err(|_| Error::Corrupt)?;
@@ -314,6 +315,7 @@ pub fn invite_from_bundle(
             .map_err(|_| Error::Corrupt)?
             .to_vec(),
         handle: handle.map(|h| h.to_string()),
+        vault: vault_name.map(|v| v.to_string()),
     })
 }
 

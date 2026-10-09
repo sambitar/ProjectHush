@@ -22,6 +22,11 @@ pub enum RelayError {
     BadRequest,
     #[error("internal")]
     Internal,
+    /// The notification could not be handed to the mail transport. Distinct from
+    /// `Internal` so a caller can tell "the relay broke" from "the mail server
+    /// refused the message".
+    #[error("mail: {0}")]
+    Mail(String),
 }
 
 impl RelayError {
@@ -34,6 +39,7 @@ impl RelayError {
             RelayError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             RelayError::BadRequest => StatusCode::BAD_REQUEST,
             RelayError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            RelayError::Mail(_) => StatusCode::BAD_GATEWAY,
         }
     }
 }

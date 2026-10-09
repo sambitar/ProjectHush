@@ -17,7 +17,7 @@
 export interface ContactPickerItem {
   /** Written back on selection: the contact's nickname. */
   nickname: string;
-  /** What the user reads, e.g. "Bob (bob@myserver.com)". */
+  /** What the user reads, e.g. "Bob (bob@hush)". */
   label: string;
   /** Extra text the filter matches, on top of the label (e.g. the raw nickname). */
   keywords?: string;
@@ -63,7 +63,7 @@ let pickerUid = 0;
 
 /**
  * Case- and accent-insensitive fold, so "alvaro" finds "Álvaro" and "bob@"
- * finds "bob@myserver.com". `NFD` splits a letter from its combining mark and
+ * finds "bob@hush". `NFD` splits a letter from its combining mark and
  * `\p{M}` drops the mark; `toLowerCase` handles case. This is the substring
  * analogue of the `localeCompare(..., { sensitivity: "base" })` used to order
  * Trusts.

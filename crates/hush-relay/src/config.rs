@@ -27,6 +27,7 @@ impl RelayConfig {
             blob_ttl: Duration::from_secs(1),
             rate_limit_max: 3,
             rate_limit_window: Duration::from_secs(60),
+            ..Self::default()
         }
     }
 }

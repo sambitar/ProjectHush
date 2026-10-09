@@ -42,14 +42,22 @@ async fn a_handle_round_trips_through_an_invite() {
 
     alice.set_mail_handle("Sandy").await.unwrap();
     assert_eq!(alice.mail_handle(), Some("sandy"));
-    assert_eq!(alice.mail_address().as_deref(), Some("sandy@myserver.com"));
+    // No vault name was set, so the address uses the default vault name.
+    assert_eq!(alice.mail_address().as_deref(), Some("sandy@hush"));
+    alice.set_vault_name("Quiet-Harbor").await.unwrap();
+    assert_eq!(alice.mail_address().as_deref(), Some("sandy@quiet-harbor"));
 
     let invite = alice.invite().await.unwrap();
     let decoded = InvitePayload::decode(&invite).unwrap();
     assert_eq!(decoded.handle.as_deref(), Some("sandy"));
+    assert_eq!(decoded.vault.as_deref(), Some("quiet-harbor"));
 
     bob.add_contact("alice", &invite).await.unwrap();
     assert_eq!(bob.contacts()[0].mail_handle.as_deref(), Some("sandy"));
+    assert_eq!(
+        bob.contacts()[0].mail_vault.as_deref(),
+        Some("quiet-harbor")
+    );
 }
 
 #[tokio::test]

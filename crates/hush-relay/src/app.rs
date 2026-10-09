@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::Response,
     routing::{get, post, put},
     Json, Router,
 };
@@ -72,10 +73,17 @@ async fn get_blob(
     State(state): State<Arc<AppState>>,
     Path((queue_id, blob_id)): Path<(String, String)>,
     headers: HeaderMap,
-) -> Result<Vec<u8>, RelayError> {
+) -> Result<Response, RelayError> {
     let token = bearer_token(&headers)?;
-    let body = state.store.get_blob(&queue_id, token, &blob_id)?;
-    Ok(body)
+    let body = state.store.get_blob(&queue_id, &token, &blob_id)?;
+    // A queue blob is ciphertext and opaque to the relay; never let a client
+    // sniff it as something renderable.
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok(response)
 }
 
 async fn delete_blob(
@@ -84,17 +92,7 @@ async fn delete_blob(
     headers: HeaderMap,
 ) -> Result<StatusCode, RelayError> {
     let token = bearer_token(&headers)?;
-    state.store.delete_blob(&queue_id, token, &blob_id)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn report_queue(
-    State(state): State<Arc<AppState>>,
-    Path(queue_id): Path<String>,
-    headers: HeaderMap,
-) -> Result<StatusCode, RelayError> {
-    let token = bearer_token(&headers)?;
-    state.store.report_queue(&queue_id, token)?;
+    state.store.delete_blob(&queue_id, &token, &blob_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -162,38 +160,23 @@ async fn get_prekey_record(
     state.store.take_prekey_record(&account_id)
 }
 
-/// A delivery id is a 32-character hex capability the sender generates. Rejecting
-/// anything else keeps the table from being usable as arbitrary keyed storage.
-fn validate_delivery_id(id: &str) -> Result<(), RelayError> {
-    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(RelayError::BadRequest);
-    }
-    Ok(())
-}
-
-/// Accept an outsider delivery.
-///
-/// Unauthenticated by design: the id is the capability, and the body is already
-/// ciphertext under a PIN the relay never sees. There is nothing here to
-/// authorize against, and requiring an account would defeat the point of a drop.
-async fn put_drop(
+/// Report a queue as burned: future deliveries to it are refused and the stored
+/// blobs are gone. Authorized with the read token — whoever can read a queue can
+/// burn it; that is the model.
+async fn report_queue(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    body: Bytes,
+    Path(queue_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, RelayError> {
-    validate_delivery_id(&id)?;
-    state.store.put_delivery(&id, &body)?;
+    let token = bearer_token(&headers)?;
+    state.store.report_queue(&queue_id, token)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_drop(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Vec<u8>, RelayError> {
-    validate_delivery_id(&id)?;
-    state.store.get_delivery(&id)
-}
-
+/// The dumb queue relay: blob stores per queue, prekey records, presence.
+///
+/// Mail is members-only, so there is no outsider delivery surface here: every
+/// route requires a queue token or is a signed prekey record.
 pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> {
     let store = Store::open(db_path, config)?;
     let state = Arc::new(AppState { store });
@@ -210,6 +193,5 @@ pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> 
         )
         .route("/q/{queue_id}/report", post(report_queue))
         .route("/q/{queue_id}/{blob_id}", get(get_blob).delete(delete_blob))
-        .route("/drop/{id}", put(put_drop).get(get_drop))
         .with_state(state))
 }

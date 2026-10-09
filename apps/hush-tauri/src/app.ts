@@ -73,6 +73,29 @@ import {
   loadPendingInvites,
   type Conclave,
 } from "./lib/conclaveStore";
+import {
+  dropById,
+  verifiedCount,
+  visibleDrops,
+} from "./lib/drops/registry";
+import {
+  isOpenable,
+  verificationDetail,
+  verificationLabel,
+} from "./lib/drops/verification";
+import type { Drop } from "./lib/drops/types";
+import {
+  closeDrop,
+  devEnabled,
+  dropsAvailable,
+  openDrop,
+  openState,
+  torStart,
+  torStatus,
+  type TorPhase,
+  type TorStatus,
+} from "./lib/drops/tauri";
+import { hueFromKey } from "./lib/hash";
 import { icon, type IconName } from "./lib/icons";
 import { avatarWithPresence, createAvatarEl } from "./components/ui/Avatar";
 import { RichTextEditor } from "./components/ui/RichTextEditor";
@@ -81,7 +104,15 @@ import { bodyToDisplayHtml, isBlankHtml } from "./lib/richText";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
 import QRCode from "qrcode";
 
-type Rail = "chats" | "trusts" | "conclaves" | "mail" | "files" | "vault" | "settings";
+type Rail =
+  | "chats"
+  | "trusts"
+  | "conclaves"
+  | "mail"
+  | "drops"
+  | "files"
+  | "vault"
+  | "settings";
 type SettingsSection =
   | "appearance"
   | "profile"
@@ -95,24 +126,10 @@ const MAX_MAIL_ATTACHMENTS = 8;
 const MAX_MAIL_BYTES = 256 * 1024;
 
 /**
- * Matches `MIN_DROP_PIN_LEN` in `hush-core`.
- *
- * Duplicated on purpose rather than fetched: the check is a courtesy that saves
- * a round trip, and the daemon enforces the real floor either way, so a stale
- * copy here can only ever be more permissive than the truth.
+ * Matches `DEFAULT_VAULT_NAME` in `hush-core`: the suffix for a vault that has
+ * no name of its own yet (or a contact whose invite predates vault naming).
  */
-const MIN_DROP_PIN_LEN = 8;
-
-/**
- * Matches `DROP_PUBLIC_KEY_PREFIX` in `hush-core`.
- *
- * The drop public-key mode is a versioned, pasteable string. Checking the prefix
- * and shape here catches a pasted invite or a half-copied key before a round
- * trip; the daemon still validates the point itself.
- */
-const DROP_PUBLIC_KEY_PREFIX = "hush-drop-pk-v1:";
-/** 32 raw bytes, base64url without padding, is exactly 43 characters. */
-const DROP_PUBLIC_KEY_BODY_LEN = 43;
+const DEFAULT_VAULT_NAME = "hush";
 
 const MAIL_FOLDER_LABEL: Record<MailFolder, string> = {
   inbox: "Inbox",
@@ -137,6 +154,22 @@ const MAIL_EMPTY: Record<MailFolder, string> = {
 /** `Re:` a subject, without stacking prefixes on an existing reply. */
 function reSubject(subject: string): string {
   return /^re:/i.test(subject.trim()) ? subject : `Re: ${subject}`;
+}
+
+/** Human wording for the Tor state. Accurate, not reassuring. */
+function torPhaseLabel(phase: TorPhase): string {
+  switch (phase) {
+    case "ready":
+      return "Tor Connected";
+    case "starting":
+      return "Connecting to Tor";
+    case "failed":
+      return "Tor Failed";
+    case "unavailable":
+      return "Tor Unavailable";
+    default:
+      return "Tor Disconnected";
+  }
 }
 
 export class App {
@@ -182,53 +215,6 @@ export class App {
   private mailComposeSubject = "";
   private mailComposeBody = "";
   /**
-   * Which kind of recipient compose is addressing.
-   *
-   * Internal picks a contact, and the message goes through the encrypted
-   * session. External types an address, and the message is sealed under a PIN
-   * and parked on the relay instead — a different transport, not a different
-   * field.
-   */
-  private mailComposeMode: "internal" | "external" = "internal";
-  /** The typed address for an external send. */
-  private mailComposeExternalTo = "";
-  /**
-   * The delivery PIN for an external send.
-   *
-   * Held in memory only. It is never written to a draft and never sent to the
-   * daemon except on the send itself, because the whole point is that it travels
-   * to the recipient through a channel the link does not use.
-   */
-  private mailComposePin = "";
-  /**
-   * Which credential an external drop is sealed under.
-   *
-   * PIN is the original mode: the sender chooses a secret and shares it out of
-   * band. Public key is the second: the recipient publishes a key and the
-   * sender pastes it, so no shared secret ever changes hands.
-   */
-  private mailComposeDropMode: "pin" | "publickey" = "pin";
-  /**
-   * The recipient's pasteable drop public key for an external send.
-   *
-   * Held in memory only, like the PIN. It is a public value, but persisting it
-   * would let a stale key outlive the send that used it.
-   */
-  private mailComposePublicKey = "";
-  /**
-   * The link from the last successful drop.
-   *
-   * Set instead of navigating away, because the send is not finished until the
-   * sender has the link: the panel stays up until they say they have copied it.
-   */
-  private mailDropResult: {
-    link: string;
-    to: string;
-    expiresUnix: number;
-    /** Which credential the drop was sealed under, so the panel says the right thing. */
-    mode: "pin" | "publickey";
-  } | null = null;
-  /**
    * Attachments held for the open compose.
    *
    * Bytes rather than refs, because both save and send post the bytes, and a
@@ -236,7 +222,29 @@ export class App {
    */
   private mailComposeFiles: { name: string; dataBase64: string; size: number }[] = [];
   private mailHandle: string | null = null;
-  private mailDomain = "myserver.com";
+  private vaultName = DEFAULT_VAULT_NAME;
+
+  // ------------------------------------------------------------------ drops
+  /** Tor status shown on the Drops rail and in the open-Drop panel. */
+  private dropsTor: TorStatus = {
+    phase: "stopped",
+    socks_port: null,
+    binary: null,
+    message: null,
+  };
+  private dropsPollTimer: number | null = null;
+  /** Whether the backend will allow the development/test Drop on this machine. */
+  private dropsDevAllowed = false;
+  /** Whether to reveal directory entries whose address is not yet verified. */
+  private dropsShowUnverified = false;
+  /** The id of the Drop open in its own window, if any. */
+  private dropsOpenId: string | null = null;
+  /** The Drop whose Open request is in flight, so only that card says so. */
+  private dropsOpeningId: string | null = null;
+  /** True while an explicit Tor connect is in flight. */
+  private dropsTorBusy = false;
+  /** The last Drop error, shown inline rather than as a toast. */
+  private dropsError: string | null = null;
   /**
    * The contact whose Delete confirmation is open, if any.
    *
@@ -356,7 +364,7 @@ export class App {
         this.selectedNick = this.contacts[0].nickname;
       }
       this.mailHandle = status.mail_handle ?? null;
-      this.mailDomain = status.mail_domain ?? "myserver.com";
+      this.vaultName = status.vault_name ?? DEFAULT_VAULT_NAME;
       await this.reloadMailbox();
       await this.reloadConclaves();
     } catch {
@@ -491,6 +499,7 @@ export class App {
   private render(): void {
     this.root.innerHTML = "";
     if (!this.status || this.status.locked) {
+      this.stopDropsPoll();
       this.root.appendChild(this.renderUnlock());
       return;
     }
@@ -507,6 +516,8 @@ export class App {
     } else if (this.rail === "mail") {
       shell.appendChild(this.renderMailFolders());
       shell.appendChild(this.renderMailMain());
+    } else if (this.rail === "drops") {
+      shell.appendChild(this.renderDrops());
     } else if (this.rail === "files") {
       shell.appendChild(this.renderFiles());
     } else if (this.rail === "vault") {
@@ -666,6 +677,13 @@ export class App {
           if (changed && this.rail === "conclaves" && !this.conclaveCreateOpen) this.render();
         });
       }
+      if (id === "drops") {
+        // Tor state lives in the shell, so poll it while the rail is up.
+        this.startDropsPoll();
+        void this.refreshDrops();
+      } else {
+        this.stopDropsPoll();
+      }
     };
     return b;
   }
@@ -684,6 +702,7 @@ export class App {
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
     rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
     rail.appendChild(this.railBtn("mail", "Mail", "mail", hasUnreadMail(this.mailPrefs())));
+    rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
     rail.appendChild(spacer);
@@ -1045,6 +1064,356 @@ export class App {
     }
   }
 
+  // ---------------------------------------------------------------- drops
+  //
+  // Drops are external anonymous-submission sites, usually SecureDrop. Hush
+  // never proxies them: the shell opens a dedicated, capability-less window
+  // whose WebKit context is pointed at a local Tor SOCKS port. This rail is the
+  // directory and the status surface around that window — nothing here talks to
+  // the Hush relay about a Drop.
+
+  private startDropsPoll(): void {
+    if (this.dropsPollTimer !== null) return;
+    this.dropsPollTimer = window.setInterval(() => void this.refreshDrops(), 2500);
+  }
+
+  private stopDropsPoll(): void {
+    if (this.dropsPollTimer !== null) clearInterval(this.dropsPollTimer);
+    this.dropsPollTimer = null;
+  }
+
+  /** Pull Tor and open-window state; repaint only when something changed. */
+  private async refreshDrops(): Promise<void> {
+    const [tor, open, dev] = await Promise.all([
+      torStatus(),
+      openState(),
+      devEnabled(),
+    ]);
+    const openId = open.open ? open.id : null;
+    const changed =
+      tor.phase !== this.dropsTor.phase ||
+      tor.message !== this.dropsTor.message ||
+      openId !== this.dropsOpenId ||
+      dev !== this.dropsDevAllowed;
+    this.dropsTor = tor;
+    this.dropsOpenId = openId;
+    this.dropsDevAllowed = dev;
+    if (changed && this.rail === "drops") this.render();
+  }
+
+  /** Bring Tor up explicitly and surface the reason if it cannot. */
+  private async connectTor(): Promise<void> {
+    if (this.dropsTorBusy) return;
+    this.dropsTorBusy = true;
+    this.dropsError = null;
+    this.render();
+    try {
+      const status = await torStart(120_000);
+      this.dropsTor = status;
+      if (status.phase === "ready") {
+        this.announce("Tor connected.");
+      } else if (status.message) {
+        this.dropsError = status.message;
+      }
+    } finally {
+      this.dropsTorBusy = false;
+      if (this.rail === "drops") this.render();
+    }
+  }
+
+  private renderDrops(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane drops-pane";
+
+    const head = document.createElement("div");
+    head.className = "trusts-head drops-head";
+    const titles = document.createElement("div");
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.textContent = "Drops";
+    const sub = document.createElement("p");
+    sub.className = "muted text-13";
+    sub.style.marginTop = "var(--space-2)";
+    const count = verifiedCount();
+    sub.textContent = count
+      ? `${count} verified ${
+          count === 1 ? "destination" : "destinations"
+        }. Opened from this device through Tor — the Hush relay is not used.`
+      : "Anonymous submission channels. Opened from this device through Tor — the Hush relay is not used.";
+    titles.append(h, sub);
+    const status = document.createElement("div");
+    status.className = "drops-head-status";
+    status.appendChild(this.dropsTorChip());
+    head.append(titles, status);
+    pane.appendChild(head);
+
+    if (this.dropsOpenId) {
+      const open = dropById(this.dropsOpenId);
+      const banner = document.createElement("div");
+      banner.className = "drops-open-banner";
+      const dot = document.createElement("span");
+      dot.className = `drops-tor-dot ${this.dropsTor.phase}`;
+      const text = document.createElement("div");
+      text.className = "drops-open-text";
+      const line1 = document.createElement("div");
+      line1.className = "text-15";
+      line1.textContent = open
+        ? `${open.name} is open in its own window.`
+        : "A Drop is open in its own window.";
+      const line2 = document.createElement("div");
+      line2.className = "muted text-13";
+      line2.textContent =
+        "Traffic to this Drop is routed through Tor. Hush relay is not used.";
+      text.append(line1, line2);
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "btn-secondary pressable";
+      close.textContent = "Close Drop";
+      close.onclick = () => void this.closeOpenDrop();
+      banner.append(dot, text, close);
+      pane.appendChild(banner);
+    }
+
+    if (this.dropsError) {
+      const err = document.createElement("p");
+      err.className = "drops-error";
+      err.textContent = this.dropsError;
+      pane.appendChild(err);
+    }
+
+    const controls = document.createElement("div");
+    controls.className = "drops-controls";
+
+    const unverified = document.createElement("label");
+    unverified.className = "drops-toggle text-13";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = this.dropsShowUnverified;
+    cb.onchange = () => {
+      this.dropsShowUnverified = cb.checked;
+      this.render();
+    };
+    unverified.append(cb, document.createTextNode("Show unverified entries"));
+    controls.appendChild(unverified);
+
+    if (this.dropsDevAllowed) {
+      const dev = document.createElement("span");
+      dev.className = "drops-dev-note text-12";
+      dev.textContent = "Development Drops enabled (HUSH_DROPS_DEV=1)";
+      controls.appendChild(dev);
+    }
+
+    if (!dropsAvailable()) {
+      const note = document.createElement("span");
+      note.className = "drops-dev-note text-12";
+      note.textContent = "Open Drops in the Hush desktop app";
+      controls.appendChild(note);
+    } else if (this.dropsTor.phase !== "ready") {
+      // Tor starts on demand when a real Drop opens; this button exists so the
+      // connection can be brought up and seen before that, and retried after a
+      // failure.
+      const connect = document.createElement("button");
+      connect.type = "button";
+      connect.className = "btn-secondary pressable";
+      connect.disabled = this.dropsTorBusy;
+      connect.textContent = this.dropsTorBusy
+        ? "Connecting to Tor…"
+        : "Connect Tor";
+      connect.onclick = () => void this.connectTor();
+      controls.appendChild(connect);
+    }
+
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "drops-refresh pressable";
+    refresh.setAttribute("aria-label", "Refresh Tor status");
+    refresh.title = "Refresh Tor status";
+    refresh.appendChild(icon("refresh"));
+    refresh.onclick = () => void this.refreshDrops();
+    controls.appendChild(refresh);
+    pane.appendChild(controls);
+
+    const drops = visibleDrops({
+      includeUnverified: this.dropsShowUnverified,
+      includeDev: this.dropsDevAllowed,
+    });
+
+    if (drops.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state";
+      const t = document.createElement("h2");
+      t.className = "text-22";
+      t.textContent = "No verified Drops yet";
+      const p = document.createElement("p");
+      p.className = "muted";
+      p.textContent =
+        "Verified SecureDrop destinations appear here once their onion address is confirmed against a trusted source.";
+      empty.append(t, p);
+      pane.append(empty, this.dropsFootnote());
+      return pane;
+    }
+
+    const grid = document.createElement("div");
+    grid.className = "bento drops-grid";
+    for (const d of drops) grid.appendChild(this.dropCard(d));
+    pane.append(grid, this.dropsFootnote());
+    return pane;
+  }
+
+  /** One Drop as a card, matching the Trusts card rhythm. */
+  private dropCard(d: Drop): HTMLElement {
+    const card = document.createElement("div");
+    card.className = `tile drop-card${d.devOnly ? " is-dev" : ""}`;
+
+    const top = document.createElement("div");
+    top.className = "drop-card-top";
+    top.appendChild(this.dropAvatar(d));
+
+    const verified = d.verified && !d.devOnly;
+    const badge = document.createElement("span");
+    badge.className = `drop-badge ${
+      d.devOnly ? "dev" : verified ? "verified" : "unverified"
+    }`;
+    badge.textContent = d.devOnly ? "Test" : verified ? "✓ Verified" : "⚠ Unverified";
+    top.appendChild(badge);
+
+    // Name and org sit on their own full-width lines under the avatar row so
+    // long names are never cut off next to the icon.
+    const meta = document.createElement("div");
+    meta.className = "drop-card-meta";
+    const name = document.createElement("div");
+    name.className = "text-17 drop-card-name";
+    name.textContent = d.name;
+    const org = document.createElement("div");
+    org.className = "muted text-13 drop-card-org";
+    org.textContent = d.organization;
+    meta.append(name, org);
+
+    const desc = document.createElement("p");
+    desc.className = "muted text-13 drop-card-desc";
+    desc.textContent = d.description;
+
+    const facts = document.createElement("div");
+    facts.className = "drop-facts text-12";
+    const fact = (ic: IconName, text: string): HTMLElement => {
+      const s = document.createElement("span");
+      s.className = "drop-fact";
+      s.append(icon(ic), document.createTextNode(text));
+      return s;
+    };
+    facts.append(
+      fact("globe", d.country),
+      fact("shieldCheck", `Protocol: ${d.protocol}`),
+      fact("files", d.category),
+    );
+
+    const verify = document.createElement("div");
+    verify.className = "drop-verify text-12";
+    verify.textContent = verificationDetail(d);
+
+    const torRow = document.createElement("div");
+    torRow.className = "drop-tor-row";
+    torRow.appendChild(this.dropsTorChip());
+
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "btn-primary pressable drop-open";
+    open.appendChild(icon("externalLink"));
+    const openLabel = document.createElement("span");
+    const busy = this.dropsOpeningId !== null;
+    openLabel.textContent = this.dropsOpeningId === d.id ? "Opening…" : "Open Drop";
+    open.appendChild(openLabel);
+    const canOpen = isOpenable(d) && !busy;
+    open.disabled = !canOpen;
+    if (!isOpenable(d)) open.title = verificationDetail(d);
+    open.onclick = () => void this.openDropCard(d);
+
+    card.append(top, meta, desc, facts, verify, torRow, open);
+    return card;
+  }
+
+  /** Initials avatar in the same visual family as the contact avatars. */
+  private dropAvatar(d: Drop): HTMLElement {
+    const el = document.createElement("div");
+    el.className = "drop-avatar";
+    const hue = hueFromKey(d.id);
+    el.style.background = `linear-gradient(135deg, hsl(${hue},52%,60%), hsl(${
+      (hue + 40) % 360
+    },46%,50%))`;
+    const initials = d.name
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0]?.toUpperCase() ?? "")
+      .join("");
+    el.textContent = initials || "?";
+    return el;
+  }
+
+  /** The Tor status pill, reused on the rail header, cards, and the banner. */
+  private dropsTorChip(): HTMLElement {
+    const shell = dropsAvailable();
+    const phase = this.dropsTor.phase;
+    const chip = document.createElement("span");
+    chip.className = `drops-tor-chip ${shell ? phase : "unavailable"}`;
+    const dot = document.createElement("span");
+    dot.className = "drops-tor-dot";
+    const label = document.createElement("span");
+    // Outside the desktop shell there is no Tor at all, so say that rather than
+    // imply a connection that failed.
+    label.textContent = shell ? torPhaseLabel(phase) : "Desktop app required";
+    chip.append(dot, label);
+    if (!shell) {
+      chip.title =
+        "Drops run Tor from the Hush desktop app, not from a browser tab.";
+    } else if (
+      this.dropsTor.message &&
+      (phase === "failed" || phase === "unavailable")
+    ) {
+      chip.title = this.dropsTor.message;
+    }
+    return chip;
+  }
+
+  private dropsFootnote(): HTMLElement {
+    const p = document.createElement("p");
+    p.className = "drops-footnote faint text-12";
+    p.textContent =
+      "Tor hides the destination from your local network. It does not make a submission anonymous by itself — follow the Drop's own guidance.";
+    return p;
+  }
+
+  private async openDropCard(d: Drop): Promise<void> {
+    if (this.dropsOpeningId) return;
+    this.dropsOpeningId = d.id;
+    this.dropsError = null;
+    this.render();
+    try {
+      if (!dropsAvailable()) {
+        throw new Error("Opening Drops needs the Hush desktop app.");
+      }
+      await openDrop(d);
+      this.dropsOpenId = d.id;
+      this.announce(`${d.name} opened. Traffic is routed through Tor.`);
+    } catch (e) {
+      // The shell returns plain-language reasons; show them as they are.
+      this.dropsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.dropsOpeningId = null;
+      if (this.rail === "drops") this.render();
+    }
+  }
+
+  private async closeOpenDrop(): Promise<void> {
+    try {
+      await closeDrop();
+    } catch (e) {
+      this.dropsError = e instanceof Error ? e.message : String(e);
+    }
+    this.dropsOpenId = null;
+    if (this.rail === "drops") this.render();
+  }
+
   // --------------------------------------------------------------- trusts
 
   /**
@@ -1172,7 +1541,7 @@ export class App {
     if (c.mail_handle) {
       const mail = document.createElement("div");
       mail.className = "muted text-12 trust-card-mail";
-      mail.textContent = `${c.mail_handle}@${this.mailDomain}`;
+      mail.textContent = this.contactAddress(c);
       meta.appendChild(mail);
     }
     top.appendChild(meta);
@@ -1588,7 +1957,24 @@ export class App {
       }
       const b = document.createElement("div");
       b.className = `bubble ${msg.outgoing ? "out" : "in"} tail`;
-      b.textContent = msg.body;
+      if (msg.file) {
+        // A shared file is a file card, not a body: `body` is empty for one.
+        const file = msg.file;
+        const fc = document.createElement("div");
+        fc.className = "file-card";
+        const nameEl = document.createElement("div");
+        nameEl.className = "text-15";
+        nameEl.style.fontWeight = "500";
+        nameEl.textContent = file.name;
+        const sizeEl = document.createElement("div");
+        sizeEl.className = "text-13 muted";
+        sizeEl.textContent = formatBytes(file.size);
+        fc.append(nameEl, sizeEl);
+        attachFileActions(fc, file.name, () => resolveMessageFileBytes(file));
+        b.appendChild(fc);
+      } else {
+        b.textContent = msg.body;
+      }
       group.appendChild(b);
       scroll.appendChild(group);
     }
@@ -1611,6 +1997,24 @@ export class App {
     composer.className = "composer";
     const inner = document.createElement("div");
     inner.className = "composer-inner";
+    // Sharing a file fans one encrypted copy out to every joined trustee, the
+    // same set text goes to. There is no shared history, so it is not backfilled
+    // for a trustee who joins later.
+    const attach = document.createElement("button");
+    attach.type = "button";
+    attach.className = "pressable";
+    attach.title = "Share a file";
+    attach.setAttribute("aria-label", "Share a file");
+    attach.appendChild(icon("attach"));
+    const fileIn = document.createElement("input");
+    fileIn.type = "file";
+    fileIn.hidden = true;
+    attach.onclick = () => fileIn.click();
+    fileIn.onchange = async () => {
+      const f = fileIn.files?.[0];
+      if (f) await this.sendConclaveFile(conclave.id, f);
+      fileIn.value = "";
+    };
     const ta = document.createElement("textarea");
     ta.rows = 1;
     ta.placeholder = "Message conclave";
@@ -1632,7 +2036,7 @@ export class App {
     };
     send.onclick = () =>
       void this.sendConclaveMessage(conclave.id, ta.value.trim(), ta, send);
-    inner.append(ta, send);
+    inner.append(attach, fileIn, ta, send);
     composer.appendChild(inner);
     syncSend();
 
@@ -1711,7 +2115,7 @@ export class App {
       items: this.contacts.map((c) => ({
         nickname: c.nickname,
         label: c.mail_handle
-          ? `${displayNick(c.nickname)} (${c.mail_handle}@${this.mailDomain})`
+          ? `${displayNick(c.nickname)} (${this.contactAddress(c)})`
           : displayNick(c.nickname),
         keywords: c.nickname,
       })),
@@ -1797,7 +2201,7 @@ export class App {
         return {
           nickname: nick,
           label: c?.mail_handle
-            ? `${displayNick(nick)} (${c.mail_handle}@${this.mailDomain})`
+            ? `${displayNick(nick)} (${this.contactAddress(c)})`
             : displayNick(nick),
           keywords: nick,
         };
@@ -1940,6 +2344,32 @@ export class App {
     } catch (e) {
       this.announce(
         e instanceof AppError ? e.message : "Couldn't send. Try again.",
+      );
+    }
+  }
+
+  /**
+   * Share a file into a conclave.
+   *
+   * Mirrors the 1:1 file flow: the bytes go to the daemon, which stores a local
+   * blob and fans one encrypted copy out per joined trustee. The message is
+   * appended to the sender's conclave log by the daemon, so a reload shows it.
+   */
+  private async sendConclaveFile(conclaveId: string, file: File): Promise<void> {
+    if (file.size > MAX_FILE_BYTES) {
+      this.announce(
+        `Files are limited to ${Math.round(MAX_FILE_BYTES / 1024)} KB for now`,
+      );
+      return;
+    }
+    try {
+      const b64 = await fileToBase64(file);
+      await api.sendConclaveFileData(conclaveId, file.name, b64);
+      await this.reloadConclaves();
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't share the file. Try again.",
       );
     }
   }
@@ -2214,7 +2644,7 @@ export class App {
       // so neither may keep showing them.
       this.mailThreadId = null;
       this.mailOpenId = null;
-      if (this.mailComposeMode === "internal" && this.mailComposeTo === nick) {
+      if (this.mailComposeTo === nick) {
         this.mailComposeOpen = false;
         this.mailDraftId = null;
         this.mailComposeTo = "";
@@ -2418,7 +2848,21 @@ export class App {
   }
 
   private mailAddress(): string | null {
-    return this.mailHandle ? `${this.mailHandle}@${this.mailDomain}` : null;
+    return this.mailHandle ? `${this.mailHandle}@${this.vaultName}` : null;
+  }
+
+  /**
+   * A contact's mail address: their handle at their own vault, learned from
+   * their invite. A contact whose invite predates vault naming falls back to
+   * the default vault name rather than this vault's name, which would be a lie
+   * about who the address belongs to.
+   */
+  private contactAddress(c: { mail_handle?: string | null; mail_vault?: string | null }): string {
+    return `${c.mail_handle ?? "?"}@${c.mail_vault ?? DEFAULT_VAULT_NAME}`;
+  }
+
+  private contactByNick(nick: string): ContactDto | undefined {
+    return this.contacts.find((c) => c.nickname === nick);
   }
 
   /** A 14px icon, for the inline marks in list rows. */
@@ -2679,8 +3123,9 @@ export class App {
     const contact =
       msgs.find((m) => !m.outgoing)?.contactNick ?? msgs[0]?.contactNick ?? "";
     const flags = this.mailPrefs();
-    // Actions apply to the message you clicked, falling back to the newest one.
-    const targetId = this.mailOpenId ?? msgs[msgs.length - 1]?.id ?? "";
+    // Actions apply to the message you clicked, falling back to the newest one,
+    // which is at the top of the thread.
+    const targetId = this.mailOpenId ?? msgs[0]?.id ?? "";
 
     const head = document.createElement("div");
     head.className = "mail-read-head";
@@ -2770,7 +3215,9 @@ export class App {
         ...this.mailHeaderField(
           "To",
           m.outgoing
-            ? (m.external?.to ?? displayNick(m.contactNick))
+            ? (this.contactByNick(m.contactNick)
+                ? this.contactAddress(this.contactByNick(m.contactNick)!)
+                : displayNick(m.contactNick))
             : (this.mailAddress() ?? "you"),
         ),
         ...this.mailHeaderField("Date", this.mailDateEl(m.createdAt)),
@@ -2999,13 +3446,6 @@ export class App {
       this.mailThreadId = null;
       this.mailOpenId = null;
     }
-    // Every open starts internal. A reply is always internal, and a draft's
-    // recipient is a contact nickname, so neither can arrive already external.
-    this.mailComposeMode = "internal";
-    this.mailComposePin = "";
-    this.mailComposeDropMode = "pin";
-    this.mailComposePublicKey = "";
-    this.mailDropResult = null;
     // Seed the editable fields from the draft (or the reply) before rendering,
     // so the first paint already has the right values and a later re-render
     // keeps them.
@@ -3050,22 +3490,10 @@ export class App {
     this.mailComposeTo = "";
     this.mailComposeSubject = "";
     this.mailComposeBody = "";
-    this.mailComposeMode = "internal";
-    this.mailComposeExternalTo = "";
-    this.mailComposePin = "";
-    this.mailComposeDropMode = "pin";
-    this.mailComposePublicKey = "";
-    this.mailDropResult = null;
     this.render();
   }
 
   private renderMailCompose(): HTMLElement {
-    // A drop is not finished when it is sent — it is finished when the sender
-    // has the link. Until they dismiss this, the pane shows the link rather
-    // than the form.
-    const dropResult = this.mailDropResult;
-    if (dropResult) return this.renderDropResult(dropResult);
-
     const pane = document.createElement("div");
     pane.className = "main-pane";
     const draft = this.mailDraftId ? draftById(this.mailDraftId) : undefined;
@@ -3092,45 +3520,16 @@ export class App {
     form.className = "mail-compose";
 
     const isReply = !!this.mailReplyThread;
-    const isExternal = this.mailComposeMode === "external";
-
-    // The mode switch. Two buttons rather than a checkbox because neither state
-    // is the "off" one: they are two transports with different rules.
-    const mode = document.createElement("div");
-    mode.className = "mail-to-mode";
-    mode.setAttribute("role", "group");
-    mode.setAttribute("aria-label", "Recipient kind");
-    for (const value of ["internal", "external"] as const) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "mail-to-mode-btn pressable";
-      b.textContent = value === "internal" ? "Internal" : "External";
-      b.setAttribute("aria-pressed", String(this.mailComposeMode === value));
-      // A reply goes back to the contact who wrote, so it cannot become a drop.
-      if (isReply && value === "external") b.disabled = true;
-      b.onclick = () => {
-        if (this.mailComposeMode === value) return;
-        this.mailComposeMode = value;
-        // A PIN or key typed for the other mode would be a leftover, not an
-        // intent, and the drop mode itself resets so the pane always reopens on
-        // the original PIN flow.
-        this.mailComposePin = "";
-        this.mailComposeDropMode = "pin";
-        this.mailComposePublicKey = "";
-        this.render();
-      };
-      mode.appendChild(b);
-    }
 
     // A keyboard-typeable picker: type to narrow, arrow to move, Enter to
     // choose. It reads and writes `this.mailComposeTo`, which is held outside
-    // the DOM so that rebuilding this pane (an attachment load, a mode switch)
-    // cannot forget the recipient.
+    // the DOM so that rebuilding this pane (an attachment load) cannot forget
+    // the recipient.
     const toPicker = new ContactPicker({
       items: this.contacts.map((c) => ({
         nickname: c.nickname,
         label: c.mail_handle
-          ? `${displayNick(c.nickname)} (${c.mail_handle}@${this.mailDomain})`
+          ? `${displayNick(c.nickname)} (${this.contactAddress(c)})`
           : displayNick(c.nickname),
         // The raw nickname stays searchable even when a display-name override
         // hides it from the label.
@@ -3149,96 +3548,7 @@ export class App {
       },
     });
 
-    // A typed address. `type=email` gets the platform keyboard and autofill on
-    // desktop; the daemon re-validates regardless, because a DOM hint is not a
-    // check.
-    const externalTo = document.createElement("input");
-    externalTo.type = "email";
-    externalTo.className = "input-field mail-compose-external-to";
-    externalTo.placeholder = "name@example.com";
-    externalTo.value = this.mailComposeExternalTo;
-    externalTo.oninput = () => {
-      this.mailComposeExternalTo = externalTo.value;
-    };
-
-    const toField = document.createElement("div");
-    toField.className = "mail-compose-to-field";
-    toField.append(mode);
-    toField.appendChild(isExternal ? externalTo : toPicker.element);
-    form.appendChild(this.composeRow("To", toField));
-
-    // The credential field. The PIN is shown, not masked: the sender has to read
-    // it out or write it down, and a field they cannot read makes that
-    // error-prone. It is never stored and never emailed. In public-key mode the
-    // PIN is replaced by the recipient's pasteable key, which the sender got out
-    // of band instead — the shape of the interaction is the same, only the
-    // credential and the crypto differ.
-    let pinInput: HTMLInputElement | null = null;
-    let publicKeyInput: HTMLInputElement | null = null;
-    if (isExternal) {
-      // A second segmented switch, separate from To's. The To switch chooses a
-      // transport; this one chooses the credential the drop is sealed under.
-      const dropMode = document.createElement("div");
-      dropMode.className = "mail-drop-mode";
-      dropMode.setAttribute("role", "group");
-      dropMode.setAttribute("aria-label", "How the drop is sealed");
-      for (const value of ["pin", "publickey"] as const) {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.className = "mail-to-mode-btn pressable";
-        b.textContent = value === "pin" ? "PIN" : "Public key";
-        b.setAttribute("aria-pressed", String(this.mailComposeDropMode === value));
-        b.onclick = () => {
-          if (this.mailComposeDropMode === value) return;
-          this.mailComposeDropMode = value;
-          // The other mode's credential is a leftover, not an intent.
-          this.mailComposePin = "";
-          this.mailComposePublicKey = "";
-          this.render();
-        };
-        dropMode.appendChild(b);
-      }
-
-      const credential = document.createElement("div");
-      credential.className = "mail-compose-to-field";
-      credential.appendChild(dropMode);
-
-      if (this.mailComposeDropMode === "pin") {
-        pinInput = document.createElement("input");
-        pinInput.type = "text";
-        pinInput.className = "input-field mail-compose-pin";
-        pinInput.placeholder = `At least ${MIN_DROP_PIN_LEN} characters`;
-        pinInput.autocomplete = "off";
-        pinInput.spellcheck = false;
-        pinInput.value = this.mailComposePin;
-        pinInput.oninput = () => {
-          this.mailComposePin = pinInput!.value;
-        };
-        const hint = document.createElement("p");
-        hint.className = "text-12 muted mail-compose-hint";
-        hint.textContent =
-          "Give this to the recipient separately — by phone, or in person. It is never emailed and never saved, so a lost PIN means sending again.";
-        credential.append(pinInput, hint);
-        form.appendChild(this.composeRow("PIN", credential));
-      } else {
-        publicKeyInput = document.createElement("input");
-        publicKeyInput.type = "text";
-        publicKeyInput.className = "input-field mail-compose-public-key";
-        publicKeyInput.placeholder = `${DROP_PUBLIC_KEY_PREFIX}…`;
-        publicKeyInput.autocomplete = "off";
-        publicKeyInput.spellcheck = false;
-        publicKeyInput.value = this.mailComposePublicKey;
-        publicKeyInput.oninput = () => {
-          this.mailComposePublicKey = publicKeyInput!.value;
-        };
-        const hint = document.createElement("p");
-        hint.className = "text-12 muted mail-compose-hint";
-        hint.textContent =
-          "Paste the public key the recipient published. No PIN is needed — only their private key opens the drop.";
-        credential.append(publicKeyInput, hint);
-        form.appendChild(this.composeRow("Public key", credential));
-      }
-    }
+    form.appendChild(this.composeRow("To", toPicker.element));
 
     const subj = document.createElement("input");
     subj.className = "input-field mail-compose-subject";
@@ -3320,13 +3630,6 @@ export class App {
     saveDraft.type = "button";
     saveDraft.className = "btn-secondary pressable";
     saveDraft.textContent = "Save draft";
-    // A drop cannot be drafted: a draft is stored in the vault, and the PIN (or
-    // key) must not be. Saving the message without its credential would leave a
-    // draft that cannot be sent, so the button is off rather than quietly lossy.
-    if (isExternal) {
-      saveDraft.disabled = true;
-      saveDraft.title = "A drop cannot be saved as a draft — its PIN or key is never stored.";
-    }
     saveDraft.onclick = () =>
       void this.saveDraft(saveDraft, {
         to: toPicker.value,
@@ -3338,23 +3641,8 @@ export class App {
     const send = document.createElement("button");
     send.type = "button";
     send.className = "btn-primary pressable";
-    send.textContent = isExternal
-      ? "Seal and send"
-      : isReply
-        ? "Send reply"
-        : "Send";
+    send.textContent = isReply ? "Send reply" : "Send";
     send.onclick = () => {
-      if (this.mailComposeMode === "external") {
-        void this.sendToOutsider(send, {
-          to: externalTo.value,
-          subject: subj.value,
-          body: editor.getHtml(),
-          pin: pinInput?.value ?? this.mailComposePin,
-          publicKey: publicKeyInput?.value ?? this.mailComposePublicKey,
-          err,
-        });
-        return;
-      }
       void this.sendMail(send, {
         to: toPicker.value,
         subject: subj.value,
@@ -3419,63 +3707,7 @@ export class App {
     return this.attachmentOrBodyError(body);
   }
 
-  /**
-   * The drop half of the same checks.
-   *
-   * Mirrors `normalize_external_address` in `hush-core` closely enough to catch
-   * the obvious mistakes without a round trip. It is deliberately not a full
-   * address parser: the daemon is the boundary, and refusing an unusual but valid
-   * address here would be worse than letting it through to be checked properly.
-   */
-  private dropError(to: string, pin: string, publicKey: string, body: string): string | null {
-    const addr = to.trim();
-    if (!addr) return "Type the recipient's email address.";
-    if (/\s/.test(addr) || addr.split("@").length !== 2) {
-      return "That does not look like an email address.";
-    }
-    const [local, domain] = addr.split("@");
-    if (!local || !domain.includes(".") || domain.startsWith(".") || domain.endsWith(".")) {
-      return "That does not look like an email address.";
-    }
-    if (domain.toLowerCase() === this.mailDomain.toLowerCase()) {
-      // Sending to this server from the external field would be a drop to
-      // somebody who could have received it as mail, under a weaker guarantee.
-      return `Use Internal to reach @${this.mailDomain} — that goes through the encrypted session instead.`;
-    }
-    // Only the credential for the mode in use is checked, so the PIN floor never
-    // blocks a public-key drop and a key never has to satisfy a PIN rule.
-    const credentialError =
-      this.mailComposeDropMode === "publickey"
-        ? this.dropPublicKeyError(publicKey)
-        : pin.length < MIN_DROP_PIN_LEN
-          ? `The PIN needs at least ${MIN_DROP_PIN_LEN} characters — it is what protects the link if it is forwarded.`
-          : null;
-    if (credentialError) return credentialError;
-    return this.attachmentOrBodyError(body);
-  }
-
-  /**
-   * The public-key half of the credential check.
-   *
-   * Mirrors the shape `decode_public_key` in `hush-core` accepts: a versioned
-   * prefix and 32 raw bytes as unpadded base64url. This is a courtesy that saves
-   * a round trip — the daemon still parses the point and can reject a key whose
-   * bytes are not a canonical X25519 public key.
-   */
-  private dropPublicKeyError(key: string): string | null {
-    const k = key.trim();
-    if (!k) return "Paste the recipient's public key.";
-    if (!k.startsWith(DROP_PUBLIC_KEY_PREFIX)) {
-      return `That does not look like a drop public key — it should start with ${DROP_PUBLIC_KEY_PREFIX}.`;
-    }
-    const body = k.slice(DROP_PUBLIC_KEY_PREFIX.length);
-    if (!/^[A-Za-z0-9_-]+$/.test(body) || body.length !== DROP_PUBLIC_KEY_BODY_LEN) {
-      return "That key is the wrong length or has characters that do not belong — check you copied the whole line.";
-    }
-    return null;
-  }
-
-  /** The checks both transports share: attachment caps, and not sending nothing. */
+  /** The checks a send shares: attachment caps, and not sending nothing. */
   private attachmentOrBodyError(body: string): string | null {
     if (this.mailComposeFiles.length > MAX_MAIL_ATTACHMENTS) {
       return `At most ${MAX_MAIL_ATTACHMENTS} attachments.`;
@@ -3622,176 +3854,6 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't send. Try again.";
     } finally {
       btn.disabled = false;
-    }
-  }
-
-  /**
-   * Seal a message for someone with no account and show the link.
-   *
-   * There is no Outbox here: a drop either reached the relay or it did not, and
-   * "did not" has no retry that could work — the PIN is gone from memory once
-   * this returns, so a queued drop could never be opened by anyone. That is why
-   * a failure is reported rather than deferred.
-   */
-  private async sendToOutsider(
-    btn: HTMLButtonElement,
-    input: {
-      to: string;
-      subject: string;
-      body: string;
-      pin: string;
-      publicKey: string;
-      err: HTMLElement;
-    },
-  ): Promise<void> {
-    input.err.hidden = true;
-    const problem = this.dropError(input.to, input.pin, input.publicKey, input.body);
-    if (problem) {
-      input.err.hidden = false;
-      input.err.textContent = problem;
-      return;
-    }
-    btn.disabled = true;
-    // Sealing is deliberately slow in PIN mode — 600k PBKDF2 iterations — so the
-    // button says what it is doing rather than just going dead.
-    const label = btn.textContent;
-    btn.textContent = "Sealing…";
-    const isKeyMode = this.mailComposeDropMode === "publickey";
-    try {
-      const common = {
-        to: input.to.trim(),
-        subject: input.subject.trim() || undefined,
-        body: input.body,
-        attachments: this.mailComposeFiles.map((f) => ({
-          name: f.name,
-          data_base64: f.dataBase64,
-        })),
-      };
-      // Exactly one credential, by construction: the API type refuses both.
-      const resp = isKeyMode
-        ? await api.sendToOutsider({ ...common, public_key: input.publicKey.trim() })
-        : await api.sendToOutsider({ ...common, pin: input.pin });
-      // The mailbox is reloaded so the message is already in Sent when the
-      // sender leaves the link panel, rather than appearing a poll later.
-      await this.reloadMailbox();
-      this.mailComposeFiles = [];
-      this.mailComposePin = "";
-      this.mailComposePublicKey = "";
-      // The credential is dropped here and nowhere else: the link panel is all
-      // that is left of the send, and re-showing the message must not need it.
-      this.mailDropResult = {
-        link: resp?.link ?? "",
-        // Lowercased to match the address the daemon recorded, so the panel and
-        // the Sent row cannot disagree about who the message went to.
-        to: input.to.trim().toLowerCase(),
-        expiresUnix: resp?.expires_unix ?? 0,
-        mode: isKeyMode ? "publickey" : "pin",
-      };
-      this.render();
-    } catch (e) {
-      input.err.hidden = false;
-      input.err.textContent =
-        e instanceof AppError ? e.message : "Couldn't send. Try again.";
-    } finally {
-      btn.disabled = false;
-      btn.textContent = label;
-    }
-  }
-
-  /**
-   * The link panel, shown in place of the form after a drop goes out.
-   *
-   * It stays up until dismissed because the link is the deliverable: navigating
-   * straight to Sent would hide the one thing the sender needs.
-   */
-  private renderDropResult(result: {
-    link: string;
-    to: string;
-    expiresUnix: number;
-    mode: "pin" | "publickey";
-  }): HTMLElement {
-    const isKeyMode = result.mode === "publickey";
-    const pane = document.createElement("div");
-    pane.className = "main-pane";
-
-    const head = document.createElement("div");
-    head.className = "mail-toolbar";
-    const title = document.createElement("h1");
-    title.className = "text-17";
-    title.textContent = "Send the link";
-    head.appendChild(title);
-    pane.appendChild(head);
-
-    const body = document.createElement("div");
-    body.className = "mail-compose mail-drop-result";
-
-    const lead = document.createElement("p");
-    lead.className = "text-15";
-    lead.textContent = isKeyMode
-      ? `Your message is sealed and waiting. Send this link to ${result.to} — they open it with their private key. No PIN is needed.`
-      : `Your message is sealed and waiting. Send this link to ${result.to}, and give them the PIN separately.`;
-    body.appendChild(lead);
-    const linkRow = document.createElement("div");
-    linkRow.className = "mail-drop-link";
-    const link = document.createElement("input");
-    link.className = "input-field mail-drop-link-input";
-    link.readOnly = true;
-    // Select on focus so the whole link can be copied with one keystroke even if
-    // the clipboard API is unavailable.
-    link.onfocus = () => link.select();
-    link.value = result.link;
-    const copy = document.createElement("button");
-    copy.type = "button";
-    copy.className = "btn-primary pressable";
-    copy.textContent = "Copy link";
-    copy.onclick = () => void this.copyDropLink(result.link, copy);
-    linkRow.append(link, copy);
-    body.appendChild(linkRow);
-
-    const warn = document.createElement("p");
-    warn.className = "text-13 muted mail-compose-hint";
-    warn.textContent = isKeyMode
-      ? `Anyone with this link and the recipient's private key can read the message. It expires ${formatUntil(result.expiresUnix * 1000)}, and it cannot be recalled.`
-      : `Anyone with this link and the PIN can read the message. It expires ${formatUntil(result.expiresUnix * 1000)}, and it cannot be recalled.`;
-    body.appendChild(warn);
-
-    const actions = document.createElement("div");
-    actions.className = "mail-compose-actions";
-    const done = document.createElement("button");
-    done.type = "button";
-    done.className = "btn-secondary pressable";
-    done.textContent = "Done";
-    done.onclick = () => {
-      this.mailDropResult = null;
-      // Land on the message that just went out, so "where did it go?" is
-      // answered by the screen rather than by the folder list.
-      this.mailComposeOpen = false;
-      this.mailComposeExternalTo = "";
-      this.mailComposeSubject = "";
-      this.mailComposeBody = "";
-      this.mailFolder = "sent";
-      const sent = listFolder("sent", this.mailPrefs())[0];
-      this.mailThreadId = sent?.threadId ?? null;
-      this.mailOpenId = null;
-      this.announce("Drop sent");
-      this.render();
-    };
-    actions.appendChild(done);
-    body.appendChild(actions);
-
-    pane.appendChild(body);
-    return pane;
-  }
-
-  private async copyDropLink(link: string, btn: HTMLButtonElement): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(link);
-      this.announce("Link copied");
-    } catch {
-      // Clipboard access can be denied. The field is already selected and
-      // read-only, so the user can still copy it by hand.
-      this.announce("Copy the link from the field above");
-      btn.blur();
     }
   }
 
@@ -3996,15 +4058,10 @@ export class App {
       input.className = "input-field";
       input.placeholder = "sandy";
       input.value = this.mailHandle ?? "";
+      input.maxLength = 64;
       const suffix = document.createElement("span");
-      suffix.className = "muted text-13";
-      suffix.textContent = `@${this.mailDomain}`;
-      const row = document.createElement("div");
-      row.style.display = "flex";
-      row.style.gap = "var(--space-2)";
-      row.style.alignItems = "center";
-      row.style.marginTop = "var(--space-2)";
-      row.append(input, suffix);
+      suffix.className = "muted text-13 handle-suffix";
+      suffix.textContent = `@${this.vaultName}`;
       const err = document.createElement("p");
       err.className = "text-13";
       err.style.color = "var(--danger)";
@@ -4012,8 +4069,10 @@ export class App {
       const save = document.createElement("button");
       save.type = "button";
       save.className = "btn-primary pressable";
-      save.style.marginTop = "var(--space-4)";
-      save.textContent = "Save address";
+      save.textContent = "Save";
+      const row = document.createElement("div");
+      row.className = "handle-edit";
+      row.append(input, suffix, save);
       save.onclick = async () => {
         err.hidden = true;
         const raw = input.value.trim();

@@ -28,6 +28,11 @@ pub struct InvitePayload {
     /// Optional so invites minted before mail still decode.
     #[serde(default)]
     pub handle: Option<String>,
+    /// The sender's vault name — the suffix of their mail address, so a
+    /// contact renders `handle@vaultname` and not `handle@`-something-guessed.
+    /// Optional so invites minted before vault naming still decode.
+    #[serde(default)]
+    pub vault: Option<String>,
 }
 
 impl InvitePayload {

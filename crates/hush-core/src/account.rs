@@ -6,17 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
-
 use crate::backup::{export_vault, import_vault};
 use crate::chat_log::{ChatLog, ChatRecordPayload, ConclaveRecord, MailAttachmentRecord, MailState};
 use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeState};
-use crate::crypto::random_bytes;
 use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
-use crate::drop::{
-    decode_public_key, seal as seal_drop, seal_to_key as seal_drop_to_key, DropAttachment,
-    DropPackage,
-};
 use crate::prekey::PreKeyRecord;
 use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_files_exist, unwrap_master_with_recovery};
 use crate::crypto::{decrypt, encrypt};
@@ -33,69 +26,6 @@ use crate::signal::{
 use crate::signal_persist::import_store;
 use crate::vault::{BlobId, Vault};
 use crate::wire::{decode_relay_blob, encode_relay_blob};
-
-/// How long a drop sits on the relay before it is purged.
-///
-/// The recipient is told to open it soon, and the sender is told the expiry so
-/// they can re-share. A drop is not a mailbox: it is a handoff, and the window is
-/// part of the security argument against guessing the PIN offline.
-pub const DROP_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-
-/// Shortest delivery PIN accepted.
-///
-/// The PIN is not the only lock: the container sits behind a 128-bit random
-/// capability, so brute-forcing it requires the link first. The PIN is what
-/// survives the link leaking — a forwarded email, a shared machine, a screenshot
-/// — and it is sent through a different channel for exactly that reason. Eight
-/// characters is a floor against a PIN so short that the second channel adds
-/// nothing; it is not a claim that a 8-character PIN is strong.
-pub const MIN_DROP_PIN_LEN: usize = 8;
-
-/// What happened to a drop: the relay capability and when it expires. The pickup
-/// link is not here on purpose — the base URL is deployment configuration, which
-/// belongs to the daemon, not to vault state.
-#[derive(Debug, Clone)]
-pub struct OutsiderOutcome {
-    pub delivery_id: String,
-    pub expires_unix: u64,
-}
-
-/// Whether a PIN clears the floor.
-///
-/// Counted in characters, not bytes, so a non-ASCII PIN is measured the way the
-/// person who chose it counts.
-fn pin_is_long_enough(pin: &str) -> bool {
-    pin.chars().count() >= MIN_DROP_PIN_LEN
-}
-
-/// Canonicalize a typed external address, or refuse it.
-///
-/// Deliberately conservative. This is not a full RFC 5322 parser; it rejects the
-/// shapes that are certainly wrong (no `@`, whitespace, no dot in the domain,
-/// two `@`) and returns the address lowercased and trimmed. The domain is not
-/// required to resolve: DNS is the sender's problem, and refusing an unusual but
-/// valid address would be worse than accepting one that bounces.
-fn normalize_external_address(input: &str) -> Result<String, Error> {
-    let addr = input.trim().to_ascii_lowercase();
-    if addr.is_empty() || addr.len() > 320 || addr.contains(char::is_whitespace) {
-        return Err(Error::InvalidAddress);
-    }
-    let mut parts = addr.split('@');
-    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(Error::InvalidAddress);
-    };
-    if local.is_empty()
-        || local.len() > 64
-        || domain.len() < 3
-        || !domain.contains('.')
-        || domain.starts_with('.')
-        || domain.ends_with('.')
-        || domain.contains("..")
-    {
-        return Err(Error::InvalidAddress);
-    }
-    Ok(addr)
-}
 
 /// What happened to a mail send: which thread it belongs to, and whether the
 /// relay actually took it.
@@ -184,6 +114,11 @@ pub struct Contact {
     /// invite. `None` for contacts added before mail, or who never set one.
     #[serde(default)]
     pub mail_handle: Option<String>,
+    /// The contact's vault name, learned from their invite — the suffix of
+    /// their mail address. `None` for contacts whose invite predates vault
+    /// naming; the UI falls back to [`DEFAULT_VAULT_NAME`].
+    #[serde(default)]
+    pub mail_vault: Option<String>,
     /// True after we successfully received at least one message from them (they added our invite).
     pub inbound_ready: bool,
 }
@@ -229,6 +164,8 @@ impl<'de> Deserialize<'de> for Contact {
                 #[serde(default)]
                 mail_handle: Option<String>,
                 #[serde(default)]
+                mail_vault: Option<String>,
+                #[serde(default)]
                 inbound_ready: bool,
             },
             Devices {
@@ -237,6 +174,8 @@ impl<'de> Deserialize<'de> for Contact {
                 devices: Vec<LegacyDevice>,
                 #[serde(default)]
                 mail_handle: Option<String>,
+                #[serde(default)]
+                mail_vault: Option<String>,
                 #[serde(default)]
                 inbound_ready: bool,
             },
@@ -262,6 +201,7 @@ impl<'de> Deserialize<'de> for Contact {
                 delivery_queue_id,
                 delivery_queue_token,
                 mail_handle,
+                mail_vault,
                 inbound_ready,
             } => Contact {
                 nickname,
@@ -272,6 +212,7 @@ impl<'de> Deserialize<'de> for Contact {
                 delivery_queue_id,
                 delivery_queue_token,
                 mail_handle,
+                mail_vault,
                 inbound_ready,
             },
             Repr::Devices {
@@ -279,6 +220,7 @@ impl<'de> Deserialize<'de> for Contact {
                 account_id,
                 devices,
                 mail_handle,
+                mail_vault,
                 inbound_ready,
             } => {
                 // Keep the entry that used to be device 1 (or the first), so the
@@ -296,6 +238,7 @@ impl<'de> Deserialize<'de> for Contact {
                     delivery_queue_id: primary.delivery_queue_id,
                     delivery_queue_token: primary.delivery_queue_token,
                     mail_handle,
+                    mail_vault,
                     inbound_ready,
                 }
             }
@@ -317,6 +260,7 @@ impl<'de> Deserialize<'de> for Contact {
                     delivery_queue_id: None,
                     delivery_queue_token: None,
                     mail_handle,
+                    mail_vault: None,
                     inbound_ready,
                 }
             }
@@ -369,6 +313,13 @@ struct AccountState {
     /// not device material: it is a label, and a restored vault should keep it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mail_handle: Option<String>,
+    /// The vault's own name, chosen when the vault is created. It is the
+    /// right-hand side of this member's mail address (`handle@vaultname`) and
+    /// travels in the invite so contacts can render the address they see.
+    /// `None` for vaults created before naming existed; [`DEFAULT_VAULT_NAME`]
+    /// stands in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_name: Option<String>,
     /// Account ids whose contact was deleted.
     ///
     /// Deleting a contact burns the one per-contact queue it delivered into, so
@@ -421,6 +372,7 @@ impl Account {
             receive_queue_id: None,
             receive_queue_token: None,
             mail_handle: None,
+            vault_name: None,
             revoked: Vec::new(),
             pending_invites: Vec::new(),
         };
@@ -590,11 +542,20 @@ impl Account {
         self.state.mail_handle.as_deref()
     }
 
+    /// The vault's own name as the mail suffix, falling back to
+    /// [`DEFAULT_VAULT_NAME`] for vaults created before naming existed.
+    pub fn vault_name(&self) -> &str {
+        self.state
+            .vault_name
+            .as_deref()
+            .unwrap_or(crate::mail::DEFAULT_VAULT_NAME)
+    }
+
     pub fn mail_address(&self) -> Option<String> {
         self.state
             .mail_handle
             .as_deref()
-            .map(crate::mail::format_address)
+            .map(|h| crate::mail::format_address(h, self.vault_name()))
     }
 
     /// Set or change this member's mail handle.
@@ -604,6 +565,19 @@ impl Account {
     /// address until the process restarted.
     pub async fn set_mail_handle(&mut self, handle: &str) -> Result<(), Error> {
         self.state.mail_handle = Some(crate::mail::normalize_handle(handle)?);
+        self.state.invite_cache = None;
+        self.save().await
+    }
+
+    /// Name this vault, or rename it.
+    ///
+    /// The name is the suffix of this member's mail address and travels in the
+    /// invite, so the cached invite is dropped exactly as a handle change does.
+    /// The vault name is chosen at creation; this exists so a name can be set
+    /// right after `create` (the CLI does that) and so a vault created before
+    /// naming existed can adopt one.
+    pub async fn set_vault_name(&mut self, name: &str) -> Result<(), Error> {
+        self.state.vault_name = Some(crate::mail::normalize_vault_name(name)?);
         self.state.invite_cache = None;
         self.save().await
     }
@@ -630,6 +604,7 @@ impl Account {
             self.device.queue_id(),
             &self.device.queue_token(),
             self.state.mail_handle.as_deref(),
+            Some(self.vault_name()),
             &bundle,
         )?;
         let encoded = payload.encode()?;
@@ -671,6 +646,7 @@ impl Account {
             delivery_queue_id: None,
             delivery_queue_token: None,
             mail_handle: payload.handle.clone(),
+            mail_vault: payload.vault.clone(),
             inbound_ready: false,
         });
         // Adding a contact clears any revocation left from a previous delete, so
@@ -903,106 +879,6 @@ impl Account {
         })
     }
 
-    /// Seal a message for someone who has no Hush account and park it on the
-    /// relay.
-    ///
-    /// This is not mail. There is no session, no ratchet and no contact: the
-    /// recipient has no keys at all, so the only thing between the relay and the
-    /// plaintext is the PIN the sender shares out of band. That is a weaker bound
-    /// than member-to-member mail, and it is the bound the product chose.
-    ///
-    /// The returned `delivery_id` is the relay capability. The pickup link is
-    /// composed by the caller, which knows the deployment's base URL; keeping it
-    /// out of here keeps configuration out of vault state.
-    pub async fn send_to_outsider(
-        &mut self,
-        to: &str,
-        subject: &str,
-        body: &str,
-        attachments: &[(String, Vec<u8>)],
-        pin: &str,
-    ) -> Result<OutsiderOutcome, Error> {
-        let to = normalize_external_address(to)?;
-        check_drop_attachments(attachments)?;
-        if !pin_is_long_enough(pin) {
-            return Err(Error::WeakPin);
-        }
-        let package = build_drop_package(subject, body, attachments);
-        let container = seal_drop(&package, pin)?;
-        self.upload_drop(&to, subject, body, attachments, container)
-            .await
-    }
-
-    /// Seal a message to the recipient's X25519 public key and park it on the
-    /// relay.
-    ///
-    /// The second drop mode: no PIN is exchanged. The recipient publishes a
-    /// public key out of band (a news channel, a support page), the sender pastes
-    /// it, and only the matching private key opens the container. There is no PIN
-    /// parameter here on purpose — the key is the whole secret, and a caller
-    /// cannot accidentally attach one.
-    ///
-    /// Like the PIN mode this is anonymous: the container carries no sender key
-    /// and no signature, so it says nothing about who sent it.
-    pub async fn send_to_outsider_with_key(
-        &mut self,
-        to: &str,
-        subject: &str,
-        body: &str,
-        attachments: &[(String, Vec<u8>)],
-        public_key: &str,
-    ) -> Result<OutsiderOutcome, Error> {
-        let to = normalize_external_address(to)?;
-        check_drop_attachments(attachments)?;
-        let key = decode_public_key(public_key)?;
-        let package = build_drop_package(subject, body, attachments);
-        let container = seal_drop_to_key(&package, &key)?;
-        self.upload_drop(&to, subject, body, attachments, container)
-            .await
-    }
-
-    /// The plumbing both drop modes share: put the sealed container on the relay
-    /// under a fresh capability, then file the sender's own copy.
-    ///
-    /// Split out so the PIN and public-key paths cannot drift: everything after
-    /// the seal — the capability, the relay upload, the vault copy, the log
-    /// record — is identical for both, and only the container bytes differ.
-    async fn upload_drop(
-        &mut self,
-        to: &str,
-        subject: &str,
-        body: &str,
-        attachments: &[(String, Vec<u8>)],
-        container: Vec<u8>,
-    ) -> Result<OutsiderOutcome, Error> {
-        // A 128-bit random capability. This is the only access control on the
-        // delivery, so it must not be derived from anything guessable.
-        let delivery_id = hex::encode(random_bytes::<16>());
-        let relay = RelayClient::try_new(&self.state.relay)?;
-        relay.put_drop(&delivery_id, &container).await?;
-
-        // Stored as vault blobs as well, so the sender's own Sent copy can show
-        // and re-open what they sent. `put_blob` is content-addressed, so this is
-        // idempotent.
-        let records = self.store_attachments(attachments)?;
-        let expires_unix = now_ms() / 1000 + DROP_TTL_SECS;
-        let master = *self.vault.master_key();
-        self.chat_log.append_external_mail(
-            &master,
-            to,
-            &delivery_id,
-            expires_unix,
-            subject,
-            body,
-            &records,
-        )?;
-
-        Ok(OutsiderOutcome {
-            delivery_id,
-            expires_unix,
-        })
-    }
-
     /// Attempt delivery of every queued message again, marking the ones the
     /// relay accepts as `Sent`. Returns how many went out.    ///
     /// The daemon calls this on a timer while the vault is unlocked. A message
@@ -1021,9 +897,6 @@ impl Account {
                     body,
                     attachments,
                     state: MailState::Queued,
-                    // Only internal mail queues. A drop is either on the relay or
-                    // the send failed outright, so it never reaches an Outbox.
-                    external: None,
                 } if r.outgoing => Some(QueuedMail {
                     id: r.id.clone(),
                     contact: r.contact_nick.clone(),
@@ -1082,7 +955,6 @@ impl Account {
                     body: mail.body,
                     attachments: mail.attachments,
                     state: MailState::Sent,
-                    external: None,
                 },
                 now_ms(),
             )?;
@@ -1307,6 +1179,7 @@ impl Account {
                 .filter(|n| !n.is_empty())
                 .collect(),
             body: body.to_string(),
+            file: None,
         };
         let targets: Vec<String> = conclave
             .joined()
@@ -1320,6 +1193,66 @@ impl Account {
         self.chat_log
             .append_conclave_message(&master, conclave_id, true, None, body)?;
         Ok(())
+    }
+
+    /// Share a file into a conclave, one encrypted copy per joined trustee.
+    ///
+    /// There is no shared blob to point everyone at: files are per-recipient
+    /// encrypted blobs, so this is N copies for N joined trustees, exactly like
+    /// group text. It targets the **joined** set only, matching text; a trustee
+    /// who joins later does not receive it, because there is no shared history
+    /// to backfill from. The bytes are also stored as a local blob so the sender
+    /// can reopen the file after a restart.
+    ///
+    /// Returns the local blob id.
+    pub async fn send_conclave_file_bytes(
+        &mut self,
+        conclave_id: &str,
+        name: &str,
+        data: &[u8],
+    ) -> Result<BlobId, Error> {
+        if data.len() > MAX_INLINE_FILE_BYTES {
+            return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
+        }
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended {
+            return Err(Error::ConclaveEnded);
+        }
+        if !conclave.is_joined(&me) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        let blob_id = self.vault.put_blob(data)?;
+        let payload = MessagePayload::Conclave {
+            conclave_id: conclave.id.clone(),
+            name: conclave.name.clone(),
+            trustees: conclave
+                .joined()
+                .map(|t| t.nick.clone())
+                .filter(|n| !n.is_empty())
+                .collect(),
+            body: String::new(),
+            file: Some(crate::payload::ConclaveFile {
+                name: name.to_string(),
+                data: data.to_vec(),
+            }),
+        };
+        let targets: Vec<String> = conclave
+            .joined()
+            .filter(|m| m.account_id != me)
+            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
+            .collect();
+        for nick in targets {
+            self.send_payload_inner(&nick, payload.clone(), false).await?;
+        }
+        let master = *self.vault.master_key();
+        self.chat_log
+            .append_conclave_file(&master, conclave_id, true, None, name, &blob_id, data.len() as u64)?;
+        Ok(blob_id)
     }
 
     /// Invite a contact to a conclave. Convener only.
@@ -1696,13 +1629,16 @@ impl Account {
         Ok(true)
     }
 
-    /// Fill every legacy conclave's trustees from its nickname list, and give a
-    /// record with no convener the local account as convener.
+    /// Fill every legacy conclave's trustees from its nickname list, ensure the
+    /// local account is a member, and give a record with no convener the local
+    /// account as convener.
     ///
     /// A record written before consent and governance existed has nicknames only
     /// and no convener. Without this it would have no trustees and no one
     /// could administer it; assigning the local account is the only sensible
-    /// default for a record that predates the concept.
+    /// default for a record that predates the concept. The local account is also
+    /// resolved from its own nickname (it is never its own contact), so a
+    /// pre-consent record is sendable rather than only listable.
     fn hydrate_conclaves(&mut self) -> Result<(), Error> {
         let me = self.state.protocol_name.clone();
         let ids: Vec<String> = self.chat_log.conclaves().iter().map(|c| c.id.clone()).collect();
@@ -2258,7 +2194,12 @@ impl Account {
                     // the sender must be a joined trustee: a message never
                     // materialises a conclave, so a stray fan-out cannot invent
                     // one. The invite handled above must be accepted first.
-                    MessagePayload::Conclave { conclave_id, body, .. } => {
+                    MessagePayload::Conclave {
+                        conclave_id,
+                        body,
+                        file,
+                        ..
+                    } => {
                         let known = self
                             .chat_log
                             .conclave(conclave_id)
@@ -2269,13 +2210,29 @@ impl Account {
                             continue;
                         }
                         let master = *self.vault.master_key();
-                        self.chat_log.append_conclave_message(
-                            &master,
-                            conclave_id,
-                            false,
-                            Some(&nick),
-                            body,
-                        )?;
+                        match file {
+                            Some(f) => {
+                                let id = self.vault.put_blob(&f.data)?;
+                                self.chat_log.append_conclave_file(
+                                    &master,
+                                    conclave_id,
+                                    false,
+                                    Some(&nick),
+                                    &f.name,
+                                    &id,
+                                    f.data.len() as u64,
+                                )?;
+                            }
+                            None => {
+                                self.chat_log.append_conclave_message(
+                                    &master,
+                                    conclave_id,
+                                    false,
+                                    Some(&nick),
+                                    body,
+                                )?;
+                            }
+                        }
                         (None, Vec::new())
                     }
                     // Handled above, before this match.
@@ -2452,37 +2409,6 @@ fn normalize_relay(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-/// The attachment caps both drop modes share, checked before anything is sealed
-/// or uploaded.
-fn check_drop_attachments(attachments: &[(String, Vec<u8>)]) -> Result<(), Error> {
-    if attachments.len() > MAX_MAIL_ATTACHMENTS {
-        return Err(Error::TooManyAttachments(MAX_MAIL_ATTACHMENTS));
-    }
-    let total: usize = attachments.iter().map(|(_, d)| d.len()).sum();
-    if total > MAX_INLINE_FILE_BYTES {
-        return Err(Error::FileTooLarge(MAX_INLINE_FILE_BYTES));
-    }
-    Ok(())
-}
-
-/// Build the plaintext package a drop carries. The same shape for both modes:
-/// the container version, not the package version, is what differs.
-fn build_drop_package(subject: &str, body: &str, attachments: &[(String, Vec<u8>)]) -> DropPackage {
-    DropPackage {
-        v: 1,
-        subject: subject.to_string(),
-        body: body.to_string(),
-        attachments: attachments
-            .iter()
-            .map(|(name, data)| DropAttachment {
-                name: name.clone(),
-                data: BASE64_STANDARD.encode(data),
-            })
-            .collect(),
-        created_unix: now_ms() / 1000,
-    }
-}
-
 fn short_name(protocol_name: &str) -> String {
     if protocol_name.len() > 12 {
         format!("{}…", &protocol_name[..12])
@@ -2534,50 +2460,6 @@ mod tests {
         path
     }
 
-    /// A typed address is the recipient for someone with no account, so this is
-    /// the only validation between the UI and the relay.
-    #[test]
-    fn an_external_address_is_normalized_or_refused() {
-        assert_eq!(normalize_external_address("  Bob@Gmail.COM ").unwrap(), "bob@gmail.com");
-        assert_eq!(normalize_external_address("a@b.co").unwrap(), "a@b.co");
-        // Dots, plus signs and subdomains are all ordinary.
-        assert_eq!(
-            normalize_external_address("first.last+tag@mail.example.co.uk").unwrap(),
-            "first.last+tag@mail.example.co.uk"
-        );
-
-        for bad in [
-            "",
-            "   ",
-            "bob",
-            "bob@",
-            "@gmail.com",
-            "a b@gmail.com",
-            "bob@gmail",
-            "bob@@x.com",
-            "bob@gmail.",
-            "bob@.gmail.com",
-            "bob@gmail..com",
-        ] {
-            assert!(
-                matches!(normalize_external_address(bad), Err(Error::InvalidAddress)),
-                "{bad:?} should have been refused"
-            );
-        }
-    }
-
-    #[test]
-    fn the_pin_floor_counts_characters_not_bytes() {
-        assert!(!pin_is_long_enough(""));
-        assert!(!pin_is_long_enough("1234567"));
-        assert!(pin_is_long_enough("12345678"));
-        // 8 characters, 10 bytes: this must pass, or a non-ASCII PIN would be
-        // measured more harshly than the person who chose it would expect.
-        assert_eq!("pässwörd".len(), 10);
-        assert_eq!("pässwörd".chars().count(), 8);
-        assert!(pin_is_long_enough("pässwörd"));
-    }
-
     /// Write the on-disk layout a vault had before the multi-device model: the
     /// device identity in `signal.enc`, and this device's relay inbox in
     /// `account.enc`.
@@ -2616,6 +2498,7 @@ mod tests {
             receive_queue_id: Some(queue_id.clone()),
             receive_queue_token: Some(queue_token.clone()),
             mail_handle: None,
+            vault_name: None,
             revoked: Vec::new(),
             pending_invites: Vec::new(),
         };

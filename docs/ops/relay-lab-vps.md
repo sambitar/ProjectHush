@@ -1,4 +1,4 @@
-# Lab VPS relay + SMTP (137.184.129.205)
+# Lab VPS relay (137.184.129.205)
 
 Provisioned 2026-10-08. This is a **lab** box: plain HTTP, no TLS, no firewall lockdown,
 no hardening. It is deliberately not production-shaped.
@@ -13,7 +13,10 @@ authenticate.
 | Service | Unit | Bind | DB / state |
 |---|---|---|---|
 | hush relay | `hush-relay.service` (enabled) | `0.0.0.0:8790` | `/var/lib/hush-relay/relay/relay.db` |
-| SMTP submission | `opensmtpd.service` (enabled) | `127.0.0.1:25`, `[::1]:25` | maildirs under recipient homes |
+
+OpenSMTPD (`opensmtpd.service`, `127.0.0.1:25`) is still installed on the box from the
+outsider-mail era, but nothing in the repo uses it any more — see the removal note below.
+It is kept off the books: do not build on it.
 
 Neither service existed before this change; both are additions. Pre-existing services
 (nginx:80, alhakim:3000, mcp-ironlink:8787, ipfs, cloudflared, BIRD:179, the wg-* units)
@@ -117,54 +120,50 @@ exchange, a B→A mail and an A→B reply all completed. The VPS relay DB shows 
 two peers created (`queues: 4`, `blobs: 1` mid-test), proving the traffic went through the
 VPS and not a local relay.
 
-## SMTP submission server (OpenSMTPD)
+## Removed: outsider-mail notification egress (2026-10-08)
 
-Installed for the daemon's outsider-mail notification egress. `opensmtpd` (7.4.0), config at
-`/etc/smtpd.conf`, listens **loopback only** (`127.0.0.1:25`). It is not bound publicly on
-purpose: this box has a public IP and a public submission port would be an open relay.
+Mail is members-only now, and the outsider drop path was taken out of the relay, the
+daemon, and the core crate: the `/drop/{id}` storage routes, the `/open/{id}` pickup page,
+and the `POST /drop/{id}/notify` hook are gone, along with `SmtpNotifier`
+(`crates/hush-relay/src/notify.rs`) and `HUSH_RELAY_MAILER`. The OpenSMTPD instance above
+was its submission server; the box also has no outbound TCP 25 (provider blocks it), which
+is one more reason the email-notification idea never worked from here and was not kept.
 
-Config (functionally the Ubuntu default, with the lab intent recorded in comments):
+## Onion service (v3)
 
-```
-listen on localhost
-table aliases file:/etc/aliases
-action "local" maildir alias <aliases>
-action "relay" relay
-match for local action "local"
-match from local for any action "relay"
-```
+Added 2026-10-08. The relay is additionally reachable as a Tor onion service, so a client
+routing through Tor never exposes its IP to the relay, and the relay's hosting location is
+not published to clients.
 
-Verified send (submission → local delivery):
+- **Onion address:** `ogkf745dfn32pdbvsk6e52uqski7mudadowosi5cbyif4yglhzuqlsad.onion`
+- **Package:** `tor` 0.4.9.11 (Ubuntu noble-updates/universe), service `tor.service` (enabled).
+- **Config:** `/etc/tor/torrc` gained a `HiddenServiceDir /var/lib/tor/hush-relay/` +
+  `HiddenServicePort 80 127.0.0.1:8790` block (full three-hop service, so the VPS location
+  stays hidden; no `HiddenServiceSingleHopMode`). `SocksPort 9050` comes from
+  `/usr/share/tor/tor-service-defaults-torrc`, bound loopback by the Debian defaults.
+- **Key material:** the service's private key lives in `/var/lib/tor/hush-relay/` (mode 700,
+  owner `debian-tor`). Back it up if the address should survive a rebuild; deleting it mints
+  a new address.
+- **Verified 2026-10-08:** `curl --socks5-hostname 127.0.0.1:9050 http://<onion>/health`
+  returns 200 through a real onion round trip (~2 s warm, ~4.5 s cold).
+- **Clients:** with `hush-core` as of this change, a release build accepts a plain-HTTP v3
+  onion relay base (`host_is_v3_onion` in `normalize_relay_base`), and a client routes the
+  whole relay path through Tor with:
 
-```
-$ python3 -c 'import smtplib; ...'      # send to hushmail@localhost via 127.0.0.1:25
-# journalctl -u opensmtpd:
-mda delivery ... to=<hushmail@localhost> user=hushmail result=Ok stat=Delivered
-# file present: /home/hushmail/Maildir/new/...
-```
+  ```sh
+  HUSH_RELAY_URL=http://ogkf745dfn32pdbvsk6e52uqski7mudadowosi5cbyif4yglhzuqlsad.onion \
+  HUSH_RELAY_SOCKS_PROXY=socks5h://127.0.0.1:9050 hush-daemon --dir <vault>
+  ```
 
-`root` cannot be a recipient (OpenSMTPD refuses: `not allowed to deliver to: root`), so a
-dedicated unprivileged `hushmail` user owns the verification mailbox.
-
-### Gap: the daemon cannot use this yet
-
-The daemon has **no SMTP client**. `hush-core/src/mailer.rs` ships only `NullMailer` and
-`FileMailer`, and `build_mailer` in `hush-daemon/src/main.rs` maps only `file:<dir>` —
-everything else, including `smtp:host`, becomes `NullMailer`. So there are no SMTP settings
-to wire today; the notification egress is a no-op unless `HUSH_MAILER=file:<dir>` is set.
-Implementing `HUSH_MAILER=smtp://<host>:<port>` is a follow-up in `hush-core`/`hush-daemon`.
-See `DEEPSEEKPROBLEMS.MD` (`[OPEN] The daemon has no SMTP client`).
-
-### Gap: no external egress from this droplet
-
-Even once the client exists, the box cannot send internet mail: the provider blocks outbound
-TCP 25 (verified: MTA `Connection failed: Network is unreachable` to the Gmail MX; 443 works).
-Real notification delivery needs a smarthost/provider relay or a DO egress exception.
+  The proxy value is validated strictly (only `socks5`/`socks5h` with a host) and ambient
+  proxy environment (`ALL_PROXY` etc.) is deliberately ignored for the relay path.
+- **RAM:** the box had ~155 MB available before tor; ~92 MB after. No swap configured. Fine
+  for a lab, do not add services to this droplet.
+- **The clearnet listener stays up** (`0.0.0.0:8790`, plain HTTP, debug clients only per the
+  release HTTP policy). The onion path is additive; nothing moved.
 
 ## Not done (flagged, not built)
 
-- **Inbound `drop@` mail ingress.** Out of scope; it is still a pending design task. No
-  `drop@` alias, no MTA ingress hook, nothing added for it.
 - **TLS.** The lab is plain HTTP by request. The relay is exposed directly; do not reuse this
   shape anywhere real.
 - **Reboot test.** The relay is `enabled` and survives `systemctl restart`; a full reboot was
