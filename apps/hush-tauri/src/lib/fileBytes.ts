@@ -1,10 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import { api } from "./api/daemon";
-import type { ChatMessage } from "./api/types";
 import { isTauriShell } from "./tauriEnv";
 
+/**
+ * The minimum a message needs for its bytes to be resolvable: either they are
+ * already in memory, or a vault blob id points at them. Both 1:1 chat messages
+ * and conclave messages satisfy this.
+ */
+export interface FileBytesSource {
+  fileData?: Uint8Array;
+  blobId?: string;
+}
+
 export async function resolveMessageFileBytes(
-  m: ChatMessage,
+  m: FileBytesSource,
 ): Promise<Uint8Array> {
   if (m.fileData?.length) return m.fileData;
   if (m.blobId) {

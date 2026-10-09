@@ -121,6 +121,36 @@ Living record. Reasons and rejected alternatives. Not a marketing doc.
 - **Ship:** Desktop first in practice; Android in the same project when the core works. iOS later.
 - **Rejected:** Flutter (two languages); GTK/Qt plus a second mobile UI; egui/iced as the product UI.
 
+### Drops (anonymous submission channels)
+
+- **Decision:** A Drops rail that opens a third-party SecureDrop-style `.onion` in its own Tauri
+  window, with traffic routed through a local Tor process. **The Hush relay is never in the path** —
+  no Drop traffic is proxied, logged, or relayed by us, and the daemon is not involved.
+- **Isolation:** the Drop window has no Tauri capability (it is absent from every
+  `capabilities/*.json`), so the page inside it can call no Hush command. It is also
+  `incognito(true)`, so it shares no cookies, storage, or history with the main window.
+- **Address rule:** an onion address is only usable when it was copied from a source we trust (the
+  organisation's own site or the SecureDrop directory). Addresses are never invented, and a
+  syntactically valid address that is not corroborated is left unusable rather than guessed at.
+  Verification says the address is authentic, not that the service is up.
+- **Scheme rule:** `http` and `https` are both accepted on a v3 onion, and the address is copied with
+  whatever scheme the source publishes. SecureDrop serves its onion over plain `http` — measured
+  against live instances from the official directory, where `https` fails and `http` returns 200.
+  Tor already authenticates the address and encrypts the link end to end, so there is no TLS layer to
+  require, and demanding `https` refused every real instance.
+- **Tor provisioning:** Tor is bundled as an app resource (`src-tauri/resources/tor/`, with the
+  libevent it links against beside it) so the feature works with no system install and no user
+  configuration. `HUSH_TOR_BIN` overrides it for development, then a bundled copy, then `PATH`.
+  Tor binds loopback only and runs `--ClientOnly 1`, so it can never become an exit.
+- **Stale Tor:** closing the window stops Tor, but a crash, a SIGKILL, or a logout leaves the child
+  running, and it still holds the data-directory lock — so the next launch's Tor exits at once and
+  every Drop fails. The pid is recorded in the data directory (`tor.pid`) and cleared on the next
+  start. The process is only signalled after its command line is confirmed to name our own data
+  directory, so a recycled pid cannot be mistaken for our Tor. Unix only; elsewhere the record is
+  cleared but nothing is signalled.
+- **Not claimed:** Tor hides the destination from the local network; it does not make a submission
+  anonymous by itself. The UI says so.
+
 ### Updates and signing
 
 - **Decision:** Signed auto-update (B). Key pinned in the binary. Website hosts artifacts; HTTPS alone is not trust.

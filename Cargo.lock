@@ -2413,6 +2413,7 @@ name = "hush-relay"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "hex",
  "http-body-util",
  "hush-core",
@@ -2438,6 +2439,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "open",
  "rfd",
  "serde",

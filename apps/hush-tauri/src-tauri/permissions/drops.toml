@@ -1,0 +1,12 @@
+[[permission]]
+identifier = "allow-drops"
+description = "Open isolated Tor-backed Drop windows and manage the local Tor process"
+commands.allow = [
+    "drops_open",
+    "drops_close",
+    "drops_open_state",
+    "drops_dev_enabled",
+    "drops_tor_status",
+    "drops_tor_start",
+    "drops_tor_stop",
+]

@@ -23,6 +23,10 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["net", "rt"] }
 tower-service = "0.3"
 
+# Signalling a Tor child left behind by a previous run. See `tor::clear_stale`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lib]
 name = "hush_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

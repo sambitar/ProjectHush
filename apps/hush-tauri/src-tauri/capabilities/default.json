@@ -1,7 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main Hush window — core APIs, daemon proxy, and chat file open/save",
+  "description": "Main Hush window — core APIs, daemon proxy, chat file open/save, and Drops",
   "windows": ["main"],
-  "permissions": ["core:default", "allow-hush-files", "allow-hush-api"]
+  "permissions": [
+    "core:default",
+    "allow-hush-files",
+    "allow-hush-api",
+    "allow-drops"
+  ]
 }

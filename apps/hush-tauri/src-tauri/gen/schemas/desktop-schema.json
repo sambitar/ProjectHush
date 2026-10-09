@@ -177,6 +177,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Open isolated Tor-backed Drop windows and manage the local Tor process",
+          "type": "string",
+          "const": "allow-drops",
+          "markdownDescription": "Open isolated Tor-backed Drop windows and manage the local Tor process"
+        },
+        {
           "description": "Proxy daemon API calls over the local Unix socket",
           "type": "string",
           "const": "allow-hush-api",

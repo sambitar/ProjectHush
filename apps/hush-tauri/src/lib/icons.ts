@@ -42,6 +42,11 @@ import {
   Handshake,
   Users,
   UserPlus,
+  Globe,
+  ExternalLink,
+  ShieldCheck,
+  AlertTriangle,
+  RotateCw,
   type IconNode,
 } from "lucide";
 
@@ -88,6 +93,11 @@ const ICONS: Record<string, IconNode> = {
   heading: Heading2,
   clearFormat: RemoveFormatting,
   link: Link,
+  globe: Globe,
+  externalLink: ExternalLink,
+  shieldCheck: ShieldCheck,
+  alert: AlertTriangle,
+  refresh: RotateCw,
 };
 
 export type IconName = keyof typeof ICONS;

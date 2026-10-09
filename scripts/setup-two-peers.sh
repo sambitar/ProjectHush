@@ -26,17 +26,16 @@ cargo run -p hush-cli --quiet -- --dir "$PEER_B" add-contact alice "$INVITE_A"
 export HUSH_PASSPHRASE="$PASS_A"
 cargo run -p hush-cli --quiet -- --dir "$PEER_A" add-contact bob "$INVITE_B"
 
-export HUSH_PASSPHRASE="$PASS_B"
-cargo run -p hush-cli --quiet -- --dir "$PEER_B" send alice --text "hello from bob"
-
-export HUSH_PASSPHRASE="$PASS_A"
-OUT=$(cargo run -p hush-cli --quiet -- --dir "$PEER_A" recv)
-echo "$OUT"
-
-if [[ "$OUT" != *"hello from bob"* ]]; then
-  echo "setup failed: alice did not receive bob's message"
+# A live chat send is presence-gated (Account::send_text -> require_online) and
+# presence is heartbeated by a running daemon. This script starts no daemons, so
+# a send here can only ever fail with ContactOffline; the old send/recv smoke was
+# removed rather than faked. What is checkable without daemons is that the relay
+# both vaults were created against is actually up.
+if ! curl -sf -o /dev/null --connect-timeout 5 "${RELAY_URL%/}/health"; then
+  echo "setup failed: relay at $RELAY_URL did not answer /health" >&2
   exit 1
 fi
+echo "relay reachable: ${RELAY_URL%/}/health"
 
 cat <<EOF
 
@@ -49,6 +48,10 @@ Two peers ready (relay: $RELAY_URL)
   Peer B (bob)    $PEER_B
     passphrase:   $PASS_B
     contact nick: alice
+
+Chat sends below need a daemon running on both sides: chat is presence-gated,
+and presence is heartbeated by the daemon. Start the dev stack first:
+  ./scripts/run-two-ui.sh --dev --relay '$RELAY_URL'
 
 Send from A → B:
   export HUSH_PASSPHRASE='$PASS_A'

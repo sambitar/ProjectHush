@@ -1,8 +1,12 @@
 use tauri::Manager;
 
 mod daemon_client;
+mod drops;
+mod tor;
 
 use daemon_client::{ApiReply, DaemonClient, Transport};
+use drops::DropsState;
+use tor::TorManager;
 
 /// Holds the socket-backed client; absent in TCP mode, where JS uses `fetch`.
 struct ProxyState {
@@ -88,20 +92,45 @@ pub fn run() {
         serde_json::to_string(&transport).expect("transport json")
     );
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(proxy)
         .invoke_handler(tauri::generate_handler![
             hush_save_file,
             hush_open_file,
-            hush_api
+            hush_api,
+            drops::drops_open,
+            drops::drops_close,
+            drops::drops_open_state,
+            drops::drops_dev_enabled,
+            drops::drops_tor_status,
+            drops::drops_tor_start,
+            drops::drops_tor_stop
         ])
         .setup(move |app| {
+            // Tor lives under the app's local data dir, not in the vault, and is
+            // owned by this process. The drop view is the only consumer.
+            let data_dir = app
+                .path()
+                .app_local_data_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("hush-tauri"))
+                .join("tor");
+            let resource_dir = app.path().resource_dir().ok();
+            app.manage(DropsState::new(TorManager::new(data_dir, resource_dir)));
+
             if let Some(window) = app.get_webview_window("main") {
                 window.set_title(&window_title)?;
                 window.eval(&init_js)?;
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(state) = app_handle.try_state::<DropsState>() {
+                state.tor.stop();
+            }
+        }
+    });
 }

@@ -14,12 +14,22 @@ import type {
  * returned. Nothing is persisted here — the record lives in the encrypted log,
  * which is what makes it survive a restart.
  */
+/** A file shared into a conclave: a vault blob reference plus its display name. */
+export interface ConclaveMessageFile {
+  name: string;
+  /** Vault blob id; bytes are fetched via `/api/blob/{id}`. */
+  blobId: string;
+  size: number;
+}
+
 export interface ConclaveMessage {
   id: string;
   outgoing: boolean;
   /** The sender's nickname as this vault knows it; absent for our own messages. */
   from?: string;
   body: string;
+  /** Present when the message carried a file; `body` is empty then. */
+  file?: ConclaveMessageFile;
   createdAt: number;
 }
 
@@ -69,6 +79,13 @@ function toMessage(m: ConclaveMessageDto): ConclaveMessage {
     outgoing: m.outgoing,
     from: m.from ?? undefined,
     body: m.body,
+    file: m.file
+      ? {
+          name: m.file.name,
+          blobId: m.file.blob_id_hex.toLowerCase(),
+          size: m.file.size,
+        }
+      : undefined,
     createdAt: m.ts_ms,
   };
 }
@@ -163,6 +180,7 @@ export function conclavePreview(m: Conclave): string {
   const last = m.messages[m.messages.length - 1];
   if (!last) return "No messages yet";
   const who = last.outgoing ? "You" : last.from ?? "Someone";
+  if (last.file) return `${who}: ${last.file.name}`;
   return `${who}: ${last.body.replace(/\s+/g, " ").trim()}`;
 }
 
