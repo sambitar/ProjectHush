@@ -230,3 +230,85 @@ export interface ChatMessage {
   reactions: string[];
   sendProgress?: number;
 }
+
+// --- Reads (Hacker News reader) -------------------------------------------------
+
+export interface ReadsStoryDto {
+  id: string;
+  title: string;
+  url: string | null;
+  domain: string | null;
+  author: string;
+  points: number;
+  num_comments: number;
+  /** Unix seconds. */
+  created_at: number;
+  hn_url: string;
+}
+
+export interface ReadsCommentDto {
+  id: string;
+  author: string;
+  /** Unix seconds. */
+  created_at: number;
+  /** Sanitized comment HTML from the daemon; injected as-is. */
+  html: string;
+  children: ReadsCommentDto[];
+}
+
+export interface ReadsStoryDetailDto {
+  story: ReadsStoryDto;
+  /** Sanitized story text for text posts (Ask HN), when present. */
+  text_html: string | null;
+  comments: ReadsCommentDto[];
+}
+
+export interface ReadsReaderDto {
+  url: string;
+  title: string | null;
+  /** Sanitized article HTML from the daemon; injected as-is. */
+  html: string;
+}
+
+export interface ReadsSavedStoryDto {
+  story: ReadsStoryDto;
+  /** Unix seconds. */
+  saved_at: number;
+}
+
+export interface ReadsHistoryEntryDto {
+  id: string;
+  /** Unix seconds. */
+  at: number;
+  title: string;
+}
+
+export interface ReadsStateDto {
+  /** User-added RSS feeds; the built-in HK News source is not state. */
+  sources: { id: string; url: string; title: string; added_at: number }[];
+  saved: ReadsSavedStoryDto[];
+  hidden: string[];
+  read: { id: string; at: number }[];
+  history: ReadsHistoryEntryDto[];
+}
+
+/** One browsable source: the built-in HK News feed or a user RSS feed. */
+export interface ReadsSourceDto {
+  id: string;
+  title: string;
+  url: string;
+  /** Built-ins cannot be removed; the UI hides the affordance. */
+  built_in: boolean;
+}
+
+/** One story in a feed page, annotated with the viewer's markers. */
+export type ReadsStoryListItem = ReadsStoryDto & {
+  saved: boolean;
+  read: boolean;
+};
+
+export interface ReadsFeedResponse {
+  stories: ReadsStoryListItem[];
+  /** True when this page looks like the last one. */
+  done: boolean;
+}

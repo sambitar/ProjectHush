@@ -10,6 +10,12 @@ import type {
   RecvResponse,
   RelayConfigResponse,
   StatusResponse,
+  ReadsFeedResponse,
+  ReadsReaderDto,
+  ReadsSourceDto,
+  ReadsStateDto,
+  ReadsStoryDetailDto,
+  ReadsStoryDto,
 } from "./types";
 
 type Transport =
@@ -311,6 +317,43 @@ export const api = {
     }),
   /** The relay switch's state; readable while the vault is locked. */
   relayConfig: () => request<RelayConfigResponse>("/api/relay"),
+  // --- Reads (Hacker News reader). Content routes serve public data and
+  // work even while locked; state routes answer 401 until unlocked. ---
+  readsFeed: (source: string, page = 0) =>
+    request<ReadsFeedResponse>(
+      `/api/reads/feed?source=${encodeURIComponent(source)}&page=${page}`,
+    ),
+  readsSources: () => request<ReadsSourceDto[]>("/api/reads/sources"),
+  readsAddSource: (url: string) =>
+    request<ReadsSourceDto[]>("/api/reads/sources", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url }),
+    }),
+  readsRemoveSource: (id: string) =>
+    request<ReadsSourceDto[]>(`/api/reads/sources/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  readsStory: (id: string) =>
+    request<ReadsStoryDetailDto>(`/api/reads/story/${encodeURIComponent(id)}`),
+  readsReader: (url: string) =>
+    request<ReadsReaderDto>(`/api/reads/reader?url=${encodeURIComponent(url)}`),
+  readsState: () => request<ReadsStateDto>("/api/reads/state"),
+  readsToggleSaved: (story: ReadsStoryDto) =>
+    request<ReadsStateDto>("/api/reads/saved", {
+      method: "POST",
+      body: JSON.stringify({ story }),
+    }),
+  readsToggleHidden: (id: string) =>
+    request<ReadsStateDto>("/api/reads/hidden", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    }),
+  readsMarkRead: (id: string, title: string) =>
+    request<ReadsStateDto>("/api/reads/read", {
+      method: "POST",
+      body: JSON.stringify({ id, title }),
+    }),
   /**
    * Flip the relay switch. `socks` is the shell Tor's SOCKS port, reported
    * when switching on; the daemon refuses to fall back to clearnet on its

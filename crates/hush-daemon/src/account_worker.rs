@@ -101,6 +101,15 @@ enum Work {
     DropRecords {
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Reads pane: load the encrypted sidecar state (None when never saved).
+    ReadsStateGet {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Reads pane: replace the encrypted sidecar state wholesale.
+    ReadsStatePut {
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
     DraftRecords {
         reply: oneshot::Sender<WorkResult>,
     },
@@ -273,11 +282,16 @@ pub enum WorkResult {
     RecoveryCode(String),
     Messages(Vec<ChatRecord>),
     /// The thread the mail was filed under, and whether the relay took it.
-    MailSent { thread_id: String, queued: bool },
+    MailSent {
+        thread_id: String,
+        queued: bool,
+    },
     Mail(Vec<ChatRecord>),
     Drafts(Vec<ChatRecord>),
     /// Every filed outsider drop.
     Drops(Vec<ChatRecord>),
+    /// The Reads pane's encrypted sidecar state; `None` until first saved.
+    ReadsState(Option<Vec<u8>>),
     /// The record id of the saved draft.
     DraftSaved(String),
     Blob(Vec<u8>),
@@ -315,7 +329,11 @@ impl AccountWorker {
                 let mut account: Option<Account> = None;
                 while let Some(work) = rx.recv().await {
                     let (reply, result) = match work {
-                        Work::Unlock { dir, passphrase, reply } => {
+                        Work::Unlock {
+                            dir,
+                            passphrase,
+                            reply,
+                        } => {
                             let result = match Account::open(&dir, &passphrase).await {
                                 Ok(a) => {
                                     // Nothing to publish on unlock: peers learn
@@ -354,10 +372,8 @@ impl AccountWorker {
                                     // there is nothing to refresh here.
                                     let mut list = Vec::new();
                                     for c in a.contacts() {
-                                        let online = a
-                                            .contact_is_online(&c.nickname)
-                                            .await
-                                            .unwrap_or(false);
+                                        let online =
+                                            a.contact_is_online(&c.nickname).await.unwrap_or(false);
                                         list.push(ContactDto {
                                             nickname: c.nickname.clone(),
                                             protocol_name: c.account_id.clone(),
@@ -479,7 +495,12 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
-                        Work::RelayApply { use_tor, onion, socks, reply } => {
+                        Work::RelayApply {
+                            use_tor,
+                            onion,
+                            socks,
+                            reply,
+                        } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Ok,
                                 Some(a) => {
@@ -517,9 +538,7 @@ impl AccountWorker {
                         Work::Messages { reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
-                                Some(a) => {
-                                    WorkResult::Messages(a.chat_history())
-                                }
+                                Some(a) => WorkResult::Messages(a.chat_history()),
                             };
                             (reply, result)
                         }
@@ -620,7 +639,8 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
-                        Work::MailRecords { reply } => {                            let result = match account.as_ref() {
+                        Work::MailRecords { reply } => {
+                            let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => WorkResult::Mail(a.mail_records()),
                             };
@@ -637,6 +657,30 @@ impl AccountWorker {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => WorkResult::Drops(a.drop_records()),
+                            };
+                            (reply, result)
+                        }
+                        Work::ReadsStateGet { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a.read_vault_sidecar(crate::reads_store::STATE_FILE) {
+                                        Ok(state) => WorkResult::ReadsState(state),
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::ReadsStatePut { bytes, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .write_vault_sidecar(crate::reads_store::STATE_FILE, &bytes)
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
                             };
                             (reply, result)
                         }
@@ -728,7 +772,8 @@ impl AccountWorker {
                         } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
-                                Some(a) => match a.send_conclave_message(&conclave_id, &body).await {
+                                Some(a) => match a.send_conclave_message(&conclave_id, &body).await
+                                {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
@@ -848,9 +893,8 @@ impl AccountWorker {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => {
-                                    let bytes = hex::decode(&id_hex).map_err(|_| {
-                                        WorkResult::Err("invalid blob id".into())
-                                    });
+                                    let bytes = hex::decode(&id_hex)
+                                        .map_err(|_| WorkResult::Err("invalid blob id".into()));
                                     match bytes {
                                         Err(e) => e,
                                         Ok(b) if b.len() != 32 => {
@@ -937,7 +981,9 @@ impl AccountWorker {
         if self.tx.send(work).await.is_err() {
             return WorkResult::Err("account worker stopped".into());
         }
-        reply.await.unwrap_or_else(|_| WorkResult::Err("worker dropped".into()))
+        reply
+            .await
+            .unwrap_or_else(|_| WorkResult::Err("worker dropped".into()))
     }
 
     pub async fn unlock(&self, dir: &PathBuf, passphrase: &str) -> WorkResult {
@@ -1060,12 +1106,8 @@ impl AccountWorker {
 
     pub async fn backup_import(&self, dir: &PathBuf, data: Vec<u8>) -> WorkResult {
         let dir = dir.clone();
-        self.call(|reply| Work::BackupImport {
-            dir,
-            data,
-            reply,
-        })
-        .await
+        self.call(|reply| Work::BackupImport { dir, data, reply })
+            .await
     }
 
     pub async fn recovery_ack(&self) -> WorkResult {
@@ -1127,6 +1169,18 @@ impl AccountWorker {
     /// Every filed outsider drop. See [`Work::DropRecords`].
     pub async fn drop_records(&self) -> WorkResult {
         self.call(|reply| Work::DropRecords { reply }).await
+    }
+
+    /// The Reads pane's encrypted sidecar state, raw bytes (None until first
+    /// saved). The JSON schema lives in [`crate::reads_store`].
+    pub async fn reads_state_get(&self) -> WorkResult {
+        self.call(|reply| Work::ReadsStateGet { reply }).await
+    }
+
+    /// Replace the Reads pane's encrypted sidecar state wholesale.
+    pub async fn reads_state_put(&self, bytes: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::ReadsStatePut { bytes, reply })
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]

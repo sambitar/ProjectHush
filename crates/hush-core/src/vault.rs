@@ -215,6 +215,46 @@ impl Vault {
         self.dir.join("blobs").join(hex::encode(id.0))
     }
 
+    /// Read a named encrypted sidecar file in the vault directory.
+    ///
+    /// For feature-owned state that must be encrypted at rest but does not
+    /// belong in the message log — reading-library state, saved filters. The
+    /// caller owns the file name and the JSON schema inside; the vault owns
+    /// the key. Returns `None` when the file does not exist yet.
+    pub fn read_encrypted_file(&self, name: &str) -> Result<Option<Vec<u8>>, Error> {
+        let path = self.sidecar_path(name)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let plain = decrypt(&self.master, &fs::read(path)?)?;
+        Ok(Some(plain))
+    }
+
+    /// Write a named encrypted sidecar file (write-then-rename, like the
+    /// unlock header, so a crash partway through keeps the previous copy).
+    pub fn write_encrypted_file(&self, name: &str, plaintext: &[u8]) -> Result<(), Error> {
+        let path = self.sidecar_path(name)?;
+        let packed = encrypt(&self.master, plaintext)?;
+        let tmp = self.dir.join(format!("{name}.tmp"));
+        fs::write(&tmp, packed)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Sidecar names come from daemon code, but treat them as untrusted
+    /// anyway: no separators, no traversal, nothing to escape the vault dir.
+    fn sidecar_path(&self, name: &str) -> Result<PathBuf, Error> {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            || name.contains("..")
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(self.dir.join(name))
+    }
+
     /// Mint the vault's published drop key.
     ///
     /// The published string is the address outsiders hold, so creation is a
@@ -426,6 +466,63 @@ mod tests {
             before,
             "reopened master must match, or every blob is lost"
         );
+    }
+
+    #[test]
+    fn encrypted_sidecars_roundtrip_and_stay_opaque() {
+        let d = scratch("sidecar");
+        let vault = Vault::create(&d, "pw").unwrap();
+
+        assert_eq!(
+            vault.read_encrypted_file("reads-state.enc").unwrap(),
+            None,
+            "a missing sidecar reads as None, not an error"
+        );
+
+        vault
+            .write_encrypted_file("reads-state.enc", b"{\"saved\":[]}")
+            .unwrap();
+
+        // On disk: not plaintext.
+        let raw = fs::read(d.join("reads-state.enc")).unwrap();
+        assert_ne!(raw, b"{\"saved\":[]}".to_vec());
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("saved"),
+            "sidecar bytes must not leak plaintext"
+        );
+
+        let reopened = Vault::open(&d, "pw").unwrap();
+        assert_eq!(
+            reopened.read_encrypted_file("reads-state.enc").unwrap(),
+            Some(b"{\"saved\":[]}".to_vec()),
+            "a sidecar survives reopen"
+        );
+
+        // Rewrites replace, not append or duplicate.
+        reopened
+            .write_encrypted_file("reads-state.enc", b"{\"saved\":[1]}")
+            .unwrap();
+        assert_eq!(
+            reopened.read_encrypted_file("reads-state.enc").unwrap(),
+            Some(b"{\"saved\":[1]}".to_vec())
+        );
+    }
+
+    #[test]
+    fn encrypted_sidecar_names_are_confined() {
+        let d = scratch("sidecar-names");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let before: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        for bad in ["../x.enc", "a/b.enc", "..", "", ".enc/.."] {
+            assert!(
+                vault.write_encrypted_file(bad, b"x").is_err(),
+                "name {bad:?} must be refused"
+            );
+            assert!(vault.read_encrypted_file(bad).is_err());
+        }
+        // Nothing written, nothing escaped: the dir is untouched.
+        let after: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(before, after);
     }
 
     #[test]

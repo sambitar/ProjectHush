@@ -1,5 +1,7 @@
 mod account_worker;
 mod paths;
+mod reads;
+mod reads_store;
 mod security;
 mod suspend_lock;
 mod ui_prefs;
@@ -13,13 +15,13 @@ use std::time::{Duration, Instant};
 
 use account_worker::{AccountWorker, ContactDto, WorkResult};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, Method, StatusCode},
     routing::{delete, get, post},
     Json, Router,
 };
-use clap::Parser;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use clap::Parser;
 use hush_core::{ChatRecord, ConclaveRecord, MessagePayload, PendingInvite, ReceivedMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -50,6 +52,8 @@ struct App {
     /// Resolved TCP bind address, if TCP was explicitly enabled.
     tcp_addr: Option<String>,
     worker: AccountWorker,
+    /// The Reads pane's HN client: outbound fetch + reader extraction + cache.
+    reads: reads::ReadsClient,
     unlocked: Mutex<bool>,
     unlocked_at: Mutex<Option<Instant>>,
     /// The SOCKS proxy the desktop shell reported its Tor to be listening on,
@@ -190,7 +194,13 @@ fn local_ui_cors() -> CorsLayer {
                     || s == "tauri://localhost"
             })
         }))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::CONTENT_TYPE])
 }
 
@@ -208,19 +218,37 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/mail/draft/{id}", delete(delete_draft))
         .route("/api/mail/{id}", delete(delete_mail))
         .route("/api/mail", get(mail))
-        .route(
-            "/api/drops/key",
-            get(drops_key).post(drops_key_create),
-        )
+        .route("/api/drops/key", get(drops_key).post(drops_key_create))
         .route("/api/drops/rotate", post(drops_rotate))
         .route("/api/drops/drain", post(drops_drain))
+        .route("/api/reads/feed", get(reads_feed))
+        .route(
+            "/api/reads/sources",
+            get(reads_sources_list).post(reads_sources_add),
+        )
+        .route("/api/reads/sources/{id}", delete(reads_sources_remove))
+        .route("/api/reads/story/{id}", get(reads_story))
+        .route("/api/reads/reader", get(reads_reader))
+        .route("/api/reads/state", get(reads_state))
+        .route("/api/reads/saved", post(reads_save_toggle))
+        .route("/api/reads/hidden", post(reads_hidden_toggle))
+        .route("/api/reads/read", post(reads_mark_read))
         .route("/api/conclaves", get(conclaves).post(create_conclave))
         .route("/api/conclaves/message", post(send_conclave_message))
         .route("/api/conclaves/file", post(send_conclave_file))
-        .route("/api/conclaves/trustees/invite", post(invite_conclave_trustee))
+        .route(
+            "/api/conclaves/trustees/invite",
+            post(invite_conclave_trustee),
+        )
         .route("/api/conclaves/trustees/kick", post(kick_conclave_trustee))
-        .route("/api/conclaves/trustees/accept", post(accept_conclave_invite))
-        .route("/api/conclaves/trustees/decline", post(decline_conclave_invite))
+        .route(
+            "/api/conclaves/trustees/accept",
+            post(accept_conclave_invite),
+        )
+        .route(
+            "/api/conclaves/trustees/decline",
+            post(decline_conclave_invite),
+        )
         .route("/api/conclaves/trustees/leave", post(leave_conclave))
         .route("/api/conclaves/invites", get(pending_invites))
         .route("/api/conclaves/end", post(end_conclave))
@@ -255,9 +283,10 @@ async fn vault_mount_watch(state: Arc<App>) {
             continue;
         }
         let dir = state.dir.clone();
-        let ok = tokio::task::spawn_blocking(move || dir.is_dir() && std::fs::metadata(&dir).is_ok())
-            .await
-            .unwrap_or(false);
+        let ok =
+            tokio::task::spawn_blocking(move || dir.is_dir() && std::fs::metadata(&dir).is_ok())
+                .await
+                .unwrap_or(false);
         if !ok {
             force_lock(&state).await;
             eprintln!("hush-daemon: vault path unavailable — auto-locked");
@@ -282,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.no_socket && tcp_addr.is_none() {
         return Err("--no-socket needs a TCP address (--addr / HUSH_DAEMON_ADDR)".into());
     }
+    let reads_cache = vault_dir.join("reads-cache");
     let app = App {
         dir: vault_dir,
         socket: if args.no_socket {
@@ -291,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         tcp_addr: tcp_addr.clone(),
         worker: AccountWorker::spawn(),
+        reads: reads::ReadsClient::new(&reads_cache),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
         relay_socks: Mutex::new(None),
@@ -385,7 +416,7 @@ fn spawn_shutdown_watch() -> tokio::sync::watch::Receiver<bool> {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
+            use tokio::signal::unix::{signal, SignalKind};
             if let Ok(mut term) = signal(SignalKind::terminate()) {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
@@ -828,7 +859,11 @@ async fn mail(
         WorkResult::Drops(list) => list,
         _ => return Err(unexpected_worker_response()),
     };
-    Ok(Json(MailboxResponse { mail, drafts, drops }))
+    Ok(Json(MailboxResponse {
+        mail,
+        drafts,
+        drops,
+    }))
 }
 
 #[derive(Serialize)]
@@ -976,7 +1011,12 @@ async fn create_conclave(
     Json(body): Json<CreateConclaveRequest>,
 ) -> Result<Json<ConclaveRecord>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    let result = map_err(state.worker.create_conclave(&body.name, body.trustees).await)?;
+    let result = map_err(
+        state
+            .worker
+            .create_conclave(&body.name, body.trustees)
+            .await,
+    )?;
     match result {
         WorkResult::ConclaveCreated(conclave) => Ok(Json(conclave)),
         _ => Err(unexpected_worker_response()),
@@ -1320,16 +1360,14 @@ async fn send_file_data(
     Json(body): Json<SendFileDataRequest>,
 ) -> Result<Json<SendFileDataResponse>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    let data = STANDARD
-        .decode(body.data_base64.trim())
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiError {
-                    error: "invalid base64 file data".into(),
-                }),
-            )
-        })?;
+    let data = STANDARD.decode(body.data_base64.trim()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "invalid base64 file data".into(),
+            }),
+        )
+    })?;
     let result = map_err(
         state
             .worker
@@ -1653,8 +1691,7 @@ async fn get_relay(State(state): State<Arc<App>>) -> Json<RelayResponse> {
                 let onion_url = onion_url
                     .or(prefs.relay_onion_staged)
                     .or_else(|| hush_core::config::resolve_onion_relay_url(&state.dir));
-                let applied =
-                    relay_tor && onion_url.is_some() && socks.is_some();
+                let applied = relay_tor && onion_url.is_some() && socks.is_some();
                 Json(RelayResponse {
                     tor_mode: prefs.relay_tor,
                     applied,
@@ -1700,7 +1737,12 @@ async fn put_relay_mode(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     if let Some(socks) = &body.socks {
         if let Err(e) = hush_core::validate_socks_proxy(socks) {
-            return Err((StatusCode::BAD_REQUEST, Json(ApiError { error: e.to_string() })));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: e.to_string(),
+                }),
+            ));
         }
     }
     let prefs = ui_prefs::load(&state.dir);
@@ -1734,7 +1776,10 @@ async fn put_relay_mode(
     } else {
         None
     };
-    let _ = state.worker.relay_apply(body.onion, onion, body.socks).await;
+    let _ = state
+        .worker
+        .relay_apply(body.onion, onion, body.socks)
+        .await;
     // The path may have just changed; drop any cached reachability so the
     // next poll probes the new route rather than reporting the old one.
     *state.relay_health.lock().await = None;
@@ -1807,7 +1852,9 @@ async fn put_ui_prefs(
             }),
         ));
     }
-    if body.auto_lock_minutes != 0 && (body.auto_lock_minutes < 5 || body.auto_lock_minutes > 24 * 60) {
+    if body.auto_lock_minutes != 0
+        && (body.auto_lock_minutes < 5 || body.auto_lock_minutes > 24 * 60)
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError {
@@ -1850,6 +1897,354 @@ async fn blob(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reads (Hacker News reader) — routes behind `/api/reads/*`.
+//
+// Content routes (feed/search/story/reader) serve public, already-sanitized
+// data and work regardless of vault lock — the UI only reaches them unlocked
+// anyway. Personal-state routes round-trip through the account worker so the
+// sidecar is only ever touched by the holder of the master key.
+// ---------------------------------------------------------------------------
+
+/// One story in a list, annotated with the viewer's own markers so lists
+/// render save/read state without a second round trip.
+#[derive(Serialize)]
+struct AnnotatedStory {
+    #[serde(flatten)]
+    story: reads::StoryDto,
+    saved: bool,
+    read: bool,
+}
+
+#[derive(Serialize)]
+struct ReadsFeedResponse {
+    stories: Vec<AnnotatedStory>,
+    /// True when this page looks like the last one (short page heuristic).
+    done: bool,
+}
+
+#[derive(Deserialize)]
+struct ReadsFeedQuery {
+    /// Which source to browse: `hk-news` (the built-in HN feed) or the id of
+    /// a user-added RSS source. Defaults to the built-in.
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    page: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ReadsAddSourceRequest {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct ReadsReaderQuery {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct ReadsSaveRequest {
+    story: reads::StoryDto,
+}
+
+#[derive(Deserialize)]
+struct ReadsHiddenRequest {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct ReadsReadRequest {
+    id: String,
+    #[serde(default)]
+    title: String,
+}
+
+fn reads_err(e: reads::ReadsError) -> (StatusCode, Json<ApiError>) {
+    let code = match &e {
+        reads::ReadsError::BadUrl(_) => StatusCode::BAD_REQUEST,
+        reads::ReadsError::NoContent => StatusCode::NOT_FOUND,
+        reads::ReadsError::Http(_)
+        | reads::ReadsError::Blocked(_)
+        | reads::ReadsError::Parse(_) => StatusCode::BAD_GATEWAY,
+    };
+    (
+        code,
+        Json(ApiError {
+            error: e.to_string(),
+        }),
+    )
+}
+
+fn worker_err(msg: String) -> (StatusCode, Json<ApiError>) {
+    if msg == "locked" {
+        (StatusCode::UNAUTHORIZED, Json(ApiError { error: msg }))
+    } else {
+        (StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))
+    }
+}
+
+/// Fetch the raw sidecar bytes through the worker.
+async fn reads_state_raw(state: &App) -> Result<Option<Vec<u8>>, (StatusCode, Json<ApiError>)> {
+    match state.worker.reads_state_get().await {
+        WorkResult::ReadsState(raw) => Ok(raw),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Lenient variant for content routes: while the vault is locked there is no
+/// personal state to annotate with, and the public stories themselves are
+/// still servable — the UI just never asks before unlocking.
+async fn reads_state_raw_lenient(
+    state: &App,
+) -> Result<Option<Vec<u8>>, (StatusCode, Json<ApiError>)> {
+    match state.worker.reads_state_get().await {
+        WorkResult::ReadsState(raw) => Ok(raw),
+        WorkResult::Err(msg) if msg == "locked" => Ok(None),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Load the state, apply one mutation, persist it back, and return the new
+/// state as the response (the UI re-renders from it). A mutation may refuse
+/// (`Err` names why); the state is then neither changed nor persisted.
+async fn mutate_reads_state(
+    state: &App,
+    apply: impl FnOnce(&mut reads_store::ReadsState) -> Result<(), String>,
+) -> Result<Json<reads_store::ReadsState>, (StatusCode, Json<ApiError>)> {
+    let raw = reads_state_raw(state).await?;
+    let mut parsed = reads_store::decode(raw.as_deref()).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    apply(&mut parsed).map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    let bytes = parsed.encode().map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    match state.worker.reads_state_put(bytes).await {
+        WorkResult::Ok => Ok(Json(parsed)),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn reads_feed(
+    State(state): State<Arc<App>>,
+    Query(q): Query<ReadsFeedQuery>,
+) -> Result<Json<ReadsFeedResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let page = q.page.unwrap_or(0);
+    let source_id = q.source.unwrap_or_else(|| reads_store::HK_NEWS_ID.into());
+    let personal = reads_state_raw_lenient(&state).await?;
+    let view = reads_store::decode(personal.as_deref()).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    let (stories, done) = match source_id.as_str() {
+        reads_store::HK_NEWS_ID => {
+            let stories = state.reads.hknews_feed(page).await.map_err(reads_err)?;
+            let done = stories.len() < reads::HITS_PER_PAGE as usize;
+            (stories, done)
+        }
+        _ => {
+            let source = view.source(&source_id).ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError {
+                        error: "that feed is not in your sources".into(),
+                    }),
+                )
+            })?;
+            let (_, stories) = state.reads.rss_feed(&source.url).await.map_err(reads_err)?;
+            (stories, true) // a feed arrives whole; there is no page 2
+        }
+    };
+    let stories = view.filter_hidden(stories);
+    let stories = stories
+        .into_iter()
+        .map(|story| AnnotatedStory {
+            saved: view.is_saved(&story.id),
+            read: view.read.iter().any(|m| m.id == story.id),
+            story,
+        })
+        .collect();
+    Ok(Json(ReadsFeedResponse { stories, done }))
+}
+
+/// One browsable source: the built-in HK News feed or a user RSS feed.
+#[derive(Serialize)]
+struct ReadsSourceDto {
+    id: String,
+    title: String,
+    url: String,
+    /// Built-ins cannot be removed; the UI hides the affordance.
+    built_in: bool,
+}
+
+async fn reads_sources_list(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<ReadsSourceDto>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    reads_sources_view(&state).await.map(Json)
+}
+
+/// The browsable source list: the built-in first, then the user's feeds.
+/// Every source route returns this same shape so the UI can swap its list
+/// wholesale after any mutation.
+async fn reads_sources_view(
+    state: &App,
+) -> Result<Vec<ReadsSourceDto>, (StatusCode, Json<ApiError>)> {
+    let personal = reads_state_raw_lenient(state).await?;
+    let view = reads_store::decode(personal.as_deref()).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    let mut sources = vec![ReadsSourceDto {
+        id: reads_store::HK_NEWS_ID.into(),
+        title: "HK News".into(),
+        url: "https://news.ycombinator.com/best".into(),
+        built_in: true,
+    }];
+    sources.extend(view.sources.iter().map(source_dto));
+    Ok(sources)
+}
+
+/// Add an RSS source. The URL is validated against the SSRF guard and
+/// fetched once now: an unreachable or unparseable feed is refused with the
+/// reason, and a good one contributes its own title.
+async fn reads_sources_add(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ReadsAddSourceRequest>,
+) -> Result<Json<Vec<ReadsSourceDto>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let raw_url = body.url.trim().to_string();
+    let (title, _) = state
+        .reads
+        .rss_feed(&raw_url)
+        .await
+        .map_err(reads_err)
+        .map_err(|(code, e)| {
+            (
+                if code == StatusCode::INTERNAL_SERVER_ERROR {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    code
+                },
+                e,
+            )
+        })?;
+    let _ = mutate_reads_state(&state, |v| {
+        v.add_source(&raw_url, &title)?;
+        Ok(())
+    })
+    .await?;
+    reads_sources_view(&state).await.map(Json)
+}
+
+async fn reads_sources_remove(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ReadsSourceDto>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let _ = mutate_reads_state(&state, |v| {
+        v.remove_source(&id);
+        Ok(())
+    })
+    .await?;
+    reads_sources_view(&state).await.map(Json)
+}
+
+fn source_dto(s: &reads_store::RssSource) -> ReadsSourceDto {
+    ReadsSourceDto {
+        id: s.id.clone(),
+        title: s.title.clone(),
+        url: s.url.clone(),
+        built_in: false,
+    }
+}
+
+async fn reads_story(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<reads::StoryDetailDto>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state.reads.story(&id).await.map_err(reads_err).map(Json)
+}
+
+async fn reads_reader(
+    State(state): State<Arc<App>>,
+    Query(q): Query<ReadsReaderQuery>,
+) -> Result<Json<reads::ReaderDto>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .reads
+        .reader(&q.url)
+        .await
+        .map_err(reads_err)
+        .map(Json)
+}
+
+async fn reads_state(
+    State(state): State<Arc<App>>,
+) -> Result<Json<reads_store::ReadsState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let raw = reads_state_raw(&state).await?;
+    let view = reads_store::decode(raw.as_deref()).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    Ok(Json(view))
+}
+
+async fn reads_save_toggle(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ReadsSaveRequest>,
+) -> Result<Json<reads_store::ReadsState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    mutate_reads_state(&state, |v| {
+        v.toggle_saved(body.story);
+        Ok(())
+    })
+    .await
+}
+
+async fn reads_hidden_toggle(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ReadsHiddenRequest>,
+) -> Result<Json<reads_store::ReadsState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    mutate_reads_state(&state, |v| {
+        v.toggle_hidden(&body.id);
+        Ok(())
+    })
+    .await
+}
+
+async fn reads_mark_read(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ReadsReadRequest>,
+) -> Result<Json<reads_store::ReadsState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    mutate_reads_state(&state, |v| {
+        v.mark_read(&body.id, &body.title);
+        Ok(())
+    })
+    .await
+}
+
 /// The drops API, against a real (in-process) relay: key creation, an
 /// outsider's sealed container parked on the rendezvous slot, a forced drain,
 /// and the drop record surfacing through `GET /api/mail`.
@@ -1862,7 +2257,7 @@ mod drops_api_tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use hush_core::{DropAttachment, DropPackage, RelayClient};
-    use hush_relay::{RelayConfig, router};
+    use hush_relay::{router, RelayConfig};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -1886,6 +2281,7 @@ mod drops_api_tests {
             socket: None,
             tcp_addr: None,
             worker: AccountWorker::spawn(),
+            reads: reads::ReadsClient::new(&dir.join("reads-cache")),
             unlocked: Mutex::new(false),
             unlocked_at: Mutex::new(None),
             relay_socks: Mutex::new(None),
@@ -1921,7 +2317,10 @@ mod drops_api_tests {
         (status, json)
     }
 
-    async fn get_json(app: &axum::Router, uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+    async fn get_json(
+        app: &axum::Router,
+        uri: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
         let res = app
             .clone()
             .oneshot(
@@ -1968,7 +2367,10 @@ mod drops_api_tests {
         assert!(pk.starts_with("hush-drop-pk-v1:"), "{pk}");
         let page_url = key["page_url"].as_str().unwrap();
         assert!(page_url.ends_with("/drop"), "{page_url}");
-        assert!(page_url.starts_with(&relay), "page_url follows the vault's relay: {page_url}");
+        assert!(
+            page_url.starts_with(&relay),
+            "page_url follows the vault's relay: {page_url}"
+        );
 
         // Creating again is refused — rotation is the deliberate act.
         let (status, _) = post_json(&app, "/api/drops/key", "{}").await;
@@ -1992,7 +2394,10 @@ mod drops_api_tests {
             &recipient_pk,
         )
         .unwrap();
-        RelayClient::new(&relay).put_drop(&slot, &container).await.unwrap();
+        RelayClient::new(&relay)
+            .put_drop(&slot, &container)
+            .await
+            .unwrap();
 
         // A forced drain files it and consumes the slot.
         let (status, report) = post_json(&app, "/api/drops/drain", "{}").await;
@@ -2020,11 +2425,11 @@ mod drops_api_tests {
         assert_eq!(record["payload"]["rendezvous_id"], slot.as_str());
         assert_eq!(record["payload"]["subject"], "through the daemon");
         assert_eq!(record["payload"]["body"], "plain text");
-        assert_eq!(record["payload"]["attachments"].as_array().unwrap().len(), 1);
         assert_eq!(
-            record["payload"]["attachments"][0]["name"],
-            "evidence.txt"
+            record["payload"]["attachments"].as_array().unwrap().len(),
+            1
         );
+        assert_eq!(record["payload"]["attachments"][0]["name"], "evidence.txt");
 
         // A second drain finds nothing.
         let (_, report) = post_json(&app, "/api/drops/drain", "{}").await;

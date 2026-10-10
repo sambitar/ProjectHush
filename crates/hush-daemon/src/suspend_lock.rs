@@ -18,7 +18,9 @@ pub fn spawn_suspend_lock_watch(state: Arc<App>) {
 }
 
 #[cfg(target_os = "linux")]
-async fn watch_prepare_for_sleep(state: Arc<App>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn watch_prepare_for_sleep(
+    state: Arc<App>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::StreamExt;
     use zbus::message::Type;
     use zbus::{Connection, MatchRule, MessageStream};

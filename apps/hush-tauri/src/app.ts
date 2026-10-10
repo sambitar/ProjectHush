@@ -1,5 +1,29 @@
 import { api, AppError, getApiBase } from "./lib/api/daemon";
-import type { ContactDto, DropsKeyDto, StatusResponse } from "./lib/api/types";
+import type {
+  ContactDto,
+  DropsKeyDto,
+  StatusResponse,
+  ReadsCommentDto,
+  ReadsSourceDto,
+  ReadsStateDto,
+  ReadsStoryDetailDto,
+  ReadsStoryDto,
+} from "./lib/api/types";
+import {
+  HK_NEWS,
+  addSource as addReadsSource,
+  clearReadsStore,
+  getState as getReadsState,
+  getSources as getReadsSources,
+  loadFeed as loadReadsFeed,
+  loadReader as loadReadsReader,
+  loadStory as loadReadsStory,
+  markRead as markReadsRead,
+  removeSource as removeReadsSource,
+  timeAgo as readsTimeAgo,
+  toggleHidden as toggleReadsHidden,
+  toggleSaved as toggleReadsSaved,
+} from "./lib/readsStore";
 import {
   addOutgoingFile,
   addOutgoingText,
@@ -22,6 +46,7 @@ import {
   unreadTotal,
 } from "./lib/chatStore";
 import { MAX_FILE_BYTES, RECV_POLL_MS } from "./lib/constants";
+import { invoke } from "@tauri-apps/api/core";
 import { isTauriShell } from "./lib/tauriEnv";
 import { playChatSound } from "./lib/chatSound";
 import {
@@ -116,6 +141,7 @@ type Rail =
   | "chats"
   | "trusts"
   | "conclaves"
+  | "reads"
   | "mail"
   | "drops"
   | "files"
@@ -239,6 +265,42 @@ export class App {
   private filesDirection: "received" | "sent" = "received";
   private recoveryModalCode: string | null = null;
   private mailFolder: MailFolder = "inbox";
+  // --- Reads (news reader pane) ---
+  /** Which source the list shows: the built-in or a user RSS feed. */
+  private readsSource: string = HK_NEWS.id;
+  private readsSourceTitle: string = HK_NEWS.title;
+  private readsSources: ReadsSourceDto[] = [HK_NEWS];
+  /** The typed-but-not-yet-added feed URL; state, so re-renders keep it. */
+  private readsSourceDraft = "";
+  /** In-flight "Add feed" submit, to disable the dialog and show progress. */
+  private readsSourceBusy = false;
+  /** Whether the "Add a feed" dialog is open. */
+  private readsAddOpen = false;
+  /**
+   * The add dialog's own error, shown beside the field it belongs to. The pane's
+   * `readsError` renders in the middle column, which is exactly why a failed add
+   * looked like "nothing happened" — the reason was nowhere near the control.
+   */
+  private readsAddError: string | null = null;
+  private readsPage = 0;
+  private readsStories: (ReadsStoryDto & { saved: boolean; read: boolean })[] = [];
+  private readsDone = false;
+  private readsLoading = false;
+  private readsError: string | null = null;
+  /** "feed" = a source page; "saved" = Saved. */
+  private readsMode: "feed" | "saved" = "feed";
+  /** The story open in the reading pane. */
+  private readsOpenId: string | null = null;
+  private readsDetail: ReadsStoryDetailDto | null = null;
+  private readsDetailLoading = false;
+  /** Which rendering the main pane shows for the open story. */
+  private readsView: "reader" | "comments" = "comments";
+  private readsReaderHtml: string | null = null;
+  private readsReaderLoading = false;
+  private readsReaderError: string | null = null;
+  private readsCollapsed = new Set<string>();
+  /** Set while the open-original confirm modal is up. */
+  private readsConfirmUrl: string | null = null;
   /** The conversation open in the reading pane. */
   private mailThreadId: string | null = null;
   /** The message the user clicked, highlighted inside its conversation. */
@@ -389,6 +451,8 @@ export class App {
       if (e.key === "Escape") {
         this.paletteOpen = false;
         this.addFriendOpen = false;
+        this.readsAddOpen = false;
+        this.readsAddError = null;
         this.profileNick = null;
         this.closeTrustDelete();
         this.conclaveCreateOpen = false;
@@ -560,7 +624,16 @@ export class App {
     clearChatStore();
     clearMailStore();
     clearConclaveStore();
+    clearReadsStore();
     clearMockLocal();
+    this.readsSource = HK_NEWS.id;
+    this.readsSourceTitle = HK_NEWS.title;
+    this.readsSources = [HK_NEWS];
+    this.readsMode = "feed";
+    this.readsOpenId = null;
+    this.readsDetail = null;
+    this.readsReaderHtml = null;
+    this.readsConfirmUrl = null;
     this.selectedNick = null;
     this.filesContactNick = null;
     this.mailThreadId = null;
@@ -624,6 +697,10 @@ export class App {
       shell.appendChild(this.renderTrusts());
     } else if (this.rail === "conclaves") {
       shell.appendChild(this.renderConclaves());
+    } else if (this.rail === "reads") {
+      shell.appendChild(this.renderReadsNav());
+      shell.appendChild(this.renderReadsList());
+      shell.appendChild(this.renderReadsMain());
     } else if (this.rail === "mail") {
       shell.appendChild(this.renderMailFolders());
       shell.appendChild(this.renderMailMain());
@@ -654,6 +731,7 @@ export class App {
     }
     if (this.paletteOpen) this.root.appendChild(this.renderPalette());
     if (this.addFriendOpen) this.root.appendChild(this.renderAddFriend());
+    if (this.readsAddOpen) this.root.appendChild(this.renderReadsAddModal());
     if (this.profileNick) this.root.appendChild(this.renderProfile());
     if (this.recoveryModalCode) this.root.appendChild(this.renderRecoveryModal());
     if (this.trustDeleteNick) this.root.appendChild(this.renderTrustDeleteModal());
@@ -661,6 +739,7 @@ export class App {
     if (this.conclaveInviteOpen) this.root.appendChild(this.renderConclaveInviteModal());
     if (this.conclaveEndId) this.root.appendChild(this.renderConclaveEndModal());
     if (this.conclaveDeleteId) this.root.appendChild(this.renderConclaveDeleteModal());
+    if (this.readsConfirmUrl) this.root.appendChild(this.renderReadsConfirm());
   }
 
   private async maybeShowRecoveryCode(): Promise<void> {
@@ -857,6 +936,15 @@ export class App {
           if (changed && this.rail === "conclaves" && !this.conclaveCreateOpen) this.render();
         });
       }
+      if (id === "reads") {
+        // Refresh the source list every time the pane opens (user feeds may
+        // have changed elsewhere / while locked only the built-in shows).
+        void getReadsSources().then((sources) => {
+          this.readsSources = sources;
+          if (this.rail === "reads") this.render();
+        });
+        if (!this.readsStories.length && !this.readsLoading) void this.readsLoad();
+      }
       if (id === "drops") {
         // Tor state lives in the shell, so poll it while the rail is up.
         this.startDropsPoll();
@@ -890,6 +978,7 @@ export class App {
     rail.appendChild(this.railBtn("chats", "Chats", "chats", unreadTotal()));
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
     rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
+    rail.appendChild(this.railBtn("reads", "Reads", "reads"));
     rail.appendChild(this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())));
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
@@ -3356,6 +3445,802 @@ export class App {
 
   // ------------------------------------------------------------- sidebar
 
+  // --- Reads (Hacker News reader pane) -------------------------------------
+
+  /** Load the current feed or search page into the list fields, then repaint. */
+  private async readsLoad(page = 0): Promise<void> {
+    this.readsLoading = true;
+    this.readsError = null;
+    if (page === 0) {
+      this.readsStories = [];
+      this.readsPage = 0;
+    }
+    this.render();
+    try {
+      const resp = await loadReadsFeed(this.readsSource, page);
+      this.readsStories = page === 0 ? resp.stories : [...this.readsStories, ...resp.stories];
+      this.readsDone = resp.done;
+      this.readsPage = page;
+    } catch (e) {
+      this.readsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.readsLoading = false;
+      this.render();
+    }
+  }
+
+  /** Browse a different source: the built-in or one of the user's feeds. */
+  private readsOpenSource(id: string): void {
+    this.readsSource = id;
+    this.readsMode = "feed";
+    this.readsSourceTitle =
+      this.readsSources.find((s) => s.id === id)?.title ?? HK_NEWS.title;
+    this.readsOpenId = null;
+    this.readsDetail = null;
+    this.readsReaderHtml = null;
+    void this.readsLoad(0);
+  }
+
+  /**
+   * Register an RSS feed from the add dialog. The daemon fetches it once before
+   * accepting, so a bad URL or an unreadable feed is refused with its reason;
+   * a good one is opened right away and the dialog closes.
+   *
+   * A URL typed without a scheme (`example.com/feed`) is the common case, and
+   * the daemon refuses it verbatim — so assume `https://` rather than bouncing
+   * the user back with a reason they did not cause.
+   */
+  private async readsAddFeed(): Promise<void> {
+    if (this.readsSourceBusy) return;
+    const typed = this.readsSourceDraft.trim();
+    if (!typed) {
+      this.readsAddError = "Paste an RSS feed URL to add.";
+      this.render();
+      return;
+    }
+    const url = /^[a-z][a-z0-9+.-]*:\/\//i.test(typed) ? typed : `https://${typed}`;
+    this.readsSourceBusy = true;
+    this.readsAddError = null;
+    this.render();
+    try {
+      this.readsSources = await addReadsSource(url);
+      this.readsSourceDraft = "";
+      this.readsSourceBusy = false;
+      this.readsAddOpen = false;
+      const added = this.readsSources.find((s) => !s.built_in && s.url === url);
+      if (added) this.readsOpenSource(added.id);
+      else this.render();
+    } catch (e) {
+      this.readsSourceBusy = false;
+      this.readsAddError = e instanceof Error ? e.message : String(e);
+      this.render();
+    }
+  }
+
+  private async readsRemoveFeed(id: string): Promise<void> {
+    try {
+      this.readsSources = await removeReadsSource(id);
+      if (this.readsSource === id) this.readsOpenSource(HK_NEWS.id);
+      else this.render();
+    } catch (e) {
+      this.readsError = e instanceof Error ? e.message : String(e);
+      this.render();
+    }
+  }
+
+  private readsOpenSaved(): void {
+    this.readsMode = "saved";
+    this.readsOpenId = null;
+    this.readsDetail = null;
+    this.readsReaderHtml = null;
+    void this.readsLoadSaved();
+  }
+
+  /** Saved stories come from personal state, not the feed cache. */
+  private async readsLoadSaved(): Promise<void> {
+    this.readsLoading = true;
+    this.readsError = null;
+    this.render();
+    try {
+      const state = await getReadsState();
+      this.readsStories = state.saved.map((x) => ({
+        ...x.story,
+        saved: true,
+        read: state.read.some((m) => m.id === x.story.id),
+      }));
+      this.readsDone = true;
+    } catch (e) {
+      this.readsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.readsLoading = false;
+      this.render();
+    }
+  }
+
+  /**
+   * Open a story in the reading pane. HN stories fetch the discussion in the
+   * background (reader text loads alongside); RSS items have no discussion
+   * and go straight to the reader.
+   */
+  private readsOpenStory(id: string): void {
+    const listed = this.readsStories.find((s) => s.id === id);
+    this.readsOpenId = id;
+    this.readsDetail = null;
+    this.readsReaderHtml = null;
+    this.readsReaderError = null;
+    const isHn = Boolean(listed?.hn_url);
+    this.readsView = isHn && !listed?.url ? "comments" : "reader";
+    this.readsDetailLoading = isHn;
+    this.render();
+    if (isHn) {
+      void loadReadsStory(id)
+        .then((detail) => {
+          this.readsDetail = detail;
+          if (this.readsView === "reader" && detail.story.url) {
+            this.readsLoadReader(detail.story.url);
+          }
+        })
+        .catch((e) => {
+          this.readsError = e instanceof Error ? e.message : String(e);
+        })
+        .finally(() => {
+          this.readsDetailLoading = false;
+          this.render();
+        });
+    } else if (listed?.url) {
+      this.readsLoadReader(listed.url);
+    }
+    // Opened is read: fire and forget, then refresh the row's marker.
+    if (listed) {
+      const title = listed.title;
+      void markReadsRead(id, title)
+        .then(() => {
+          listed.read = true;
+          if (this.rail === "reads") this.render();
+        })
+        .catch(() => {
+          /* read markers are best-effort */
+        });
+    }
+  }
+
+  private readsLoadReader(url: string): void {
+    this.readsView = "reader";
+    if (this.readsReaderHtml !== null) {
+      this.render();
+      return;
+    }
+    this.readsReaderLoading = true;
+    this.readsReaderError = null;
+    this.render();
+    void loadReadsReader(url)
+      .then((r) => {
+        this.readsReaderHtml = r.html;
+      })
+      .catch((e) => {
+        this.readsReaderError = e instanceof Error ? e.message : String(e);
+      })
+      .finally(() => {
+        this.readsReaderLoading = false;
+        this.render();
+      });
+  }
+
+  private readsSwitchView(view: "reader" | "comments"): void {
+    const detail = this.readsDetail;
+    if (!detail) return;
+    if (view === "reader") {
+      if (!detail.story.url) return;
+      this.readsLoadReader(detail.story.url);
+      return;
+    }
+    this.readsView = "comments";
+    this.render();
+  }
+
+  private async readsSave(id: string): Promise<void> {
+    const listed = this.readsStories.find((s) => s.id === id);
+    const detailStory = this.readsDetail?.story;
+    const story = listed ?? detailStory;
+    if (!story) return;
+    try {
+      const state = await toggleReadsSaved(story);
+      if (this.readsMode === "saved") {
+        // Unstarring from the Saved list removes the row.
+        await this.readsLoadSaved();
+      } else {
+        this.readsApplyState(state);
+      }
+    } catch (e) {
+      this.readsError = e instanceof Error ? e.message : String(e);
+      this.render();
+    }
+  }
+
+  private async readsHide(id: string): Promise<void> {
+    try {
+      const state = await toggleReadsHidden(id);
+      this.readsApplyState(state);
+      // A hidden story leaves the list, and closes if it was open.
+      this.readsStories = this.readsStories.filter((s) => s.id !== id);
+      if (this.readsOpenId === id) {
+        this.readsOpenId = null;
+        this.readsDetail = null;
+        this.readsReaderHtml = null;
+      }
+    } catch (e) {
+      this.readsError = e instanceof Error ? e.message : String(e);
+    }
+    this.render();
+  }
+
+  /** Re-annotate list rows from fresh personal state. */
+  private readsApplyState(state: ReadsStateDto): void {
+    for (const s of this.readsStories) {
+      s.saved = state.saved.some((x) => x.story.id === s.id);
+      s.read = state.read.some((m) => m.id === s.id);
+    }
+    this.render();
+  }
+
+  /** Every external link routes through the confirm modal; never auto-open. */
+  private readsConfirmOpen(url: string): void {
+    this.readsConfirmUrl = url;
+    this.render();
+  }
+
+  private readsHostOf(url: string): string {
+    try {
+      return new URL(url).host;
+    } catch {
+      return url;
+    }
+  }
+
+  private renderReadsNav(): HTMLElement {
+    const col = document.createElement("div");
+    col.className = "reads-nav";
+
+    const head = document.createElement("div");
+    head.className = "conv-list-header";
+    const h = document.createElement("span");
+    h.className = "text-22";
+    h.textContent = "Reads";
+    head.append(h);
+    col.appendChild(head);
+
+    const list = document.createElement("div");
+    list.className = "reads-surface-list";
+    for (const s of this.readsSources) {
+      const row = document.createElement("div");
+      row.className = "reads-source-row";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      const active = this.readsMode === "feed" && this.readsSource === s.id;
+      btn.className = `reads-nav-btn pressable${active ? " active" : ""}`;
+      btn.textContent = s.title;
+      btn.title = s.url;
+      btn.onclick = () => this.readsOpenSource(s.id);
+      row.appendChild(btn);
+      if (!s.built_in) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "reads-source-remove btn-icon-round pressable";
+        remove.setAttribute("aria-label", `Remove ${s.title}`);
+        remove.textContent = "×";
+        remove.onclick = () => void this.readsRemoveFeed(s.id);
+        row.appendChild(remove);
+      }
+      list.appendChild(row);
+    }
+
+    // A dialog rather than an inline field: the field was cramped in the nav,
+    // and its errors rendered over in the middle column where nobody looked —
+    // so a refused feed read as "nothing happened". The dialog keeps the URL,
+    // its validation, and its reason together.
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "reads-add-feed pressable";
+    addBtn.appendChild(icon("plus"));
+    addBtn.appendChild(document.createTextNode("Add a feed"));
+    addBtn.onclick = () => {
+      this.readsAddOpen = true;
+      this.readsAddError = null;
+      this.render();
+    };
+    list.appendChild(addBtn);
+
+    const savedBtn = document.createElement("button");
+    savedBtn.type = "button";
+    savedBtn.className = `reads-nav-btn pressable${this.readsMode === "saved" ? " active" : ""}`;
+    savedBtn.textContent = "Saved";
+    void getReadsState().then((state) => {
+      const n = state.saved.length;
+      if (n > 0 && this.rail === "reads") {
+        const count = savedBtn.querySelector(".reads-nav-count");
+        if (count) count.textContent = String(n);
+      }
+    });
+    const savedCount = document.createElement("span");
+    savedCount.className = "reads-nav-count";
+    savedBtn.appendChild(savedCount);
+    savedBtn.onclick = () => this.readsOpenSaved();
+    list.appendChild(savedBtn);
+    col.appendChild(list);
+    return col;
+  }
+
+  private renderReadsList(): HTMLElement {
+    const col = document.createElement("div");
+    col.className = "reads-list";
+
+    const head = document.createElement("div");
+    head.className = "conv-list-header";
+    const title = document.createElement("span");
+    title.className = "text-15 muted";
+    title.textContent = this.readsMode === "saved" ? "Saved" : this.readsSourceTitle;
+    head.appendChild(title);
+    col.appendChild(head);
+
+    if (this.readsError) {
+      const err = document.createElement("p");
+      err.className = "reads-status muted text-13";
+      err.textContent = this.readsError;
+      col.appendChild(err);
+    }
+    if (this.readsLoading && !this.readsStories.length) {
+      const loading = document.createElement("p");
+      loading.className = "reads-status muted text-13";
+      loading.textContent = "Loading…";
+      col.appendChild(loading);
+      return col;
+    }
+
+    const stories = this.readsStories;
+    if (!stories.length) {
+      const empty = document.createElement("p");
+      empty.className = "reads-status muted text-13";
+      empty.textContent =
+        this.readsMode === "saved"
+          ? "Nothing saved yet — star a story to read it later."
+          : "Nothing here right now — check back soon.";
+      col.appendChild(empty);
+    }
+    for (const s of stories) {
+      col.appendChild(this.renderReadsRow(s));
+    }
+
+    if (this.readsMode !== "saved" && !this.readsDone && !this.readsLoading) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "btn-primary pressable reads-more";
+      more.textContent = "More";
+      more.onclick = () => void this.readsLoad(this.readsPage + 1);
+      col.appendChild(more);
+    }
+    if (this.readsLoading && this.readsStories.length) {
+      const loading = document.createElement("p");
+      loading.className = "reads-status muted text-13";
+      loading.textContent = "Loading…";
+      col.appendChild(loading);
+    }
+    return col;
+  }
+
+  private renderReadsRow(s: ReadsStoryDto & { saved: boolean; read: boolean }): HTMLElement {
+    const row = document.createElement("article");
+    row.className = `reads-row pressable${s.read ? " read" : ""}${this.readsOpenId === s.id ? " open" : ""}`;
+
+    const top = document.createElement("div");
+    top.className = "reads-row-top";
+    const title = document.createElement("button");
+    title.type = "button";
+    title.className = "reads-row-title text-15";
+    title.textContent = s.title;
+    title.onclick = () => this.readsOpenStory(s.id);
+    top.appendChild(title);
+
+    const actions = document.createElement("div");
+    actions.className = "reads-row-actions";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn-icon-round pressable";
+    save.setAttribute("aria-label", s.saved ? "Remove from Saved" : "Save for later");
+    const saveIcon = icon("star");
+    if (s.saved) saveIcon.classList.add("active-star");
+    save.appendChild(saveIcon);
+    save.onclick = (ev) => {
+      ev.stopPropagation();
+      void this.readsSave(s.id);
+    };
+    const hide = document.createElement("button");
+    hide.type = "button";
+    hide.className = "btn-icon-round pressable";
+    hide.setAttribute("aria-label", "Hide this story");
+    hide.appendChild(icon("hide"));
+    hide.onclick = (ev) => {
+      ev.stopPropagation();
+      void this.readsHide(s.id);
+    };
+    actions.append(save, hide);
+    top.appendChild(actions);
+    row.appendChild(top);
+
+    const meta = document.createElement("div");
+    meta.className = "reads-row-meta text-12 muted";
+    const parts: string[] = [s.author, readsTimeAgo(s.created_at)];
+    if (s.hn_url) {
+      // HN story: points and discussion size mean something here.
+      parts.unshift(`${s.points} points`);
+      parts.push(`${s.num_comments} comment${s.num_comments === 1 ? "" : "s"}`);
+    }
+    if (s.domain) parts.push(s.domain);
+    const metaText = document.createElement("span");
+    metaText.textContent = parts.join(" · ");
+    meta.appendChild(metaText);
+    row.appendChild(meta);
+    return row;
+  }
+
+  private renderReadsMain(): HTMLElement {
+    const main = document.createElement("div");
+    main.className = "reads-main";
+    const id = this.readsOpenId;
+    if (!id) {
+      const empty = document.createElement("div");
+      empty.className = "reads-empty";
+      empty.appendChild(icon("reads"));
+      const p = document.createElement("p");
+      p.className = "muted text-15";
+      p.textContent = "Pick something to read.";
+      empty.appendChild(p);
+      main.appendChild(empty);
+      return main;
+    }
+    // HN stories resolve to their detail (points, comments); RSS items only
+    // exist as list rows — the reader is the whole story.
+    const detail = this.readsDetail;
+    const s = detail?.story ?? this.readsStories.find((x) => x.id === id);
+    if (!s) {
+      if (this.readsDetailLoading) {
+        const loading = document.createElement("p");
+        loading.className = "reads-status muted text-13";
+        loading.textContent = "Loading…";
+        main.appendChild(loading);
+        return main;
+      }
+      const empty = document.createElement("div");
+      empty.className = "reads-empty";
+      empty.appendChild(icon("reads"));
+      const p = document.createElement("p");
+      p.className = "muted text-15";
+      p.textContent = "Pick something to read.";
+      empty.appendChild(p);
+      main.appendChild(empty);
+      return main;
+    }
+
+    const head = document.createElement("header");
+    head.className = "reads-article-head";
+    const h1 = document.createElement("h1");
+    h1.className = "text-22";
+    h1.textContent = s.title;
+    head.appendChild(h1);
+
+    const meta = document.createElement("p");
+    meta.className = "reads-row-meta text-12 muted";
+    const parts: string[] = [s.author, readsTimeAgo(s.created_at)];
+    if (s.hn_url) {
+      parts.unshift(`${s.points} points`);
+      parts.push(`${s.num_comments} comment${s.num_comments === 1 ? "" : "s"}`);
+    }
+    meta.textContent = parts.join(" · ");
+    head.appendChild(meta);
+
+    const actions = document.createElement("div");
+    actions.className = "reads-article-actions";
+    const viewBtn = (label: string, view: "reader" | "comments", enabled: boolean) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `reads-view-btn pressable${this.readsView === view ? " active" : ""}`;
+      b.disabled = !enabled;
+      b.textContent = label;
+      b.onclick = () => this.readsSwitchView(view);
+      return b;
+    };
+    actions.append(
+      viewBtn("Read here", "reader", Boolean(s.url)),
+      // Only HN stories have a discussion behind them.
+      viewBtn(`Discussion (${s.num_comments})`, "comments", Boolean(s.hn_url)),
+    );
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "reads-view-btn pressable";
+    const savedNow = this.readsStories.find((x) => x.id === s.id)?.saved ?? false;
+    save.textContent = savedNow ? "★ Saved" : "☆ Save";
+    save.onclick = () => void this.readsSave(s.id);
+    actions.appendChild(save);
+
+    if (s.url) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "reads-view-btn pressable";
+      open.appendChild(icon("externalLink"));
+      const span = document.createElement("span");
+      span.textContent = "Open original";
+      open.appendChild(span);
+      open.onclick = () => this.readsConfirmOpen(s.url!);
+      actions.appendChild(open);
+    }
+    head.appendChild(actions);
+    main.appendChild(head);
+
+    if (this.readsView === "reader") {
+      if (this.readsReaderLoading) {
+        const p = document.createElement("p");
+        p.className = "reads-status muted text-13";
+        p.textContent = "Fetching the article…";
+        main.appendChild(p);
+      } else if (this.readsReaderError) {
+        main.appendChild(
+          this.readsReaderUnavailable(s.url ?? null, this.readsReaderError),
+        );
+      } else if (this.readsReaderHtml !== null) {
+        main.appendChild(this.readsSanitizedPane(this.readsReaderHtml, "reads-article"));
+      }
+      return main;
+    }
+
+    // Discussion view: the story's own text (Ask HN) above the comment tree.
+    if (!detail) {
+      const loading = document.createElement("p");
+      loading.className = "reads-status muted text-13";
+      loading.textContent = "Loading…";
+      main.appendChild(loading);
+      return main;
+    }
+    const thread = document.createElement("div");
+    thread.className = "reads-thread";
+    if (detail.text_html) {
+      thread.appendChild(this.readsSanitizedPane(detail.text_html, "reads-story-text"));
+    }
+    if (!detail.comments.length) {
+      const none = document.createElement("p");
+      none.className = "reads-status muted text-13";
+      none.textContent = "No comments yet.";
+      thread.appendChild(none);
+    }
+    for (const c of detail.comments) {
+      thread.appendChild(this.renderReadsComment(c, 0));
+    }
+    main.appendChild(thread);
+    return main;
+  }
+
+  /**
+   * The reader could not fetch this page.
+   *
+   * The common cause is a bot challenge (Cloudflare and friends) that no header
+   * tweak gets past, so it is shown as a deliberate, centered state with the way
+   * out — open the original in a real browser — as the one obvious action. A
+   * muted one-liner under the article head read as a bug and left the reader
+   * with no clear move.
+   */
+  private readsReaderUnavailable(url: string | null, reason: string): HTMLElement {
+    const box = document.createElement("div");
+    box.className = "reads-empty reads-unavailable";
+    box.appendChild(icon("externalLink"));
+
+    // The daemon's `Blocked` reason is the one case worth its own words; every
+    // other failure (no content, timeout) shows its reason as-is.
+    const blocked = reason.includes("automated reader");
+    const h = document.createElement("p");
+    h.className = "text-17";
+    h.textContent = blocked
+      ? "This site blocks automated readers"
+      : "This page could not be loaded";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent = blocked
+      ? "It only serves its pages to a real browser. You can still read it in yours."
+      : reason;
+    box.append(h, p);
+
+    if (url) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "btn-primary pressable reads-unavailable-open";
+      open.appendChild(icon("externalLink"));
+      const span = document.createElement("span");
+      span.textContent = "Open the original";
+      open.appendChild(span);
+      open.onclick = () => this.readsConfirmOpen(url);
+      box.appendChild(open);
+    }
+    return box;
+  }
+
+  /**
+   * The only place in the pane where daemon-sanitized network HTML is
+   * injected. Clicks on links are intercepted for the confirm step; nothing
+   * navigates the webview itself.
+   */
+  private readsSanitizedPane(html: string, cls: string): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = cls;
+    pane.innerHTML = html;
+    pane.addEventListener("click", (ev) => {
+      const target = ev.target as HTMLElement | null;
+      const a = target?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!a) return;
+      ev.preventDefault();
+      this.readsConfirmOpen(a.href);
+    });
+    return pane;
+  }
+
+  private renderReadsComment(c: ReadsCommentDto, depth: number): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "reads-comment";
+    wrap.style.setProperty("--depth", String(depth));
+
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "reads-comment-head text-12 muted pressable";
+    const collapsed = this.readsCollapsed.has(c.id);
+    head.textContent = `${collapsed ? "▸" : "▾"} ${c.author} · ${readsTimeAgo(c.created_at)}`;
+    head.setAttribute("aria-label", `${collapsed ? "Expand" : "Collapse"} comment by ${c.author}`);
+    head.onclick = () => {
+      if (this.readsCollapsed.has(c.id)) this.readsCollapsed.delete(c.id);
+      else this.readsCollapsed.add(c.id);
+      this.render();
+    };
+    wrap.appendChild(head);
+
+    if (!collapsed) {
+      if (c.html) wrap.appendChild(this.readsSanitizedPane(c.html, "reads-comment-body"));
+      for (const child of c.children) {
+        wrap.appendChild(this.renderReadsComment(child, Math.min(depth + 1, 8)));
+      }
+    }
+    return wrap;
+  }
+
+  /**
+   * The "Add a feed" dialog.
+   *
+   * The daemon validates a feed by fetching it once, so the URL, the in-flight
+   * state, and the reason a feed was refused all live here together — instead
+   * of a cramped nav field whose error rendered over in the middle column.
+   */
+  private renderReadsAddModal(): HTMLElement {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.onclick = (e) => {
+      if (e.target === back) this.closeReadsAdd();
+    };
+    const modal = document.createElement("div");
+    modal.className = "modal reads-add-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Add an RSS feed");
+
+    const title = document.createElement("h2");
+    title.className = "text-22";
+    title.textContent = "Add an RSS feed";
+
+    const hint = document.createElement("p");
+    hint.className = "muted text-13";
+    hint.textContent =
+      "Paste the feed's address — RSS, Atom, and JSON Feed all work. Without a scheme, https:// is assumed.";
+
+    const err = document.createElement("p");
+    err.className = "reads-add-error text-13";
+    err.hidden = !this.readsAddError;
+    err.textContent = this.readsAddError ?? "";
+
+    const input = document.createElement("input");
+    input.className = "input-field reads-add-field";
+    input.type = "text";
+    input.placeholder = "https://example.com/feed.xml";
+    input.setAttribute("aria-label", "RSS feed URL");
+    input.value = this.readsSourceDraft;
+    input.disabled = this.readsSourceBusy;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.oninput = () => {
+      this.readsSourceDraft = input.value;
+      // Clear the reason as soon as the URL changes: it belonged to the last try.
+      if (this.readsAddError) {
+        this.readsAddError = null;
+        err.hidden = true;
+        err.textContent = "";
+      }
+    };
+    input.onkeydown = (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        void this.readsAddFeed();
+      }
+    };
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => this.closeReadsAdd();
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "btn-primary pressable";
+    add.textContent = this.readsSourceBusy ? "Adding…" : "Add feed";
+    add.disabled = this.readsSourceBusy;
+    add.onclick = () => void this.readsAddFeed();
+    actions.append(cancel, add);
+
+    modal.append(title, hint, input, err, actions);
+    back.appendChild(modal);
+
+    // Focus once the node is in the document, so paste-and-Enter is the path.
+    queueMicrotask(() => {
+      if (this.readsAddOpen) input.focus();
+    });
+    return back;
+  }
+
+  private closeReadsAdd(): void {
+    this.readsAddOpen = false;
+    this.readsAddError = null;
+    this.render();
+  }
+
+  private renderReadsConfirm(): HTMLElement {
+    const url = this.readsConfirmUrl!;
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-label", "Open external link");
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Open outside Hush?";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent = `This leaves the app and opens ${this.readsHostOf(url)} in your browser. The site will see your normal browsing identity, not Hush's.`;
+    const row = document.createElement("div");
+    row.className = "reads-confirm-row";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Stay here";
+    cancel.onclick = () => {
+      this.readsConfirmUrl = null;
+      this.render();
+    };
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "btn-primary pressable";
+    open.textContent = "Open in browser";
+    open.onclick = () => {
+      this.readsConfirmUrl = null;
+      if (isTauriShell()) {
+        void invoke("hush_open_url", { url }).catch(() => {
+          /* the modal already closed; the failure is visible by nothing happening */
+        });
+      } else {
+        window.open(url, "_blank", "noopener,noreferrer");
+      }
+      this.render();
+    };
+    row.append(cancel, open);
+    modal.append(h, p, row);
+    back.appendChild(modal);
+    return back;
+  }
+
   private renderMailFolders(): HTMLElement {
     const col = document.createElement("div");
     col.className = "mail-folders";
@@ -4058,6 +4943,16 @@ export class App {
     const card = document.createElement("article");
     card.className = "mail-message";
 
+    // The same two-column shape as `renderMailThread`: a fixed avatar column
+    // and a content column. A drop has no sender, so the avatar is a neutral
+    // mark rather than a contact colour — but the column still has to exist,
+    // or the grid would drop the header and body into the 44px avatar slot and
+    // wrap the body to a few characters per line.
+    card.appendChild(createAvatarEl("anonymous-drop", "sm"));
+
+    const content = document.createElement("div");
+    content.className = "mail-message-content";
+
     const msgHead = document.createElement("dl");
     msgHead.className = "mail-message-head";
     msgHead.append(
@@ -4067,27 +4962,27 @@ export class App {
       ...this.mailHeaderField("Sealed", this.mailDateEl(drop.createdAt)),
       ...this.mailHeaderField("Subject", drop.subject || "(no subject)"),
     );
-    card.appendChild(msgHead);
 
     const rule = document.createElement("hr");
     rule.className = "mail-message-rule";
-    card.appendChild(rule);
 
     const body = document.createElement("div");
     body.className = "text-15 mail-message-body drop-body";
     // textContent, never innerHTML: a drop body is untrusted text, so it is
     // shown as-is, unwrapped by any sanitizer, with links left inert.
     body.textContent = drop.body;
-    card.appendChild(body);
+
+    content.append(msgHead, rule, body);
 
     if (drop.attachments.length) {
       const attachRule = document.createElement("hr");
       attachRule.className = "mail-message-rule";
-      card.appendChild(attachRule);
+      content.appendChild(attachRule);
       for (const a of drop.attachments) {
-        card.appendChild(this.dropAttachmentChip(a));
+        content.appendChild(this.dropAttachmentChip(a));
       }
     }
+    card.appendChild(content);
     pane.appendChild(card);
     return pane;
   }

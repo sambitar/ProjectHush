@@ -22,6 +22,14 @@ futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 
+# Reads (HN reader): comment/reader HTML sanitizing, article extraction, cache keys.
+ammonia = "4"
+scraper = "0.23"
+ego-tree = "0.10"
+sha2 = "0.10"
+url = "2"
+feed-rs = "3.0.0"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }

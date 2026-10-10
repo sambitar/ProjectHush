@@ -58,6 +58,18 @@ fn hush_open_file(file_name: String, bytes: Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
+/// Open one URL in the user's browser, after the UI's own confirm step.
+/// Only http(s) is passed through: the webview must never become a launcher
+/// for file:// or other schemes a hostile page might have snuck into a link.
+#[tauri::command]
+fn hush_open_url(url: String) -> Result<(), String> {
+    let parsed = url::Url::parse(&url).map_err(|e| format!("bad url: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("refused to open {} link", parsed.scheme()));
+    }
+    open::that(&url).map_err(|e| e.to_string())
+}
+
 /// Proxy one daemon API call over the Unix socket (DR-02).
 #[tauri::command]
 async fn hush_api(
@@ -98,6 +110,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             hush_save_file,
             hush_open_file,
+            hush_open_url,
             hush_api,
             drops::drops_open,
             drops::drops_close,

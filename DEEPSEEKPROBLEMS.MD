@@ -13,6 +13,362 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-10 — Reads reader mode against Cloudflare-challenged sites
+
+### Concluded a bot-block was deterministic from one sample of it — FIXED (wrong assumption, corrected)
+
+- What was attempted: owner asked for a workaround for `fetch failed: HTTP status client error
+  (403 Forbidden)` when the reader fetched a `politico.com` article.
+- Symptom: a first batch of probes (daemon UA, Chrome UA, full `sec-ch-ua` client hints,
+  HTTP/1.1, and the homepage) all returned 403 with `cf-mitigated: challenge` and a "Just a
+  moment..." body, so the block was called deterministic and header-independent. Then the
+  rebuilt daemon fetched the *same* URL successfully once (HTTP 200, real article, cached at
+  11:48:49 — cache filename is `sha256(url)`, and the entry held the real title). Deleting that
+  cache entry and refetching 403'd again, and six immediate retries against a cache-busted
+  variant all 403'd.
+- Resolution: the block is intermittent per-IP (Cloudflare reputation), not deterministic, and
+  it does not converge under retry. Kept the honest failure path (clear reason plus a prominent
+  "Open the original") and deliberately did *not* add a retry loop, which 6/6 failures show
+  would only add load and burn reputation further.
+- Lesson: one sample of a 403 from a bot-challenge CDN is not evidence that the block is
+  permanent. The same client can pass on a later attempt. Sample the same client over time
+  before declaring a ceiling — and do not treat "it failed for me once" as "it cannot work".
+
+### `pkill -f "<pattern>"` killed the shell running it — FIXED
+
+- What was attempted: `pkill -f "target/debug/hush-daemon"` to restart the daemon.
+- Symptom: the command exited 0 in ~100 ms with no output; the daemon died, but so did the
+  shell, so the rest of the script (restart, unlock, verify) never ran. `pkill -f` matches the
+  whole command line, and the shell's own command line contained the pattern text. Hit the same
+  self-match twice, the second time via the script path (`python3 /tmp/stub_api.py`) that also
+  appeared in the script body.
+- Resolution: kill by port (`fuser -k 9899/tcp`) or by PID, and where a pattern is unavoidable
+  use a bracket class (`[t]arget/...`) whose literal text cannot appear in the invoking script.
+- Lesson: any `pkill -f` whose pattern string appears in the script that runs it will kill that
+  script. This is tooling, not a repo problem, but it silently truncated a restart twice.
+
+### Verification stub emitted duplicate CORS headers — FIXED (tooling)
+
+- What was attempted: stood up a small proxy on :9899 that makes `/api/reads/reader` return the
+  bot-block error, so the pane's new state could be rendered without depending on Cloudflare
+  choosing to challenge at that moment.
+- Symptom: the app sat on the unlock screen even though `/api/status` reported `locked:false`.
+  The stub copied the daemon's response headers and then added its own, producing two
+  `access-control-allow-origin` values (`http://localhost:5199` and `*`). Browsers reject such
+  responses, so `api.status()` threw, `refreshStatus` set `this.status = null`, and `render()`
+  fell through to the unlock screen.
+- Resolution: the stub drops upstream `access-control-*` headers and emits a single set.
+  Confirmed with `curl -H "Origin: ..."` that exactly one `access-control-allow-origin` is
+  returned. This was stub tooling only; the real daemon serves one header.
+- Lesson: a proxy that adds CORS headers must strip the origin's. A failure that looks like an
+  auth/lock problem can be a header problem one layer down.
+
+### The panel's `height: 100%` pushed its button off the fold — FIXED
+
+- What was attempted: reused `.reads-empty` (the pane's centered empty state) for the
+  reader-unavailable panel.
+- Symptom: measured geometry put the panel at `y=312..1157` inside an 849 px pane.
+  `height: 100%` resolves against the scroll container, not the space left under the article
+  head, so the block started below the head and overflowed; the "Open the original" button sat
+  at `y=833..871`, cut off at the bottom edge.
+- Resolution: `.reads-unavailable` overrides to `height: auto` with its own vertical padding.
+  It now measures `y=312..604` with the button at `y=534..572` — inside the pane and near its
+  middle. Verified for both the blocked and the generic failure variants.
+- Lesson: `height: 100%` in a scroll container is a claim about the container, not about the
+  space remaining after a sibling. Measure the geometry instead of trusting a class name that
+  says "centered".
+
+### Reader block reproduced through a stub, not a live story — WORKED AROUND
+
+- What was attempted: verify the new "site blocks automated readers" state against a real
+  Cloudflare-blocked story in the running app.
+- Symptom: the block is intermittent (see the first entry). No story in the current HK News feed
+  was blocked at the time (`apnews.com`, `gizmodo.com`, `www.techspot.com`,
+  `www.classaction.org` all fetched 200), and forcing a challenge by hammering politico would
+  fail and worsen the IP reputation.
+- Resolution: verified the daemon's error through direct API calls (502 plus `this site refused
+  an automated reader (HTTP 403)`), then rendered the pane state against a stub returning that
+  exact string. Both variants were checked live in the browser: blocked ("This site blocks
+  automated readers") and generic (`could not extract readable text; try the original` →
+  "This page could not be loaded"), including that the button opens the existing
+  open-outside-Hush confirm. Not verified end-to-end: a live blocked story driving the panel in
+  a single flow.
+- Lesson: with an intermittent upstream, the honest test is "the message the daemon actually
+  returns, fed to the real UI" rather than waiting for the network to misbehave on camera. State
+  which half was simulated.
+
+### Two daemons were polling the same vault — FIXED (environment)
+
+- What was attempted: restarted the daemon to pick up the new binary.
+- Symptom: `pgrep -af hush-daemon` showed two processes on `instances/peer-a` — the one started
+  by hand (`--addr 127.0.0.1:9876`, 11:12) and one the Tauri app spawned (socket only, 11:37).
+  Both had the vault open and `ss` listed two listeners on
+  `/run/user/1000/hush-one/hush.sock`, so the browser and the app were being served by different
+  processes over the same vault.
+- Resolution: killed both and started a single daemon serving the socket and 9876; the app
+  reconnects to the socket. Verified one process, socket present, `/api/status` 200.
+- Lesson: an app that spawns its own daemon while a hand-started one is already running yields
+  two writers on one vault. The daemon has no single-instance guard on the socket or vault
+  directory; not fixed here, but worth one.
+
+---
+
+## 2026-10-10 — Reads "Add feed" reported as doing nothing
+
+### A refused feed explained itself in the wrong column — FIXED
+
+- What was attempted: owner reported the RSS add "doesn't work" and that clicking Add did
+  nothing; asked for the add to move into a dialog.
+- Symptom: reproduced by driving the real UI — clicking Add with a scheme-less URL
+  (`news.ycombinator.com/rss`) did submit, but the daemon's refusal
+  (`refused URL "news.ycombinator.com/rss"`) was written to `readsError`, which
+  `renderReadsList` paints in the *middle* column. The nav, where the Add control lives,
+  showed no change at all, so from the control's side it looked like nothing happened. The
+  empty-field case behaves the same way.
+- Resolution: replaced the inline nav field with an "Add a feed" dialog that holds the URL,
+  the busy state, and the refusal reason together; a URL typed without a scheme is assumed to
+  be `https://` instead of being bounced. Verified live: a refused URL keeps the dialog open
+  with the reason beside the field, and a scheme-less good URL adds and opens the source.
+- Lesson: feedback belongs next to the control that caused it. An error rendered in a
+  different pane is indistinguishable from no action at all. Reproduce before assuming the
+  request never fired.
+
+---
+
+## 2026-10-10 — Received drop rendered one character per line in Mail
+
+### A drop body wrapped to a few characters per line — the card skipped its content column — FIXED
+
+- What was attempted: user reported a received drop "shows a vertical line of letters" when
+  opened in Mail.
+- Symptom: `renderDropView` appended the header, the rule, and the body straight onto the
+  `article.mail-message`. `.mail-message` is a two-column grid (`grid-template-columns: 44px
+  1fr`) whose first column is the 44px avatar slot, so auto-placement dropped the header and
+  the body into that narrow column. With `white-space: pre-wrap` and `overflow-wrap:
+  break-word`, the body then wrapped to a handful of characters per line. `renderMailThread`
+  avoids this by appending an avatar and wrapping everything else in `.mail-message-content`.
+- Resolution: `renderDropView` now appends a neutral avatar
+  (`createAvatarEl("anonymous-drop", "sm")`) and wraps the header/rule/body/attachments in a
+  `.mail-message-content` div, matching the thread layout. Verified live against a real drop
+  sealed to the vault's published key and parked on the relay: the card computes
+  `44px 568px` and `.drop-body` sits inside `.mail-message-content` at 568x75 px (3 lines)
+  instead of a ~44px-wide column.
+- Lesson: the body data was never the problem — it was clean multi-line text. A grid
+  container with an implicit narrow first column turns "append three children" into "put two
+  of them in the avatar slot". A view that reuses a layout class must reproduce that class's
+  child structure.
+
+## 2026-10-10 — RSS add reported broken a second time
+
+### "Still can't add RSS feed" — the daemon was not running at all — FIXED (environment)
+
+- What was attempted: user reported the Reads "Add RSS feed" flow still failing after the
+  earlier stale-daemon fix. Checked for a running daemon before touching any reads code.
+- Symptom: no `hush-daemon` process existed; `/run/user/1000/hush-one/hush.sock` was a
+  stale leftover (mtime 11:05, nothing listening — `curl --unix-socket` failed with
+  `(7) Failed to connect`). The rebuilt binary (`target/debug/hush-daemon`, 11:04:42) was
+  never running, so every reads request would fail with "Can't reach the Hush daemon".
+- Resolution: started the daemon on the `peer-a` vault with both the unix socket and
+  `--addr 127.0.0.1:9876` (the browser UI's default base), unlocked it, then drove the real
+  UI at `localhost:5199/?api=http://127.0.0.1:9876`: the Reads pane listed the user source
+  and clicking Add on `https://lobste.rs/rss` returned 200 and rendered a new "Lobsters"
+  row with a Remove ×. The API path was confirmed independently (`POST /api/reads/sources`
+  → 200, source list grew). The reads routes and add flow are correct; the only fault was
+  the daemon being down.
+- Side effect: two feeds added to the `peer-a` vault during verification (Hacker News,
+  Lobsters); removable from the nav × if unwanted.
+- Lesson: "can't add RSS" is not evidence of a reads bug. Confirm the daemon is up and the
+  vault unlocked first — the same class as "Tauri shell proxies to whatever daemon process
+  is already running" above. A stale socket file makes the daemon look present when it is
+  not; `curl --unix-socket` (or `ss -xlp`) is the honest check.
+
+## 2026-10-10 — Relay redeploy after the drops slice
+
+### Blank white page on the onion `/drop` — the deployed relay predates the route — FIXED
+
+- What was attempted: user reported `http://ogkf…sad.onion/drop` renders blank white.
+  Checked the committed bundle (`page.built.html` intact, 53 KB, JS inlined), then probed
+  the lab VPS over SSH: `hush-relay` and `tor` both active, clearnet `/health` 200.
+- Symptom: through the onion, `/health` → 200 but `/drop` → **404 with an empty body**
+  (clearnet identical). An empty 404 is exactly what a browser renders as a blank white
+  page; the dark-themed drop page itself never reaches the browser.
+- Cause: the deployed binary was built 2026-10-08 20:13 UTC; the `/drop` page route landed
+  in `d81837b` (2026-10-09 17:41). The Tor onion service forwarded fine — the relay behind
+  it just did not know the route.
+- Resolution: rebuilt `hush-relay` release from HEAD in a throwaway worktree (only
+  committed code; the working tree has WIP in `hush-core`) and redeployed per
+  `docs/ops/relay-lab-vps.md` (sha256 `ed1cf4bf…`, checksum verified on the box).
+  Onion `/drop` now 200 with the 53837-byte page, `text/html; charset=utf-8`; the drop
+  family round-tripped through the onion (PUT 204 / GET 200 exact bytes / DELETE 204 /
+  GET-after-delete 404). `cargo test -p hush-relay` 18 passed (2 drops, 8 prekey,
+  3 queue-credentials, 5 relay-queues).
+- Lesson: same class as the stale-daemon entry below — a relay feature does not exist
+  until the deployed binary is replaced. After a relay-facing slice, redeploy and curl the
+  live surface through both bases; the onion path answering `/health` proves only
+  reachability, not that new routes exist.
+
+### Fresh target dir cannot build `hush-core` without `protoc` — WORKED AROUND (environment)
+
+- What was attempted: the clean-source worktree build above hit the earlier `protoc` gap
+  (see "A throwaway cargo project cannot build `hush-core` because `protoc` is absent")
+  from the other direction: a fresh target dir re-runs `sparsepostquantumratchet`'s build
+  script even though the workspace's own cached `target/` hides it.
+- Symptom: same panic — `Could not find 'protoc'` — 96 s into `cargo build --release
+  --locked -p hush-relay` from an empty target dir. `which protoc` is empty and there is
+  no system protobuf-compiler.
+- Resolution: no system change needed — a usable `protoc` ships inside the uv/torch cache:
+  `PROTOC=/ssd/sam/cache/uv/archive-v0/u47pJhhlHvKWEJVjcotQM/torch/bin/protoc` (libprotoc
+  3.13.0) unblocked the full from-scratch release build (2 m 25 s). The underlying
+  environment gap stands for any fresh clone; installing `protobuf-compiler` would close
+  it for good.
+- Lesson: point builds at a `PROTOC` env var instead of relying on a warm `target/`;
+  a cached build script output is invisible infrastructure until the first cold build.
+
+### Removing the build worktree wedged the persistent shell session — WORKED AROUND (tooling)
+
+- What was attempted: `git worktree remove --force /tmp/hush-relay-deploy` from the agent
+  shell, whose cwd was still inside that worktree from the build commands.
+- Symptom: `fatal: Unable to read current working directory`, then every subsequent shell
+  command — including `pwd` — returned no exit status. The removal itself succeeded (the
+  directory is gone and the repo reads fine through file tools), but the shell session is
+  unrecoverable and needs a restart. Purely a tooling problem; no repo state affected.
+- Resolution: no in-repo fix. Verify worktree cleanup with file tools instead of the shell
+  when this happens; `git worktree prune` on the next real shell use clears any stale
+  registration.
+- Lesson: `cd` out of a directory before deleting it out from under the persistent shell —
+  a deleted cwd poisons the whole session, not just the next command.
+
+## 2026-10-10 — Reads RSS Add button
+
+### Add-feed POST returned a different source list than GET — FIXED
+
+- What was attempted: after `POST /api/reads/sources`, the handler returned only the user's
+  `RssSource` entries from `ReadsState`, while `GET /api/reads/sources` returned built-in
+  first plus user sources.
+- Symptom: reproduced in the dev page — clicking Add succeeded but the nav then rendered
+  `["Hacker News", "Saved"]`; `HK News` vanished from the source list until the next rail
+  refresh refetched.
+- Resolution: extracted `reads_sources_view(&App)`; GET, POST, and DELETE now all return the
+  same `Vec<ReadsSourceDto>` shape so the frontend can swap its list wholesale after any
+  mutation. Verified in browser: after Add, nav is `["HK News", "Hacker News", "Saved"]`.
+- Lesson: when two endpoints conceptually return "the list", share one builder. Hand-rolled
+  projections drift the moment one endpoint gains a field.
+
+### RSS feed URL input was uncontrolled inside a re-rendered pane — FIXED
+
+- What was attempted: the add-feed input kept its value only in the DOM node; any
+  `render()` (poll tick, sources refresh) rebuilt the nav from state and cleared it.
+- Symptom: a click on Add after a re-render submitted an empty draft, which silently
+  returned — the user-visible effect is "the Add button doesn't work" with no feedback.
+- Resolution: added `readsSourceDraft` app state bound via `input.oninput`; Enter/Add read
+  the draft, a successful add clears it, and an empty draft now sets a visible
+  `readsError` ("Type or paste an RSS feed URL to add.") instead of a silent no-op.
+  Caveat: automated typing into a captured element reference does not survive a re-render
+  even with state binding — the harness must re-query the live element per keystroke.
+- Lesson: any input in a pane that re-renders from scratch needs its draft in state, or it
+  will eat user input on unrelated re-renders.
+
+### Tauri shell proxies to whatever daemon process is already running — OPEN (environment)
+
+- What was attempted: explaining the user report that Add "doesn't work" in the real app.
+- Symptom: `src-tauri/lib.rs` `transport_from_env` connects to an existing Unix-socket
+  daemon; the shell never spawns one. A daemon binary started before the source routes
+  existed answers `404` for `POST /api/reads/sources`, so Add fails there with an error
+  shown at the top of the list pane.
+- Resolution: none in-repo — the routes exist and are tested. The user's running daemon
+  must be killed and relaunched from the rebuilt binary for the Add flow to work.
+- Lesson: new daemon routes require restarting the sidecar-less daemon; a webview rebuild
+  alone is not enough.
+
+## 2026-10-09 — Reads pane (HN reader, `docs/tasks/hush-reads.md`)
+
+Slice goal: new Reads rail pane fed by Hacker News via Algolia — surfaces, search, in-app
+reader mode, sanitized comments, vault-backed saved/read/hidden state.
+
+### [FIXED] RSS items hit the main pane's "pick something to read" empty state
+
+- **Attempted:** after switching Reads to a source list, an RSS item (which has no HN
+  discussion) was opened straight into the reader — no `readsDetail` fetch ever runs for
+  it.
+- **Symptom:** the main pane's guard (`!id || (!detail && !detailLoading)`) decided
+  "nothing open" the moment the row was clicked, because for RSS there is no detail to
+  load: the reader flow skipped straight past the empty state. Caught in the browser pass.
+- **Resolution:** `renderReadsMain` now resolves the story from `detail.story` **or** the
+  listed row, and the loading/empty states are decided after that; the discussion branch
+  additionally requires `detail` to exist. HN behavior unchanged (verified: 179-comment
+  thread still renders; RSS reader renders with Discussion disabled).
+- **Lesson:** when one pane serves two content kinds, resolve "what am I rendering" once
+  at the top instead of guarding on one kind's loading flags — the second kind trips the
+  first kind's empty state otherwise.
+
+### [FIXED] Built the domain filter on an Algolia `domain_{host}` tag that does not exist
+
+- **Attempted:** the task doc specified domain filtering as `tags=story,domain_{host}`
+  combined with the surface; `search_url` in `reads.rs` implemented exactly that.
+- **Symptom:** every domain-filtered query returned zero stories, and the UI showed an
+  empty list. Direct curl against the live API showed hits whose `_tags` only ever contain
+  `story`, `author_*`, `story_*`, `front_page`, `ask_hn`, `show_hn` — no `domain_*` tag on
+  the public `hn.algolia.com` API v1 (it may exist on Algolia's internal index, not on the
+  public proxy).
+- **Resolution:** moved domain narrowing into the daemon: `domain_search` scans a bounded
+  10 pages of the popularity index (mem-cached after the first click), keeps host matches
+  via a new `normalize_host` helper, and serves UI pages out of the filtered list. Niche
+  domains can come back short; the empty state in the UI says so, and the task doc's
+  surfaces table no longer claims a `domain_` tag. `by_date` is deliberately ignored in
+  domain mode ("more from this site" reads as best-of).
+- **Lesson:** design against observed API responses, not remembered features. The tag was
+  never verified against a live hit before the UI was built on it — one curl of a real
+  search with `_tags` in the payload would have caught it at design time.
+
+### [FIXED] Domain chip handler wiped its own filter; a stale-render race made the test look like it passed
+
+- **Attempted:** the row chip's onclick did `this.readsDomain = s.domain; this.readsRunSearch();`
+  while `readsRunSearch()` unconditionally does `this.readsDomain = null`.
+- **Symptom:** clicking a domain chip never filtered — the run erased the domain before the
+  load. First browser test reported the filter "working" because the probe counted rows
+  before the list re-rendered: the wait loop exited on `rows > 0` (old rows still on
+  screen) and the domain assertions ran against the previous surface's DOM.
+- **Resolution:** new `readsRunDomainSearch(domain)` that sets mode/domain/query in one
+  place; chip routes through it. Test rewritten to wait for the list to *clear* (row count
+  drops below the pre-click value) and then settle, and to assert all rendered domains
+  match the filter — verified live: github.com → 4 rows, all github.com, nav chip shows
+  the clear control.
+- **Lesson:** setters that reset sibling state make "set then run" callers silently undo
+  themselves — state transitions that belong together need one entry point. And an async
+  UI assertion must anchor on the transition having started (list cleared), not on the DOM
+  being non-empty, or it asserts stale markup.
+
+### [FIXED] `#[serde(flatten)]` on `SavedStory` silently broke every save/read annotation in the UI
+
+- **Attempted:** `SavedStory { #[serde(flatten)] story: StoryDto, saved_at }` in
+  `reads_store.rs`, with the TypeScript side typed as `{ story: ReadsStoryDto; saved_at }`.
+- **Symptom:** saving worked on the daemon (state route returned the story, nav count
+  incremented) but the UI never flipped: `state.saved.some(x => x.story.id === id)` compared
+  against `undefined` because flatten serializes story fields at the top level. No error
+  anywhere — just silently false annotations. Caught in the browser pass, not by cargo tests
+  (the roundtrip test asserted the same nested shape as TS, so the two sides disagreed with
+  only the Rust side real).
+- **Resolution:** removed `flatten`; daemon nests `{ story, saved_at }` to match the TS type.
+  Also caught the flip side live: a sidecar written by the pre-fix daemon no longer parses
+  (`missing field 'story'`), which for the never-shipped format meant deleting the throwaway
+  smoke vault's `reads-state.enc` — no migration code for a format that never shipped.
+- **Lesson:** when the same JSON has a Rust and a TypeScript declaration, the roundtrip test
+  must assert the *wire* shape against a literal sample, not against Rust's own types, or
+  both sides can be consistently wrong. `serde(flatten)` + a hand-written TS type is a
+  standing trap.
+
+### [WORKED AROUND] Unlock screen has no status poll, so an unlocked vault keeps showing the passphrase form
+
+- **Attempted:** during the browser smoke, unlocked via `curl POST /api/unlock` and expected
+  the unlock screen to flip to the shell on its own.
+- **Symptom:** the unlock screen never re-renders while idle — `startPoll` (and every other
+  refresh loop) starts only after the shell renders; status is fetched once at init.
+- **Resolution:** reload the page in that state; `refreshStatus` at init sees `locked:false`
+  and goes straight to the shell. Real users always unlock through the form, so this is a
+  smoke-testing artifact, not a product bug.
+- **Lesson:** when scripting UI flows against this app, the unlock screen is a dead end for
+  out-of-band unlocks; drive the form or reload.
+
 ## 2026-10-09 — Incoming drops (sealed box, vault key storage)
 
 Slice goal: rebuild the inbound outsider-drop path per `docs/plans/2026-10-09-incoming-drops.md` —

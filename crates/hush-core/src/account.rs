@@ -595,6 +595,19 @@ impl Account {
         self.vault.get_blob(id)
     }
 
+    /// Read a named encrypted vault sidecar (see
+    /// [`Vault::read_encrypted_file`]). For feature-owned state that must be
+    /// encrypted at rest; the caller owns the name and the schema inside.
+    pub fn read_vault_sidecar(&self, name: &str) -> Result<Option<Vec<u8>>, Error> {
+        self.vault.read_encrypted_file(name)
+    }
+
+    /// Write a named encrypted vault sidecar (see
+    /// [`Vault::write_encrypted_file`]).
+    pub fn write_vault_sidecar(&self, name: &str, plaintext: &[u8]) -> Result<(), Error> {
+        self.vault.write_encrypted_file(name, plaintext)
+    }
+
     pub fn vault_dir(&self) -> &Path {
         &self.dir
     }
