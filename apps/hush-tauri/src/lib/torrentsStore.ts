@@ -243,6 +243,12 @@ export function torrentStatusLabel(item: TorrentItemDto): string {
     case "ready":
       return "Ready — starting download";
     case "downloading": {
+      // The transfer and the vault store are one status: the bytes can be
+      // fully on disk while the file is still being encrypted into the vault,
+      // which for a multi-GB file takes a while. Say so, or 100% looks stuck.
+      if (item.dl_total > 0 && item.dl_done >= item.dl_total) {
+        return "Sealing into the vault…";
+      }
       const pct = item.dl_total
         ? Math.round((item.dl_done / item.dl_total) * 100)
         : 0;

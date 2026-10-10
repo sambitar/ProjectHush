@@ -13,6 +13,427 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-10 — Release daemon abort on a 2 GiB blob read (finite memlock + MCL_FUTURE)
+
+Slice goal: confirm the release desktop instance was still connected to the lab relay. It was
+not: the daemon had aborted.
+
+### [FIXED] A finite `RLIMIT_MEMLOCK` plus `MCL_FUTURE` turned a 2 GiB allocation into a process abort
+
+- **Attempted:** check the running instance's `/api/status` and `/api/relay` after the relay
+  origin work.
+- **Symptom:** the daemon was gone, `ps` showed only the old vite, and the run script's log ended
+  with `2814506 Aborted`. `logs/daemon.log` held the two startup lines followed by
+  `memory allocation of 2147483648 bytes failed` and the `RUST_BACKTRACE` note — that is Rust's
+  allocation-error handler, so the process aborted rather than shutting down. The desktop window
+  went with it (the script's `wait -n` tears the run down when the daemon exits).
+- **Cause:** `crates/hush-daemon/src/security.rs` requested
+  `mlockall(MCL_CURRENT | MCL_FUTURE)` whenever `RLIMIT_MEMLOCK` was at least
+  `FUTURE_LOCK_MIN_BYTES` (256 MiB). The limit on this host is finite — `ulimit -l` reports
+  2,083,516,416 bytes (1.94 GiB) — so `MCL_FUTURE` was enabled, and the kernel then charges every
+  future mapping against that cap. A probe using the host's real limit reproduces it exactly:
+  with `MCL_CURRENT|MCL_FUTURE`, `mmap(2147483648)` fails `EAGAIN` while `mmap(1073741824)`
+  succeeds; with `MCL_CURRENT` alone, `mmap(2147483648)` succeeds. The daemon asked for exactly
+  2,147,483,648 bytes, so the mapping was refused and the process aborted. The threshold was the
+  whole bug: 1.94 GiB is not "comfortably larger than any plausible growth" when one legitimate
+  buffer is the size of a user file. The old doc comment predicted this exact outcome.
+- **Trigger:** reproduced deterministically with `GET /api/blob/3041b5f8…` (the 1.65 GB,
+  212-chunk torrent blob): `Vault::get_blob` collects a chunked blob into a `Vec` whose doubling
+  growth lands on an exact 2 GiB reservation. Unlocking alone did not abort (25s soak, alive);
+  the blob request did, within ~26s.
+- **Resolution:** the decision is now `should_lock_future`, which enables `MCL_FUTURE` only when
+  `RLIMIT_MEMLOCK` is unlimited (`u64::MAX`); a finite limit no longer caps allocations.
+  Evidence: unit test `security::tests::future_locking_requires_an_unlimited_memlock_limit`
+  (passes, with the 1.94 GiB and 2 GiB cases pinned as not-roomy); the relaunched daemon logs
+  `memory_locked=on (current pages only; set LimitMEMLOCK=infinity for full coverage)` with
+  `VmLck 561312 kB`, so current pages are still pinned, and it survives unlock.
+- **Lesson:** a hardening measure must never convert a large-but-legitimate allocation into a
+  fatal error. When a limit is really a cap on the failure mode rather than on the threat, lift
+  it entirely or leave the failure mode intact — a "generous" finite threshold is still a crash
+  waiting for a big enough file.
+
+### [OPEN] The 2 GiB request itself is untouched: `/api/blob/{id}` still materialises whole files
+
+- This is the existing entry "Multi-GB Library Open/Save is unbounded in memory", with a worse
+  symptom than it recorded: the path does not merely fail to scale, it aborted the daemon. The
+  hardening fix removes the abort, not the allocation. `GET /api/blob/{id}` still builds the full
+  plaintext `Vec` and then a base64 JSON body, so opening the 1.65 GB torrent is roughly a 4 GiB
+  spike inside the daemon.
+- Re-issuing the request after the fix was deliberately not done on this workstation: it has
+  3.6 GB available with swap nearly full and Chrome plus Cursor resident, so the spike risks an
+  OOM kill instead of a clean pass. The end-to-end claim verified here is the memlock policy, not
+  that a 1.65 GB open now succeeds. Closing this needs the streaming / `Range` blob route plus a
+  Tauri command that writes to a file without the webview holding the bytes.
+
+### [WORKED AROUND] The daemon logs no requests, so the abort had to be re-derived by replay
+
+- The daemon's log is two startup lines plus the allocator's message; nothing records which
+  request was in flight. The trigger could only be found by restarting the release binary and
+  re-issuing candidate requests by hand (unlock first, then the blob read). A one-line request log
+  — method, route, response size — would have named the caller immediately and would make any
+  future "the daemon died" report diagnosable without a repro session. Logging was not added in
+  this slice; the gap is recorded rather than papered over.
+
+---
+
+## 2026-10-10 — HTTPS origin for the lab relay, part 2 (release daemon reachability)
+
+Slice goal: get the release desktop daemon onto the lab relay over the box's existing Cloudflare
+HTTPS route.
+
+### [FIXED] The configured HTTPS origin had been reclaimed; the hostname was NXDOMAIN
+
+- **Attempted:** use the box's Cloudflare HTTPS origin as the release relay base.
+- **Symptom:** the configured origin, `https://citations-stuffed-bulletin-shade.trycloudflare.com`
+  (pinned in `HUSH_RELAY_DROP_BASE_URL`), returned nothing: `dig @1.1.1.1` gave no answer
+  (NXDOMAIN) while `trycloudflare.com` resolved, and every `curl` was `http=000`. On the box,
+  `cloudflared-quick.service` was `active` but had been looping on
+  `ERR failed to serve tunnel connection error="control stream encountered a failure while
+  serving"` every ~17s since its last successful registration at `Oct 09 09:29:00`. It had worked
+  on Oct 8 (the drop base was verified then), so it was reclaimed between the 9th and the 10th —
+  the "no uptime guarantee" caveat the quick tunnel prints at startup, made concrete.
+- **Resolution:** `systemctl restart cloudflared-quick.service` minted
+  `https://ban-therapeutic-daughter-organic.trycloudflare.com`, which resolved and served nginx
+  within ~25s (`/ironlink-health` 200). The old hostname is dead and cannot be recovered.
+- **Lesson:** a quick-tunnel hostname is not an identity. Check that the hostname resolves before
+  treating "the tunnel service is active" as "the origin is up" — `active` covered a
+  month-old process that had stopped being reachable.
+
+### [FIXED] The HTTPS origin only carried `/open/` and `/drop/`, so it could not be a relay base
+
+- **Attempted:** point a release vault at `https://<host>` and let the daemon ping it.
+- **Symptom:** through the tunnel, `/health` returned 307 and `/q/x` returned 307 — the alhakim
+  app's redirect to `/login`, not the relay. The 2026-10-08 ingress had added only
+  `location /open/` and `location /drop/` (for the drop opener), and the relay client builds
+  `{base}/health`, `{base}/q/{queue_id}...` and `{base}/k/{account_id}`
+  (`crates/hush-core/src/relay_client.rs`), so every relay call fell through to the app.
+- **Resolution:** added `location = /health`, `location /q/`, `location /k/` to
+  `/etc/nginx/sites-available/alhakim`, all proxying to `http://127.0.0.1:8790`, with a
+  timestamped backup (`alhakim.bak-20261010`) and `nginx -t` before the reload. Verified through
+  the origin: `/health` 200, `/q/x` 401 `{"error":"unauthorized"}`, `/k/x` 404, while
+  `/ironlink-health` stayed 200 and `/` stayed 307 — the other apps on the box were untouched.
+- **Lesson:** the relay client's base is a whole protocol root, not a page prefix. An ingress
+  that serves one route of a protocol proves nothing about the protocol.
+
+### [FIXED] `GET /drop` (the published drop page) fell through to the app
+
+- **Attempted:** reach the relay's drop page through the HTTPS origin.
+- **Symptom:** `GET https://<host>/drop` returned 301 (the app's redirect), because nginx only had
+  `location /drop/` and a bare `/drop` does not match a trailing-slash prefix. The relay serves
+  the page at exactly `GET /drop` (`crates/hush-relay/src/app.rs`), and the URL the daemon
+  publishes is `{base}/drop` from `drop_page_url()`
+  (`crates/hush-daemon/src/account_worker.rs:264`), so the published link would have opened the
+  medical app's login page.
+- **Resolution:** added `location = /drop` → relay. `GET /drop` now 200 with the drop page HTML.
+  Also corrected the block comment: `/open/{id}` is no longer a relay route (the pickup page was
+  retired), so `location /open/` is legacy and answers 404 — kept only so an older binary in
+  front is not silently sent to the app.
+- **Lesson:** in nginx a trailing-slash prefix and the bare path are different locations. Check
+  the exact URL a client publishes, not the family it belongs to.
+
+### [FIXED] `HUSH_RELAY_DROP_BASE_URL` is no longer read by the relay
+
+- **Attempted:** update the box's drop-base drop-in to the new hostname so drop links stay live.
+- **Symptom:** no `drop_base_url` exists anywhere in `crates/hush-relay/src`; it appears only in
+  this log and `docs/plans/2026-10-07-outsider-mail.md`. The current relay serves a static
+  `GET /drop` and the published URL is composed client-side, so the drop-in's `Environment=` line
+  is inert.
+- **Resolution:** updated the value anyway (harmless, and keeps the file honest about which origin
+  is current) and documented it as inert in `docs/ops/relay-lab-vps.md`. The behaviour change that
+  mattered was the nginx `location = /drop` above.
+- **Lesson:** an env var with no remaining reader fails silently. Grep the crate before treating a
+  service's environment as its configuration.
+
+### [OPEN] The relay's HTTPS origin is still an ephemeral quick-tunnel hostname
+
+- **Attempted:** make the release daemon's relay base durable.
+- **Symptom:** the origin that now works, `https://ban-therapeutic-daughter-organic.trycloudflare.com`,
+  is a `trycloudflare.com` quick tunnel. Its hostname is assigned at process start and changes on
+  every `cloudflared-quick.service` restart (`Restart=always`), and Cloudflare reclaimed the
+  previous one. Any vault pointed at it breaks the next time the tunnel restarts.
+- **Resolution:** none in this slice. The box already runs a durable named tunnel
+  (`cloudflared.service`, tunnel `cricket-po`, connected) in front of the same nginx, but its
+  public hostname is configured in the Cloudflare dashboard and is not readable from the box: no
+  `cert.pem` (`cloudflared tunnel list` fails with "Cannot determine default origin certificate
+  path"), no `CLOUDFLARE_API_TOKEN`, and nothing in the unit files, `/root` notes, or bash history
+  names it. Getting it needs the dashboard (or a token), which is the user's.
+- **Progress (same day):** the user created a tunnel named `hush` in a *second* Cloudflare account
+  (`75743fae…`, vs the box's `8bccbccb…`) and supplied its token. A connector was installed on the
+  box as **`cloudflared-hush.service`** (not `cloudflared.service`, which already belongs to
+  cricket-po — `cloudflared service install <token>` would have overwritten it and moved the
+  medical app, cricket PWA, and MCP onto the new tunnel). The unit runs
+  `cloudflared --config /etc/cloudflared/hush.yml tunnel run --token-file
+  /etc/cloudflared/hush.token`; the explicit `--config` exists so the default
+  `/etc/cloudflared/config.yml` (cricket-po) is not picked up. Token and config are `0600`/`0644`.
+  The connector authenticates and registers (4 QUIC connections), but it logs
+  `WRN No ingress rules were defined in provided config (if any) nor from the cli, cloudflared
+  will return 503 for all incoming HTTP requests` — i.e. **no public hostname is configured on the
+  tunnel yet**, so there is still no URL to point the vaults at. Adding one needs a domain/zone in
+  that account (Zero Trust → Networks → Tunnels → hush → Public Hostname → service
+  `HTTP localhost:8790`), which is a dashboard action only the user can take.
+- **Lesson:** "the server has an HTTPS route" and "the server can tell you its HTTPS route" are
+  different questions; a named tunnel's hostname lives in the account, not on the host. Also,
+  `cloudflared service install` is not idempotent across tunnels — it writes the shared unit path,
+  so a second tunnel needs its own unit.
+
+### [WORKED AROUND] `pkill -f` matched the invoking shell and killed the command mid-run
+
+- **Attempted:** `pkill -f "target/debug/hush-tauri"` to stop the desktop UI from a shell call.
+- **Symptom:** the tool returned exit 0 with completely empty output and the rest of the script
+  never ran (the daemon was still up afterwards). The pattern matched the shell's own command
+  line, which contained that literal string, so `pkill` killed the shell running the script.
+- **Resolution:** killed by PID instead (`kill <pid>`, then polled `kill -0`) for the remaining
+  stops. This is a tooling/workflow mistake, not a repo problem.
+- **Lesson:** with `pkill -f` the invoking command is a match candidate. Capture PIDs first
+  (`ps -eo pid,cmd | grep ...`) and kill by PID, or exclude self.
+
+---
+
+## 2026-10-10 — Running the desktop instance
+
+### The release daemon cannot reach the lab relay, so the app shows "disconnected" — FIXED
+
+- What was attempted: open the desktop instance and use it. The top-rail shield reported
+  "Hush is disconnected."
+- Symptom: `GET /api/relay` returns `reachable: false` while `curl http://137.184.129.205:8790/health`
+  from the same machine returns 200. The cause is the build profile, not the network.
+  `HttpPolicy::current()` is `LoopbackOnly` in release and `Allow` in debug, and
+  `Account::relay_client()` builds through `RelayClient::try_new_with_proxy(&self.state.relay, None)`
+  → `normalize_relay_base` → the policy. The vault's relay is `http://137.184.129.205:8790`, a
+  cleartext HTTP URL on a public IP, so in release the client constructor fails with
+  `Relay("insecure relay URL: use HTTPS except for localhost")`, `relay_ping` returns false, and
+  every relay path (presence, chat, mail, drops) fails. Mail queues in the Outbox rather than
+  erroring, so the failure is quiet apart from the light.
+- Evidence, same vault and same relay URL, only the profile changed:
+  `RELEASE: relay=http://137.184.129.205:8790 / vault reachable=False` vs
+  `DEBUG: relay=http://137.184.129.205:8790 / vault reachable=True` (nothing listens on 8787, so
+  the debug probe really reached the lab box). Independently, `hush-cli init --relay <lab url>`
+  succeeds under `target/debug/hush-cli` and fails under `target/release/hush-cli` with the error
+  above.
+- Cause of the regression: the same-day change that made `run-one-ui.sh` / `run-two-ui.sh` start
+  `target/release/hush-daemon` (for the 43x faster AEAD blob store) put a release daemon behind a
+  plain-HTTP lab relay. `docs/ops/relay-lab-vps.md` already documents that this cannot work:
+  "So a **release** daemon cannot use this plain-HTTP relay; it needs `https://` ... or a **debug**
+  build." The two requirements were never reconciled; the store fix silently broke the relay.
+- Blast radius: `instances/peer-a` and `instances/peer-b` both store
+  `http://137.184.129.205:8790`. Only peer-a has an `onion_relay` on file, so only peer-a has an
+  in-release escape route (Tor mode). peer-b has no onion and no loopback alternative.
+- Options considered while this was open (kept as history; none was needed): Tor relay mode (peer-a
+  already had an onion on file, peer-b would need re-init with `--onion`), a loopback relay
+  (`WITH_LOCAL_RELAY=1`, `http://127.0.0.1:8787` — allowed in release, but repointing is destructive
+  and the lab VPS leaves the loop), TLS in front of the lab relay (the checklist requires a publicly
+  trusted CA and the client bundles `webpki-roots`, so it needs a hostname — the box is a bare IP),
+  reverting the daemon to debug (gives up the fast store), or a dev-profile `opt-level` override
+  (unmeasured). A release-mode "insecure" switch was never on the table:
+  `docs/ops/relay-https-checklist.md` forbids it outright.
+- Resolution (2026-10-10, later the same day): the box already had a Cloudflare HTTPS origin in front
+  of nginx; the ingress was widened to carry the whole relay protocol and the vaults were repointed
+  with `hush-cli --dir instances/<v> --passphrase <pw> relay set --url
+  https://ban-therapeutic-daughter-organic.trycloudflare.com` (vault state, plus the advisory
+  `client-config.json`), then the desktop instance was restarted. Verified on the live release
+  daemon: `GET /api/status` → `"relay": "https://ban-…trycloudflare.com"`, `"relay_source": "vault"`,
+  and `GET /api/relay` → `reachable: true`. No build profile changed and no vault was recreated. See
+  the section above for the ingress and the tunnel work.
+- Caveat: that origin is an ephemeral quick tunnel (see the OPEN entry above), so this is a working
+  fix, not a durable one.
+- Lesson: changing a build profile changes more than speed when behaviour is gated on
+  `cfg!(debug_assertions)`. Grep for `debug_assertions` before moving a service between profiles, and
+  do not assume a green light from a script that only proves the process started.
+
+## 2026-10-10 — Running the desktop instance (scripts)
+
+### `scripts/run-one-ui.sh` was not executable — FIXED
+
+- What was attempted: start the single-desktop-instance script the way its own header documents it,
+  `./scripts/run-one-ui.sh`.
+- Symptom: `--: line 1: ./scripts/run-one-ui.sh: Permission denied`. The file was `100644` in git
+  while every other runnable script in `scripts/` is `100755`. Nothing about the file changed in
+  this session; the mode was simply wrong in the index, so the failure was latent until someone
+  ran it directly rather than via `bash script.sh`.
+- Blast radius: a previous note in this log told the user to run exactly `./scripts/run-one-ui.sh`
+  to pick up the release-daemon change. That instruction could not have worked.
+- Resolution: `chmod +x scripts/run-one-ui.sh`. Checked the rest of `scripts/` for the same defect
+  and found `scripts/smoke-tor-relay.sh` (`100644` with a shebang, the only smoke script not
+  `100755`), so it was fixed too. `scripts/drops-vector.mjs` is also `100644` but is documented as
+  `node scripts/drops-vector.mjs`, so that one is intentional and was left alone. Verified the
+  script then ran end to end: UI build, Rust build, daemon on `instances/peer-a`, window up.
+- Lesson: `git ls-files -s` is the authority on the exec bit, not `ls`. A script that is only ever
+  invoked as `bash foo.sh` can carry a wrong mode for a long time, so check the mode when a
+  README or header tells the user to run it directly.
+
+## 2026-10-10 — Torrents Library renders a blank page
+
+### `icon("folder")` named an icon that does not exist — FIXED
+
+- What was attempted: open the Torrents > Library tab, and open a torrent entry inside it.
+- Symptom: the Library pane rendered blank. It worked while the Library was empty (that branch
+  renders a plain "Nothing in the library yet" paragraph) and went blank as soon as the first
+  torrent was filed, which is also why the just-downloaded file looked missing: "cant find the
+  file in library as well" and "library open blank page when i click on it" are the same defect.
+  The Library renderer calls `this.libraryItemShell("folder", ...)` for both a torrent entry and
+  a subfolder, but `ICONS` in `src/lib/icons.ts` has no `folder` key, only `folderOpen`. So
+  `icon("folder")` passed `undefined` to lucide's `createElement`, which destructures its
+  argument. Reproduced in isolation: `TypeError: undefined is not iterable (cannot read property
+  Symbol(Symbol.iterator))`. The throw happened inside `render()`, so the pane was left
+  half-built and looked empty.
+- Why TypeScript did not catch it: `ICONS` was annotated `Record<string, IconNode>`, which makes
+  `IconName = keyof typeof ICONS` collapse to `string`. Every icon name typechecked, including
+  ones with no entry. `libraryItemShell(ic: IconName, ...)` therefore accepted `"folder"`.
+- Resolution: added `folder: Folder` to `ICONS`; changed the annotation to
+  `satisfies Record<string, IconNode>` so `IconName` is the real key union again; and `icon()`
+  now throws a named error instead of relying on lucide's destructuring when a name is missing.
+  Verified: `npx tsc --noEmit` and `npx vite build` pass; a temporary probe that imported the real
+  `icons.ts` through esbuild with a stubbed `document` rendered `folder`, `folderOpen`, `files`,
+  `fileVideo`, `file`, `trash`, `download` as `<svg>` elements; and a temporary bad name
+  (`icon("nope-not-an-icon")`) now fails typecheck with `TS2345 ... is not assignable to parameter
+  of type '"lock" | "chats" | ... | "drive"'`, proving the union is enforced.
+- End-to-end A/B, in the real UI: started a throwaway stub daemon that answers `/api/status` and
+  `/api/torrents/state` with one canned Library entry (one file at the root, plus an `Extras/`
+  subfolder with two files), then drove the Vite dev server at `localhost:5199/?api=…` through the
+  browser. With `folder` present: the Library tab listed the entry, clicking it showed the folder
+  row and the file row, and clicking `Extras` showed both files, with breadcrumbs
+  `Library / <torrent> / Extras`. With `folder` deleted again (relying on HMR, since Vite does not
+  typecheck): clicking the Library tab left `document.body.innerText` empty and `#app` childless —
+  the reported blank page — and it came back after restoring the key. The stub daemon and its file
+  were removed afterwards.
+- Lesson: an `as Record<string, T>` / `Record<string, T>` annotation on a lookup table throws away
+  the key union and with it all typo checking. Use `satisfies` when the keys are the contract. And
+  when a render function throws, the symptom is a blank pane, not an error — a lookup that cannot
+  be validated at compile time should fail loudly at the point of use.
+
+### Multi-GB Library Open/Save is unbounded in memory — OPEN
+
+- What was attempted: click a completed 1.65 GB torrent file in the Library (row click = Open,
+  download button = Save).
+- Symptom: not reproduced end-to-end in this session, but the path cannot work at that size.
+  `torrentsOpenFile`/`torrentsSaveFile` call `resolveMessageFileBytes({ blobId })`, which calls
+  `api.blob(id)`; `GET /api/blob/:id` returns `{ data_base64 }` for the whole blob, and the daemon
+  decrypts the entire file into a `Vec<u8>` first. A 1.65 GB file becomes ~2.2 GB of base64 in a
+  single JSON response, then `atob` into a JS string, then a `Uint8Array`, then
+  `Array.from(bytes)` across the Tauri IPC boundary in `openBytesNative`. Each step is a separate
+  full-size copy; the small-attachment pattern it was copied from does not scale to torrent files.
+- Resolution: none yet. Needs a design decision — a streaming or `Range` blob endpoint the UI can
+  hand to the OS/Tauri without buffering, versus a daemon-side "save blob to path / open with
+  handler" command. Not attempted in this slice because it is a new endpoint, not a fix to the
+  blank page, and the two options differ in where the file ends up on disk.
+- Lesson: the whole-blob-base64 endpoint is fine for chat attachments and wrong for a media file.
+  Anything that renders user-chosen file sizes needs a size ceiling at minimum, so it fails with a
+  message instead of hanging the webview.
+
+## 2026-10-10 — Torrents: "100% then stalls, not in Library"
+
+### The vault store is 43x slower in a debug build — FIXED
+
+- What was attempted: store a 1.65 GB downloaded file into the vault via `put_blob_stream`.
+- Symptom: the item sat at "Downloading to vault (100%)" for ~17 minutes with an empty Library,
+  which read as a hang. The daemon was a debug build (`target/debug/hush-daemon`), single
+  threaded at ~98% CPU, writing chunks at ~1.7 MiB/s. A micro-benchmark of `put_blob_stream`
+  on 256 MiB measured 1.7 MiB/s in debug vs 73.3 MiB/s in release (43x). Nothing is wrong with
+  the code: `encrypt` is plain XChaCha20Poly1305, and AEAD is one of the things `--release`
+  speeds up most.
+- Resolution: `scripts/run-one-ui.sh` and `scripts/run-two-ui.sh` now build the daemon with
+  `cargo build --release -p hush-daemon` and launch `target/release/hush-daemon`; the relay and
+  desktop stay in debug. 1.65 GB then stores in ~25 s. Verified: the release binary starts,
+  serves `/api/status`, and refuses a second instance.
+- Lesson: a slow-looking pipeline stage can be a build-profile artifact. Measure the stage in
+  isolation and in both profiles before hunting for an algorithmic bug.
+
+### Nothing in the UI distinguished "transfer done" from "storing" — FIXED
+
+- What was attempted: show progress while a torrent downloads into the vault.
+- Symptom: `dl_done` reaches `dl_total` when the bytes are on disk, but the item is not done
+  until `put_blob_stream` finishes. Both phases share `status: "downloading"`, so the bar pinned
+  at 100% and the label still said "Downloading to vault (100%)" for the whole store — the exact
+  window in which the file is not yet in the Library.
+- Resolution: `torrentStatusLabel` now returns "Sealing into the vault…" once `dl_done >= dl_total`.
+  A full store-progress indicator would need progress plumbed out of `put_blob_stream`, which is
+  a single blocking actor op; the label is the honest minimum.
+
+### Two daemons ran against one vault — FIXED
+
+- What was attempted: run the daemon for manual testing.
+- Symptom: `ps` showed two live `hush-daemon` processes with `--dir instances/peer-a` (started
+  11:48 and 13:05), and `ss` showed two LISTEN sockets on the same path. They share the state
+  sidecar and the vault, so they clobber each other's state and duplicate work. The existing
+  `bind_socket` guard calls `UnixStream::connect` to decide whether a peer is live, but a daemon
+  that is alive and blocked (e.g. mid-way through a long debug-mode store, not accepting) fails
+  that probe, so the second daemon unlinked its socket and took over.
+- Resolution: `acquire_vault_lock` takes a non-blocking `flock(LOCK_EX)` on
+  `<vault>/.hush-daemon.lock` before anything else starts; a second daemon now exits with a clear
+  message. Verified by starting two daemons on one temp vault with *different* sockets: the
+  second exits 1 with "another hush-daemon is already running on …".
+- Lesson: a liveness probe over the same socket the peer serves is not a mutual-exclusion
+  primitive. Lock the resource (the vault), not the transport.
+
+### Sandbox blocked process introspection, and a frozen counter sent me the wrong way — FIXED
+
+- What was attempted: identify which of the two daemons owned the socket and was doing the work.
+- Symptom: `/proc/<pid>/fd` reads returned nothing, `ptrace` was denied (`PTRACE_SEIZE:
+  Operation not permitted`), `perf` needs `linux-tools` (not installed), and `ss -xlpn` showed no
+  pids. As a substitute I read `dl_speed` from the API and found it frozen at 20642902.0, which
+  implied the API daemon was not the one running the pipeline. That inference was wrong — the
+  item completed and moved to the Library on that same daemon minutes later. The frozen value was
+  a persisted field on a daemon whose reporter was not ticking, not proof of a second writer.
+- Resolution: confirmed the end state directly instead — 212 chunks in the blob, packed bytes
+  exactly `plaintext + 212 * 40`, library entry present with the right `blob_id`. The duplicate
+  daemon was confirmed from `ps` + two socket listeners, not from the frozen counter.
+- Lesson: a single stale-looking field is not evidence of split-brain. In a sandbox that blocks
+  per-pid inspection, confirm the *end state on disk* rather than reasoning from one counter.
+
+---
+
+## 2026-10-10 — Torrents: large-file download restarts
+
+### CDN download inherited the 30 s API timeout — FIXED
+
+- What was attempted: stream a TorBox CDN file to disk with `TorboxClient::fetch_to`.
+- Symptom: a ~1 GB file "stops in the middle and starts back again 0%". `TorboxClient::new`
+  built one `reqwest::Client` with `.timeout(REQUEST_TIMEOUT)` where `REQUEST_TIMEOUT` is 30 s.
+  reqwest's `timeout` is a *total* budget covering the response body, so any transfer lasting
+  longer than 30 s is severed mid-stream. A 1 GB file always exceeds that, so `fetch_to`
+  returned `TorboxError::Network`, the item backed off, and it retried. The source even
+  claimed "the download itself uses a separate, longer budget" while no such client existed.
+- Resolution: downloads now use a dedicated `download_http` client with
+  `connect_timeout(30s)` + `read_timeout(60s)` and no total timeout. `read_timeout` resets on
+  every chunk, so an active transfer is never cut off while a silent connection still fails.
+- Lesson: a comment describing intended behaviour is not the behaviour. `reqwest`'s `.timeout`
+  is total, not idle — never set it on a client that also streams large bodies.
+
+### Resume reported 0% because progress was per-attempt, not on-disk — FIXED
+
+- What was attempted: report live progress while a multi-file torrent downloads.
+- Symptom: even when the HTTP Range resume worked and bytes were already on disk, the bar
+  snapped back to 0% on every retry. Progress was `done_files + inflight`, where `inflight` was
+  an `AtomicU64` created fresh per `download_item` call and only counted bytes written by the
+  current attempt. A resumed attempt started that counter at 0, so `dl_done` fell back to the
+  bytes of fully-stored files (0% for a single file) while the transfer actually continued.
+- Resolution: progress is now read from disk — `partial_bytes` sums the `.part` temp files of
+  the not-yet-stored files each tick, and `refresh_download_totals(on_disk)` adds that to the
+  stored files' sizes. `CountingWriter` and the `inflight` counter were removed. The same read
+  also yields a real `dl_speed` (delta over the 1 s tick), now shown on the card.
+- Lesson: derive progress from durable state (the files) rather than from counters that live
+  only as long as one attempt; retries and restarts then report the truth for free.
+
+### `RANGE_UNSUPPORTED` wiped the partial with no bound — FIXED
+
+- What was attempted: resume a file when the CDN ignores the `Range` header and answers 200.
+- Symptom: `download_one` deleted the `.part` file, reset `offset = 0`, and `continue`d with no
+  limit. A server that never honours Range would loop forever, wiping and re-downloading the
+  file each pass — and each pass was also being killed by the timeout above, so it never made
+  progress.
+- Resolution: the restart is capped at two attempts, after which it returns a `FileError`
+  marked non-transient so the item stops in `Error` with an explanation instead of retrying.
+  Transient-vs-permanent is now centralised in `TorboxError::is_transient`, used by both the
+  pipeline tick and `download_one`, replacing two copies of the same `matches!`.
+
+### Blocking file write on an async task — still OPEN, note updated
+
+- The `CountingWriter` wrapper referenced in the entry below no longer exists (progress is read
+  from disk now); `fetch_to` receives the raw `std::fs::File` and still calls `write_all` inside
+  the `async fn`. The underlying concern is unchanged and the entry stays OPEN.
+
+---
+
 ## 2026-10-10 — Torrents (TorBox) pane
 
 ### Large torrent files can be stored streamed but not opened streamed — OPEN

@@ -71,7 +71,7 @@ import {
   type IconNode,
 } from "lucide";
 
-const ICONS: Record<string, IconNode> = {
+const ICONS = {
   lock: Lock,
   chats: MessageCircle,
   trusts: Handshake,
@@ -131,6 +131,7 @@ const ICONS: Record<string, IconNode> = {
   fileImage: FileImage,
   fileAudio: FileAudio,
   fileArchive: FileArchive,
+  folder: Folder,
   folderOpen: FolderOpen,
   grid: LayoutGrid,
   listView: List,
@@ -142,12 +143,19 @@ const ICONS: Record<string, IconNode> = {
   sort: ArrowUpDown,
   eye: Eye,
   drive: HardDrive,
-};
+} satisfies Record<string, IconNode>;
 
+/**
+ * Every valid icon name. Derived from `ICONS` keys so a typo is a compile
+ * error rather than a runtime crash (lucide's `createElement` throws on an
+ * unknown node, which blanks the whole pane that is rendering).
+ */
 export type IconName = keyof typeof ICONS;
 
 export function icon(name: IconName): SVGElement {
-  const el = createElement(ICONS[name]);
+  const node = ICONS[name];
+  if (!node) throw new Error(`Unknown icon: ${String(name)}`);
+  const el = createElement(node);
   el.setAttribute("width", "20");
   el.setAttribute("height", "20");
   el.setAttribute("stroke-width", "1.75");

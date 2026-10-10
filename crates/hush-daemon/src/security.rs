@@ -5,9 +5,18 @@
 //! of swap. Everything here is best-effort: a failure is reported and logged,
 //! never fatal, because hardening depends on the host's limits and sandbox.
 
-/// Below this much memlock headroom, `MCL_FUTURE` is unsafe to request.
+/// Whether `MCL_FUTURE` may be requested for a given memlock headroom.
+///
+/// Only an unlimited limit is safe. A finite limit is a hard cap on how much
+/// address space can be locked, and `MCL_FUTURE` charges every future mapping
+/// against it, so a single allocation larger than the cap fails outright. The
+/// daemon legitimately asks for buffers the size of user files -- the chunked
+/// blob egress path builds a multi-gigabyte `Vec` -- and a failed allocation
+/// aborts the process, so a finite cap turns hardening into a crash.
 #[cfg(target_os = "linux")]
-const FUTURE_LOCK_MIN_BYTES: u64 = 256 * 1024 * 1024;
+fn should_lock_future(memlock_headroom: Option<u64>) -> bool {
+    memlock_headroom == Some(u64::MAX)
+}
 
 /// What hardening actually took effect; the daemon logs this at startup.
 #[derive(Debug, Clone)]
@@ -71,13 +80,11 @@ fn disable_core_dumps_linux() -> bool {
 
 /// Lock the address space into RAM. Returns `(locked, note)`.
 ///
-/// `MCL_FUTURE` is only used when the memlock limit is comfortably larger than
-/// any plausible growth: with a tight limit, future allocations would fail
-/// outright instead of merely paging, turning a hardening measure into a crash.
+/// `MCL_FUTURE` is only requested when the memlock limit is unlimited; see
+/// [`should_lock_future`] for why a finite limit must never be used.
 #[cfg(target_os = "linux")]
 fn lock_memory_linux() -> (bool, Option<String>) {
-    let headroom = memlock_headroom();
-    let roomy = headroom.is_some_and(|h| h >= FUTURE_LOCK_MIN_BYTES);
+    let roomy = should_lock_future(memlock_headroom());
     let flags = if roomy {
         libc::MCL_CURRENT | libc::MCL_FUTURE
     } else {
@@ -136,6 +143,18 @@ mod tests {
     fn harden_reports_core_dumps_disabled() {
         let h = harden_process();
         assert!(h.core_dumps_disabled, "core dumps should be disabled");
+    }
+
+    #[test]
+    fn future_locking_requires_an_unlimited_memlock_limit() {
+        // Regression: a 1.94 GiB finite limit (this host's `ulimit -l`) used to
+        // count as headroom, so `MCL_FUTURE` was requested and a 2 GiB blob
+        // allocation failed with EAGAIN, aborting the daemon.
+        assert!(!should_lock_future(Some(2 * 1024 * 1024 * 1024)));
+        assert!(!should_lock_future(Some(256 * 1024 * 1024)));
+        assert!(!should_lock_future(Some(0)));
+        assert!(!should_lock_future(None));
+        assert!(should_lock_future(Some(u64::MAX)));
     }
 
     #[test]

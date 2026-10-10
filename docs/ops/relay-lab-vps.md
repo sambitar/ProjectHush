@@ -106,6 +106,81 @@ So a **release** daemon cannot use this plain-HTTP relay; it needs `https://` (t
 in front — see `docs/ops/relay-https-checklist.md`) or a **debug** build. The lab
 cross-machine test therefore runs debug binaries.
 
+## HTTPS origin (Cloudflare quick tunnel + nginx path ingress)
+
+Added 2026-10-08 for the drop opener, extended 2026-10-10 to carry the whole relay protocol so
+a **release** daemon can use the box.
+
+- **Hostname:** `https://ban-therapeutic-daughter-organic.trycloudflare.com`
+- **Tunnel:** `cloudflared-quick.service` — `cloudflared tunnel --no-autoupdate --url
+  http://127.0.0.1:80`, `Restart=always`. It fronts **nginx**, not the relay.
+- **Ingress:** nginx (`/etc/nginx/sites-available/alhakim`, `server_name _`) path-proxies the
+  relay's routes to `http://127.0.0.1:8790`; everything else falls through to the alhakim app
+  on `127.0.0.1:3000`:
+
+  | nginx location | Relay route | Purpose |
+  |---|---|---|
+  | `location = /health` | `GET /health` | relay liveness; the client's ping |
+  | `location /q/` | `/q/{queue_id}[/{blob_id}\|/presence\|/report]` | queues, blobs, presence |
+  | `location /k/` | `/k/{account_id}` | prekey/key directory |
+  | `location = /drop` | `GET /drop` | browser drop page (what `drop_page_url()` publishes) |
+  | `location /drop/` | `/drop/{id}` | drop container put/get/delete |
+  | `location /open/` | — | legacy per-id pickup page; the current relay has no such route and 404s |
+
+  None of those paths exist as routes in the alhakim app (`src/app` has only `(staff)`,
+  `(staff-print)`, `api`, `portal`), so the ingress is additive. A backup of the previous file
+  is on the box at `/etc/nginx/sites-available/alhakim.bak-20261010`.
+- **A release client uses the bare hostname as its relay base:**
+
+  ```sh
+  hush-cli --dir <vault> --passphrase <pw> relay set --url https://<hostname>
+  ```
+
+  `client-config.json`'s `relay_url` is advisory (new vaults only); the vault's stored relay
+  wins at runtime, so the vault must be repointed, not just the file.
+- **`HUSH_RELAY_DROP_BASE_URL` is inert.** The current relay build does not read it (no
+  `drop_base_url` anywhere in `crates/hush-relay/src`); the drop page is a static `GET /drop`
+  and the published URL is composed client-side by `drop_page_url()` in
+  `crates/hush-daemon/src/account_worker.rs`. The drop-in
+  (`/etc/systemd/system/hush-relay.service.d/20-lab-drop-base.conf`) is kept as history only.
+- **Lifetime: ephemeral.** A quick tunnel's hostname is assigned at process start and changes
+  on every restart, and Cloudflare gives account-less tunnels no uptime guarantee — it
+  reclaimed this origin on 2026-10-10 (the hostname went NXDOMAIN while the connector sat in a
+  re-registration loop; see `DEEPSEEKPROBLEMS.MD`). After any restart, re-read the hostname and
+  re-point the vaults:
+
+  ```sh
+  ssh -i /home/sam/.ssh/alhakim_deploy root@137.184.129.205 \
+    "journalctl -u cloudflared-quick.service | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1"
+  ```
+
+  A named tunnel with a stable DNS record is the durable fix. The box already runs one
+  (`cloudflared.service`, tunnel `cricket-po`) pointing at the same nginx, but its public
+  hostname is dashboard-managed and not readable from the box (no `cert.pem`, no API token).
+
+### Durable tunnel `hush` (installed 2026-10-10, awaiting a public hostname)
+
+A second, purpose-built named tunnel exists in a **different** Cloudflare account
+(`75743fae…` vs the box's `8bccbccb…`). Its connector runs on the box as its own unit:
+
+- **Unit:** `cloudflared-hush.service` — `cloudflared --no-autoupdate --config
+  /etc/cloudflared/hush.yml tunnel run --token-file /etc/cloudflared/hush.token`
+- **Why its own unit:** `cloudflared service install <token>` writes
+  `/etc/systemd/system/cloudflared.service` and `/etc/cloudflared/config.yml`, both of which
+  already belong to `cricket-po`. Installing the new tunnel the documented way would have
+  overwritten them and moved the alhakim medical app, the cricket PWA, and the IronLine MCP onto
+  the new tunnel. The explicit `--config` also keeps the default `config.yml` out of this process.
+- **State:** `active`, `enabled`, 4 QUIC connections registered; `cricket-po` untouched.
+- **Blocked on:** a public hostname. The connector logs `No ingress rules were defined in provided
+  config (if any) nor from the cli, cloudflared will return 503 for all incoming HTTP requests`,
+  so the tunnel has no route yet. In the dashboard: Zero Trust → Networks → Tunnels → `hush` →
+  Public Hostname → add subdomain + zone, service **HTTP → `localhost:8790`**. Pointing it
+  straight at the relay (not nginx) is the right target: every relay route (`/health`, `/q/`,
+  `/k/`, `/drop`) then works verbatim with no path ingress. This needs a domain/zone in that
+  account; if it has none, the tunnel cannot get a hostname.
+- **Once it has a hostname:** repoint the vaults at `https://<hostname>` and the ephemeral quick
+  tunnel above (and its `cloudflared-quick.service`) can be retired.
+
 ## Cross-machine test
 
 `scripts/smoke-relay-lab.sh` runs two **local** daemons against the remote relay and
@@ -168,7 +243,9 @@ not published to clients.
 
 ## Not done (flagged, not built)
 
-- **TLS.** The lab is plain HTTP by request. The relay is exposed directly; do not reuse this
-  shape anywhere real.
+- **TLS.** The relay's own listener is still plain HTTP by request, exposed directly on
+  `0.0.0.0:8790`; do not reuse this shape anywhere real. A release client can still use the box
+  through the Cloudflare HTTPS origin above — that is path ingress, not a TLS terminator in
+  front of the relay.
 - **Reboot test.** The relay is `enabled` and survives `systemctl restart`; a full reboot was
   not run (the box hosts unrelated services).

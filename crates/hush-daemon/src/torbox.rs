@@ -26,9 +26,18 @@ use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "https://api.torbox.app/v1/api";
 
-/// One request must not hang forever; a stalled TorBox call would freeze the
-/// pipeline tick. The download itself uses a separate, longer budget.
+/// One API request must not hang forever; a stalled TorBox call would freeze
+/// the pipeline tick.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Downloads get their own client. A CDN transfer can legitimately run for
+/// hours, so a *total* timeout would abort any file that takes longer than the
+/// API budget to stream — which is exactly what a 1 GB file does. These are the
+/// two timeouts that still apply: a connection that never opens, and a
+/// connection that goes silent mid-transfer. The idle window resets on every
+/// chunk, so an active download is never cut off.
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A TorBox call failed, classified so the caller can react and the UI can
 /// explain.
@@ -77,6 +86,16 @@ impl std::fmt::Display for TorboxError {
 }
 
 impl std::error::Error for TorboxError {}
+
+impl TorboxError {
+    /// Whether another attempt could plausibly succeed. A network blip or a
+    /// rate limit will clear on its own; a rejected key, a plan limit, or a
+    /// malformed reply will not, so the pipeline should stop and surface them
+    /// instead of retrying forever.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, TorboxError::Network(_) | TorboxError::RateLimited(_))
+    }
+}
 
 /// The standard TorBox envelope. `data` is often an object, sometimes a list,
 /// and `null` on success for control operations.
@@ -304,6 +323,9 @@ impl Control {
 #[derive(Clone)]
 pub struct TorboxClient {
     http: reqwest::Client,
+    /// Separate from `http`: no total timeout, only connect + idle, so a long
+    /// CDN download is not torn down by the 30 s API budget.
+    download_http: reqwest::Client,
 }
 
 impl TorboxClient {
@@ -313,7 +335,16 @@ impl TorboxClient {
             .user_agent("hush-daemon/0.1")
             .build()
             .expect("torbox http client");
-        Self { http }
+        let download_http = reqwest::Client::builder()
+            .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+            .read_timeout(DOWNLOAD_IDLE_TIMEOUT)
+            .user_agent("hush-daemon/0.1")
+            .build()
+            .expect("torbox download client");
+        Self {
+            http,
+            download_http,
+        }
     }
 
     fn get(&self, key: &str, path: &str) -> reqwest::RequestBuilder {
@@ -513,7 +544,8 @@ impl TorboxClient {
         mut sink: W,
     ) -> Result<u64, TorboxError> {
         use futures_util::StreamExt;
-        let mut req = self.http.get(url);
+        // The download client: connect + idle timeouts only, never a total one.
+        let mut req = self.download_http.get(url);
         if offset > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={offset}-"));
         }
@@ -653,6 +685,24 @@ mod tests {
             classify(500, None, None),
             TorboxError::Api { .. }
         ));
+    }
+
+    #[test]
+    fn only_network_and_rate_limit_errors_are_transient() {
+        // A dropped connection or a 429 will clear on its own; a bad key, a
+        // plan limit, a rejected API call, or a malformed reply will not, so
+        // the pipeline must stop and surface those instead of retrying forever.
+        assert!(TorboxError::Network("reset".into()).is_transient());
+        assert!(TorboxError::RateLimited(None).is_transient());
+        assert!(!TorboxError::Auth("bad key".into()).is_transient());
+        assert!(!TorboxError::Plan("limit".into()).is_transient());
+        assert!(!TorboxError::Api {
+            code: "RANGE_UNSUPPORTED".into(),
+            detail: "no resume".into()
+        }
+        .is_transient());
+        assert!(!TorboxError::Decode("garbage".into()).is_transient());
+        assert!(!TorboxError::NoKey.is_transient());
     }
 
     #[test]

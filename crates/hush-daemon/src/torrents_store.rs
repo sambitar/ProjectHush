@@ -178,9 +178,10 @@ impl TorrentItem {
     }
 
     /// Recompute the aggregate download counters from the per-file sizes and
-    /// the current byte offset. `in_flight` is bytes already written for the
-    /// file currently downloading.
-    pub fn refresh_download_totals(&mut self, in_flight: u64) {
+    /// the bytes already on disk for the files that are not done yet (their
+    /// temp files). Counting from disk means a resumed transfer reports its
+    /// real position instead of restarting the bar at 0%.
+    pub fn refresh_download_totals(&mut self, on_disk: u64) {
         let done_bytes: u64 = self
             .files
             .iter()
@@ -188,7 +189,7 @@ impl TorrentItem {
             .map(|f| f.size)
             .sum();
         self.dl_total = self.files.iter().map(|f| f.size).sum();
-        self.dl_done = (done_bytes + in_flight).min(self.dl_total);
+        self.dl_done = (done_bytes + on_disk).min(self.dl_total);
     }
 }
 
@@ -458,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn download_totals_sum_done_files_plus_in_flight() {
+    fn download_totals_sum_done_files_plus_bytes_on_disk() {
         let mut i = item("a", ItemStatus::Downloading);
         i.files = vec![
             ItemFile {

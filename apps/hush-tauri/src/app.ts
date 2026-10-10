@@ -5917,6 +5917,8 @@ export class App {
     }
     if (item.status === "downloading" && item.dl_total) {
       bits.push(`${formatBytes(item.dl_done)} / ${formatBytes(item.dl_total)}`);
+      const speed = formatSpeed(item.dl_speed);
+      if (speed) bits.push(speed);
     }
     bits.push(readsTimeAgo(item.added_at));
     const meta = document.createElement("div");

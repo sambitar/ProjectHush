@@ -28,9 +28,8 @@
 //! The state itself lives in [`crate::torrents_store`]; this module only drives
 //! it.
 
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +42,42 @@ use crate::torbox::{self, Control, TorboxClient, TorboxError, UserInfo};
 use crate::torrents_store::{
     decode, now_secs, ItemFile, ItemStatus, LibraryEntry, SourceKind, TorrentItem, TorrentsState,
 };
+
+/// Why one file's download failed, and whether another attempt could help.
+///
+/// The pipeline treats the whole item as one unit: the first failure decides
+/// the item's fate, so a permanent cause (a CDN that will not resume, a file
+/// that will never match its expected size) must not be retried forever the
+/// way a dropped connection should be.
+#[derive(Debug, Clone)]
+struct FileError {
+    message: String,
+    transient: bool,
+}
+
+impl FileError {
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: true,
+        }
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+        }
+    }
+
+    /// Carry a TorBox error's own transient/permanent classification.
+    fn from_torbox(e: TorboxError) -> Self {
+        Self {
+            transient: e.is_transient(),
+            message: e.to_string(),
+        }
+    }
+}
 
 /// Poll cadence while at least one item is active.
 const ACTIVE_POLL: Duration = Duration::from_secs(4);
@@ -570,10 +605,7 @@ impl TorrentsManager {
                 self.mark_dirty().await;
             }
             Err(e) => {
-                let transient = matches!(
-                    e,
-                    TorboxError::Network(_) | TorboxError::RateLimited(_)
-                );
+                let transient = e.is_transient();
                 self.fail(id, e.to_string(), transient).await;
             }
         }
@@ -628,10 +660,7 @@ impl TorrentsManager {
                 self.mark_dirty().await;
             }
             Err(e) => {
-                let transient = matches!(
-                    e,
-                    TorboxError::Network(_) | TorboxError::RateLimited(_)
-                );
+                let transient = e.is_transient();
                 self.fail(id, e.to_string(), transient).await;
             }
         }
@@ -665,19 +694,13 @@ impl TorrentsManager {
         }
         .max(1);
 
-        let inflight = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let reporter = self.spawn_progress_reporter(id.to_string(), inflight.clone(), stop.clone());
+        let reporter = self.spawn_progress_reporter(id.to_string(), stop.clone());
 
-        let results: Vec<(i64, Result<String, String>)> = stream::iter(pending)
-            .map(|file| {
-                let inflight = inflight.clone();
-                async move {
-                    let res = self
-                        .download_one(key, torrent_id, id, &file, inflight)
-                        .await;
-                    (file.file_id, res)
-                }
+        let results: Vec<(i64, Result<String, FileError>)> = stream::iter(pending)
+            .map(|file| async move {
+                let res = self.download_one(key, torrent_id, id, &file).await;
+                (file.file_id, res)
             })
             .buffer_unordered(concurrency)
             .collect()
@@ -686,8 +709,13 @@ impl TorrentsManager {
         stop.store(true, Ordering::SeqCst);
         let _ = reporter.await;
 
+        // Bytes already on disk for the files that are not done yet. The temp
+        // files keep whatever a previous attempt (or a crash) downloaded, so
+        // this is the true progress and does not snap back to 0% on resume.
+        let on_disk = self.partial_bytes(id).await;
+
         // Apply results: stored blob ids for successes, an error otherwise.
-        let mut first_error: Option<String> = None;
+        let mut first_error: Option<FileError> = None;
         {
             let mut s = self.state.lock().await;
             if let Some(item) = s.item_mut(id) {
@@ -699,21 +727,21 @@ impl TorrentsManager {
                                 f.done = true;
                             }
                         }
-                        Err(msg) => {
+                        Err(err) => {
                             if first_error.is_none() {
-                                first_error = Some(msg.clone());
+                                first_error = Some(err.clone());
                             }
                         }
                     }
                 }
-                item.refresh_download_totals(0);
+                item.refresh_download_totals(on_disk);
                 item.dl_speed = 0.0;
             }
         }
         self.mark_dirty().await;
 
-        if let Some(msg) = first_error {
-            self.fail(id, msg, true).await;
+        if let Some(err) = first_error {
+            self.fail(id, err.message, err.transient).await;
             return;
         }
 
@@ -734,16 +762,17 @@ impl TorrentsManager {
         torrent_id: i64,
         item_id: &str,
         file: &ItemFile,
-        inflight: Arc<AtomicU64>,
-    ) -> Result<String, String> {
+    ) -> Result<String, FileError> {
         let url = self
             .client
             .request_dl(key, torrent_id, file.file_id)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(FileError::from_torbox)?;
         tokio::fs::create_dir_all(&self.tmp_dir)
             .await
-            .map_err(|e| format!("could not create the download folder: {e}"))?;
+            .map_err(|e| {
+                FileError::transient(format!("could not create the download folder: {e}"))
+            })?;
         let part = self.part_path(item_id, file.file_id);
 
         let mut offset = tokio::fs::metadata(&part)
@@ -762,6 +791,7 @@ impl TorrentsManager {
             offset = 0;
         }
 
+        let mut restarts = 0u32;
         loop {
             let file_handle = tokio::fs::OpenOptions::new()
                 .create(true)
@@ -770,32 +800,40 @@ impl TorrentsManager {
                 .truncate(offset == 0)
                 .open(&part)
                 .await
-                .map_err(|e| format!("could not open the download file: {e}"))?;
+                .map_err(|e| {
+                    FileError::transient(format!("could not open the download file: {e}"))
+                })?;
             let std_file = file_handle.into_std().await;
-            let writer = CountingWriter {
-                inner: std_file,
-                inflight: inflight.clone(),
-            };
-            match self.client.fetch_to(&url, offset, writer).await {
+            match self.client.fetch_to(&url, offset, std_file).await {
                 Ok(written) => {
                     offset += written;
                     break;
                 }
                 Err(TorboxError::Api { code, .. }) if code == "RANGE_UNSUPPORTED" => {
-                    // Server restarted from zero; drop the partial and retry once.
+                    // The CDN ignored our Range and restarted from zero, so the
+                    // partial must be dropped. Allow it twice, then stop: a
+                    // server that never honours Range would otherwise loop
+                    // forever, wiping and re-downloading the file each time.
+                    restarts += 1;
+                    if restarts > 2 {
+                        return Err(FileError::permanent(format!(
+                            "the download server refused to resume {}; it could not be fetched in one pass",
+                            file.name
+                        )));
+                    }
                     let _ = tokio::fs::remove_file(&part).await;
                     offset = 0;
                     continue;
                 }
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(FileError::from_torbox(e)),
             }
         }
 
         if file.size > 0 && offset != file.size {
-            return Err(format!(
+            return Err(FileError::transient(format!(
                 "download of {} stopped early ({} of {} bytes)",
                 file.name, offset, file.size
-            ));
+            )));
         }
 
         self.store_part(&part).await
@@ -803,36 +841,73 @@ impl TorrentsManager {
 
     /// Encrypt a completed temp file into the vault as a chunked blob, then
     /// drop the plaintext temp file. Returns the blob id.
-    async fn store_part(&self, part: &Path) -> Result<String, String> {
+    async fn store_part(&self, part: &Path) -> Result<String, FileError> {
         let blob = match self.worker.blob_store_file(&part.to_path_buf()).await {
             WorkResult::BlobId(id) => id,
-            WorkResult::Err(m) => return Err(m),
-            _ => return Err("could not store the file in the vault".into()),
+            WorkResult::Err(m) => return Err(FileError::transient(m)),
+            _ => {
+                return Err(FileError::transient(
+                    "could not store the file in the vault",
+                ))
+            }
         };
         let _ = tokio::fs::remove_file(part).await;
         Ok(blob)
     }
 
-    /// Spawn the 1s progress reporter that keeps `dl_done` live while files
-    /// download. Returns the join handle; the caller flips `stop` and awaits it.
+    /// Bytes already on disk for an item's not-yet-stored files.
+    ///
+    /// The honest progress figure: a temp file keeps whatever an earlier
+    /// attempt (or a crash) downloaded, so reading it back means a resumed
+    /// transfer reports where it actually is instead of restarting the bar at
+    /// 0%. Cheap enough at one call per second.
+    async fn partial_bytes(&self, item_id: &str) -> u64 {
+        let file_ids: Vec<i64> = {
+            let s = self.state.lock().await;
+            match s.item(item_id) {
+                Some(i) => i
+                    .files
+                    .iter()
+                    .filter(|f| !f.done)
+                    .map(|f| f.file_id)
+                    .collect(),
+                None => return 0,
+            }
+        };
+        let mut total = 0u64;
+        for fid in file_ids {
+            if let Ok(m) = tokio::fs::metadata(self.part_path(item_id, fid)).await {
+                total += m.len();
+            }
+        }
+        total
+    }
+
+    /// Spawn the 1s progress reporter that keeps `dl_done`/`dl_speed` live while
+    /// files download. Returns the join handle; the caller flips `stop` and
+    /// awaits it.
     fn spawn_progress_reporter(
         self: &Arc<Self>,
         item_id: String,
-        inflight: Arc<AtomicU64>,
         stop: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
+            let mut last_bytes = this.partial_bytes(&item_id).await;
             loop {
                 tokio::time::sleep(PROGRESS_TICK).await;
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
+                let on_disk = this.partial_bytes(&item_id).await;
+                let speed =
+                    (on_disk.saturating_sub(last_bytes)) as f64 / PROGRESS_TICK.as_secs_f64();
+                last_bytes = on_disk;
                 {
                     let mut s = this.state.lock().await;
                     if let Some(item) = s.item_mut(&item_id) {
-                        item.refresh_download_totals(inflight.load(Ordering::Relaxed));
-                        item.dl_speed = 0.0;
+                        item.refresh_download_totals(on_disk);
+                        item.dl_speed = speed;
                     }
                 }
                 this.mark_dirty().await;
@@ -912,25 +987,6 @@ fn relative_path(f: &torbox::TorrentFile) -> String {
         f.name.clone()
     };
     raw.trim_start_matches(['/', '\\']).to_string()
-}
-
-/// A writer that counts bytes written, so the pipeline can report live
-/// download progress without a shared lock on every chunk.
-struct CountingWriter<W: Write> {
-    inner: W,
-    inflight: Arc<AtomicU64>,
-}
-
-impl<W: Write> Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.inflight.fetch_add(n as u64, Ordering::Relaxed);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -1016,18 +1072,5 @@ mod tests {
         assert_eq!(percent_decode("My%20Torrent"), "My Torrent");
         assert_eq!(percent_decode("Plain"), "Plain");
         assert_eq!(percent_decode("a%2Fb"), "a/b");
-    }
-
-    #[test]
-    fn counting_writer_reports_bytes() {
-        let count = Arc::new(AtomicU64::new(0));
-        let mut w = CountingWriter {
-            inner: Vec::new(),
-            inflight: count.clone(),
-        };
-        w.write_all(b"hello").unwrap();
-        w.write_all(b" world").unwrap();
-        assert_eq!(count.load(Ordering::Relaxed), 11);
-        assert_eq!(w.inner, b"hello world");
     }
 }

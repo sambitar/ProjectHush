@@ -323,6 +323,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hardening = security::harden_process();
     let args = Args::parse();
     let vault_dir = paths::vault_dir_from_args(args.dir);
+    // One daemon per vault. Held for the process lifetime; the OS releases it
+    // on exit, so a crash never leaves a stale lock.
+    let _vault_lock = acquire_vault_lock(&vault_dir)?;
     let tcp_addr = hush_core::config::resolve_daemon_addr(&vault_dir, args.addr.as_deref());
     let socket = hush_core::config::resolve_daemon_socket(&vault_dir, args.socket.as_deref());
     if args.no_socket && tcp_addr.is_none() {
@@ -501,6 +504,44 @@ fn bind_socket(path: &std::path::Path) -> std::io::Result<tokio::net::UnixListen
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(listener)
+}
+
+/// Take an exclusive, non-blocking lock on the vault directory.
+///
+/// The socket check in [`bind_socket`] only catches a peer that is *answering*
+/// on the socket. A daemon that is alive but busy — for example blocked in a
+/// long vault store, so it is not accepting — looks dead there, and a second
+/// daemon will unlink the socket and take over. Both then run against one
+/// vault: they share the state sidecar and the vault, so they clobber each
+/// other's state and duplicate downloads. This lock closes that hole. The OS
+/// releases it when the process exits, so a crash never leaves a stale lock.
+#[cfg(target_os = "linux")]
+fn acquire_vault_lock(dir: &std::path::Path) -> Result<Option<std::fs::File>, String> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let path = dir.join(".hush-daemon.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!(
+            "another hush-daemon is already running on {} ({err}); stop it before starting a new one",
+            dir.display()
+        ));
+    }
+    Ok(Some(file))
+}
+
+/// No-op on platforms without `flock`; the socket check still applies.
+#[cfg(not(target_os = "linux"))]
+fn acquire_vault_lock(_dir: &std::path::Path) -> Result<Option<std::fs::File>, String> {
+    Ok(None)
 }
 
 fn is_socket_file(path: &std::path::Path) -> bool {

@@ -89,7 +89,10 @@ PASS_B="${HUSH_PEER_B_PASS:-peer-b-pass}"
 
 BIN="${ROOT}/target/debug"
 RELAY_BIN="${BIN}/hush-relay"
-DAEMON_BIN="${BIN}/hush-daemon"
+# The daemon runs in release: its vault store encrypts multi-GB torrent files
+# chunk by chunk, and AEAD is ~40x slower in a debug build (see run-one-ui.sh),
+# which made large downloads look stalled at 100%.
+DAEMON_BIN="${ROOT}/target/release/hush-daemon"
 TAURI_BIN="${BIN}/hush-tauri"
 
 LOG_DIR="${RUN_DIR}/logs"
@@ -118,20 +121,21 @@ fi
 if [[ "$DEV" == 1 ]]; then
   if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
     echo "Dev mode: building the local relay and the daemon (no UI or desktop build)."
-    cargo build -p hush-relay -p hush-daemon
+    cargo build -p hush-relay
   else
     echo "Dev mode: building the daemon only (remote relay; no UI or desktop build)."
-    cargo build -p hush-daemon
   fi
+  cargo build --release -p hush-daemon
 else
   echo "Building UI (Vite)…"
   (cd "${ROOT}/apps/hush-tauri" && npm run build)
   echo "Building Rust binaries…"
   if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
-    cargo build -p hush-relay -p hush-daemon -p hush-tauri
+    cargo build -p hush-relay -p hush-tauri
   else
-    cargo build -p hush-daemon -p hush-tauri
+    cargo build -p hush-tauri
   fi
+  cargo build --release -p hush-daemon
 fi
 
 REQUIRED_BINS=("$DAEMON_BIN")
@@ -313,7 +317,7 @@ start_vite() {
   echo "  Both sides must add each other's invite (Copy my invite)."
   echo ""
   echo "After a change under crates/, rebuild the daemon and re-run with --dev:"
-  echo "  cargo build -p hush-daemon   # then Ctrl+C here and run $0 --dev"
+  echo "  cargo build --release -p hush-daemon   # then Ctrl+C here and run $0 --dev"
   echo "The desktop binary is neither built nor started in dev mode."
 }
 

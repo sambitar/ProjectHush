@@ -31,9 +31,14 @@ chmod 700 "$RUN_DIR" 2>/dev/null || true
 
 echo "Building UI (Vite) and desktop binary…"
 (cd apps/hush-tauri && npm run build)
-cargo build -p hush-relay -p hush-daemon -p hush-tauri -p hush-cli
+cargo build -p hush-relay -p hush-tauri -p hush-cli
+# The daemon runs in release. Its vault store encrypts multi-GB torrent files
+# chunk by chunk, and AEAD is ~40x slower in a debug build (measured 1.7 MiB/s
+# debug vs 73 MiB/s release), which made large downloads look stalled at 100%
+# for ~17 minutes. The relay and desktop stay in debug: neither is CPU-bound.
+cargo build --release -p hush-daemon
 
-DAEMON_BIN="$ROOT/target/debug/hush-daemon"
+DAEMON_BIN="$ROOT/target/release/hush-daemon"
 TAURI_BIN="$ROOT/target/debug/hush-tauri"
 
 daemon_ready() {
@@ -83,7 +88,13 @@ fi
 # State lives in the vault on disk, so a restart is free.
 if daemon_ready "$SOCK"; then
   echo "Stopping the stale daemon on $SOCK…"
-  pkill -f "^$DAEMON_BIN --dir $VAULT_DIR" 2>/dev/null || true
+  # Match the vault dir in both absolute and relative form: a daemon started by
+  # hand with a relative --dir or binary path (e.g. `./target/debug/hush-daemon
+  # --dir instances/peer-a`) does not match the absolute path, so an exact
+  # command-line match misses it. With the vault lock in place a second daemon
+  # now refuses to start, so missing the stale one would fail this script.
+  VAULT_DIR_REL="${VAULT_DIR#"$ROOT"/}"
+  pkill -f "hush-daemon.*--dir ($VAULT_DIR|$VAULT_DIR_REL)( |$)" 2>/dev/null || true
   for _ in $(seq 1 50); do
     daemon_ready "$SOCK" || break
     sleep 0.1
