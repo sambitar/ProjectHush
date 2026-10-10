@@ -146,6 +146,10 @@ not published to clients.
   a new address.
 - **Verified 2026-10-08:** `curl --socks5-hostname 127.0.0.1:9050 http://<onion>/health`
   returns 200 through a real onion round trip (~2 s warm, ~4.5 s cold).
+- **Redeployed 2026-10-10** with the drops slice (`d81837b`): the Oct 8 binary predated
+  the `/drop` routes and answered 404 — a blank page in a browser. After the redeploy,
+  onion `GET /drop` returns 200 with the 53837-byte page and the `/drop/{id}`
+  PUT/GET/DELETE family round-trips through the onion.
 - **Clients:** with `hush-core` as of this change, a release build accepts a plain-HTTP v3
   onion relay base (`host_is_v3_onion` in `normalize_relay_base`), and a client routes the
   whole relay path through Tor with:
