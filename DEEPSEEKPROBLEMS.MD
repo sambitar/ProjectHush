@@ -13,6 +13,75 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-10 — Torrents (TorBox) pane
+
+### Large torrent files can be stored streamed but not opened streamed — OPEN
+
+- What was attempted: honour the constraint "make it work for large files (stream to disk,
+  don't buffer in memory)" for the whole torrent path.
+- Symptom: the TorBox → vault leg is streamed (HTTP Range into a temp file, then chunked
+  AEAD into `blobs/<hex>/chunk-N` in 8 MiB chunks), so it never holds a whole file. But the
+  Library's Open / Save as… actions reuse the app's existing `/api/blob/{id}` route, which
+  returns the plaintext base64-encoded in one JSON body (`Vault::get_blob` collects the whole
+  file into a `Vec<u8>`). A multi-GB torrent file therefore materialises in the daemon, in the
+  JSON string, and in the webview when opened.
+- Resolution: none in this slice. The download-into-vault path is memory-bounded; the
+  open/play path inherits the app-wide limitation of the base64 blob endpoint (chat
+  attachments are capped at 256 KiB, so it was never a problem before). Closing this needs a
+  streaming blob route plus a Tauri command that writes to a temp file without the webview
+  holding the bytes.
+- Lesson: "streams to disk" was only true for the ingest half. The egress half of a
+  large-file feature has to be checked separately.
+
+### `fetch_to` writes to a blocking `std::io::Write` on an async task — OPEN
+
+- What was attempted: stream a CDN response into a file while counting bytes.
+- Symptom: `TorboxClient::fetch_to` takes `W: std::io::Write` and calls `write_all` inside the
+  `async fn` while draining `resp.bytes_stream()`. Each 8 KiB chunk does a blocking file write
+  on a Tokio worker thread. With the default 2–3 concurrent downloads this is unlikely to
+  stall the runtime, but it is a blocking call in async context and is not defended.
+- Resolution: not fixed; would require a channel into `spawn_blocking` or `tokio::fs::File`
+  with an adapter. Flagged rather than left implicit.
+- Lesson: the byte-counting writer made progress reporting easy but also fixed the sink as a
+  sync `Write`, which is exactly what should not be written to from async code.
+
+### The magnet/`.torrent` source would have been serialised into the UI state — FIXED
+
+- What was attempted: hand `PublicState { items: Vec<TorrentItem> }` straight to the webview.
+- Symptom: `TorrentItem.source_data` holds the pasted magnet or the base64 `.torrent` bytes
+  until TorBox accepts the torrent, and it derives `Serialize` with no skip, so it was in the
+  `/api/torrents/state` body. The user asked that magnet links not be exposed.
+- Resolution: added `TorrentItem::public_clone()` which clears `source_data`, and used it in
+  `TorrentsManager::public_state`. The full value is still written to the encrypted sidecar so
+  a queued add survives a restart. Test `public_clone_drops_the_source_secret_but_keeps_the_rest`
+  covers both halves.
+- Lesson: `#[serde(skip_serializing)]` would have been the wrong fix here because the same
+  `Serialize` impl writes the persistence file; the redaction has to happen at the boundary,
+  not on the type.
+
+### Resuming a file whose bytes were already complete re-fetched and 416'd — FIXED
+
+- What was attempted: resume every file with an HTTP Range from the temp file's current length.
+- Symptom: a crash after the last byte landed but before the blob was stored leaves
+  `part` exactly `file.size` bytes. The next tick issued `Range: bytes=<size>-`, TorBox
+  answered 416, `fetch_to` mapped any non-success to a `Network` error, and the item parked in
+  `Error` with a permanent failure it could never retry out of.
+- Resolution: `download_one` now returns the stored blob directly when `offset == file.size`,
+  and truncates and restarts when `offset > file.size`. The blob-store tail was extracted to
+  `store_part` so both paths share it.
+- Lesson: "resume" has a third case besides partial and zero — already-complete — and a Range
+  request cannot express it.
+
+### Duplicate `List` import broke `tsc` — FIXED (tooling)
+
+- What was attempted: add `List` and `LayoutGrid` to `lib/icons.ts` for the Library view toggle.
+- Symptom: `src/lib/icons.ts(35,3): error TS2300: Duplicate identifier 'List'` — `List` was
+  already imported for the rich-text editor's bullet-list button.
+- Resolution: dropped the duplicate import and reused the existing binding in the ICONS map.
+- Lesson: `icons.ts` already had a `list` entry; grep the file before adding a lucide name.
+
+---
+
 ## 2026-10-10 — Reads reader mode against Cloudflare-challenged sites
 
 ### Concluded a bot-block was deterministic from one sample of it — FIXED (wrong assumption, corrected)

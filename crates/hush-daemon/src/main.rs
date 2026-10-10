@@ -4,6 +4,9 @@ mod reads;
 mod reads_store;
 mod security;
 mod suspend_lock;
+mod torbox;
+mod torrents;
+mod torrents_store;
 mod ui_prefs;
 
 use std::path::PathBuf;
@@ -54,6 +57,8 @@ struct App {
     worker: AccountWorker,
     /// The Reads pane's HN client: outbound fetch + reader extraction + cache.
     reads: reads::ReadsClient,
+    /// The Torrents pane's TorBox pipeline: add → cache → download into vault.
+    torrents: Arc<torrents::TorrentsManager>,
     unlocked: Mutex<bool>,
     unlocked_at: Mutex<Option<Instant>>,
     /// The SOCKS proxy the desktop shell reported its Tor to be listening on,
@@ -233,6 +238,18 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/reads/saved", post(reads_save_toggle))
         .route("/api/reads/hidden", post(reads_hidden_toggle))
         .route("/api/reads/read", post(reads_mark_read))
+        .route("/api/torrents/state", get(torrents_state))
+        .route("/api/torrents/key", post(torrents_set_key))
+        .route("/api/torrents/test", post(torrents_test_key))
+        .route("/api/torrents/refresh", post(torrents_refresh))
+        .route("/api/torrents/add", post(torrents_add))
+        .route("/api/torrents/add-file", post(torrents_add_file))
+        .route("/api/torrents/pause", post(torrents_pause))
+        .route("/api/torrents/resume", post(torrents_resume))
+        .route("/api/torrents/retry", post(torrents_retry))
+        .route("/api/torrents/remove", post(torrents_remove))
+        .route("/api/torrents/concurrency", post(torrents_concurrency))
+        .route("/api/torrents/library/{id}", delete(torrents_delete_library))
         .route("/api/conclaves", get(conclaves).post(create_conclave))
         .route("/api/conclaves/message", post(send_conclave_message))
         .route("/api/conclaves/file", post(send_conclave_file))
@@ -312,6 +329,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--no-socket needs a TCP address (--addr / HUSH_DAEMON_ADDR)".into());
     }
     let reads_cache = vault_dir.join("reads-cache");
+    let worker = AccountWorker::spawn();
+    let torrents = Arc::new(torrents::TorrentsManager::new(
+        worker.clone(),
+        &vault_dir,
+    ));
     let app = App {
         dir: vault_dir,
         socket: if args.no_socket {
@@ -320,8 +342,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(socket.clone())
         },
         tcp_addr: tcp_addr.clone(),
-        worker: AccountWorker::spawn(),
+        worker,
         reads: reads::ReadsClient::new(&reads_cache),
+        torrents: torrents.clone(),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
         relay_socks: Mutex::new(None),
@@ -334,6 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(vault_mount_watch(state.clone()));
     tokio::spawn(outbox_loop(state.clone()));
     tokio::spawn(heartbeat_loop(state.clone()));
+    tokio::spawn(torrents.run());
     suspend_lock::spawn_suspend_lock_watch(state.clone());
 
     let router = api_router(state.clone());
@@ -2245,6 +2269,205 @@ async fn reads_mark_read(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Torrents — the TorBox-powered pipeline behind `/api/torrents/*`.
+//
+// Every call goes through [`torrents::TorrentsManager`]; the API key lives in
+// the vault sidecar and is never part of a response. A locked vault is a 401,
+// the same contract the Reads state routes use.
+// ---------------------------------------------------------------------------
+
+fn torrents_err(msg: String) -> (StatusCode, Json<ApiError>) {
+    if msg == "locked" {
+        (StatusCode::UNAUTHORIZED, Json(ApiError { error: msg }))
+    } else {
+        (StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))
+    }
+}
+
+#[derive(Deserialize)]
+struct TorrentsKeyRequest {
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct TorrentsAddRequest {
+    source: String,
+}
+
+#[derive(Deserialize)]
+struct TorrentsAddFileRequest {
+    name: String,
+    data_base64: String,
+}
+
+#[derive(Deserialize)]
+struct TorrentsIdRequest {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct TorrentsConcurrencyRequest {
+    max: u32,
+}
+
+async fn torrents_state(
+    State(state): State<Arc<App>>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .public_state()
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_set_key(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsKeyRequest>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .set_key(&body.key)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_test_key(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsKeyRequest>,
+) -> Result<Json<torbox::UserInfo>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .test_key(&body.key)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_refresh(
+    State(state): State<Arc<App>>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .refresh_account()
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_add(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsAddRequest>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .add_source(&body.source)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_add_file(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsAddFileRequest>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let bytes = STANDARD
+        .decode(body.data_base64.as_bytes())
+        .map_err(|_| (StatusCode::BAD_REQUEST, Json(ApiError { error: "bad torrent file data".into() })))?;
+    state
+        .torrents
+        .add_torrent_file(&body.name, bytes)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_pause(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsIdRequest>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .pause(&body.id)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_resume(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsIdRequest>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .resume(&body.id)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_retry(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsIdRequest>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .retry(&body.id)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_remove(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsIdRequest>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .remove(&body.id)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_concurrency(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsConcurrencyRequest>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .set_concurrency(body.max)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
+async fn torrents_delete_library(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .torrents
+        .delete_library(&id)
+        .await
+        .map(Json)
+        .map_err(torrents_err)
+}
+
 /// The drops API, against a real (in-process) relay: key creation, an
 /// outsider's sealed container parked on the rendezvous slot, a forced drain,
 /// and the drop record surfacing through `GET /api/mail`.
@@ -2282,6 +2505,7 @@ mod drops_api_tests {
             tcp_addr: None,
             worker: AccountWorker::spawn(),
             reads: reads::ReadsClient::new(&dir.join("reads-cache")),
+            torrents: Arc::new(torrents::TorrentsManager::new(AccountWorker::spawn(), dir)),
             unlocked: Mutex::new(false),
             unlocked_at: Mutex::new(None),
             relay_socks: Mutex::new(None),

@@ -16,6 +16,8 @@ import type {
   ReadsStateDto,
   ReadsStoryDetailDto,
   ReadsStoryDto,
+  TorboxUserDto,
+  TorrentsStateDto,
 } from "./types";
 
 type Transport =
@@ -354,6 +356,61 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ id, title }),
     }),
+  // --- Torrents (TorBox-powered client). The API key lives in the vault
+  // sidecar and is never sent back; the daemon does all TorBox traffic. ---
+  torrentsState: () => request<TorrentsStateDto>("/api/torrents/state"),
+  torrentsTestKey: (key: string) =>
+    request<TorboxUserDto>("/api/torrents/test", {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  torrentsSetKey: (key: string) =>
+    request<TorrentsStateDto>("/api/torrents/key", {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  torrentsRefresh: () =>
+    request<TorrentsStateDto>("/api/torrents/refresh", { method: "POST" }),
+  torrentsAdd: (source: string) =>
+    request<TorrentsStateDto>("/api/torrents/add", {
+      method: "POST",
+      body: JSON.stringify({ source }),
+    }),
+  torrentsAddFile: (name: string, data_base64: string) =>
+    request<TorrentsStateDto>("/api/torrents/add-file", {
+      method: "POST",
+      body: JSON.stringify({ name, data_base64 }),
+    }),
+  torrentsPause: (id: string) =>
+    request<TorrentsStateDto>("/api/torrents/pause", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    }),
+  torrentsResume: (id: string) =>
+    request<TorrentsStateDto>("/api/torrents/resume", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    }),
+  torrentsRetry: (id: string) =>
+    request<TorrentsStateDto>("/api/torrents/retry", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    }),
+  torrentsRemove: (id: string) =>
+    request<TorrentsStateDto>("/api/torrents/remove", {
+      method: "POST",
+      body: JSON.stringify({ id }),
+    }),
+  torrentsSetConcurrency: (max: number) =>
+    request<TorrentsStateDto>("/api/torrents/concurrency", {
+      method: "POST",
+      body: JSON.stringify({ max }),
+    }),
+  torrentsDeleteLibrary: (id: string) =>
+    request<TorrentsStateDto>(
+      `/api/torrents/library/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
   /**
    * Flip the relay switch. `socks` is the shell Tor's SOCKS port, reported
    * when switching on; the daemon refuses to fall back to clearnet on its

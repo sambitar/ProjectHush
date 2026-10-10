@@ -8,6 +8,21 @@ pub struct AccountWorker {
     tx: mpsc::Sender<Work>,
 }
 
+impl Clone for AccountWorker {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+/// Parse a hex blob id into the vault's `BlobId`.
+fn blob_id_from_hex(s: &str) -> Option<hush_core::BlobId> {
+    let bytes = hex::decode(s).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(hush_core::BlobId(arr))
+}
+
 enum Work {
     Unlock {
         dir: PathBuf,
@@ -108,6 +123,26 @@ enum Work {
     /// Reads pane: replace the encrypted sidecar state wholesale.
     ReadsStatePut {
         bytes: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Torrents pane: load the encrypted sidecar state (None when never saved).
+    TorrentsStateGet {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Torrents pane: replace the encrypted sidecar state wholesale.
+    TorrentsStatePut {
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Store a file from disk into the vault as a chunked blob (large-file
+    /// path for torrent downloads).
+    BlobStoreFile {
+        path: PathBuf,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Delete a stored blob (single or chunked).
+    BlobDelete {
+        id_hex: String,
         reply: oneshot::Sender<WorkResult>,
     },
     DraftRecords {
@@ -684,6 +719,54 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::TorrentsStateGet { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a.read_vault_sidecar(crate::torrents_store::STATE_FILE) {
+                                        Ok(state) => WorkResult::ReadsState(state),
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::TorrentsStatePut { bytes, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.write_vault_sidecar(
+                                    crate::torrents_store::STATE_FILE,
+                                    &bytes,
+                                ) {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::BlobStoreFile { path, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.store_blob_file(&path) {
+                                    Ok(id) => WorkResult::BlobId(hex::encode(id.0)),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::BlobDelete { id_hex, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match blob_id_from_hex(&id_hex) {
+                                    None => WorkResult::Err("bad blob id".into()),
+                                    Some(id) => match a.delete_blob(&id) {
+                                        Ok(_) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    },
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::SaveDraft {
                             id,
                             thread_id,
@@ -1181,6 +1264,34 @@ impl AccountWorker {
     pub async fn reads_state_put(&self, bytes: Vec<u8>) -> WorkResult {
         self.call(|reply| Work::ReadsStatePut { bytes, reply })
             .await
+    }
+
+    /// The Torrents pane's encrypted sidecar state, raw bytes (None until first
+    /// saved). The JSON schema lives in [`crate::torrents_store`].
+    pub async fn torrents_state_get(&self) -> WorkResult {
+        self.call(|reply| Work::TorrentsStateGet { reply }).await
+    }
+
+    /// Replace the Torrents pane's encrypted sidecar state wholesale.
+    pub async fn torrents_state_put(&self, bytes: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::TorrentsStatePut { bytes, reply })
+            .await
+    }
+
+    /// Store a file from disk into the vault as a chunked blob; returns its
+    /// hex id. See [`hush_core::Vault::put_blob_stream`].
+    pub async fn blob_store_file(&self, path: &PathBuf) -> WorkResult {
+        let path = path.clone();
+        self.call(|reply| Work::BlobStoreFile { path, reply }).await
+    }
+
+    /// Delete a stored blob by hex id.
+    pub async fn blob_delete(&self, id_hex: &str) -> WorkResult {
+        self.call(|reply| Work::BlobDelete {
+            id_hex: id_hex.to_string(),
+            reply,
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

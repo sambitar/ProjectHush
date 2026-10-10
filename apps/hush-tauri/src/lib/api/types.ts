@@ -312,3 +312,84 @@ export interface ReadsFeedResponse {
   /** True when this page looks like the last one. */
   done: boolean;
 }
+
+// --- Torrents (TorBox-powered client) ------------------------------------------
+
+/** Where a queued item's data came from. */
+export type TorrentSourceKind = "magnet" | "link" | "file";
+
+/** The pipeline state of one torrent, mirroring the daemon's `ItemStatus`. */
+export type TorrentItemStatus =
+  | "queued"
+  | "sending"
+  | "caching"
+  | "ready"
+  | "downloading"
+  | "completed"
+  | "paused"
+  | "error";
+
+/** One file inside a torrent. `path` may contain `/`; the Library nests on it. */
+export interface TorrentFileDto {
+  file_id: number;
+  name: string;
+  path: string;
+  size: number;
+  mimetype: string | null;
+  blob_id: string | null;
+  done: boolean;
+}
+
+/** One queued or in-progress torrent. `source_data` never reaches the UI. */
+export interface TorrentItemDto {
+  id: string;
+  name: string;
+  source: TorrentSourceKind;
+  hash: string | null;
+  torrent_id: number | null;
+  status: TorrentItemStatus;
+  /** TorBox caching progress, 0..1. */
+  progress: number;
+  /** TorBox's own download speed, bytes/s. */
+  speed: number;
+  seeds: number;
+  size: number;
+  cached: boolean;
+  /** A human sentence when `status === "error"`. */
+  message: string | null;
+  files: TorrentFileDto[];
+  dl_done: number;
+  dl_total: number;
+  dl_speed: number;
+  added_at: number;
+  retry: number;
+}
+
+/** A completed torrent in the Library; its files are real vault blobs. */
+export interface TorrentLibraryEntryDto {
+  id: string;
+  name: string;
+  hash: string | null;
+  size: number;
+  added_at: number;
+  files: TorrentFileDto[];
+}
+
+/** `GET /api/torrents/state` — everything the pane renders, minus the API key. */
+export interface TorrentsStateDto {
+  has_key: boolean;
+  plan: number | null;
+  plan_label: string | null;
+  email: string | null;
+  max_concurrent: number;
+  items: TorrentItemDto[];
+  library: TorrentLibraryEntryDto[];
+}
+
+/** `POST /api/torrents/test` — a validated key's account info. */
+export interface TorboxUserDto {
+  plan: number;
+  plan_label: string;
+  email: string | null;
+  expires: string | null;
+}

@@ -608,6 +608,31 @@ impl Account {
         self.vault.write_encrypted_file(name, plaintext)
     }
 
+    /// Store a file from disk into the vault as a chunked, content-addressed
+    /// blob without buffering the whole file in memory. See
+    /// [`Vault::put_blob_stream`].
+    pub fn store_blob_file(&self, path: &Path) -> Result<BlobId, Error> {
+        let mut file = fs::File::open(path)?;
+        self.vault.put_blob_stream(&mut file)
+    }
+
+    /// Stream a stored blob out to a file on disk. See
+    /// [`Vault::read_blob_stream`].
+    pub fn write_blob_to_file(&self, id: &BlobId, path: &Path) -> Result<u64, Error> {
+        let mut file = fs::File::create(path)?;
+        self.vault.read_blob_stream(id, &mut file)
+    }
+
+    /// Remove a stored blob. Returns whether anything was there.
+    pub fn delete_blob(&self, id: &BlobId) -> Result<bool, Error> {
+        self.vault.delete_blob(id)
+    }
+
+    /// Whether a blob id is stored in this vault.
+    pub fn has_blob(&self, id: &BlobId) -> bool {
+        self.vault.has_blob(id)
+    }
+
     pub fn vault_dir(&self) -> &Path {
         &self.dir
     }

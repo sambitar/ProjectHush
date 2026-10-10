@@ -8,6 +8,10 @@ import type {
   ReadsStateDto,
   ReadsStoryDetailDto,
   ReadsStoryDto,
+  TorrentFileDto,
+  TorrentItemDto,
+  TorrentLibraryEntryDto,
+  TorrentsStateDto,
 } from "./lib/api/types";
 import {
   HK_NEWS,
@@ -24,6 +28,27 @@ import {
   toggleHidden as toggleReadsHidden,
   toggleSaved as toggleReadsSaved,
 } from "./lib/readsStore";
+import {
+  addTorrent,
+  addTorrentFile,
+  clearTorrentsStore,
+  deleteLibraryEntry,
+  getTorrentsState,
+  pauseTorrent,
+  refreshTorboxAccount,
+  refreshTorrents,
+  removeTorrent,
+  resumeTorrent,
+  retryTorrent,
+  saveTorboxKey,
+  setTorrentConcurrency,
+  setTorrentsHooks,
+  setTorrentsPaneOpen,
+  subscribeTorrents,
+  testTorboxKey,
+  torrentStatusLabel,
+} from "./lib/torrentsStore";
+import { showToast } from "./lib/toast";
 import {
   addOutgoingFile,
   addOutgoingText,
@@ -88,8 +113,10 @@ import { fileToBase64, formatAbsolute, formatBytes, formatRelative, formatUntil 
 import {
   attachFileActions,
   downloadBase64File,
+  openBytesInNewTab,
   readFileAsBase64,
   resolveMessageFileBytes,
+  saveBytesAsFile,
 } from "./lib/fileBytes";
 import { groupMessages, dayLabel } from "./lib/messageGroups";
 import {
@@ -142,6 +169,7 @@ type Rail =
   | "trusts"
   | "conclaves"
   | "reads"
+  | "torrents"
   | "mail"
   | "drops"
   | "files"
@@ -152,6 +180,7 @@ type SettingsSection =
   | "profile"
   | "relay"
   | "drops"
+  | "torbox"
   | "notifications"
   | "security"
   | "recovery"
@@ -193,6 +222,46 @@ const MAIL_EMPTY: Record<MailFolder, string> = {
 /** `Re:` a subject, without stacking prefixes on an existing reply. */
 function reSubject(subject: string): string {
   return /^re:/i.test(subject.trim()) ? subject : `Re: ${subject}`;
+}
+
+/** How many torrents still need the pipeline's attention (for the rail badge). */
+function activeTorrentCount(state: TorrentsStateDto): number {
+  return state.items.filter((i) =>
+    ["queued", "sending", "caching", "ready", "downloading"].includes(i.status),
+  ).length;
+}
+
+/** Whether a pasted string is a magnet link or a `.torrent` URL. Mirrors the
+ * daemon's own check so the Add bar can reject the obvious typo locally. */
+function looksLikeTorrentSource(s: string): boolean {
+  const t = s.trim().toLowerCase();
+  if (t.startsWith("magnet:")) return true;
+  return (t.startsWith("http://") || t.startsWith("https://")) && t.includes(".torrent");
+}
+
+/** "1.2 MB/s", or "" when idle. */
+function formatSpeed(bytesPerSec: number): string {
+  if (!bytesPerSec || bytesPerSec <= 0) return "";
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
+/** A file-type icon for a Library/torrent file, by mime or extension. */
+function torrentFileIcon(f: { mimetype: string | null; name: string }): IconName {
+  const mime = (f.mimetype ?? "").toLowerCase();
+  const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
+  if (mime.startsWith("video/") || ["mkv", "mp4", "avi", "mov", "webm", "m4v"].includes(ext)) {
+    return "fileVideo";
+  }
+  if (mime.startsWith("image/") || ["jpg", "jpeg", "png", "gif", "webp", "bmp"].includes(ext)) {
+    return "fileImage";
+  }
+  if (mime.startsWith("audio/") || ["mp3", "flac", "m4a", "wav", "ogg", "opus"].includes(ext)) {
+    return "fileAudio";
+  }
+  if (["zip", "rar", "7z", "tar", "gz", "xz", "bz2"].includes(ext)) {
+    return "fileArchive";
+  }
+  return "file";
 }
 
 /** Human wording for the Tor state. Accurate, not reassuring. */
@@ -301,6 +370,30 @@ export class App {
   private readsCollapsed = new Set<string>();
   /** Set while the open-original confirm modal is up. */
   private readsConfirmUrl: string | null = null;
+  // --- Torrents (TorBox client pane) ---
+  /** Which tab the Torrents pane shows. */
+  private torrentsView: "active" | "library" = "active";
+  /** The typed-but-not-yet-added magnet/URL; state, so re-renders keep it. */
+  private torrentsAddInput = "";
+  /** In-flight add, to disable the button and show progress. */
+  private torrentsAddBusy = false;
+  /** The Add bar's own error, shown beside the field it belongs to. */
+  private torrentsAddError: string | null = null;
+  /** True while a .torrent file is dragged over the Add bar. */
+  private torrentsDragOver = false;
+  /** Library folder path (segments of `ItemFile.path`), for breadcrumbs. */
+  private torrentsLibraryPath: string[] = [];
+  private torrentsLibraryView: "grid" | "list" = "list";
+  private torrentsLibrarySearch = "";
+  private torrentsLibrarySort: "date" | "name" | "size" = "date";
+  /** The Library entry awaiting delete confirmation. */
+  private torrentsDeleteId: string | null = null;
+  /** Settings > TorBox field state. */
+  private torboxKeyDraft = "";
+  private torboxKeyVisible = false;
+  private torboxTestOk: string | null = null;
+  private torboxTestError: string | null = null;
+  private torboxBusy = false;
   /** The conversation open in the reading pane. */
   private mailThreadId: string | null = null;
   /** The message the user clicked, highlighted inside its conversation. */
@@ -442,6 +535,27 @@ export class App {
     this.liveRegion.setAttribute("aria-live", "polite");
     this.liveRegion.className = "sr-only";
     document.body.appendChild(this.liveRegion);
+    // Torrents: the daemon pipeline runs on its own; the store polls and, when
+    // an item finishes or fails, says so even if the pane is not on screen.
+    setTorrentsHooks({
+      finished: (item) => {
+        showToast(`Torrent ready: ${item.name}`, { kind: "success" });
+        this.announce(`Torrent ready: ${item.name}`);
+      },
+      failed: (item) => {
+        showToast(`Torrent failed: ${item.name} — ${item.message ?? "unknown error"}`, {
+          kind: "error",
+        });
+        this.announce(`Torrent failed: ${item.name}`);
+      },
+    });
+    subscribeTorrents(() => {
+      if (this.rail !== "torrents") return;
+      // Never clobber the Add field while the user is typing in it.
+      const ae = document.activeElement;
+      if (ae instanceof HTMLInputElement && ae.closest(".torrents-pane")) return;
+      this.render();
+    });
     document.addEventListener("keydown", (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
         e.preventDefault();
@@ -460,6 +574,7 @@ export class App {
         this.closeConclaveEnd();
         this.closeConclaveDelete();
         if (this.filesContactNick) this.filesContactNick = null;
+        this.torrentsDeleteId = null;
         this.render();
       }
     });
@@ -625,6 +740,7 @@ export class App {
     clearMailStore();
     clearConclaveStore();
     clearReadsStore();
+    clearTorrentsStore();
     clearMockLocal();
     this.readsSource = HK_NEWS.id;
     this.readsSourceTitle = HK_NEWS.title;
@@ -677,6 +793,7 @@ export class App {
     if (!this.status || this.status.locked) {
       this.stopDropsPoll();
       this.stopTorPoll();
+      setTorrentsPaneOpen(false);
       this.root.appendChild(this.renderUnlock());
       return;
     }
@@ -701,6 +818,8 @@ export class App {
       shell.appendChild(this.renderReadsNav());
       shell.appendChild(this.renderReadsList());
       shell.appendChild(this.renderReadsMain());
+    } else if (this.rail === "torrents") {
+      shell.appendChild(this.renderTorrents());
     } else if (this.rail === "mail") {
       shell.appendChild(this.renderMailFolders());
       shell.appendChild(this.renderMailMain());
@@ -715,6 +834,7 @@ export class App {
     }
     this.root.appendChild(shell);
     this.startTorPoll();
+    setTorrentsPaneOpen(this.rail === "torrents");
     this.renderedNick = this.rail === "chats" ? this.selectedNick : null;
     // Now that the thread pane is in the document and has layout, put the
     // reader where the conversation should open: the newest message, or their
@@ -740,6 +860,7 @@ export class App {
     if (this.conclaveEndId) this.root.appendChild(this.renderConclaveEndModal());
     if (this.conclaveDeleteId) this.root.appendChild(this.renderConclaveDeleteModal());
     if (this.readsConfirmUrl) this.root.appendChild(this.renderReadsConfirm());
+    if (this.torrentsDeleteId) this.root.appendChild(this.renderTorrentsDeleteModal());
   }
 
   private async maybeShowRecoveryCode(): Promise<void> {
@@ -945,6 +1066,12 @@ export class App {
         });
         if (!this.readsStories.length && !this.readsLoading) void this.readsLoad();
       }
+      if (id === "torrents") {
+        // The pipeline may have advanced while another rail was up.
+        void refreshTorrents().then(() => {
+          if (this.rail === "torrents") this.render();
+        });
+      }
       if (id === "drops") {
         // Tor state lives in the shell, so poll it while the rail is up.
         this.startDropsPoll();
@@ -979,6 +1106,14 @@ export class App {
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
     rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
     rail.appendChild(this.railBtn("reads", "Reads", "reads"));
+    rail.appendChild(
+      this.railBtn(
+        "torrents",
+        "Torrents",
+        "torrents",
+        activeTorrentCount(getTorrentsState()),
+      ),
+    );
     rail.appendChild(this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())));
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
@@ -5500,6 +5635,909 @@ export class App {
     }
   }
 
+  // ------------------------------------------------------------------
+  // Torrents (TorBox-powered client)
+  //
+  // The pane is a thin view over `torrentsStore`, which polls the daemon. The
+  // daemon owns the pipeline (TorBox → vault); nothing here talks to TorBox.
+  // ------------------------------------------------------------------
+
+  private renderTorrents(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane torrents-pane";
+    const state = getTorrentsState();
+
+    const head = document.createElement("div");
+    head.className = "torrents-head";
+    const title = document.createElement("h1");
+    title.className = "text-22";
+    title.textContent = "Torrents";
+    const settingsBtn = document.createElement("button");
+    settingsBtn.type = "button";
+    settingsBtn.className = "btn-secondary text-13 pressable";
+    settingsBtn.textContent = state.has_key ? "TorBox settings" : "Set up TorBox";
+    settingsBtn.onclick = () => {
+      this.rail = "settings";
+      this.settingsSection = "torbox";
+      this.render();
+    };
+    head.append(title, settingsBtn);
+    pane.appendChild(head);
+
+    if (!state.has_key) {
+      pane.appendChild(this.renderTorrentsNoKey());
+      return pane;
+    }
+
+    pane.appendChild(this.renderTorrentsAddBar());
+
+    const active = activeTorrentCount(state);
+    const tabs = document.createElement("div");
+    tabs.className = "torrents-tabs";
+    const tabDefs: { id: "active" | "library"; label: string }[] = [
+      { id: "active", label: active > 0 ? `Active & Queue (${active})` : "Active & Queue" },
+      { id: "library", label: `Library${state.library.length ? ` (${state.library.length})` : ""}` },
+    ];
+    for (const t of tabDefs) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `torrents-tab pressable${this.torrentsView === t.id ? " active" : ""}`;
+      b.textContent = t.label;
+      b.onclick = () => {
+        this.torrentsView = t.id;
+        this.torrentsLibraryPath = [];
+        this.render();
+      };
+      tabs.appendChild(b);
+    }
+    pane.appendChild(tabs);
+
+    pane.appendChild(
+      this.torrentsView === "active"
+        ? this.renderTorrentsActive(state)
+        : this.renderTorrentsLibrary(state),
+    );
+    return pane;
+  }
+
+  private renderTorrentsNoKey(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "torrents-empty";
+    const ic = icon("torrents");
+    ic.classList.add("torrents-empty-icon");
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Connect TorBox to start";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent =
+      "Torrents are fetched in the cloud by TorBox, then downloaded straight into your vault. Paste your TorBox API key once to turn it on.";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-primary pressable";
+    btn.textContent = "Open Settings → TorBox";
+    btn.onclick = () => {
+      this.rail = "settings";
+      this.settingsSection = "torbox";
+      this.render();
+    };
+    wrap.append(ic, h, p, btn);
+    return wrap;
+  }
+
+  private renderTorrentsAddBar(): HTMLElement {
+    const bar = document.createElement("div");
+    bar.className = `torrents-add${this.torrentsDragOver ? " drag-over" : ""}`;
+
+    const input = document.createElement("input");
+    input.className = "input-field torrents-add-input";
+    input.placeholder = "Paste a magnet link or .torrent URL";
+    input.value = this.torrentsAddInput;
+    input.spellcheck = false;
+    input.oninput = () => {
+      this.torrentsAddInput = input.value;
+    };
+    // Auto-detect on paste: a magnet or .torrent URL is added without a
+    // second click. The timeout lets the paste land in the field first.
+    input.onpaste = () => {
+      window.setTimeout(() => {
+        const text = input.value.trim();
+        if (looksLikeTorrentSource(text)) {
+          this.torrentsAddInput = text;
+          void this.torrentsSubmit();
+        }
+      }, 0);
+    };
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void this.torrentsSubmit();
+      }
+    };
+
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "btn-primary pressable";
+    add.textContent = this.torrentsAddBusy ? "Adding…" : "Add";
+    add.disabled = this.torrentsAddBusy;
+    add.onclick = () => void this.torrentsSubmit();
+
+    const fileBtn = document.createElement("button");
+    fileBtn.type = "button";
+    fileBtn.className = "btn-secondary text-13 pressable";
+    fileBtn.textContent = "Choose .torrent…";
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = ".torrent,application/x-bittorrent";
+    fileInput.hidden = true;
+    fileInput.onchange = () => {
+      const f = fileInput.files?.[0];
+      if (f) void this.torrentsSubmitFile(f);
+    };
+    fileBtn.onclick = () => fileInput.click();
+
+    bar.append(input, add, fileBtn, fileInput);
+
+    const hint = document.createElement("p");
+    hint.className = "muted text-13 torrents-add-hint";
+    hint.textContent =
+      "Or drop a .torrent file here. TorBox fetches it, then it downloads into your vault automatically.";
+    bar.appendChild(hint);
+
+    if (this.torrentsAddError) {
+      const err = document.createElement("p");
+      err.className = "text-13 torrents-add-error";
+      err.textContent = this.torrentsAddError;
+      bar.appendChild(err);
+    }
+
+    bar.ondragover = (e) => {
+      e.preventDefault();
+      if (!this.torrentsDragOver) {
+        this.torrentsDragOver = true;
+        bar.classList.add("drag-over");
+      }
+    };
+    bar.ondragleave = () => {
+      this.torrentsDragOver = false;
+      bar.classList.remove("drag-over");
+    };
+    bar.ondrop = (e) => {
+      e.preventDefault();
+      this.torrentsDragOver = false;
+      bar.classList.remove("drag-over");
+      const f = e.dataTransfer?.files?.[0];
+      if (f) void this.torrentsSubmitFile(f);
+    };
+    return bar;
+  }
+
+  private async torrentsSubmit(): Promise<void> {
+    const source = this.torrentsAddInput.trim();
+    this.torrentsAddError = null;
+    if (!source) {
+      this.torrentsAddError = "Paste a magnet link or .torrent URL first.";
+      this.render();
+      return;
+    }
+    if (!looksLikeTorrentSource(source)) {
+      this.torrentsAddError = "That doesn't look like a magnet link or a .torrent URL.";
+      this.render();
+      return;
+    }
+    this.torrentsAddBusy = true;
+    this.render();
+    try {
+      await addTorrent(source);
+      this.torrentsAddInput = "";
+      this.torrentsView = "active";
+      this.announce("Torrent added");
+    } catch (e) {
+      this.torrentsAddError =
+        e instanceof AppError ? e.message : "Could not add that torrent.";
+    } finally {
+      this.torrentsAddBusy = false;
+      this.render();
+    }
+  }
+
+  private async torrentsSubmitFile(file: File): Promise<void> {
+    this.torrentsAddError = null;
+    if (!/\.torrent$/i.test(file.name) && file.type !== "application/x-bittorrent") {
+      this.torrentsAddError = "Drop a .torrent file (not a video or archive).";
+      this.render();
+      return;
+    }
+    this.torrentsAddBusy = true;
+    this.render();
+    try {
+      const b64 = await readFileAsBase64(file);
+      await addTorrentFile(file.name, b64);
+      this.torrentsView = "active";
+      this.announce("Torrent added");
+    } catch (e) {
+      this.torrentsAddError =
+        e instanceof AppError ? e.message : "Could not read that torrent file.";
+    } finally {
+      this.torrentsAddBusy = false;
+      this.render();
+    }
+  }
+
+  private renderTorrentsActive(state: TorrentsStateDto): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "torrents-list";
+    if (!state.items.length) {
+      const p = document.createElement("p");
+      p.className = "muted torrents-list-empty";
+      p.textContent = "Nothing in the queue. Add a magnet above to get started.";
+      wrap.appendChild(p);
+      return wrap;
+    }
+    for (const item of state.items) wrap.appendChild(this.renderTorrentCard(item));
+    return wrap;
+  }
+
+  private renderTorrentCard(item: TorrentItemDto): HTMLElement {
+    const card = document.createElement("div");
+    card.className = `torrent-card status-${item.status}`;
+
+    const top = document.createElement("div");
+    top.className = "torrent-card-top";
+    const name = document.createElement("div");
+    name.className = "torrent-card-name text-15";
+    name.textContent = item.name;
+    name.title = item.name;
+    const badge = document.createElement("span");
+    badge.className = `torrent-badge status-${item.status}`;
+    badge.textContent = torrentStatusLabel(item);
+    top.append(name, badge);
+    card.appendChild(top);
+
+    const frac =
+      item.status === "downloading" || item.status === "completed"
+        ? item.dl_total
+          ? item.dl_done / item.dl_total
+          : 0
+        : item.progress;
+    const bar = document.createElement("div");
+    bar.className = "torrent-bar";
+    const fill = document.createElement("div");
+    fill.className = "torrent-bar-fill";
+    fill.style.width = `${Math.max(0, Math.min(1, frac)) * 100}%`;
+    bar.appendChild(fill);
+    card.appendChild(bar);
+
+    const bits: string[] = [];
+    if (item.size) bits.push(formatBytes(item.size));
+    if (item.status === "caching") {
+      const speed = formatSpeed(item.speed);
+      if (speed) bits.push(speed);
+      if (item.seeds) bits.push(`${item.seeds} seed${item.seeds === 1 ? "" : "s"}`);
+    }
+    if (item.status === "downloading" && item.dl_total) {
+      bits.push(`${formatBytes(item.dl_done)} / ${formatBytes(item.dl_total)}`);
+    }
+    bits.push(readsTimeAgo(item.added_at));
+    const meta = document.createElement("div");
+    meta.className = "torrent-meta muted text-13";
+    meta.textContent = bits.join(" · ");
+    card.appendChild(meta);
+
+    if (item.status === "error" && item.message) {
+      const err = document.createElement("p");
+      err.className = "torrent-error text-13";
+      err.textContent = item.message;
+      card.appendChild(err);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "torrent-actions";
+    if (item.status === "paused") {
+      actions.appendChild(
+        this.torrentActionBtn("Resume", "play", () => this.torrentsControl(item.id, "resume")),
+      );
+    } else if (item.status !== "completed") {
+      actions.appendChild(
+        this.torrentActionBtn("Pause", "pause", () => this.torrentsControl(item.id, "pause")),
+      );
+    }
+    if (item.status === "error") {
+      actions.appendChild(
+        this.torrentActionBtn("Retry", "refresh", () => this.torrentsControl(item.id, "retry")),
+      );
+    }
+    actions.appendChild(
+      this.torrentActionBtn("Remove", "trash", () => this.torrentsControl(item.id, "remove")),
+    );
+    card.appendChild(actions);
+    return card;
+  }
+
+  private torrentActionBtn(
+    label: string,
+    ic: IconName,
+    fn: () => Promise<void>,
+  ): HTMLElement {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn-secondary text-13 pressable";
+    b.appendChild(icon(ic));
+    const s = document.createElement("span");
+    s.textContent = label;
+    b.appendChild(s);
+    b.onclick = () => void fn();
+    return b;
+  }
+
+  private async torrentsControl(
+    id: string,
+    action: "pause" | "resume" | "retry" | "remove",
+  ): Promise<void> {
+    try {
+      if (action === "pause") await pauseTorrent(id);
+      else if (action === "resume") await resumeTorrent(id);
+      else if (action === "retry") await retryTorrent(id);
+      else await removeTorrent(id);
+    } catch (e) {
+      showToast(e instanceof AppError ? e.message : "That action failed.", {
+        kind: "error",
+      });
+    } finally {
+      this.render();
+    }
+  }
+
+  private renderTorrentsLibrary(state: TorrentsStateDto): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "torrents-library";
+
+    // Breadcrumbs: Library / <torrent> / <subfolder…>
+    const crumbs = document.createElement("div");
+    crumbs.className = "torrents-crumbs";
+    const rootBtn = document.createElement("button");
+    rootBtn.type = "button";
+    rootBtn.className = "crumb pressable";
+    rootBtn.textContent = "Library";
+    rootBtn.onclick = () => {
+      this.torrentsLibraryPath = [];
+      this.render();
+    };
+    crumbs.appendChild(rootBtn);
+    for (let i = 0; i < this.torrentsLibraryPath.length; i++) {
+      const seg = this.torrentsLibraryPath[i];
+      const sep = document.createElement("span");
+      sep.className = "crumb-sep";
+      sep.textContent = "/";
+      crumbs.appendChild(sep);
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "crumb pressable";
+      b.textContent =
+        i === 0
+          ? state.library.find((e) => e.id === seg)?.name ?? "Torrent"
+          : seg;
+      b.onclick = () => {
+        this.torrentsLibraryPath = this.torrentsLibraryPath.slice(0, i + 1);
+        this.render();
+      };
+      crumbs.appendChild(b);
+    }
+    wrap.appendChild(crumbs);
+
+    // Toolbar: search, sort, view toggle.
+    const tools = document.createElement("div");
+    tools.className = "torrents-tools";
+    const search = document.createElement("div");
+    search.className = "search-pill";
+    search.appendChild(icon("search"));
+    const si = document.createElement("input");
+    si.placeholder = "Search";
+    si.value = this.torrentsLibrarySearch;
+    si.oninput = () => {
+      this.torrentsLibrarySearch = si.value;
+      this.render();
+    };
+    search.appendChild(si);
+    const sortSel = document.createElement("select");
+    sortSel.className = "input-field torrents-sort";
+    for (const [v, t] of [
+      ["date", "Newest"],
+      ["name", "Name"],
+      ["size", "Size"],
+    ] as const) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = t;
+      sortSel.appendChild(o);
+    }
+    sortSel.value = this.torrentsLibrarySort;
+    sortSel.onchange = () => {
+      this.torrentsLibrarySort = sortSel.value as "date" | "name" | "size";
+      this.render();
+    };
+    const viewToggle = document.createElement("div");
+    viewToggle.className = "segmented torrents-view";
+    for (const v of ["list", "grid"] as const) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = this.torrentsLibraryView === v ? "active" : "";
+      b.appendChild(icon(v === "list" ? "listView" : "grid"));
+      b.setAttribute("aria-label", v === "list" ? "List view" : "Grid view");
+      b.onclick = () => {
+        this.torrentsLibraryView = v;
+        this.render();
+      };
+      viewToggle.appendChild(b);
+    }
+    tools.append(search, sortSel, viewToggle);
+    wrap.appendChild(tools);
+
+    const q = this.torrentsLibrarySearch.trim().toLowerCase();
+
+    if (this.torrentsLibraryPath.length === 0) {
+      // Top level: one folder per downloaded torrent.
+      let entries = [...state.library];
+      if (q) entries = entries.filter((e) => e.name.toLowerCase().includes(q));
+      entries.sort((a, b) => {
+        if (this.torrentsLibrarySort === "name") return a.name.localeCompare(b.name);
+        if (this.torrentsLibrarySort === "size") return b.size - a.size;
+        return b.added_at - a.added_at;
+      });
+      if (!entries.length) {
+        const p = document.createElement("p");
+        p.className = "muted torrents-list-empty";
+        p.textContent = state.library.length
+          ? "No torrents match that search."
+          : "Nothing in the library yet. Finished torrents land here.";
+        wrap.appendChild(p);
+        return wrap;
+      }
+      const container = document.createElement("div");
+      container.className = `torrents-items ${this.torrentsLibraryView}`;
+      for (const e of entries) container.appendChild(this.renderLibraryTorrent(e));
+      wrap.appendChild(container);
+      return wrap;
+    }
+
+    // Inside a torrent: immediate children of the current subfolder.
+    const entry = state.library.find((e) => e.id === this.torrentsLibraryPath[0]);
+    if (!entry) {
+      const p = document.createElement("p");
+      p.className = "muted torrents-list-empty";
+      p.textContent = "That torrent is no longer in the library.";
+      wrap.appendChild(p);
+      return wrap;
+    }
+    const sub = this.torrentsLibraryPath.slice(1);
+    const nodes = new Map<string, { name: string; folder: boolean; size: number; file?: TorrentFileDto }>();
+    for (const f of entry.files) {
+      const parts = f.path.split("/").filter(Boolean);
+      if (parts.slice(0, sub.length).join("/") !== sub.join("/")) continue;
+      const rel = parts.slice(sub.length);
+      if (!rel.length) continue;
+      const head = rel[0];
+      if (rel.length === 1) {
+        nodes.set(head, { name: head, folder: false, size: f.size, file: f });
+      } else if (!nodes.has(head)) {
+        nodes.set(head, { name: head, folder: true, size: 0 });
+      }
+    }
+    let list = [...nodes.values()];
+    if (q) list = list.filter((n) => n.name.toLowerCase().includes(q));
+    list.sort((a, b) => {
+      if (a.folder !== b.folder) return a.folder ? -1 : 1;
+      if (this.torrentsLibrarySort === "name") return a.name.localeCompare(b.name);
+      if (this.torrentsLibrarySort === "size") return b.size - a.size;
+      return a.name.localeCompare(b.name);
+    });
+
+    const deleteRow = document.createElement("div");
+    deleteRow.className = "torrents-library-actions";
+    deleteRow.appendChild(
+      this.torrentActionBtn("Delete torrent", "trash", async () => {
+        this.torrentsDeleteId = entry.id;
+        this.render();
+      }),
+    );
+    wrap.appendChild(deleteRow);
+
+    if (!list.length) {
+      const p = document.createElement("p");
+      p.className = "muted torrents-list-empty";
+      p.textContent = "This folder is empty.";
+      wrap.appendChild(p);
+      return wrap;
+    }
+    const container = document.createElement("div");
+    container.className = `torrents-items ${this.torrentsLibraryView}`;
+    for (const n of list) {
+      container.appendChild(
+        n.folder
+          ? this.renderLibraryFolder(n.name, () => {
+              this.torrentsLibraryPath = [...this.torrentsLibraryPath, n.name];
+              this.render();
+            })
+          : this.renderLibraryFile(n.file!),
+      );
+    }
+    wrap.appendChild(container);
+    return wrap;
+  }
+
+  private renderLibraryTorrent(e: TorrentLibraryEntryDto): HTMLElement {
+    const open = () => {
+      this.torrentsLibraryPath = [e.id];
+      this.torrentsLibrarySearch = "";
+      this.render();
+    };
+    const el = this.libraryItemShell("folder", e.name, formatBytes(e.size), open);
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "library-item-action pressable";
+    del.setAttribute("aria-label", `Delete ${e.name}`);
+    del.appendChild(icon("trash"));
+    del.onclick = (ev) => {
+      ev.stopPropagation();
+      this.torrentsDeleteId = e.id;
+      this.render();
+    };
+    el.appendChild(del);
+    const meta = document.createElement("span");
+    meta.className = "library-item-sub muted text-12";
+    meta.textContent = `${e.files.length} file${e.files.length === 1 ? "" : "s"} · ${readsTimeAgo(e.added_at)}`;
+    el.appendChild(meta);
+    return el;
+  }
+
+  private renderLibraryFolder(name: string, open: () => void): HTMLElement {
+    return this.libraryItemShell("folder", name, "", open);
+  }
+
+  private renderLibraryFile(f: TorrentFileDto): HTMLElement {
+    const el = this.libraryItemShell(
+      torrentFileIcon(f),
+      f.name,
+      formatBytes(f.size),
+      () => void this.torrentsOpenFile(f),
+    );
+    const actions = document.createElement("div");
+    actions.className = "library-item-actions";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "library-item-action pressable";
+    save.setAttribute("aria-label", `Save ${f.name}`);
+    save.appendChild(icon("download"));
+    save.onclick = (ev) => {
+      ev.stopPropagation();
+      void this.torrentsSaveFile(f);
+    };
+    actions.appendChild(save);
+    el.appendChild(actions);
+    return el;
+  }
+
+  /** Shared row/tile shell for a Library folder or file. */
+  private libraryItemShell(
+    ic: IconName,
+    name: string,
+    sizeText: string,
+    onOpen: () => void,
+  ): HTMLElement {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "library-item pressable";
+    const icEl = icon(ic);
+    icEl.classList.add("library-item-icon");
+    const label = document.createElement("span");
+    label.className = "library-item-name text-15";
+    label.textContent = name;
+    label.title = name;
+    el.append(icEl, label);
+    if (sizeText) {
+      const size = document.createElement("span");
+      size.className = "library-item-size muted text-12";
+      size.textContent = sizeText;
+      el.appendChild(size);
+    }
+    el.onclick = onOpen;
+    return el;
+  }
+
+  private async torrentsOpenFile(f: TorrentFileDto): Promise<void> {
+    if (!f.blob_id) {
+      showToast("That file isn't stored in the vault yet.", { kind: "error" });
+      return;
+    }
+    try {
+      const bytes = await resolveMessageFileBytes({ blobId: f.blob_id });
+      await openBytesInNewTab(f.name, bytes);
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Could not open that file.", {
+        kind: "error",
+      });
+    }
+  }
+
+  private async torrentsSaveFile(f: TorrentFileDto): Promise<void> {
+    if (!f.blob_id) {
+      showToast("That file isn't stored in the vault yet.", { kind: "error" });
+      return;
+    }
+    try {
+      const bytes = await resolveMessageFileBytes({ blobId: f.blob_id });
+      await saveBytesAsFile(f.name, bytes);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Could not save that file.";
+      if (!msg.toLowerCase().includes("cancel")) showToast(msg, { kind: "error" });
+    }
+  }
+
+  private renderTorrentsDeleteModal(): HTMLElement {
+    const id = this.torrentsDeleteId!;
+    const entry = getTorrentsState().library.find((e) => e.id === id);
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Delete from library");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Delete from library?";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-3)";
+    p.textContent = entry
+      ? `“${entry.name}” and its ${entry.files.length} file${entry.files.length === 1 ? "" : "s"} will be removed from your vault. This cannot be undone.`
+      : "This torrent will be removed from your vault. This cannot be undone.";
+
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.torrentsDeleteId = null;
+      this.render();
+    };
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "btn-primary pressable";
+    del.style.background = "var(--danger)";
+    del.textContent = "Delete";
+    del.onclick = async () => {
+      del.disabled = true;
+      try {
+        await deleteLibraryEntry(id);
+        this.announce("Deleted from library");
+      } catch (e) {
+        showToast(e instanceof AppError ? e.message : "Could not delete that.", {
+          kind: "error",
+        });
+      } finally {
+        this.torrentsDeleteId = null;
+        this.torrentsLibraryPath = [];
+        this.render();
+      }
+    };
+    row.append(cancel, del);
+    modal.append(h, p, row);
+    back.appendChild(modal);
+    back.onclick = (ev) => {
+      if (ev.target === back) {
+        this.torrentsDeleteId = null;
+        this.render();
+      }
+    };
+    return back;
+  }
+
+  private renderTorboxSettings(): HTMLElement {
+    const state = getTorrentsState();
+    const body = document.createElement("div");
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "TorBox";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent =
+      "TorBox does the torrenting in the cloud; Hush downloads the finished files into your vault. Your API key is stored encrypted inside the vault and never logged or shown in a URL.";
+    body.append(h, p);
+
+    // Current status line.
+    const status = document.createElement("p");
+    status.className = "text-13";
+    status.style.marginTop = "var(--space-3)";
+    if (state.has_key) {
+      const plan = state.plan_label ? ` · ${state.plan_label} plan` : "";
+      const email = state.email ? ` (${state.email})` : "";
+      status.textContent = `Connected${plan}${email}`;
+      status.style.color = "var(--success-text)";
+    } else {
+      status.textContent = "No API key set.";
+      status.className = "muted text-13";
+    }
+    body.appendChild(status);
+
+    // Key field with show/hide.
+    const label = document.createElement("p");
+    label.className = "muted";
+    label.style.marginTop = "var(--space-4)";
+    label.textContent = "API key";
+    const field = document.createElement("div");
+    field.className = "torbox-key-field";
+    const input = document.createElement("input");
+    input.className = "input-field";
+    input.type = this.torboxKeyVisible ? "text" : "password";
+    input.placeholder = state.has_key ? "•••••• (saved) — enter to replace" : "Paste your TorBox API key";
+    input.value = this.torboxKeyDraft;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.oninput = () => {
+      this.torboxKeyDraft = input.value;
+    };
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "btn-icon-round pressable";
+    toggle.setAttribute("aria-label", this.torboxKeyVisible ? "Hide key" : "Show key");
+    toggle.appendChild(icon(this.torboxKeyVisible ? "hide" : "eye"));
+    toggle.onclick = () => {
+      this.torboxKeyVisible = !this.torboxKeyVisible;
+      this.render();
+    };
+    field.append(input, toggle);
+    body.append(label, field);
+
+    // Test + Save.
+    const actions = document.createElement("div");
+    actions.className = "torbox-actions";
+    const test = document.createElement("button");
+    test.type = "button";
+    test.className = "btn-secondary pressable";
+    test.textContent = this.torboxBusy ? "Working…" : "Test connection";
+    test.disabled = this.torboxBusy;
+    test.onclick = async () => {
+      this.torboxBusy = true;
+      this.torboxTestOk = null;
+      this.torboxTestError = null;
+      this.render();
+      try {
+        const info = await testTorboxKey(this.torboxKeyDraft);
+        this.torboxTestOk = `Connected — ${info.plan_label} plan${info.email ? ` (${info.email})` : ""}.`;
+      } catch (e) {
+        this.torboxTestError = e instanceof AppError ? e.message : "TorBox rejected that key.";
+      } finally {
+        this.torboxBusy = false;
+        this.render();
+      }
+    };
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn-primary pressable";
+    save.textContent = this.torboxBusy ? "Working…" : "Save";
+    // An empty field means "no change" when a key is already saved; clearing is
+    // an explicit action, so a stray Save cannot silently disconnect TorBox.
+    save.disabled = this.torboxBusy || !this.torboxKeyDraft.trim();
+    save.onclick = async () => {
+      this.torboxBusy = true;
+      this.torboxTestOk = null;
+      this.torboxTestError = null;
+      this.render();
+      try {
+        await saveTorboxKey(this.torboxKeyDraft);
+        this.torboxKeyDraft = "";
+        showToast("TorBox key saved", { kind: "success" });
+      } catch (e) {
+        this.torboxTestError = e instanceof AppError ? e.message : "Could not save that key.";
+      } finally {
+        this.torboxBusy = false;
+        this.render();
+      }
+    };
+    actions.append(test, save);
+    if (state.has_key) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-secondary pressable";
+      remove.textContent = "Remove key";
+      remove.disabled = this.torboxBusy;
+      remove.onclick = async () => {
+        this.torboxBusy = true;
+        this.render();
+        try {
+          await saveTorboxKey("");
+          this.torboxKeyDraft = "";
+          showToast("TorBox key removed", { kind: "info" });
+        } catch (e) {
+          this.torboxTestError =
+            e instanceof AppError ? e.message : "Could not remove that key.";
+        } finally {
+          this.torboxBusy = false;
+          this.render();
+        }
+      };
+      actions.appendChild(remove);
+    }
+    body.appendChild(actions);
+
+    const feedback = document.createElement("p");
+    feedback.className = "text-13";
+    feedback.style.marginTop = "var(--space-3)";
+    if (this.torboxTestError) {
+      feedback.style.color = "var(--danger)";
+      feedback.textContent = this.torboxTestError;
+    } else if (this.torboxTestOk) {
+      feedback.textContent = this.torboxTestOk;
+    } else {
+      feedback.hidden = true;
+    }
+    body.appendChild(feedback);
+
+    // Concurrency.
+    const concLabel = document.createElement("p");
+    concLabel.className = "muted";
+    concLabel.style.marginTop = "var(--space-5)";
+    concLabel.textContent = "Simultaneous vault downloads";
+    const conc = document.createElement("select");
+    conc.className = "input-field";
+    conc.style.marginTop = "var(--space-2)";
+    for (const n of [1, 2, 3, 4]) {
+      const o = document.createElement("option");
+      o.value = String(n);
+      o.textContent = n === 1 ? "1 file" : `${n} files`;
+      conc.appendChild(o);
+    }
+    conc.value = String(state.max_concurrent);
+    conc.onchange = async () => {
+      try {
+        await setTorrentConcurrency(Number(conc.value));
+      } catch (e) {
+        showToast(e instanceof AppError ? e.message : "Could not change that.", {
+          kind: "error",
+        });
+        this.render();
+      }
+    };
+    const concHint = document.createElement("p");
+    concHint.className = "muted text-13";
+    concHint.style.marginTop = "var(--space-2)";
+    concHint.textContent = "How many files download from TorBox at once. 2–3 suits most connections.";
+    body.append(concLabel, conc, concHint);
+
+    // A refresh of the account's plan, and a jump to the pane.
+    const footer = document.createElement("div");
+    footer.className = "torbox-actions";
+    footer.style.marginTop = "var(--space-5)";
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "btn-secondary pressable";
+    refresh.textContent = "Refresh account";
+    refresh.onclick = async () => {
+      try {
+        await refreshTorboxAccount();
+      } catch (e) {
+        showToast(e instanceof AppError ? e.message : "Could not refresh.", { kind: "error" });
+      } finally {
+        this.render();
+      }
+    };
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "btn-secondary pressable";
+    open.textContent = "Open Torrents";
+    open.onclick = () => {
+      this.rail = "torrents";
+      this.render();
+    };
+    footer.append(refresh, open);
+    body.appendChild(footer);
+    return body;
+  }
+
   private renderVault(): HTMLElement {    const pane = document.createElement("div");
     pane.className = "main-pane";
     const h = document.createElement("h1");
@@ -5552,7 +6590,19 @@ export class App {
       this.rail = "files";
       this.render();
     });
-    grid.append(storage, lock, backup, filesTile);
+    const torrentsState = getTorrentsState();
+    const torrentsTile = document.createElement("div");
+    torrentsTile.className = "tile";
+    const torrentBytes = torrentsState.library.reduce((sum, e) => sum + e.size, 0);
+    const torrentsHint = torrentsState.has_key
+      ? `${torrentsState.library.length} torrent${torrentsState.library.length === 1 ? "" : "s"} · ${formatBytes(torrentBytes)} from TorBox`
+      : "Connect TorBox to download torrents into your vault";
+    torrentsTile.innerHTML = `<div class="text-15">Torrents</div><div class="muted text-13">${torrentsHint}</div><button type="button" class="btn-secondary pressable torrents-tile-btn" style="margin-top:12px">Open Torrents</button>`;
+    torrentsTile.querySelector(".torrents-tile-btn")!.addEventListener("click", () => {
+      this.rail = "torrents";
+      this.render();
+    });
+    grid.append(storage, lock, backup, filesTile, torrentsTile);
     pane.append(h, grid);
     return pane;
   }
@@ -5734,6 +6784,7 @@ export class App {
       { id: "profile", label: "Profile" },
       { id: "relay", label: "Relay" },
       { id: "drops", label: "Drops" },
+      { id: "torbox", label: "TorBox" },
       { id: "notifications", label: "Notifications" },
       { id: "security", label: "Security" },
       { id: "recovery", label: "Recovery" },
@@ -5768,6 +6819,8 @@ export class App {
       body.appendChild(seg);
     } else if (this.settingsSection === "relay") {
       body.appendChild(this.renderRelaySettings());
+    } else if (this.settingsSection === "torbox") {
+      body.appendChild(this.renderTorboxSettings());
     } else if (this.settingsSection === "profile") {
       body.innerHTML = `<h2 class="text-22">Profile</h2><p class="muted text-13">Your mail address is a label bound to your keys, shared inside your invite. There is no public directory — contacts learn it only when you add each other.</p>`;
       const current = document.createElement("p");

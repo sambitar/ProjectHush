@@ -19,7 +19,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["cors"] }
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
 uuid = { version = "1", features = ["v4"] }
 
 # Reads (HN reader): comment/reader HTML sanitizing, article extraction, cache keys.

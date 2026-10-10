@@ -2555,3 +2555,464 @@
   justify-content: flex-end;
   margin-top: var(--space-4);
 }
+
+/* ==========================================================================
+   Torrents (TorBox-powered client) and toasts
+   ========================================================================== */
+
+.torrents-pane {
+  padding: var(--space-5);
+  gap: var(--space-4);
+}
+
+.torrents-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.torrents-head .btn-secondary {
+  width: auto;
+}
+
+/* Empty state: no API key yet. */
+.torrents-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: var(--space-3);
+  color: var(--text-dim);
+  padding: var(--space-7) var(--space-5);
+}
+
+.torrents-empty-icon svg {
+  width: 48px;
+  height: 48px;
+  color: var(--accent);
+}
+
+.torrents-empty h2 {
+  color: var(--text);
+}
+
+.torrents-empty .btn-primary {
+  width: auto;
+}
+
+/* Add bar */
+.torrents-add {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: var(--space-2);
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  transition: border-color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+
+.torrents-add.drag-over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.torrents-add .btn-primary,
+.torrents-add .btn-secondary {
+  width: auto;
+  white-space: nowrap;
+}
+
+.torrents-add-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.torrents-add-error {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--danger);
+}
+
+/* Tabs */
+.torrents-tabs {
+  display: flex;
+  gap: var(--space-1);
+  border-bottom: 1px solid var(--border);
+}
+
+.torrents-tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  padding: var(--space-2) var(--space-4);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.torrents-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* Active / queue list */
+.torrents-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.torrents-list-empty {
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+}
+
+.torrent-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  box-shadow: var(--shadow-1);
+}
+
+.torrent-card.status-error {
+  border-color: var(--danger);
+}
+
+.torrent-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.torrent-card-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.torrent-badge {
+  flex-shrink: 0;
+  font-size: 12px;
+  padding: 2px var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.torrent-badge.status-caching,
+.torrent-badge.status-ready,
+.torrent-badge.status-sending,
+.torrent-badge.status-queued {
+  background: var(--warning-soft);
+  color: var(--warning-text);
+}
+
+.torrent-badge.status-completed {
+  background: var(--success-soft);
+  color: var(--success-text);
+}
+
+.torrent-badge.status-error {
+  background: var(--danger);
+  color: #fff;
+}
+
+.torrent-bar {
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.torrent-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width var(--dur-base) var(--ease-out);
+}
+
+.torrent-card.status-completed .torrent-bar-fill {
+  background: var(--success-text);
+}
+
+.torrent-error {
+  margin: 0;
+  color: var(--danger);
+}
+
+.torrent-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.torrent-actions .btn-secondary {
+  width: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.torrent-actions svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Library */
+.torrents-library {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.torrents-crumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}
+
+.crumb {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 2px var(--space-1);
+  font-size: 13px;
+}
+
+.crumb-sep {
+  color: var(--text-faint);
+}
+
+.torrents-tools {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.torrents-tools .search-pill {
+  flex: 1;
+}
+
+.torrents-sort {
+  width: auto;
+}
+
+.torrents-view button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.torrents-view svg {
+  width: 16px;
+  height: 16px;
+}
+
+.torrents-library-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.torrents-library-actions .btn-secondary {
+  width: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.torrents-items.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.torrents-items.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--space-3);
+}
+
+.library-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  color: var(--text);
+}
+
+.torrents-items.grid .library-item {
+  flex-direction: column;
+  align-items: flex-start;
+  min-height: 110px;
+}
+
+.library-item:hover {
+  background: var(--surface-2);
+}
+
+.library-item-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.library-item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.torrents-items.grid .library-item-name {
+  white-space: normal;
+  word-break: break-word;
+}
+
+.library-item-size,
+.library-item-sub {
+  flex-shrink: 0;
+}
+
+.library-item-actions {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.library-item-action {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: var(--space-1);
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+}
+
+.library-item-action:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.library-item-action svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Settings → TorBox */
+.torbox-key-field {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.torbox-key-field .input-field {
+  flex: 1;
+}
+
+.torbox-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+.torbox-actions .btn-primary,
+.torbox-actions .btn-secondary {
+  width: auto;
+}
+
+/* Toasts */
+.toast-stack {
+  position: fixed;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  z-index: 2000;
+  max-width: min(420px, 90vw);
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+  padding: var(--space-3) var(--space-4);
+  animation: toast-in var(--dur-base) var(--ease-out);
+}
+
+.toast-success {
+  border-left-color: var(--success-text);
+}
+
+.toast-error {
+  border-left-color: var(--danger);
+}
+
+.toast-text {
+  flex: 1;
+  font-size: 14px;
+}
+
+.toast-action {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.toast-close {
+  background: transparent;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 var(--space-1);
+}
+
+.toast-leaving {
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

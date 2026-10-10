@@ -1,8 +1,10 @@
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -207,12 +209,122 @@ impl Vault {
 
     pub fn get_blob(&self, id: &BlobId) -> Result<Vec<u8>, Error> {
         let path = self.blob_path(id);
+        // A chunked blob is a directory (large, streamed writes); a plain blob
+        // is a single file. Both live under `blobs/<hex>`.
+        if path.is_dir() {
+            let mut out = Vec::new();
+            self.read_blob_stream(id, &mut out)?;
+            return Ok(out);
+        }
         let packed = fs::read(path).map_err(|_| Error::BlobNotFound)?;
         decrypt(&self.master, &packed)
     }
 
     fn blob_path(&self, id: &BlobId) -> PathBuf {
         self.dir.join("blobs").join(hex::encode(id.0))
+    }
+
+    /// Stream a large plaintext into the vault as a chunked, content-addressed
+    /// blob, without ever holding the whole file in memory.
+    ///
+    /// This is the large-file path (torrent downloads). Each chunk is encrypted
+    /// on its own with the master key and written under `blobs/<hex>/chunk-N`;
+    /// the id is the SHA-256 of the full plaintext, computed as the bytes pass
+    /// through. The single-file [`Self::put_blob`] format is untouched, so
+    /// existing blobs keep reading exactly as before.
+    ///
+    /// Content-addressing makes this idempotent: storing the same bytes twice
+    /// keeps the first copy. The write goes to a temp directory first and is
+    /// renamed into place only when complete, so a crash never leaves a
+    /// half-blob under a real id.
+    pub fn put_blob_stream<R: Read>(&self, reader: &mut R) -> Result<BlobId, Error> {
+        let blobs = self.dir.join("blobs");
+        fs::create_dir_all(&blobs)?;
+        let tmp = blobs.join(format!(".tmp-{}", hex::encode(random_bytes::<16>())));
+        fs::create_dir_all(&tmp)?;
+
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; CHUNK_BYTES];
+        let mut index: u32 = 0;
+        loop {
+            let n = read_full(reader, &mut buf)?;
+            hasher.update(&buf[..n]);
+            let packed = encrypt(&self.master, &buf[..n])?;
+            fs::write(tmp.join(chunk_name(index)), packed)?;
+            index += 1;
+            if n < buf.len() {
+                break;
+            }
+        }
+
+        let id = BlobId(hasher.finalize().into());
+        let dest = self.blob_path(&id);
+        if dest.exists() {
+            // Same content already stored; drop the temp copy.
+            let _ = fs::remove_dir_all(&tmp);
+            return Ok(id);
+        }
+        fs::rename(&tmp, &dest)?;
+        Ok(id)
+    }
+
+    /// Reassemble a blob into `w`, streaming, and verify it against its id.
+    ///
+    /// A single-file blob decrypts in one step; a chunked blob decrypts chunk by
+    /// chunk. Either way the plaintext is hashed as it is written, and a
+    /// mismatch (truncation, reordering, tampering) is an error rather than
+    /// silently corrupt output. Returns the number of plaintext bytes written.
+    pub fn read_blob_stream<W: Write>(&self, id: &BlobId, w: &mut W) -> Result<u64, Error> {
+        let path = self.blob_path(id);
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        if path.is_dir() {
+            let mut names: Vec<_> = fs::read_dir(&path)?
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .filter(|n| n.to_string_lossy().starts_with("chunk-"))
+                .collect();
+            names.sort();
+            if names.is_empty() {
+                return Err(Error::BlobNotFound);
+            }
+            for name in names {
+                let packed = fs::read(path.join(name))?;
+                let plain = decrypt(&self.master, &packed)?;
+                hasher.update(&plain);
+                w.write_all(&plain)?;
+                total += plain.len() as u64;
+            }
+        } else {
+            let packed = fs::read(&path).map_err(|_| Error::BlobNotFound)?;
+            let plain = decrypt(&self.master, &packed)?;
+            hasher.update(&plain);
+            w.write_all(&plain)?;
+            total += plain.len() as u64;
+        }
+        if hasher.finalize().as_slice() != id.0 {
+            return Err(Error::Corrupt);
+        }
+        Ok(total)
+    }
+
+    /// Remove a blob (single file or chunked directory). Returns whether
+    /// anything was there.
+    pub fn delete_blob(&self, id: &BlobId) -> Result<bool, Error> {
+        let path = self.blob_path(id);
+        if path.is_dir() {
+            fs::remove_dir_all(&path)?;
+            return Ok(true);
+        }
+        if path.exists() {
+            fs::remove_file(&path)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Whether a blob is stored (either format).
+    pub fn has_blob(&self, id: &BlobId) -> bool {
+        self.blob_path(id).exists()
     }
 
     /// Read a named encrypted sidecar file in the vault directory.
@@ -342,6 +454,30 @@ impl Vault {
 const RETIRED_DROP_KEYS: usize = 3;
 
 const DROP_KEYS_FILE: &str = "drop-keys.enc";
+
+/// Plaintext bytes per encrypted chunk for [`Vault::put_blob_stream`]. Large
+/// enough that per-chunk overhead is negligible, small enough that peak memory
+/// stays flat regardless of file size.
+const CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+fn chunk_name(index: u32) -> String {
+    format!("chunk-{index:04}")
+}
+
+/// Fill `buf` as far as the reader allows, returning the byte count. `Read::read`
+/// may return short reads for a healthy stream, so one call is not enough.
+fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize, Error> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Ok(filled)
+}
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -670,5 +806,68 @@ mod tests {
             !d.join("vault.lock.json.tmp").exists(),
             "temporary header must not survive the rename"
         );
+    }
+
+    #[test]
+    fn chunked_blob_roundtrips_across_chunk_boundaries() {
+        let d = scratch("chunked");
+        let vault = Vault::create(&d, "pw").unwrap();
+        // Spans more than one chunk so the chunk loop is exercised, not just a
+        // single short read.
+        let plain: Vec<u8> = (0..(CHUNK_BYTES * 2 + 12345))
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let id = vault.put_blob_stream(&mut plain.as_slice()).unwrap();
+        assert_eq!(id.0, sha256(&plain), "id is the content hash");
+        assert!(vault.blob_path(&id).is_dir(), "stored as a chunk directory");
+
+        // Both the streaming and the plain reader return the same bytes.
+        let mut out = Vec::new();
+        let n = vault.read_blob_stream(&id, &mut out).unwrap();
+        assert_eq!(n as usize, plain.len());
+        assert_eq!(out, plain);
+        assert_eq!(vault.get_blob(&id).unwrap(), plain);
+
+        // Idempotent: the same content does not create a second copy or fail.
+        let again = vault.put_blob_stream(&mut plain.as_slice()).unwrap();
+        assert_eq!(again.0, id.0);
+        assert!(vault.has_blob(&id));
+
+        assert!(vault.delete_blob(&id).unwrap());
+        assert!(!vault.has_blob(&id));
+        assert!(matches!(vault.get_blob(&id), Err(Error::BlobNotFound)));
+    }
+
+    #[test]
+    fn chunked_blob_detects_tampering() {
+        let d = scratch("chunked-tamper");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let id = vault
+            .put_blob_stream(&mut b"a short chunked blob".as_slice())
+            .unwrap();
+
+        // Flip a byte inside the first chunk's ciphertext.
+        let chunk = vault.blob_path(&id).join(chunk_name(0));
+        let mut bytes = fs::read(&chunk).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        fs::write(&chunk, bytes).unwrap();
+
+        let mut out = Vec::new();
+        assert!(
+            vault.read_blob_stream(&id, &mut out).is_err(),
+            "a tampered chunk must not decrypt to bytes"
+        );
+    }
+
+    #[test]
+    fn single_and_chunked_blobs_coexist() {
+        let d = scratch("coexist");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let single = vault.put_blob(b"small").unwrap();
+        let chunked = vault.put_blob_stream(&mut b"streamed".as_slice()).unwrap();
+        assert_eq!(vault.get_blob(&single).unwrap(), b"small");
+        assert_eq!(vault.get_blob(&chunked).unwrap(), b"streamed");
     }
 }
