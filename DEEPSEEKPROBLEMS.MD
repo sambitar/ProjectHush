@@ -13,6 +13,481 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-10 — Self-custody wallet: BDK, sealed in the vault, locked to the relay's Tor
+
+Slice goal: embed a wallet in Hush with no third party. Bitcoin first (BIP84 over electrum), with
+Ethereum and its tokens to follow. The seed and the wallet state are sealed in the vault sidecar,
+the daemon serves `/api/wallet/*` only over the Unix socket, and the wallet is never less private
+than the app: when the relay is on Tor the wallet is on Tor and the toggle is locked.
+
+### [FIXED] The receive address shown to the user was pinned to index 0 forever
+
+- **Attempted:** `PublicState.address` was filled with `w.address_at(0)` — a read-only peek at
+  derivation index 0 — while the "new address" action called `reveal_next_address`, which on a
+  fresh wallet also returns index 0.
+- **Symptom:** a daemon test asserted the two differ and failed with both sides equal:
+  `assertion left != right failed / left: "bc1qlemxze4f2qxytlq32zgde0fc68n57kezlez6cd" / right:
+  "bc1qlemxze4f2qxytlq32zgde0fc68n57kezlez6cd"`. The deeper problem was not the test: once the
+  index-0 address had been paid, the UI would have kept displaying it, inviting a second payer to
+  reuse an address the wallet had already used.
+- **Fix:** a new wallet now reveals index 0 at creation, so the first "new address" is genuinely
+  new. The UI-facing address comes from `BitcoinWallet::current_receive_address()`, the most
+  recently revealed address (read-only, safe on every poll). `sync()` reveals the next one when an
+  output — spent or unspent, via `list_output()` — has landed on the address on screen.
+- **Verified:** `cargo test -p hush-wallet` (17 tests) and the three `wallet_api_tests` in
+  `hush-daemon` pass; the create test now asserts the shown address is mainnet P2WPKH and that the
+  first "new address" differs and becomes the one the state route returns.
+- **Lesson:** "read-only peek at index 0" and "the address you hand out" are different concepts.
+  Any displayed address that can be paid must be the one the keychain considers handed out, and it
+  must advance when it is used. A test that asserts two addresses differ is what surfaced it —
+  a shape-only check (`starts_with("bc1q")`) would have passed.
+
+### [FIXED] Flipping the relay switch on the pre-login screen left the wallet on clearnet
+
+- **Attempted:** the wallet's own routing mode is set through `WalletManager::apply_relay`, which
+  only `POST /api/relay/mode` called. Meanwhile the wallet's *reported* mode is read fresh from
+  `ui-prefs.json` on every request (`relay_is_tor`).
+- **Symptom:** nothing failed loudly. `PUT /api/ui-prefs` can set `relay_tor` — that is exactly how
+  the pre-login screen flips the switch while the vault is locked — and `apply_relay_prefs` at
+  unlock applied the switch to the relay worker but never to the wallet. So the UI would report
+  `mode: "tor"`, `mode_locked: true` while the BDK client still held `NetworkMode::Clearnet` and
+  would have queried electrum over the open network. A privacy invariant broken silently.
+- **Fix:** one helper, `sync_wallet_relay`, reads the switch and the shell's SOCKS port and applies
+  both to the wallet; `apply_relay_prefs`, `put_relay_mode`, and `put_ui_prefs` all call it. The
+  prefs route only calls it when `relay_tor` actually changed, so a theme change does not rebuild
+  the wallet. New test `the_relay_switch_on_the_prefs_route_also_locks_the_wallet` drives the prefs
+  route and asserts the wallet reports Tor, is locked on, and refuses clearnet.
+- **Lesson:** when a value is read from one place (prefs) and applied from another (an explicit
+  endpoint), every writer of the first place has to be checked. The bug was not in the wallet or in
+  the prefs route; it was in the assumption that only one route could move the switch.
+
+### [FIXED] `bdk_wallet` re-exports `ChangeSet`/`WalletPersister`, so the module path does not compile
+
+- **Attempted:** `use bdk_wallet::wallet::{ChangeSet, WalletPersister};`.
+- **Symptom:** `error[E0603]: module 'wallet' is private`.
+- **Fix:** import from the crate root, `use bdk_wallet::{ChangeSet, PersistedWallet, Wallet,
+  WalletPersister, ...};`, where BDK 3.2 re-exports them.
+- **Lesson:** in BDK 3.x the public names are at the crate root; the module paths seen in 1.x docs
+  are private now.
+
+### [FIXED] `Mnemonic::generate_in` does not exist without the `bip39/rand` feature
+
+- **Attempted:** `Mnemonic::generate_in(Language::English, 12)` to mint a fresh phrase.
+- **Symptom:** `error[E0599]: no associated function or constant named 'generate_in' found for
+  struct 'Mnemonic'` — `bdk_wallet` does not enable `bip39`'s `rand` feature, so the method is
+  compiled out.
+- **Fix:** use the `GeneratableKey` trait that BDK does re-export:
+  `let generated: GeneratedKey<Mnemonic, Segwitv0> =
+  Mnemonic::generate((WordCount::Words12, Language::English))?;` then `.into_key()`. No extra
+  feature, no second RNG in the tree.
+- **Lesson:** an error naming a missing associated function on a re-exported foreign type is a
+  feature-flag problem, not a version problem. Check what the wrapper crate enables before adding
+  a dependency feature.
+
+### [WORKED AROUND] `Wallet::sign` is deprecated in BDK 3.2; kept it rather than rebuild the signers
+
+- **Attempted:** sign a built PSBT with the wallet's own signers.
+- **Symptom:** deprecation warning pointing at `sign_with_signers`, which wants a caller-owned
+  `SignersContainer`. The wallet already owns the correct signers for a single-key BIP84
+  descriptor, so building a second container would be duplicated state with no behavioural gain.
+- **Resolution:** `#[allow(deprecated)]` on `build_send`, with a comment saying why and when to
+  revisit. `sign` still returns a correct boolean, and the `!signed` case is handled.
+- **Lesson:** deprecation is not removal. When the replacement would mean duplicating state the
+  type already holds, keep the deprecated path, annotate it, and say what would change the answer.
+
+### [WORKED AROUND] The Wallet pane was verified against a mock daemon in a browser, not the real window
+
+- **Attempted:** to see the pane render and behave before claiming it works. This box has no screenshot
+  tool for the Tauri window, and `tauri.conf.json` bakes `ui/dist` into the binary, so the running app
+  cannot be observed without a Rust rebuild and a window restart.
+- **Resolution:** copied `ui/dist` to a temp directory, injected `window.__TAURI__ = {}` (so
+  `isTauriShell()` is true and the wallet pane draws instead of its "needs the desktop app" empty
+  state) and `window.__HUSH_TRANSPORT__ = { kind: "tcp", base: "http://127.0.0.1:8791" }`, then ran a
+  small Python mock of the daemon's routes on that port and served the dist over
+  `python3 -m http.server`. Driven over CDP and the browser tools.
+- **What that verified, for real:** the rail gains a Wallet entry and the pane opens; the one-time
+  phrase card lists the twelve words with numbers and a copy action; the balance renders as
+  `0.01234567 BTC` / `1,234,567 sat` with a pending line; the receive address renders with a copy
+  button and a QR canvas that actually paints (148x148, 10350 dark pixels); the amount field's live
+  hint updates to `= 0.0015 BTC`; Send reaches the daemon and comes back as "Sent. Fee 142 sat." with
+  the txid, clearing the form; and the capsule is a real `.segmented` pill (`--surface-2` track,
+  `--surface` on the active side) with `aria-pressed` set. With the relay on Tor the Clearnet side is
+  `disabled` at `opacity: 0.45` with an explanatory `title`, Tor is `pressed`, and the pane says
+  "Locked on Tor while the relay uses it."; with the relay on clearnet both sides are enabled and
+  switching to Tor persists to the daemon.
+- **What that did NOT verify:** a real electrum sync, a real signed transaction, a real Tor SOCKS
+  route, and the real vault sealing of the phrase. Those need a funded wallet and a live network. The
+  mock is a stand-in for the daemon's HTTP contract, nothing more.
+- **Lesson:** with a compiled-in frontend and no window screenshot, a mock daemon plus a browser is
+  the only way to check a pane's behaviour rather than its markup. It is worth the setup cost, but
+  the summary must not present it as an end-to-end run.
+
+
+
+### [OPEN] Electrum hides the IP but not the address linkage; no embeddable BIP157/158 crate
+
+- **What is unverified:** the claim that this wallet is "as private as possible". Over Tor the
+  electrum server cannot see the IP, but it still learns every script the wallet queries, so one
+  server can link a wallet's addresses together. Compact block filters (BIP157/158) would take the
+  server out of the trust path entirely, and there is no mature embeddable Rust crate for them
+  yet.
+- **What is needed:** either an audited BIP157/158 client crate, or a documented policy of
+  user-supplied electrum endpoints. Until then this is a stated trade, not a closed item. Recorded
+  in the module docs of `crates/hush-wallet/src/bitcoin.rs`.
+
+### [OPEN] The wallet's network paths are untested in this environment
+
+- **What is unverified:** `sync()`, `build_send()`, and `broadcast()` have never run against a real
+  electrum server, and the Tor path has never run through the shell's SOCKS proxy. The tests cover
+  derivation, address advance, change-set round trip, amount and network validation, and the Tor
+  "no proxy" refusal — all offline.
+- **What is needed:** a live run against an electrum endpoint (clearnet first, then through Tor)
+  with a funded regtest or testnet wallet. Until that happens, treat the send path as unproven.
+
+
+
+## 2026-10-10 — Library file rows: the row stops being a button, two named actions
+
+Slice goal: the user asked for the file row to stop being one big button ("get rid of the file as
+a button in the first place") and to carry two clearly separate actions instead — "Open inside
+vault" (shield icon, green) and "Export" (export-arrow icon).
+
+### [FIXED] Every Library row was a `<button>` with other `<button>`s nested inside it
+
+- **Attempted:** the file row was built by `libraryItemShell`, which created
+  `<button class="library-item">` and set `onclick` on it; `renderLibraryFile` then appended an
+  actions `<div>` holding two more `<button>`s inside that button.
+- **Symptom:** invalid HTML. A `<button>` inside a `<button>` has no defined activation behaviour —
+  engines disagree about which element owns the click, and the inner control can simply never fire.
+  It also made the whole row a click target with `cursor: pointer`, which is exactly what the user
+  was objecting to. The torrent row had the same shape (a trash `<button>` inside the row button).
+- **Fix:** `libraryItemShell` now returns a plain `<div class="library-item">` and puts the click on
+  an inner `.library-item-main`, which is a `<button>` only when the caller passes `onOpen`
+  (folders, torrents) and a `<div>` otherwise (files). The torrent trash button and the file action
+  buttons are siblings of the name area, never descendants of another button.
+- **Verified:** in a browser against the shipped dist CSS, `document.querySelectorAll("button
+  button").length === 0`; the file row's `.library-item-main` is a `DIV` and its computed `cursor`
+  is `auto`, while the folder/torrent row's is a `BUTTON` with `cursor: pointer`. The accessibility
+  tree for a file row lists only "Open inside vault" and "Export" — no row-level button.
+- **Lesson:** the shell helper owned the "row is a control" assumption, so the bug was in the shared
+  component, not in one caller. When a row needs both a row-level action and per-row controls, the
+  row must be a container and the row-level action must be its own element.
+
+### [WORKED AROUND] A UI-only change still cost a 2m40s Rust relink and a window restart
+
+- **Attempted:** changed `app.ts` and `app.css`, ran `npm run build`, and expected the running window
+  to show the new markup.
+- **Symptom:** it did not. `strings target/debug/hush-tauri | grep -oE "index-[A-Za-z0-9_-]{8}.js"`
+  printed `index-CxLUQujr.js` while `ui/dist/assets/` held `index-DepdreVP.js`, and the binary's
+  mtime (21:39) predated the new bundle (21:51). `tauri.conf.json` sets `frontendDist` and no
+  `devUrl`, and `tauri-codegen-2.7.1/src/context.rs` embeds `frontendDist` unless
+  `dev && config.build.dev_url.is_some()`. So the dist is baked into the binary and a frontend edit
+  cannot reach the window without a Rust rebuild.
+- **Resolution:** `cargo build -p hush-tauri` (2m40s), then restart only the window — the daemon was
+  left running and stayed unlocked, so no passphrase re-entry. `scripts/run-one-ui.sh` already does
+  the rebuild first and documents why.
+- **Lesson:** on this app, "I changed the frontend" is never enough on its own. Before concluding a
+  UI change did not work, confirm which bundle the binary carries (`strings` for the hashed asset
+  name) rather than trusting that the running process is current.
+
+### [WORKED AROUND] No screenshot tool on this box, and `browser_navigate` refuses `file://`
+
+- **Attempted:** to eyeball the redesigned rows, tried to screenshot the window. `grim`,
+  `gnome-screenshot`, `import`, `scrot`, and `spectacle` are all absent, and pointing the browser
+  tool at `file:///tmp/.../index.html` is rejected ("Security restriction: file:// URLs are not
+  allowed").
+- **Resolution:** served a hand-written page containing the exact DOM the new code produces over
+  `python3 -m http.server` on 127.0.0.1, linked the real `ui/dist/assets/index-*.css`, and read
+  `getComputedStyle` back over CDP. That gave objective numbers: `.btn-library-open` is
+  `rgb(127,224,190)` on `rgb(18,54,44)` in dark and `rgb(8,80,65)` on `rgb(225,245,238)` in light
+  (i.e. the success tokens, green); the export button stays neutral; the grid tile's two labels wrap
+  instead of overflowing (`flex-wrap` applied, no horizontal overflow in either view).
+- **Caveat:** this checks the CSS and the DOM shape, not the running app. The real window was not
+  observed rendering the new rows — that needs the user's eyes or an input-driven capture.
+- **Lesson:** in this environment, verify styling by measuring computed styles, not by looking.
+
+### [WORKED AROUND] The decrypt spinner does not rotate — this machine suppresses every animation
+
+- **Attempted:** after the redesign shipped, the user reported that the ring next to "Decrypting…"
+  never rotates and asked for it to spin. The CSS looks correct: `.spinner` carries
+  `animation: spin 0.8s linear infinite` and `@keyframes spin` is defined twice (app.css, for
+  `.key-card::before`, and motion.css — identical bodies).
+- **Root cause, machine-level, not the app:** `gsettings get
+  org.gnome.desktop.interface enable-animations` returns **`false`**. WebKitGTK maps that to
+  `prefers-reduced-motion: reduce`, and `motion.css` opens with a global
+  `*, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1
+  !important; transition-duration: 0.01ms !important }` reset, plus a `.breathe, .skeleton,
+  .spinner { animation: none }` guard further down. Both fire, so **every** animation in the app is
+  suppressed on this box — the spinner included, by design, not by defect.
+- **Resolution:** an override was written (exempt `.spinner` from the `*` reset via a
+  higher-specificity `!important` rule and drop it from the guard, with a shared `--dur-spin` token
+  to avoid restating the duration) and then **reverted at the user's request** — they accepted the
+  frozen ring on their own machine rather than have the preference overridden. Nothing in the repo
+  was left changed for this.
+- **Unverified:** that the ring rotates anywhere. It cannot be observed in this environment, and the
+  override that would have forced it was removed. The row still reads "Decrypting…" in text and both
+  action buttons are disabled, so the busy state is still communicated without the rotation.
+- **Lesson:** `prefers-reduced-motion` is not only a browser setting — a GTK/GNOME desktop setting
+  turns it on, and it silently disables every animation in this app. When an animation "does not
+  work" here, check `gsettings get org.gnome.desktop.interface enable-animations` before touching
+  the CSS.
+
+### [WORKED AROUND] `pkill -f "http.server 8777"` killed the shell that ran it
+
+- **Attempted:** `pkill -f "http.server 8777"` to stop the temporary static server, followed by
+  `rm -rf` of the preview directory.
+- **Symptom:** the command returned no output at all, and the follow-up check showed the directory
+  still present. The pattern matched the `bash -c` process running the command — its own argv
+  contains the literal string — so the shell was killed before `rm` ran. It happened twice, the
+  second time with `for p in $(pgrep -f ...)`.
+- **Resolution:** used a pattern that cannot match its own command line
+  (`pgrep -f 'http[.]server 87'`) and removed the directory in a separate call. Verified the server
+  is gone, port 8777 free, `/tmp/hush-library-preview` removed.
+- **Lesson:** `pkill -f` / `pgrep -f` match the invoking shell too. Bracket one character of the
+  pattern, or match on the process name.
+
+---
+
+## 2026-10-10 — "Can't open any downloaded torrent file" (handler sandbox, not the app)
+
+Slice goal: files filed into the Torrents Library render correctly but will not open — the user
+reported it for "1.5 G or couple of megabytes", so size was not the variable.
+
+### [WORKED AROUND] The ACL verification printed `absent` because it read a stale build directory
+
+- **Attempted:** a background job checked the freshly built ACL with
+  `ls -dt target/debug/build/hush-tauri-*/out | head -1` and grepped that directory for the blob
+  commands.
+- **Symptom:** it reported `hush_open_blob: absent`, `hush_save_blob: absent`, `hush_open_url:
+  absent` — apparently contradicting the fix. The directory it picked (`…a0e227e9c85ffa4a`) was an
+  earlier build from the same morning; `ls -dt` sorted by directory mtime, which did not identify the
+  OUT_DIR the current build actually used.
+- **Resolution:** checked the real artifacts instead — `strings target/debug/hush-tauri | grep -c
+  allow-hush-url` returns 1, and the `acl-manifests.json` written at 21:25 (in
+  `…f9ee78ea814ffacd`, the OUT_DIR that build used) contains `hush_open_blob`, `hush_save_blob`, and
+  `hush_open_url`. The grants are present; the first check was wrong, not the fix.
+- **Lesson:** do not identify a build's OUT_DIR by directory mtime. Confirm against the produced
+  binary or the artifact written by the build that just ran.
+
+### [OPEN — root cause found, fix compiled in, awaiting the click test] Library "open"/"save" was denied by the Tauri v2 command ACL
+
+- **Root cause:** `src-tauri/permissions/hush-files.toml` allowed only `hush_save_file` and
+  `hush_open_file`. The blob-streaming slice added `hush_open_blob`/`hush_save_blob` to the Rust
+  handler and to the UI but never to the ACL, so Tauri rejected every `invoke("hush_open_blob")` in
+  the webview before it reached the daemon. `hush_open_url` had the same gap and its call site
+  swallows the rejection ("the failure is visible by nothing happening"), so "Open in browser" was
+  silently dead too. The daemon half was always fine — the request simply never left the webview,
+  which is why `/tmp/hush-open` stayed empty.
+- **How it was pinned down:** two 10x10 DOM dots written by the UI and read back out of an `xwd`
+  capture of the window (XWD parsed to PNG in Python). Magenta proved the freshly built bundle was
+  executing; red proved `invoke` was **rejecting**. That killed the "stale bundle" and "input never
+  reaches the webview" theories that had consumed most of the previous session.
+- **Fix:** added `hush_open_blob`/`hush_save_blob` to `permissions/hush-files.toml`, added
+  `permissions/hush-url.toml` (`allow-hush-url`) for `hush_open_url`, listed `allow-hush-url` in
+  `capabilities/default.json`, and removed all temporary probes. Verified in the build output: the
+  regenerated `acl-manifests.json` (21:25) contains all three commands and the binary contains
+  `allow-hush-url`.
+- **Lesson:** a command added to `generate_handler!` and called from the UI is still dead until it is
+  granted in `src-tauri/permissions/*.toml` **and** referenced by a capability. Add the permission in
+  the same commit as the command. And when the IPC path itself is suspect, prefer a UI-visible signal
+  (a colored DOM marker read back from a screenshot) over `eprintln!`.
+- **Also affected by the same gap:** chat/conclave/mail attachment "Open" and "Save as…", and "Open
+  in browser".
+
+- **Attempted:** after the MIME-handler fix, the user still reported "i click and nothing happens".
+  Rebuilt the shell with `eprintln!` in `hush_open_blob` plus a `[diag]` toast at the top of
+  `torrentsOpenFile`, relaunched it against the already-running daemon, and watched
+  `/run/user/1000/hush-one/logs/ui.log`.
+- **Symptom:** `/tmp/hush-open` stayed empty and the log stayed 0 bytes after the user's clicks, so
+  `hush_open_blob` was never invoked. The code-side wiring reads correctly: `renderLibraryFile` →
+  `libraryItemShell(... el.onclick = onOpen)` → `torrentsOpenFile` → `openVaultBlob` →
+  `invoke("hush_open_blob")`, and `canStreamBlobs()` should be true (`getApiBase()` is `unix://…`).
+- **Second symptom (the actual blocker):** to test input delivery independently I relaunched the
+  shell as an Xwayland client (`GDK_BACKEND=x11`) and drove it with `xdotool`. `xdotool key ctrl+k`
+  changed 251,104 of 836,000 window pixels, so keyboard input does reach the webview and the app is
+  responsive. Synthetic clicks produced no reaction. A startup probe (`invoke("hush_debug_log")`
+  from the constructor) then also logged nothing — even though `hush_debug_log` is compiled into the
+  binary (`strings` finds it 4×), the running process's fd 2 points at `ui.log`, and the embedded
+  asset timestamp matches the current dist. So the silence is not explained by the click alone.
+- **Unverified:** whether the running webview is executing the current bundle. `WebKitCache/Version
+  17` is empty and no `devUrl` is configured, but a constructor `invoke` producing no stderr output
+  is still unexplained. A colored-dot probe (magenta = new JS running, cyan/red = invoke ok/failed)
+  was added to `app.ts` at the point of pausing but has **not** been built or run.
+- **Lesson:** do not trust `eprintln!`/`invoke` diagnostics from a rebuilt shell until one is shown
+  to work in that environment; use a signal independent of the IPC path (window pixel diff, or a DOM
+  element with a unique color) to confirm the running code first.
+- **Probe cleanup:** every temporary probe was removed in the same change — the global click
+  listener, the startup/keydown `hush_debug_log` calls, the colored-dot probe, the `[diag]` toast,
+  the `eprintln!` in `hush_open_blob`, and the `hush_debug_log` command itself.
+
+### [WORKED AROUND] Every open failed because the default video handler is a Flatpak with no filesystem access
+
+- **Attempted:** reproduced the whole open path. The daemon half is sound: `POST
+  /api/blob/{id}/materialize` returned 200 with the exact byte count for both the 1.77 GB
+  `Animals…mkv` (1,776,106,107 bytes) and the 17 KB docx, peak daemon RSS 58 MiB, written under
+  `/tmp/hush-open`; the shell binary (`target/debug/hush-tauri`, 18:19) embeds the new dist
+  (18:16) and registers `hush_open_blob`/`hush_save_blob`. The failure is downstream of the app.
+- **Symptom:** the OS handler never sees the file. `xdg-mime query default video/x-matroska` is
+  `com.stremio.Legacy.desktop`, a Flatpak. Probing the sandbox directly:
+  `flatpak run --command=cat com.stremio.Legacy /tmp/hush-open/probe.txt` →
+  `cat: /tmp/hush-open/probe.txt: No such file or directory`, and the sandbox `/tmp` holds only
+  `.X11-unix`. `flatpak info --show-permissions com.stremio.Legacy` shows
+  `filesystems=xdg-config/kdeglobals:ro` — no `home`, no `xdg-download`, no documents portal — so
+  it cannot read *any* local file, and the `--file-forwarding` in its `.desktop` cannot help
+  without the documents portal. That is why size was irrelevant: every open was handed to a
+  process that cannot see `/tmp`.
+- **Resolution:** pointed the video MIME types at native VLC (`/usr/bin/vlc`, not a Flatpak) with
+  `xdg-mime default vlc.desktop` for `video/x-matroska`, `video/mp4`, `video/x-msvideo`,
+  `video/webm`, `video/x-flv`, `video/mpeg`, `video/ogg`, `video/x-m4v`, `video/3gpp`,
+  `video/quicktime`, `video/x-ms-wmv`, `video/mp2t`, `video/x-ms-asf`. Verified VLC reads a file
+  in the materialize dir: `vlc -I dummy … /tmp/hush-open/tiny.mp4` logged
+  `` `file:///tmp/hush-open/tiny.mp4' gives access `file' … path `/tmp/hush-open/tiny.mp4' ``.
+- **Not fixed:** the app still materializes to `/tmp/hush-open` and hands the path to whatever the
+  OS default is, so any *sandboxed* handler (Flatpak/Snap) will fail the same way. Fixing that
+  class needs the XDG document portal (`org.freedesktop.portal.OpenURI.OpenFile`), and even that
+  only helps a handler that requests document access — Stremio's does not. On this machine the
+  handler choice is the fix.
+- **Broader audit (same slice):** every other content handler on this machine is native and
+  unaffected — jpeg/png/gif/webp → Chrome, bmp/svg → eog, tiff/pdf → Evince, audio → VLC,
+  zip/tar → Nautilus, text/plain → gnome-text-editor. Two exceptions: `image/avif` also pointed
+  at a sandboxed app (the Firefox *snap*, itself broken here with `cannot create user data
+  directory`), now switched to native Chrome; and `application/x-bittorrent` still points at the
+  Stremio Flatpak (not a content file). Types with **no** handler at all — docx/doc/odt/epub/
+  markdown/octet-stream — still fail xdg-open; LibreOffice is not installed, so nothing is
+  registered for them.
+- **Lesson:** "the file opens from the shell but not from the app" is not always an app bug. Check
+  whether the *handler* is sandboxed before touching the egress path; a private `/tmp` makes file
+  size and file format irrelevant.
+
+### [FIXED] Materializing to the runtime dir hit tmpfs ENOSPC on a 1.65 GiB blob
+
+- **Attempted:** open the 1.77 GB `Animals…mkv` through the new streaming egress.
+- **Symptom:** `write_blob_to_file` failed with `io: No space left on device (os error 28)` and
+  the partial file was removed, leaving an empty `open` dir. `open_tmp_dir()` was
+  `hush_core::default_runtime_dir().join("open")` = `/run/user/1000/hush-one/open`, a 1.6 GiB
+  RAM-backed tmpfs — smaller than the file, and its pages count as memory.
+- **Resolution:** `open_tmp_dir()` now returns `std::env::temp_dir().join("hush-open")`
+  (`/tmp/hush-open` on the ext4 root, 108 GiB free). Re-verified: 1.77 GB materialize → 200,
+  1,776,106,107 bytes, peak daemon RSS 58 MiB; 17 KB docx → 200, 17,282 bytes.
+- **Lesson:** a "temp file" is not one thing; the runtime dir is RAM. Use the disk temp dir for
+  anything that can hold a user file.
+
+### [WORKED AROUND] `pkill -f` / `pgrep -f` matched the tool's own shell and killed it
+
+- **Attempted:** restart the daemon by matching its command line (`pgrep -f "release/hush-daemon
+  --dir …"`, then `kill $OLD`), and later clean up with `pkill -f "hush-open/probe"`.
+- **Symptom:** the shell running the command matched its own command line, so it killed itself:
+  the first call printed two PIDs and exited in 266 ms with the daemon dead and its replacement
+  never started; the second returned empty output. (Tooling, not a repo problem.)
+- **Resolution:** match the exact process name (`pgrep -x hush-daemon`, `pkill -x vlc`) or a
+  pattern that cannot appear in the command text.
+- **Lesson:** `-f` matches the invoking shell too. Prefer `-x`, or the process self-terminates
+  mid-script.
+
+---
+
+## 2026-10-10 — Opening a large torrent OOM-killed the UI (egress path)
+
+Slice goal: the desktop window came up under `scripts/run-one-ui.sh` and was SIGKILLed a
+couple of minutes later; `ui.log` was empty.
+
+### [FIXED] The Library's Open reused the base64 blob route, so a 1.65 GiB file ballooned the webview
+
+- **Attempted:** traced the `Killed` exit. `journalctl -k` showed
+  `Out of memory: Killed process 3027851 (hush-tauri) total-vm:81188076kB, anon-rss:4941924kB`
+  — the kernel OOM killer, not a panic (`ui.log` empty, SIGKILL leaves no trace). The machine
+  was already swapping hard (7.8 GiB of 7.9 GiB used), so the biggest process was the victim.
+- **Symptom:** `hush-tauri` reached ~4.7 GiB RSS / ~77 GiB VM. The vault held a single
+  1.65 GiB torrent (`instances/peer-a/blobs/3041b5f8…`, 211 × 8 MiB chunks). Opening it ran the
+  chain `Vault::get_blob` (whole `Vec`) → base64 JSON → the Tauri `hush_api` proxy (whole body
+  as a JS `String`) → `atob` → `Uint8Array` → `Array.from(bytes)` (an N-element JSON number
+  array back over IPC) → `hush_open_file`'s `Vec<u8>`. ~6 full copies, twice across IPC. The
+  earlier memlock hardening had turned a clean abort into an allocation the kernel then killed
+  — the failure moved from the daemon to the UI.
+- **Resolution:** a streaming egress. `POST /api/blob/{id}/materialize` decrypts a blob to a
+  uniquely named file under the runtime dir via `Vault::read_blob_stream` (chunk by chunk,
+  memory flat), and the desktop shell's new `hush_open_blob` / `hush_save_blob` commands open
+  or copy that path. The bytes never enter the webview and no base64 or `Array.from` remains on
+  the open/save path. The old `/api/blob/{id}` route stays for the 256 KiB-capped chat/mail
+  attachments and browser/TCP dev. Regression test
+  `the_blob_route_materializes_a_file_for_open` stores an 8 MiB+ multi-chunk blob and asserts
+  the materialized bytes match, that the extension survives, and that two files of the same
+  name get distinct paths; suite passes (46 tests).
+- **Not verified here:** the live GUI open of the 1.65 GiB file. The workstation still has swap
+  nearly full, so re-running a 1.65 GiB materialize + open was deliberately not done. The daemon
+  route is covered by the multi-chunk test; the desktop half compiles and typechecks.
+- **Lesson:** the egress half of a large-file feature must be checked separately from the ingest
+  half; a fix that removes an abort can just move the failure to an OOM kill. And
+  `Array.from(uint8array)` over Tauri IPC is a JSON number array — never do it for file bytes.
+
+---
+
+## 2026-10-10 — TorBox `size: -1` fails decode, and an item sits in Caching with no explanation
+
+Follow-up to the `"files": null` fix: the same add produced two more symptoms.
+
+### [FIXED] `invalid value: integer -1, expected u64` — TorBox reports unknown sizes as −1
+
+- **Attempted:** after the null-files fix, the same torrent failed at the next decode point.
+- **Symptom:** `Unexpected reply from TorBox: invalid value: integer -1, expected u64`. TorBox
+  reports `size: -1` for a torrent it has not parsed yet; the four `size` fields
+  (`TorrentInfo`, `TorrentFile`, `CachedInfo`, `CachedFile`) are `u64`, which rejects any
+  negative, and `#[serde(default)]` does not help because the field is present.
+- **Resolution:** a `lenient_u64` deserializer on all four `size` fields folds negatives to 0,
+  which the pipeline already treats as "unknown" (`dl_total`/`size` guards). Regression test
+  `negative_sizes_mean_unknown_not_a_decode_error`; suite passes (44 tests).
+- **Lesson:** same class as the null entry: match the provider's encoding of "unknown"
+  (−1, null, empty) instead of assuming the happy shape. Anything a third party can send,
+  the deserializer must survive.
+
+### [FIXED] An item sat in `Caching` forever with nothing on screen saying why
+
+- **Attempted:** traced the Caching loop: `is_due` polls every 4s, so the poll *was* running —
+  TorBox just never reported ready for it.
+- **Symptom:** status stayed "Caching" indefinitely. The poll's Ok-not-ready branch cleared
+  `message` and moved on, so TorBox's own `download_state` ("queued", a full active-slot
+  queue, …) never reached the UI. A slot queue on TorBox's side is indistinguishable from a
+  hang. Likely trigger here: the first item, marked Error locally by the −1 decode bug, kept
+  occupying an active-download slot on TorBox's side while the second torrent queued behind it.
+- **Resolution:** `TorrentItem.remote_state` now carries TorBox's verbatim `download_state`
+  (set each poll while still caching, cleared when ready), the caching label renders it
+  ("Caching on TorBox — queued (0%)"), and the unambiguous terminal states (`failed`,
+  `not downloadable`) now fail the item with TorBox's word in the message instead of waiting
+  forever. Whether this user's item was queued on TorBox's side could not be observed from
+  here (the key lives in the encrypted vault store); the label will now show it either way.
+- **Lesson:** a poller that swallows the remote's own status turns their queue into our hang.
+  Surface the upstream state verbatim next to the local one when a local state can outlive
+  its upstream cause.
+
+## 2026-10-10 — TorBox replies with `"files": null` and the item dies as "Unexpected reply from TorBox"
+
+Slice goal: the user tried adding a torrent and the item failed with
+`Unexpected reply from TorBox: invalid type: null, expected a sequence`.
+
+### [FIXED] `#[serde(default)]` does not cover an explicit JSON `null`, so `files: null` failed the whole reply
+
+- **Attempted:** traced the error string to `TorboxError::Decode`
+  (`crates/hush-daemon/src/torbox.rs`), then checked every deserialization point for a field
+  that could receive `null`: `list()` already folds a `null` `data` to an empty list, but the
+  `files` field on `TorrentInfo` and `CachedInfo` is `Vec<_>` with `#[serde(default)]`.
+- **Symptom:** `poll_caching` polls a freshly created torrent; TorBox reports
+  `"files": null` until it has parsed the file list. serde's `default` applies only to a
+  *missing* field, so the explicit `null` failed `serde_json::from_value` with exactly
+  `invalid type: null, expected a sequence`. Because `is_transient()` says `false` for
+  `Decode`, the item was marked permanently failed and the UI showed the raw serde text.
+- **Resolution:** a `nullable_seq` deserializer folds `null` to an empty list on both
+  `files` fields, and `checkcached`'s hash→info map now routes through `decode_cached_map`,
+  which drops hashes TorBox maps to an explicit `null` (previously such a reply failed the
+  whole map; the `if let Ok` at the call site silently swallowed it, losing the "cached"
+  hint). Regression tests: `torrent_info_tolerates_an_explicit_null_file_list`,
+  `cached_map_skips_hashes_that_map_to_null`; full `hush-daemon` suite passes (43 tests).
+  Note: the live API shape was not captured directly — the fix is from serde semantics plus
+  the observed error, and the new tests pin the null shape deterministically.
+- **Lesson:** every `#[serde(default)]` on data from a third-party API is a silent
+  `null` landmine; `default` and `null` are different cases. For anything a provider is
+  known to emit as `null` (lists in particular), pair `default` with a
+  `deserialize_with` that folds null to the default.
+
 ## 2026-10-10 — Release daemon abort on a 2 GiB blob read (finite memlock + MCL_FUTURE)
 
 Slice goal: confirm the release desktop instance was still connected to the lab relay. It was
@@ -436,21 +911,21 @@ HTTPS route.
 
 ## 2026-10-10 — Torrents (TorBox) pane
 
-### Large torrent files can be stored streamed but not opened streamed — OPEN
+### Large torrent files can be stored streamed but not opened streamed — FIXED
 
 - What was attempted: honour the constraint "make it work for large files (stream to disk,
   don't buffer in memory)" for the whole torrent path.
 - Symptom: the TorBox → vault leg is streamed (HTTP Range into a temp file, then chunked
   AEAD into `blobs/<hex>/chunk-N` in 8 MiB chunks), so it never holds a whole file. But the
-  Library's Open / Save as… actions reuse the app's existing `/api/blob/{id}` route, which
+  Library's Open / Save as… actions reused the app's existing `/api/blob/{id}` route, which
   returns the plaintext base64-encoded in one JSON body (`Vault::get_blob` collects the whole
-  file into a `Vec<u8>`). A multi-GB torrent file therefore materialises in the daemon, in the
+  file into a `Vec<u8>`). A multi-GB torrent file therefore materialised in the daemon, in the
   JSON string, and in the webview when opened.
-- Resolution: none in this slice. The download-into-vault path is memory-bounded; the
-  open/play path inherits the app-wide limitation of the base64 blob endpoint (chat
-  attachments are capped at 256 KiB, so it was never a problem before). Closing this needs a
-  streaming blob route plus a Tauri command that writes to a temp file without the webview
-  holding the bytes.
+- Resolution: closed by the streaming egress above (the same slice that diagnosed the UI OOM).
+  `POST /api/blob/{id}/materialize` streams the blob to a temp file via
+  `Vault::read_blob_stream`; the shell's `hush_open_blob` / `hush_save_blob` open or copy that
+  path, so neither the daemon nor the webview holds the whole file. Evidence:
+  `the_blob_route_materializes_a_file_for_open` (multi-chunk blob, bytes match, unique names).
 - Lesson: "streams to disk" was only true for the ingest half. The egress half of a
   large-file feature has to be checked separately.
 

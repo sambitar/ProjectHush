@@ -12,6 +12,8 @@ import type {
   TorrentItemDto,
   TorrentLibraryEntryDto,
   TorrentsStateDto,
+  WalletNetworkMode,
+  WalletStateDto,
 } from "./lib/api/types";
 import {
   HK_NEWS,
@@ -49,6 +51,24 @@ import {
   torrentStatusLabel,
 } from "./lib/torrentsStore";
 import { showToast } from "./lib/toast";
+import {
+  DEFAULT_FEE_RATE,
+  clearWalletStore,
+  createWallet,
+  formatBtc,
+  formatSats,
+  getWalletLoadError,
+  getWalletState,
+  isWalletLoaded,
+  newReceiveAddress,
+  restoreWallet,
+  sendPayment,
+  setWalletMode,
+  setWalletPaneOpen,
+  subscribeWallet,
+  syncWallet,
+  wipeWallet,
+} from "./lib/walletStore";
 import {
   addOutgoingFile,
   addOutgoingText,
@@ -113,10 +133,10 @@ import { fileToBase64, formatAbsolute, formatBytes, formatRelative, formatUntil 
 import {
   attachFileActions,
   downloadBase64File,
-  openBytesInNewTab,
+  openVaultBlob,
   readFileAsBase64,
   resolveMessageFileBytes,
-  saveBytesAsFile,
+  saveVaultBlob,
 } from "./lib/fileBytes";
 import { groupMessages, dayLabel } from "./lib/messageGroups";
 import {
@@ -170,6 +190,7 @@ type Rail =
   | "conclaves"
   | "reads"
   | "torrents"
+  | "wallet"
   | "mail"
   | "drops"
   | "files"
@@ -262,6 +283,14 @@ function torrentFileIcon(f: { mimetype: string | null; name: string }): IconName
     return "fileArchive";
   }
   return "file";
+}
+
+/** An inline "working…" marker, shown while a vault blob is decrypted. */
+function spinner(): HTMLElement {
+  const el = document.createElement("span");
+  el.className = "spinner";
+  el.setAttribute("aria-hidden", "true");
+  return el;
 }
 
 /** Human wording for the Tor state. Accurate, not reassuring. */
@@ -388,6 +417,14 @@ export class App {
   private torrentsLibrarySort: "date" | "name" | "size" = "date";
   /** The Library entry awaiting delete confirmation. */
   private torrentsDeleteId: string | null = null;
+  /**
+   * Blob id of the Library file currently being decrypted out of the vault for
+   * an open or export. Decrypting a multi-GB file is not instant, so the row
+   * shows a spinner and its actions are disabled rather than looking inert.
+   */
+  private torrentsBusyBlob: string | null = null;
+  /** Dismisses the "Decrypting…" toast when the busy action settles. */
+  private torrentsBusyToast: (() => void) | null = null;
   /** Settings > TorBox field state. */
   private torboxKeyDraft = "";
   private torboxKeyVisible = false;
@@ -513,6 +550,31 @@ export class App {
   private conclaveDeleteId: string | null = null;
   private conclaveDeleteConfirm = "";
 
+  // --- Wallet pane ---------------------------------------------------------
+
+  /**
+   * The phrase shown once, right after creation, until the user says they have
+   * written it down (or leaves the pane). Held here and nowhere else: the
+   * daemon returns it exactly once and never again, so losing it loses it.
+   */
+  private walletPhrase: string | null = null;
+  /** Network chosen for create/restore; only `mainnet` is offered in the UI. */
+  private walletNetwork = "mainnet";
+  /** What the user has typed into the restore field. */
+  private walletRestoreInput = "";
+  /** Send form fields. `walletSendAmount` is in satoshi, as typed. */
+  private walletSendTo = "";
+  private walletSendAmount = "";
+  private walletSendFee = String(DEFAULT_FEE_RATE);
+  /** The txid of the last successful send, shown until the pane is left. */
+  private walletLastTx: { txid: string; fee_sat: number } | null = null;
+  /** The last wallet error, shown inline rather than as a toast. */
+  private walletError: string | null = null;
+  /** What the user has typed to confirm wiping the wallet. */
+  private walletWipeConfirm = "";
+  /** A wallet operation is in flight; the pane's actions are disabled. */
+  private walletBusy = false;
+
   /** Read/star/archive/trash, straight from `ui-prefs.json`. */
   private mailPrefs(): MailFlags {
     return mailFlags();
@@ -554,6 +616,19 @@ export class App {
       // Never clobber the Add field while the user is typing in it.
       const ae = document.activeElement;
       if (ae instanceof HTMLInputElement && ae.closest(".torrents-pane")) return;
+      this.render();
+    });
+    subscribeWallet(() => {
+      if (this.rail !== "wallet") return;
+      // While an operation is in flight its own handler owns the re-render;
+      // this keeps one action from painting twice.
+      if (this.walletBusy) return;
+      // Never clobber a field the user is typing in, and never wipe the
+      // one-time phrase card out from under them mid-copy.
+      const ae = document.activeElement;
+      if (ae instanceof HTMLInputElement && ae.closest(".wallet-pane")) return;
+      if (ae instanceof HTMLTextAreaElement && ae.closest(".wallet-pane")) return;
+      if (this.walletPhrase) return;
       this.render();
     });
     document.addEventListener("keydown", (e) => {
@@ -741,6 +816,14 @@ export class App {
     clearConclaveStore();
     clearReadsStore();
     clearTorrentsStore();
+    clearWalletStore();
+    this.walletPhrase = null;
+    this.walletLastTx = null;
+    this.walletError = null;
+    this.walletSendTo = "";
+    this.walletSendAmount = "";
+    this.walletRestoreInput = "";
+    this.walletWipeConfirm = "";
     clearMockLocal();
     this.readsSource = HK_NEWS.id;
     this.readsSourceTitle = HK_NEWS.title;
@@ -820,6 +903,8 @@ export class App {
       shell.appendChild(this.renderReadsMain());
     } else if (this.rail === "torrents") {
       shell.appendChild(this.renderTorrents());
+    } else if (this.rail === "wallet") {
+      shell.appendChild(this.renderWallet());
     } else if (this.rail === "mail") {
       shell.appendChild(this.renderMailFolders());
       shell.appendChild(this.renderMailMain());
@@ -835,6 +920,7 @@ export class App {
     this.root.appendChild(shell);
     this.startTorPoll();
     setTorrentsPaneOpen(this.rail === "torrents");
+    setWalletPaneOpen(this.rail === "wallet");
     this.renderedNick = this.rail === "chats" ? this.selectedNick : null;
     // Now that the thread pane is in the document and has layout, put the
     // reader where the conversation should open: the newest message, or their
@@ -1114,6 +1200,7 @@ export class App {
         activeTorrentCount(getTorrentsState()),
       ),
     );
+    rail.appendChild(this.railBtn("wallet", "Wallet", "wallet"));
     rail.appendChild(this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())));
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
@@ -1314,8 +1401,11 @@ export class App {
           const uploading =
             m.sendProgress !== undefined && m.sendProgress < 100;
           if (!uploading && (m.fileData || m.blobId)) {
-            attachFileActions(fc, m.fileName ?? "file", () =>
-              resolveMessageFileBytes(m),
+            attachFileActions(
+              fc,
+              m.fileName ?? "file",
+              () => resolveMessageFileBytes(m),
+              m.blobId,
             );
           } else if (!uploading && !m.fileData && !m.blobId) {
             const hint = document.createElement("p");
@@ -2545,7 +2635,12 @@ export class App {
         sizeEl.className = "text-13 muted";
         sizeEl.textContent = formatBytes(file.size);
         fc.append(nameEl, sizeEl);
-        attachFileActions(fc, file.name, () => resolveMessageFileBytes(file));
+        attachFileActions(
+          fc,
+          file.name,
+          () => resolveMessageFileBytes(file),
+          file.blobId,
+        );
         b.appendChild(fc);
       } else {
         b.textContent = msg.body;
@@ -3518,8 +3613,11 @@ export class App {
       card.className = "tile";
       card.innerHTML = `<div class="text-15" style="font-weight:500">${m.fileName}</div><div class="text-13 muted">${formatBytes(m.fileSize ?? 0)} · ${formatRelative(m.createdAt)}</div>`;
       if (m.fileData || m.blobId) {
-        attachFileActions(card, m.fileName ?? "file", () =>
-          resolveMessageFileBytes(m),
+        attachFileActions(
+          card,
+          m.fileName ?? "file",
+          () => resolveMessageFileBytes(m),
+          m.blobId,
         );
       }
       const chatLink = document.createElement("button");
@@ -5147,14 +5245,20 @@ export class App {
     hash.textContent = `SHA-256 ${a.blobId}`;
     hash.title = "The attachment's SHA-256, as saved in the vault";
     chip.append(line, hash);
-    attachFileActions(chip, a.name, async () => {
-      const r = await api.blob(a.blobId);
-      if (!r?.data_base64) throw new Error("Could not load attachment from the vault");
-      const bin = atob(r.data_base64);
-      const out = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-      return out;
-    });
+    attachFileActions(
+      chip,
+      a.name,
+      async () => {
+        const r = await api.blob(a.blobId);
+        if (!r?.data_base64)
+          throw new Error("Could not load attachment from the vault");
+        const bin = atob(r.data_base64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      },
+      a.blobId,
+    );
     return chip;
   }
 
@@ -5168,14 +5272,20 @@ export class App {
     size.className = "text-12 faint";
     size.textContent = formatBytes(a.size);
     chip.append(name, size);
-    attachFileActions(chip, a.name, async () => {
-      const r = await api.blob(a.blobId);
-      if (!r?.data_base64) throw new Error("Could not load attachment from the vault");
-      const bin = atob(r.data_base64);
-      const out = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-      return out;
-    });
+    attachFileActions(
+      chip,
+      a.name,
+      async () => {
+        const r = await api.blob(a.blobId);
+        if (!r?.data_base64)
+          throw new Error("Could not load attachment from the vault");
+        const bin = atob(r.data_base64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      },
+      a.blobId,
+    );
     return chip;
   }
 
@@ -5641,6 +5751,571 @@ export class App {
   // The pane is a thin view over `torrentsStore`, which polls the daemon. The
   // daemon owns the pipeline (TorBox → vault); nothing here talks to TorBox.
   // ------------------------------------------------------------------
+
+  /**
+   * The Wallet pane: one self-custody Bitcoin wallet per vault.
+   *
+   * The phrase is generated and sealed by the daemon; this pane sees it exactly
+   * once, at creation, and is responsible for making the user write it down.
+   * Everything else — the balance, the address, sending — is the daemon's
+   * state rendered back.
+   */
+  private renderWallet(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane wallet-pane";
+    const state = getWalletState();
+
+    const head = document.createElement("div");
+    head.className = "wallet-head";
+    const title = document.createElement("h1");
+    title.className = "text-22";
+    title.textContent = "Wallet";
+    head.appendChild(title);
+    if (state.exists) {
+      const sync = document.createElement("button");
+      sync.type = "button";
+      sync.className = "btn-secondary text-13 pressable";
+      sync.textContent = this.walletBusy ? "Working…" : "Sync";
+      sync.disabled = this.walletBusy;
+      sync.title = "Scan the chain for payments to this wallet";
+      sync.onclick = () => void this.walletSyncNow();
+      head.appendChild(sync);
+    }
+    pane.appendChild(head);
+
+    if (!isTauriShell()) {
+      pane.appendChild(this.walletNeedsDesktop());
+      return pane;
+    }
+
+    // Nothing has been read yet. Until the daemon answers, the pane cannot
+    // tell "no wallet" from "not reachable", and showing the create form to
+    // someone who already has a wallet would be worse than showing nothing.
+    if (!isWalletLoaded()) {
+      const wait = document.createElement("p");
+      wait.className = "muted text-13";
+      wait.textContent = getWalletLoadError() ?? "Reading the wallet…";
+      pane.appendChild(wait);
+      return pane;
+    }
+
+    if (this.walletError) {
+      const warn = document.createElement("p");
+      warn.className = "wallet-error text-13";
+      warn.textContent = this.walletError;
+      pane.appendChild(warn);
+    }
+
+    if (!state.exists) {
+      pane.appendChild(this.walletSetup());
+      return pane;
+    }
+
+    if (this.walletPhrase) {
+      pane.appendChild(this.walletPhraseCard(this.walletPhrase));
+    }
+    pane.appendChild(this.walletBalanceCard(state));
+    pane.appendChild(this.walletReceiveCard(state));
+    pane.appendChild(this.walletSendCard(state));
+    pane.appendChild(this.walletModeCard(state));
+    pane.appendChild(this.walletDangerCard());
+    return pane;
+  }
+
+  /** The wallet routes live on the daemon's Unix socket only (DR-02). */
+  private walletNeedsDesktop(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "wallet-empty";
+    const ic = icon("wallet");
+    ic.classList.add("wallet-empty-icon");
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "The wallet lives in the desktop app";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent =
+      "The wallet can move money, so the daemon only serves it over the local socket the desktop app uses — never over the TCP port a browser can reach. Open Hush to use it.";
+    wrap.append(ic, h, p);
+    return wrap;
+  }
+
+  /** No wallet yet: create one, or restore from a phrase. */
+  private walletSetup(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "wallet-setup";
+
+    const intro = document.createElement("p");
+    intro.className = "muted text-13";
+    intro.textContent =
+      "Hush holds the keys, not a company. The recovery phrase is sealed into this vault with your master key and never leaves it — but a wallet you cannot restore from a phrase is a wallet you cannot recover, so write it down when it is shown.";
+
+    const createCard = document.createElement("section");
+    createCard.className = "wallet-card";
+    createCard.innerHTML = `<h2 class="text-18">Create a wallet</h2><p class="muted text-13">A new Bitcoin wallet, derived from a fresh 12-word phrase.</p>`;
+    const createBtn = document.createElement("button");
+    createBtn.type = "button";
+    createBtn.className = "btn-primary pressable";
+    createBtn.textContent = this.walletBusy ? "Working…" : "Create wallet";
+    createBtn.disabled = this.walletBusy;
+    createBtn.onclick = () => void this.walletCreateNow();
+    createCard.appendChild(createBtn);
+
+    const restoreCard = document.createElement("section");
+    restoreCard.className = "wallet-card";
+    restoreCard.innerHTML = `<h2 class="text-18">Restore from a phrase</h2><p class="muted text-13">Bring back a wallet you already hold the phrase for. Nothing is overwritten — a vault holds one wallet.</p>`;
+    const input = document.createElement("textarea");
+    input.className = "input-field wallet-phrase-input";
+    input.rows = 3;
+    input.placeholder = "twelve words, separated by spaces";
+    input.spellcheck = false;
+    input.autocapitalize = "off";
+    input.value = this.walletRestoreInput;
+    input.oninput = () => {
+      this.walletRestoreInput = input.value;
+    };
+    const restoreBtn = document.createElement("button");
+    restoreBtn.type = "button";
+    restoreBtn.className = "btn-secondary pressable";
+    restoreBtn.textContent = this.walletBusy ? "Working…" : "Restore wallet";
+    restoreBtn.disabled = this.walletBusy;
+    restoreBtn.onclick = () => void this.walletRestoreNow();
+    restoreCard.append(input, restoreBtn);
+
+    wrap.append(intro, createCard, restoreCard);
+    return wrap;
+  }
+
+  /** The one and only time the phrase is shown. */
+  private walletPhraseCard(phrase: string): HTMLElement {
+    const card = document.createElement("section");
+    card.className = "wallet-card wallet-phrase-card";
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Write this down now";
+    const p = document.createElement("p");
+    p.className = "text-13";
+    p.textContent =
+      "These twelve words are the wallet. Anyone who has them can spend the money, and nobody — including Hush — can restore them for you. This is the only time they are shown.";
+    const words = document.createElement("ol");
+    words.className = "wallet-phrase-words";
+    for (const w of phrase.split(/\s+/)) {
+      const li = document.createElement("li");
+      li.textContent = w;
+      words.appendChild(li);
+    }
+    const actions = document.createElement("div");
+    actions.className = "wallet-card-actions";
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "btn-secondary pressable";
+    copy.textContent = "Copy phrase";
+    copy.onclick = () => {
+      void navigator.clipboard.writeText(phrase);
+      showToast("Phrase copied. Paste it somewhere offline.", { kind: "success" });
+    };
+    const done = document.createElement("button");
+    done.type = "button";
+    done.className = "btn-primary pressable";
+    done.textContent = "I have written it down";
+    done.onclick = () => {
+      this.walletPhrase = null;
+      this.render();
+    };
+    actions.append(copy, done);
+    card.append(h, p, words, actions);
+    return card;
+  }
+
+  private walletBalanceCard(state: WalletStateDto): HTMLElement {
+    const card = document.createElement("section");
+    card.className = "wallet-card";
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Balance";
+    const amount = document.createElement("p");
+    amount.className = "wallet-balance";
+    amount.textContent = `${formatBtc(state.confirmed_sat)} BTC`;
+    const sats = document.createElement("p");
+    sats.className = "faint text-12";
+    sats.textContent = formatSats(state.confirmed_sat);
+    card.append(h, amount, sats);
+    if (state.pending_sat > 0) {
+      const pending = document.createElement("p");
+      pending.className = "text-13";
+      pending.style.color = "var(--warning-text)";
+      pending.textContent = `Waiting to confirm: ${formatBtc(state.pending_sat)} BTC (${formatSats(state.pending_sat)})`;
+      card.appendChild(pending);
+    }
+    const note = document.createElement("p");
+    note.className = "faint text-12";
+    note.textContent =
+      "A balance only moves when the wallet scans the chain. Press Sync after you expect a payment.";
+    card.appendChild(note);
+    return card;
+  }
+
+  private walletReceiveCard(state: WalletStateDto): HTMLElement {
+    const card = document.createElement("section");
+    card.className = "wallet-card";
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Receive";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent =
+      "Share this address to be paid. It is the next unused one, so it changes after a payment arrives.";
+    card.append(h, p);
+
+    const address = state.address;
+    if (!address) {
+      const none = document.createElement("p");
+      none.className = "faint text-13";
+      none.textContent = "No address yet — sync the wallet to derive one.";
+      card.appendChild(none);
+      return card;
+    }
+
+    const box = document.createElement("div");
+    box.className = "wallet-address";
+    const code = document.createElement("code");
+    code.textContent = address;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "btn-icon-round pressable";
+    copy.setAttribute("aria-label", "Copy address");
+    copy.title = "Copy address";
+    copy.appendChild(icon("copy"));
+    copy.onclick = () => {
+      void navigator.clipboard.writeText(address);
+      showToast("Address copied.", { kind: "success" });
+    };
+    box.append(code, copy);
+    card.appendChild(box);
+
+    const qr = document.createElement("canvas");
+    qr.className = "wallet-qr";
+    qr.setAttribute("aria-label", `QR code for ${address}`);
+    void QRCode.toCanvas(qr, address, { width: 148, margin: 1 }).catch(() => {
+      /* a QR that will not render is not worth an error over */
+    });
+    card.appendChild(qr);
+
+    const fresh = document.createElement("button");
+    fresh.type = "button";
+    fresh.className = "btn-secondary text-13 pressable";
+    fresh.textContent = "New address";
+    fresh.disabled = this.walletBusy;
+    fresh.onclick = () => void this.walletNewAddress();
+    card.appendChild(fresh);
+    return card;
+  }
+
+  private walletSendCard(state: WalletStateDto): HTMLElement {
+    const card = document.createElement("section");
+    card.className = "wallet-card";
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Send";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent = "Bitcoin only, on the wallet's own network. The fee is what the miners take.";
+    card.append(h, p);
+
+    const to = document.createElement("input");
+    to.className = "input-field";
+    to.placeholder = "Destination address";
+    to.spellcheck = false;
+    to.value = this.walletSendTo;
+    to.oninput = () => {
+      this.walletSendTo = to.value;
+    };
+
+    const amount = document.createElement("input");
+    amount.className = "input-field";
+    amount.placeholder = "Amount in satoshi";
+    amount.inputMode = "numeric";
+    amount.value = this.walletSendAmount;
+    amount.oninput = () => {
+      this.walletSendAmount = amount.value;
+      const n = Number.parseInt(amount.value, 10);
+      hint.textContent =
+        Number.isFinite(n) && n > 0
+          ? `= ${formatBtc(n)} BTC`
+          : "Satoshi, not BTC. 100,000,000 sat = 1 BTC.";
+    };
+    const hint = document.createElement("p");
+    hint.className = "faint text-12";
+    const typed = Number.parseInt(this.walletSendAmount, 10);
+    hint.textContent =
+      Number.isFinite(typed) && typed > 0
+        ? `= ${formatBtc(typed)} BTC`
+        : "Satoshi, not BTC. 100,000,000 sat = 1 BTC.";
+
+    const fee = document.createElement("input");
+    fee.className = "input-field";
+    fee.placeholder = "Fee rate (sat/vB)";
+    fee.inputMode = "numeric";
+    fee.value = this.walletSendFee;
+    fee.oninput = () => {
+      this.walletSendFee = fee.value;
+    };
+
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "btn-primary pressable";
+    send.textContent = this.walletBusy ? "Sending…" : "Send";
+    send.disabled = this.walletBusy;
+    send.onclick = () => void this.walletSendNow();
+
+    card.append(to, amount, hint, fee, send);
+
+    if (this.walletLastTx) {
+      const done = document.createElement("p");
+      done.className = "text-13";
+      done.style.color = "var(--success-text)";
+      done.textContent = `Sent. Fee ${formatSats(this.walletLastTx.fee_sat)}.`;
+      const txid = document.createElement("code");
+      txid.className = "wallet-txid";
+      txid.textContent = this.walletLastTx.txid;
+      card.append(done, txid);
+    }
+
+    if (state.confirmed_sat === 0) {
+      const none = document.createElement("p");
+      none.className = "faint text-12";
+      none.textContent = "There is nothing to send until the wallet holds a confirmed balance.";
+      card.appendChild(none);
+    }
+    return card;
+  }
+
+  /**
+   * The clearnet/Tor capsule.
+   *
+   * The rule the daemon enforces and this mirrors: while Hush's relay is on Tor
+   * the wallet is on Tor and clearnet is not offered. On clearnet the user may
+   * choose, and the choice sticks until the relay moves.
+   */
+  private walletModeCard(state: WalletStateDto): HTMLElement {
+    const card = document.createElement("section");
+    card.className = "wallet-card";
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Network";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent = state.mode_locked
+      ? "Hush is routing through Tor, so the wallet is too. It is never less private than the rest of the app."
+      : "Clearnet reaches the chain source directly, so it sees your IP. Tor hides it. Your balance and address are the same either way.";
+    card.append(h, p);
+
+    const capsule = document.createElement("div");
+    capsule.className = "segmented wallet-mode";
+    capsule.setAttribute("role", "group");
+    capsule.setAttribute("aria-label", "Wallet network");
+    const options: { id: WalletNetworkMode; label: string }[] = [
+      { id: "clearnet", label: "Clearnet" },
+      { id: "tor", label: "Tor" },
+    ];
+    for (const opt of options) {
+      const active = state.mode === opt.id;
+      const locked = state.mode_locked && opt.id !== "tor";
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `pressable${active ? " active" : ""}`;
+      b.textContent = opt.label;
+      b.disabled = locked || this.walletBusy;
+      b.setAttribute("aria-pressed", active ? "true" : "false");
+      if (locked) b.title = "The relay is on Tor, so the wallet stays on Tor.";
+      b.onclick = () => {
+        if (active || locked) return;
+        void this.walletChangeMode(opt.id);
+      };
+      capsule.appendChild(b);
+    }
+    card.appendChild(capsule);
+
+    if (state.mode_locked) {
+      const lock = document.createElement("p");
+      lock.className = "faint text-12";
+      lock.textContent = "Locked on Tor while the relay uses it.";
+      card.appendChild(lock);
+    }
+    return card;
+  }
+
+  private walletDangerCard(): HTMLElement {
+    const card = document.createElement("section");
+    card.className = "wallet-card wallet-danger";
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Remove this wallet";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent =
+      "Erases the phrase and the wallet state from this vault. The coins stay on the chain — but without the phrase they are gone for good. Type remove to confirm.";
+    const input = document.createElement("input");
+    input.className = "input-field";
+    input.placeholder = "remove";
+    input.value = this.walletWipeConfirm;
+    input.oninput = () => {
+      this.walletWipeConfirm = input.value;
+    };
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-danger pressable";
+    btn.textContent = "Remove wallet";
+    btn.disabled = this.walletBusy || this.walletWipeConfirm.trim() !== "remove";
+    btn.onclick = () => void this.walletWipeNow();
+    card.append(h, p, input, btn);
+    return card;
+  }
+
+  // --- Wallet actions -------------------------------------------------------
+
+  private async walletCreateNow(): Promise<void> {
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      this.walletPhrase = await createWallet(this.walletNetwork);
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "The wallet could not be created.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
+
+  private async walletRestoreNow(): Promise<void> {
+    const phrase = this.walletRestoreInput.trim();
+    if (!phrase) {
+      this.walletError = "Enter the recovery phrase first.";
+      this.render();
+      return;
+    }
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      await restoreWallet(phrase, this.walletNetwork);
+      this.walletRestoreInput = "";
+      showToast("Wallet restored. Press Sync to find your balance.", {
+        kind: "success",
+      });
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "That phrase could not be restored.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
+
+  private async walletNewAddress(): Promise<void> {
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      await newReceiveAddress();
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "A new address could not be made.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
+
+  private async walletSyncNow(): Promise<void> {
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      const state = await syncWallet();
+      showToast(
+        state.confirmed_sat > 0
+          ? `Balance: ${formatBtc(state.confirmed_sat)} BTC`
+          : "Synced. No confirmed balance yet.",
+        { kind: "success" },
+      );
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "The wallet could not reach the chain.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
+
+  private async walletSendNow(): Promise<void> {
+    const to = this.walletSendTo.trim();
+    const amountSat = Number.parseInt(this.walletSendAmount, 10);
+    if (!to) {
+      this.walletError = "Enter a destination address.";
+      this.render();
+      return;
+    }
+    if (!Number.isFinite(amountSat) || amountSat <= 0) {
+      this.walletError = "Enter an amount in satoshi, greater than zero.";
+      this.render();
+      return;
+    }
+    const feeRate = Number.parseInt(this.walletSendFee, 10);
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      this.walletLastTx = await sendPayment(
+        to,
+        amountSat,
+        Number.isFinite(feeRate) && feeRate > 0 ? feeRate : null,
+      );
+      this.walletSendTo = "";
+      this.walletSendAmount = "";
+      showToast("Sent.", { kind: "success" });
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "The payment could not be sent.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
+
+  private async walletChangeMode(mode: WalletNetworkMode): Promise<void> {
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      await setWalletMode(mode);
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "The network could not be changed.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
+
+  private async walletWipeNow(): Promise<void> {
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      await wipeWallet();
+      this.walletLastTx = null;
+      this.walletWipeConfirm = "";
+      showToast("Wallet removed from this vault.", { kind: "success" });
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "The wallet could not be removed.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
 
   private renderTorrents(): HTMLElement {
     const pane = document.createElement("div");
@@ -6174,21 +6849,23 @@ export class App {
       this.render();
     };
     const el = this.libraryItemShell("folder", e.name, formatBytes(e.size), open);
+    const meta = document.createElement("span");
+    meta.className = "library-item-sub muted text-12";
+    meta.textContent = `${e.files.length} file${e.files.length === 1 ? "" : "s"} · ${readsTimeAgo(e.added_at)}`;
+    el.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "library-item-actions";
     const del = document.createElement("button");
     del.type = "button";
     del.className = "library-item-action pressable";
     del.setAttribute("aria-label", `Delete ${e.name}`);
     del.appendChild(icon("trash"));
-    del.onclick = (ev) => {
-      ev.stopPropagation();
+    del.onclick = () => {
       this.torrentsDeleteId = e.id;
       this.render();
     };
-    el.appendChild(del);
-    const meta = document.createElement("span");
-    meta.className = "library-item-sub muted text-12";
-    meta.textContent = `${e.files.length} file${e.files.length === 1 ? "" : "s"} · ${readsTimeAgo(e.added_at)}`;
-    el.appendChild(meta);
+    actions.appendChild(del);
+    el.appendChild(actions);
     return el;
   }
 
@@ -6197,52 +6874,97 @@ export class App {
   }
 
   private renderLibraryFile(f: TorrentFileDto): HTMLElement {
+    const busy = f.blob_id != null && f.blob_id === this.torrentsBusyBlob;
+    // No onOpen: the file row is not a control. Opening is one of the two
+    // buttons below, so a click on the name does nothing surprising.
     const el = this.libraryItemShell(
-      torrentFileIcon(f),
+      busy ? spinner() : torrentFileIcon(f),
       f.name,
-      formatBytes(f.size),
-      () => void this.torrentsOpenFile(f),
+      busy ? "Decrypting…" : formatBytes(f.size),
     );
+    if (busy) el.setAttribute("aria-busy", "true");
+
     const actions = document.createElement("div");
     actions.className = "library-item-actions";
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "library-item-action pressable";
-    save.setAttribute("aria-label", `Save ${f.name}`);
-    save.appendChild(icon("download"));
-    save.onclick = (ev) => {
-      ev.stopPropagation();
-      void this.torrentsSaveFile(f);
-    };
-    actions.appendChild(save);
+
+    // In-place open: decrypt inside the vault and hand the plaintext to the
+    // OS. Green and shield-marked because it is the safe default — the file
+    // never leaves the vault.
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "btn-library-open pressable";
+    open.disabled = busy;
+    open.title = `Decrypt and open ${f.name} inside the vault`;
+    // Visible label first, so the accessible name still contains "Open inside
+    // vault" (WCAG 2.5.3) while the file name disambiguates the row.
+    open.setAttribute("aria-label", `Open inside vault: ${f.name}`);
+    const openLabel = document.createElement("span");
+    openLabel.textContent = "Open inside vault";
+    open.append(icon("vault"), openLabel);
+    open.onclick = () => void this.torrentsOpenFile(f);
+
+    // Export: write a plaintext copy out to the filesystem. Not a download
+    // arrow — nothing is fetched from a server, and that glyph already means
+    // "download a torrent" elsewhere in this app.
+    const exportCopy = document.createElement("button");
+    exportCopy.type = "button";
+    exportCopy.className = "btn-library-export pressable";
+    exportCopy.disabled = busy;
+    exportCopy.title = `Export ${f.name} to a folder…`;
+    exportCopy.setAttribute("aria-label", `Export ${f.name} to a folder`);
+    const exportLabel = document.createElement("span");
+    exportLabel.textContent = "Export";
+    exportCopy.append(icon("upload"), exportLabel);
+    exportCopy.onclick = () => void this.torrentsSaveFile(f);
+
+    actions.append(open, exportCopy);
     el.appendChild(actions);
     return el;
   }
 
-  /** Shared row/tile shell for a Library folder or file. */
+  /**
+   * Shared row/tile shell for a Library entry: icon, name, size.
+   *
+   * Deliberately a plain container, not a <button>. Callers add their own
+   * controls, and a <button> inside a <button> is invalid HTML — engines
+   * disagree about which one owns the click, so the inner control silently
+   * stops working. Rows that open something pass `onOpen` and get a button
+   * around the name area only; file rows pass nothing and stay inert, so the
+   * only controls on them are the explicit action buttons.
+   */
   private libraryItemShell(
-    ic: IconName,
+    ic: IconName | HTMLElement,
     name: string,
     sizeText: string,
-    onOpen: () => void,
+    onOpen?: () => void,
   ): HTMLElement {
-    const el = document.createElement("button");
-    el.type = "button";
-    el.className = "library-item pressable";
-    const icEl = icon(ic);
+    const el = document.createElement("div");
+    el.className = "library-item";
+    let main: HTMLElement;
+    if (onOpen) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.onclick = onOpen;
+      main = btn;
+      el.classList.add("clickable");
+    } else {
+      main = document.createElement("div");
+    }
+    main.className = "library-item-main";
+    const icEl = typeof ic === "string" ? icon(ic) : ic;
     icEl.classList.add("library-item-icon");
     const label = document.createElement("span");
     label.className = "library-item-name text-15";
     label.textContent = name;
     label.title = name;
-    el.append(icEl, label);
+    main.append(icEl, label);
     if (sizeText) {
       const size = document.createElement("span");
       size.className = "library-item-size muted text-12";
       size.textContent = sizeText;
-      el.appendChild(size);
+      main.appendChild(size);
     }
-    el.onclick = onOpen;
+    el.appendChild(main);
     return el;
   }
 
@@ -6251,13 +6973,17 @@ export class App {
       showToast("That file isn't stored in the vault yet.", { kind: "error" });
       return;
     }
+    if (this.torrentsBusyBlob) return;
+    const blobId = f.blob_id;
+    this.beginTorrentsBusy(blobId, f.name, f.size);
     try {
-      const bytes = await resolveMessageFileBytes({ blobId: f.blob_id });
-      await openBytesInNewTab(f.name, bytes);
+      await openVaultBlob(f.name, blobId);
     } catch (e) {
       showToast(e instanceof Error ? e.message : "Could not open that file.", {
         kind: "error",
       });
+    } finally {
+      this.endTorrentsBusy();
     }
   }
 
@@ -6266,13 +6992,38 @@ export class App {
       showToast("That file isn't stored in the vault yet.", { kind: "error" });
       return;
     }
+    if (this.torrentsBusyBlob) return;
+    const blobId = f.blob_id;
+    this.beginTorrentsBusy(blobId, f.name, f.size);
     try {
-      const bytes = await resolveMessageFileBytes({ blobId: f.blob_id });
-      await saveBytesAsFile(f.name, bytes);
+      await saveVaultBlob(f.name, blobId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Could not save that file.";
       if (!msg.toLowerCase().includes("cancel")) showToast(msg, { kind: "error" });
+    } finally {
+      this.endTorrentsBusy();
     }
+  }
+
+  /**
+   * Decrypting happens on the daemon and is not observable from here, so mark
+   * the row busy and hold a toast open until the action settles. A large
+   * torrent takes a while, and silence reads as a broken click.
+   */
+  private beginTorrentsBusy(blobId: string, name: string, size: number): void {
+    this.torrentsBusyBlob = blobId;
+    this.torrentsBusyToast = showToast(
+      `Decrypting ${name} (${formatBytes(size)})…`,
+      { kind: "info", timeoutMs: 0 },
+    );
+    this.render();
+  }
+
+  private endTorrentsBusy(): void {
+    this.torrentsBusyBlob = null;
+    this.torrentsBusyToast?.();
+    this.torrentsBusyToast = null;
+    this.render();
   }
 
   private renderTorrentsDeleteModal(): HTMLElement {

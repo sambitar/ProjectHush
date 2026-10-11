@@ -1,0 +1,33 @@
+[package]
+name = "hush-wallet"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# The Ethereum + ERC-20 adapter pulls `alloy`, which is a large dependency
+# tree. Off by default so a Bitcoin-only build stays lean; the daemon enables
+# it explicitly when it wants the second chain.
+ethereum = ["dep:alloy", "dep:async-trait"]
+
+[dependencies]
+hush-core = { path = "../hush-core" }
+bdk_wallet = { version = "3", features = ["keys-bip39"] }
+bdk_electrum = "0.24"
+# Only for the `Merge` trait `WalletPersister` needs to fold a staged change set
+# into the one held in memory. Pinned to the minor that `bdk_wallet` 3.2 uses.
+bdk_chain = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+# Ethereum adapter (feature `ethereum`). Optional so the default build does not
+# compile the alloy tree.
+alloy = { version = "2", optional = true, features = ["signer-local", "provider-http", "rpc-types", "network"] }
+async-trait = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

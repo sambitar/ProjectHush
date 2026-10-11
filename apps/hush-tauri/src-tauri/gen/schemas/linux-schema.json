@@ -195,10 +195,16 @@
           "markdownDescription": "Proxy daemon API calls over the local Unix socket"
         },
         {
-          "description": "Save and open chat attachment bytes via native dialogs",
+          "description": "Open and save files through the OS: chat attachments and vault blobs",
           "type": "string",
           "const": "allow-hush-files",
-          "markdownDescription": "Save and open chat attachment bytes via native dialogs"
+          "markdownDescription": "Open and save files through the OS: chat attachments and vault blobs"
+        },
+        {
+          "description": "Open external http(s) links in the user's browser",
+          "type": "string",
+          "const": "allow-hush-url",
+          "markdownDescription": "Open external http(s) links in the user's browser"
         },
         {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",

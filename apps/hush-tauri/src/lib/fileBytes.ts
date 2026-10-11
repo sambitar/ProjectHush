@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { api } from "./api/daemon";
+import { api, getApiBase } from "./api/daemon";
 import { isTauriShell } from "./tauriEnv";
 
 /**
@@ -38,6 +38,52 @@ export async function downloadBase64File(
   const bin = atob(dataBase64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  await saveBytesAsFile(name, bytes);
+}
+
+/**
+ * Whether the desktop shell can ask the daemon to materialize a blob to a file
+ * (Unix-socket transport only). TCP/browser builds fall back to fetching the
+ * blob into the webview, which is fine for the 256 KiB-capped chat attachments
+ * but must never be used for the multi-GB torrent library.
+ */
+function canStreamBlobs(): boolean {
+  return isTauriShell() && getApiBase().startsWith("unix://");
+}
+
+/**
+ * Open a vault blob in the OS handler. In the desktop shell the daemon
+ * decrypts the file to a temp path and the shell opens that path, so the bytes
+ * never enter the webview — opening a multi-GB torrent no longer OOMs the UI.
+ */
+export async function openVaultBlob(name: string, blobId: string): Promise<void> {
+  if (canStreamBlobs()) {
+    await invoke("hush_open_blob", { id: blobId.toLowerCase(), name });
+    return;
+  }
+  const bytes = await resolveMessageFileBytes({ blobId });
+  await openBytesInNewTab(name, bytes);
+}
+
+/**
+ * Save a vault blob to a user-chosen path. Same streaming path as
+ * [`openVaultBlob`]; the shell copies the daemon's temp file to the chosen
+ * destination without the webview holding the bytes.
+ */
+export async function saveVaultBlob(
+  name: string,
+  blobId: string,
+  defaultName?: string,
+): Promise<void> {
+  if (canStreamBlobs()) {
+    await invoke("hush_save_blob", {
+      id: blobId.toLowerCase(),
+      name,
+      defaultName: defaultName ?? name,
+    });
+    return;
+  }
+  const bytes = await resolveMessageFileBytes({ blobId });
   await saveBytesAsFile(name, bytes);
 }
 
@@ -112,6 +158,7 @@ export function attachFileActions(
   container: HTMLElement,
   fileName: string,
   loadBytes: () => Promise<Uint8Array>,
+  blobId?: string | null,
 ): void {
   const row = document.createElement("div");
   row.style.display = "flex";
@@ -125,8 +172,12 @@ export function attachFileActions(
   openBtn.onclick = async () => {
     openBtn.disabled = true;
     try {
-      const bytes = await loadBytes();
-      await openBytesInNewTab(fileName, bytes);
+      if (blobId) {
+        await openVaultBlob(fileName, blobId);
+      } else {
+        const bytes = await loadBytes();
+        await openBytesInNewTab(fileName, bytes);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Could not open file";
       if (msg.toLowerCase().includes("cancel")) return;
@@ -143,8 +194,12 @@ export function attachFileActions(
   saveBtn.onclick = async () => {
     saveBtn.disabled = true;
     try {
-      const bytes = await loadBytes();
-      await saveBytesAsFile(fileName, bytes);
+      if (blobId) {
+        await saveVaultBlob(fileName, blobId);
+      } else {
+        const bytes = await loadBytes();
+        await saveBytesAsFile(fileName, bytes);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Could not save file";
       if (msg.toLowerCase().includes("cancel")) return;

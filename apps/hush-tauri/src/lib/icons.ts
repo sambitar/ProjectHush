@@ -68,6 +68,9 @@ import {
   ArrowUpDown,
   Eye,
   HardDrive,
+  Wallet,
+  Bitcoin,
+  Copy,
   type IconNode,
 } from "lucide";
 
@@ -143,6 +146,9 @@ const ICONS = {
   sort: ArrowUpDown,
   eye: Eye,
   drive: HardDrive,
+  wallet: Wallet,
+  bitcoin: Bitcoin,
+  copy: Copy,
 } satisfies Record<string, IconNode>;
 
 /**

@@ -236,10 +236,14 @@ export function torrentStatusLabel(item: TorrentItemDto): string {
       return "Queued";
     case "sending":
       return "Sending to TorBox";
-    case "caching":
+    case "caching": {
+      // TorBox's own state explains a stall ("queued" = waiting for a slot
+      // there), which otherwise looks identical to a hang.
+      const remote = item.remote_state ? ` — ${item.remote_state}` : "";
       return item.cached
         ? "Cached — preparing"
-        : `Caching on TorBox (${Math.round(item.progress * 100)}%)`;
+        : `Caching on TorBox${remote} (${Math.round(item.progress * 100)}%)`;
+    }
     case "ready":
       return "Ready — starting download";
     case "downloading": {

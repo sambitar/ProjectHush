@@ -23,7 +23,7 @@ vault-encrypted.
 | API key storage | Vault-encrypted sidecar `torrents-state.enc`, beside `reads-state.enc` / `drop-keys.enc`. Never logged, never returned to the UI, never in a URL shown to the user. |
 | Downloaded files | **Real vault entries** — chunked XChaCha20-Poly1305 blobs under `blobs/<hex>/chunk-N`. Visible to the rest of the vault. |
 | Folder organisation | The vault is a flat content-addressed blob store with no tree, so the tree lives in the sidecar: each torrent keeps its files' in-torrent `path` and the Library reconstructs folders from it. One folder per torrent. |
-| Large files | Streamed both ways in the ingest leg: HTTP Range into a temp file, then 8 MiB chunked AEAD into the vault. See the OPEN note about the open/save leg below. |
+| Large files | Streamed both ways. Ingest: HTTP Range into a temp file, then 8 MiB chunked AEAD into the vault. Egress: `POST /api/blob/{id}/materialize` decrypts chunk by chunk to a temp file the shell opens/saves, so the bytes never enter the webview. |
 | Resume | HTTP Range from the temp file's current length; a complete-but-unstored temp file is stored directly instead of re-fetched. |
 | Concurrency | Bounded per torrent (default 2, configurable 1–8 in Settings). |
 | Polling | Daemon ticks every 4 s while anything is active, 30 s when idle. The UI polls 3 s while active, 8 s when the pane is open and idle, and stops when the pane is closed and nothing is active. |
@@ -84,23 +84,36 @@ add ─▶ Queued ─▶ Sending ─▶ Caching ─▶ Ready ─▶ Downloading 
 | `POST /concurrency` | `{max}` | `PublicState` |
 | `DELETE /library/{id}` | — | `PublicState` (deletes the vault blobs too) |
 
+Opening a Library file is not under `/api/torrents`: `POST /api/blob/{id}/materialize`
+(`{name}` → `{path}`) decrypts the blob to a temp file the shell opens or saves, so the bytes
+never enter the webview. See the Open/Save note below.
+
 A locked vault answers **401** on every state route, matching the Reads contract.
 
 ---
 
 ## Known limitations (honest)
 
-1. **Open / Save as… on very large files buffers.** The ingest leg is streamed, but the
-   Library's Open and Save as… reuse the app's existing `/api/blob/{id}` route, which
-   base64-encodes the whole file in one JSON body. A multi-GB file materialises in the daemon
-   and the webview. Closing this needs a streaming blob route plus a Tauri command that writes
-   a temp file without the webview holding the bytes. Logged OPEN in `DEEPSEEKPROBLEMS.MD`.
-2. **Delete is per torrent, not per file.** The daemon's Library delete removes a whole entry
+1. **Open / Save as… streams, with a plaintext temp file.** Both legs are now memory-bounded:
+   `POST /api/blob/{id}/materialize` decrypts chunk by chunk (via `Vault::read_blob_stream`)
+   into a uniquely named file under the system temp dir (`/tmp/hush-open`; never the runtime
+   dir, which is RAM-backed), and `hush_open_blob` / `hush_save_blob` open or copy that path.
+   The webview never holds the bytes and the base64 `Array.from` path is gone for blobs. Two
+   costs remain: the file is plaintext on disk while it exists (0600, in the 0700 temp dir,
+   swept after an hour), and the daemon is a single-threaded actor, so a very large materialize
+   blocks other API calls for its duration — the same as the old read did.
+2. **Opening needs a handler that can read the temp dir.** The shell hands the materialized
+   path to the OS default handler. A sandboxed handler (Flatpak/Snap) with no filesystem access
+   cannot see `/tmp/hush-open` and opens nothing — this is what made every torrent file "show
+   fine but not open" when the video default was the Stremio Flatpak, whose permissions grant no
+   filesystem at all. Making this robust needs the XDG document portal; for now the handler must
+   be a native app (e.g. VLC).
+3. **Delete is per torrent, not per file.** The daemon's Library delete removes a whole entry
    and its blobs; there is no single-file delete.
-3. **"Reveal in vault" is represented by the Vault pane's Torrents tile**, because the vault
+4. **"Reveal in vault" is represented by the Vault pane's Torrents tile**, because the vault
    is a flat blob store with no per-file browser to reveal into. The Library itself is the
    vault view for torrent files.
-4. **Not verified against a live TorBox account.** Endpoint shapes follow the official docs
+5. **Not verified against a live TorBox account.** Endpoint shapes follow the official docs
    and SDKs; the client's decoding is unit-tested against documented payloads, but no real key
    was available.
 
@@ -119,3 +132,21 @@ A locked vault answers **401** on every state route, matching the Reads contract
 7. Kill the daemon mid-download and restart: the download resumes (Range) rather than
    restarting.
 8. Vault pane: the Torrents tile shows the count and total size and jumps to the pane.
+
+---
+
+## Next move (planned, not built)
+
+**Export files out of the app.** The Open path hands a decrypted temp file to the OS handler,
+which fails for any sandboxed handler (see limitation 2). An explicit **Export** is the durable
+answer for every handler that has ordinary filesystem access.
+
+- The primitive already exists: `Save as…` → `hush_save_blob` decrypts the blob and copies it to
+  a user-chosen path, so the file lands outside the vault and opens with anything.
+- To make it first-class: rename the action to **Export…**, default the dialog to `~/Downloads`
+  (`rfd::FileDialog::set_directory`), add **Export all files** for a whole torrent (preserving the
+  folder tree), and surface it on the files rail, chat, mail and conclave attachments too.
+- It does not rescue a handler with *zero* filesystem access (e.g. the Stremio Flatpak); only the
+  XDG document portal could. Export and a native handler are complementary.
+- Exported files are plaintext outside the vault — label the action so it is not mistaken for a
+  move.

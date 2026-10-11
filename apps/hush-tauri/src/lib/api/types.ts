@@ -355,6 +355,8 @@ export interface TorrentItemDto {
   seeds: number;
   size: number;
   cached: boolean;
+  /** TorBox's own `download_state` while caching ("queued", "downloading", …). */
+  remote_state: string | null;
   /** A human sentence when `status === "error"`. */
   message: string | null;
   files: TorrentFileDto[];
@@ -392,4 +394,48 @@ export interface TorboxUserDto {
   plan_label: string;
   email: string | null;
   expires: string | null;
+}
+
+// --- Wallet (self-custody Bitcoin) ---------------------------------------------
+
+/**
+ * How the wallet reaches its chain-data source. Tor is forced on while the
+ * relay is on Tor: the wallet must never be less private than the rest of Hush.
+ */
+export type WalletNetworkMode = "clearnet" | "tor";
+
+/** `GET /api/wallet` — everything the pane renders. Never carries the phrase. */
+export interface WalletStateDto {
+  exists: boolean;
+  /** `"mainnet"`, `"testnet"`, `"signet"`, or `"regtest"`. */
+  network: string;
+  /** The mode in effect: Tor whenever the relay is on Tor. */
+  mode: WalletNetworkMode;
+  /** True while the relay pins the wallet to Tor, so the toggle is locked on. */
+  mode_locked: boolean;
+  label: string | null;
+  /** The address to show for receiving; null before a wallet exists. */
+  address: string | null;
+  /** Satoshi. */
+  confirmed_sat: number;
+  pending_sat: number;
+  /** Unix seconds. */
+  created_at: number;
+}
+
+/** `POST /api/wallet/create` — the phrase is returned exactly once, here. */
+export interface WalletCreateDto {
+  state: WalletStateDto;
+  mnemonic: string;
+}
+
+export interface WalletAddressDto {
+  address: string;
+}
+
+/** `POST /api/wallet/send` — the broadcast txid and the fee actually paid. */
+export interface WalletSendDto {
+  txid: string;
+  /** Satoshi. */
+  fee_sat: number;
 }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use hush_core::{Account, ChatRecord, ConclaveRecord, InboxResult, PendingInvite};
@@ -21,6 +21,96 @@ fn blob_id_from_hex(s: &str) -> Option<hush_core::BlobId> {
     let bytes = hex::decode(s).ok()?;
     let arr: [u8; 32] = bytes.try_into().ok()?;
     Some(hush_core::BlobId(arr))
+}
+
+/// Where decrypted blobs are materialized for the UI to open or save.
+///
+/// The system temp dir (disk-backed, honoring `TMPDIR`), never the vault and
+/// never the runtime dir: on Linux `$XDG_RUNTIME_DIR` is a RAM-backed tmpfs
+/// sized to a fraction of RAM, so a multi-GB file there exhausts it (ENOSPC)
+/// and, worse, its pages count as memory. A plaintext copy must also not look
+/// like, or be counted as, vault content. The dir is 0700, files are 0600, and
+/// both are swept (see [`sweep_open_dir`]).
+fn open_tmp_dir() -> PathBuf {
+    std::env::temp_dir().join("hush-open")
+}
+
+/// A file name safe to join onto [`open_tmp_dir`]: base name only, no path
+/// separators, and a non-empty fallback. The extension is preserved because it
+/// drives the OS open handler (`.mkv` → the video player).
+fn sanitize_open_name(name: &str) -> String {
+    let base = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let safe: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() || safe == "." || safe == ".." {
+        "file".into()
+    } else {
+        safe
+    }
+}
+
+/// Materialize `id` into a uniquely named file and return its path.
+///
+/// This is the streaming egress: `write_blob_to_file` decrypts chunk by chunk,
+/// so peak memory is one chunk no matter how large the blob is. A failure
+/// mid-write removes the partial file, so a later open never sees a truncated
+/// blob.
+fn materialize_blob(a: &Account, id: &hush_core::BlobId, name: &str) -> Result<PathBuf, String> {
+    let dir = open_tmp_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create the open folder: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    sweep_open_dir(&dir);
+    // A random token keeps two files of the same name from colliding, so
+    // opening two `video.mkv` torrents cannot overwrite one with the other.
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let path = dir.join(format!("{token}-{}", sanitize_open_name(name)));
+    if let Err(e) = a.write_blob_to_file(id, &path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e.to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
+/// Best-effort cleanup of materialized files older than an hour. Opening hands
+/// the path to an external player, so the file must outlive this call; the
+/// runtime dir is wiped on logout regardless.
+fn sweep_open_dir(dir: &Path) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        if now
+            .duration_since(modified)
+            .map(|d| d > MAX_AGE)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 enum Work {
@@ -134,6 +224,15 @@ enum Work {
         bytes: Vec<u8>,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Wallet: load the sealed wallet sidecar (None when never saved).
+    WalletStateGet {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Wallet: replace the sealed wallet sidecar wholesale.
+    WalletStatePut {
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// Store a file from disk into the vault as a chunked blob (large-file
     /// path for torrent downloads).
     BlobStoreFile {
@@ -143,6 +242,14 @@ enum Work {
     /// Delete a stored blob (single or chunked).
     BlobDelete {
         id_hex: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Materialize a stored blob to a temp file so the UI can open or save it
+    /// without the bytes crossing the webview. Returns the file path.
+    BlobMaterialize {
+        id_hex: String,
+        /// The original file name; its extension drives the OS open handler.
+        name: String,
         reply: oneshot::Sender<WorkResult>,
     },
     DraftRecords {
@@ -331,6 +438,8 @@ pub enum WorkResult {
     DraftSaved(String),
     Blob(Vec<u8>),
     BlobId(String),
+    /// The path a stored blob was materialized to for open/save.
+    Path(String),
     /// Every conclave this vault holds, with its message log.
     Conclaves(Vec<ConclaveRecord>),
     /// The conclave that was just created.
@@ -744,6 +853,30 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::WalletStateGet { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a.read_vault_sidecar(crate::wallet::STATE_FILE) {
+                                        Ok(state) => WorkResult::ReadsState(state),
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::WalletStatePut { bytes, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .write_vault_sidecar(crate::wallet::STATE_FILE, &bytes)
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::BlobStoreFile { path, reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
@@ -763,6 +896,27 @@ impl AccountWorker {
                                         Ok(_) => WorkResult::Ok,
                                         Err(e) => WorkResult::Err(e.to_string()),
                                     },
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::BlobMaterialize { id_hex, name, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match blob_id_from_hex(&id_hex) {
+                                    None => WorkResult::Err("invalid blob id".into()),
+                                    Some(id) => {
+                                        if !a.has_blob(&id) {
+                                            WorkResult::Err("no such file in the vault".into())
+                                        } else {
+                                            match materialize_blob(a, &id, &name) {
+                                                Ok(path) => {
+                                                    WorkResult::Path(path.display().to_string())
+                                                }
+                                                Err(e) => WorkResult::Err(e),
+                                            }
+                                        }
+                                    }
                                 },
                             };
                             (reply, result)
@@ -1278,6 +1432,17 @@ impl AccountWorker {
             .await
     }
 
+    /// The Wallet's sealed sidecar state, raw bytes (None until first saved).
+    /// The schema lives in [`crate::wallet`]; the bytes are ciphertext to us.
+    pub async fn wallet_state_get(&self) -> WorkResult {
+        self.call(|reply| Work::WalletStateGet { reply }).await
+    }
+
+    /// Replace the Wallet's sealed sidecar state wholesale.
+    pub async fn wallet_state_put(&self, bytes: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::WalletStatePut { bytes, reply }).await
+    }
+
     /// Store a file from disk into the vault as a chunked blob; returns its
     /// hex id. See [`hush_core::Vault::put_blob_stream`].
     pub async fn blob_store_file(&self, path: &PathBuf) -> WorkResult {
@@ -1289,6 +1454,18 @@ impl AccountWorker {
     pub async fn blob_delete(&self, id_hex: &str) -> WorkResult {
         self.call(|reply| Work::BlobDelete {
             id_hex: id_hex.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Materialize a stored blob to a temp file so the UI can open or save it
+    /// without the bytes crossing the webview. Returns the file path. See
+    /// [`materialize_blob`].
+    pub async fn blob_materialize(&self, id_hex: &str, name: &str) -> WorkResult {
+        self.call(|reply| Work::BlobMaterialize {
+            id_hex: id_hex.to_string(),
+            name: name.to_string(),
             reply,
         })
         .await
@@ -1454,5 +1631,29 @@ impl AccountWorker {
     /// One drain pass over the drop slots. See [`Work::DrainDrops`].
     pub async fn drain_drops(&self) -> WorkResult {
         self.call(|reply| Work::DrainDrops { reply }).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_open_name_keeps_the_base_and_extension_only() {
+        // The extension must survive: it is what makes the OS pick the player.
+        assert_eq!(sanitize_open_name("Movie.mkv"), "Movie.mkv");
+        assert_eq!(sanitize_open_name("S01/E01.mkv"), "E01.mkv");
+        assert_eq!(sanitize_open_name("/abs/path/video.mp4"), "video.mp4");
+        // Path traversal and separators are stripped, not trusted. On Linux a
+        // backslash is not a separator, so it becomes an underscore instead of
+        // splitting the name — either way it cannot escape the open dir.
+        assert_eq!(sanitize_open_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_open_name("a\\b.mkv"), "a_b.mkv");
+        // Spaces and other unsafe characters become underscores.
+        assert_eq!(sanitize_open_name("my movie (2024).mkv"), "my_movie__2024_.mkv");
+        // Empty or dot-only names fall back to a usable default.
+        assert_eq!(sanitize_open_name(""), "file");
+        assert_eq!(sanitize_open_name(".."), "file");
+        assert_eq!(sanitize_open_name("."), "file");
     }
 }

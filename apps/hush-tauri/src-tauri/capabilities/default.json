@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "allow-hush-files",
+    "allow-hush-url",
     "allow-hush-api",
     "allow-drops",
     "allow-chat-sound"

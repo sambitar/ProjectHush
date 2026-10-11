@@ -2855,10 +2855,29 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: var(--space-3);
-  cursor: pointer;
   text-align: left;
   width: 100%;
   color: var(--text);
+}
+
+/* The name area. A button when the row opens something (folder, torrent), a
+   plain div when the row is only a container for explicit actions (files). */
+.library-item-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+button.library-item-main {
+  cursor: pointer;
 }
 
 .torrents-items.grid .library-item {
@@ -2867,7 +2886,13 @@
   min-height: 110px;
 }
 
-.library-item:hover {
+.torrents-items.grid .library-item-main {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+}
+
+.library-item.clickable:hover {
   background: var(--surface-2);
 }
 
@@ -2896,7 +2921,18 @@
 
 .library-item-actions {
   display: flex;
-  gap: var(--space-1);
+  gap: var(--space-2);
+  flex-shrink: 0;
+  /* Narrow grid tiles cannot fit both labels on one line. */
+  flex-wrap: wrap;
+}
+
+.library-item.clickable .library-item-actions {
+  /* A divider sets the actions apart from the row's own click-to-open, so the
+     two do not read as one control. */
+  padding-left: var(--space-2);
+  margin-left: var(--space-1);
+  border-left: 1px solid var(--border);
 }
 
 .library-item-action {
@@ -2909,7 +2945,12 @@
   display: inline-flex;
 }
 
-.library-item-action:hover {
+.library-item-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.library-item-action:hover:not(:disabled) {
   color: var(--text);
   background: var(--surface-2);
 }
@@ -2917,6 +2958,55 @@
 .library-item-action svg {
   width: 16px;
   height: 16px;
+}
+
+/* Library file actions: two named, visibly distinct controls. "Open inside
+   vault" is the safe default — the plaintext never leaves the vault — so it
+   carries the success colour and the shield. "Export" writes a copy out. */
+.btn-library-open,
+.btn-library-export {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.btn-library-open {
+  color: var(--success-text);
+  background: var(--success-soft);
+  border: 1px solid var(--success-text);
+}
+
+.btn-library-open:hover:not(:disabled) {
+  background: var(--success-text);
+  color: var(--surface);
+}
+
+.btn-library-export {
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.btn-library-export:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.btn-library-open:disabled,
+.btn-library-export:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn-library-open svg,
+.btn-library-export svg {
+  width: 15px;
+  height: 15px;
 }
 
 /* Settings → TorBox */
@@ -3015,4 +3105,223 @@
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* Wallet pane: one self-custody Bitcoin wallet per vault. */
+.wallet-pane {
+  padding: var(--space-5);
+  gap: var(--space-4);
+}
+
+.wallet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.wallet-head .btn-secondary {
+  width: auto;
+  white-space: nowrap;
+}
+
+.wallet-setup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 720px;
+}
+
+.wallet-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  box-shadow: var(--shadow-1);
+  max-width: 720px;
+}
+
+.wallet-card > h2 {
+  margin: 0;
+}
+
+.wallet-card > p {
+  margin: 0;
+}
+
+.wallet-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.wallet-card-actions .btn-primary,
+.wallet-card-actions .btn-secondary {
+  width: auto;
+}
+
+.wallet-card .btn-primary,
+.wallet-card .btn-secondary {
+  width: auto;
+  align-self: flex-start;
+}
+
+.wallet-error {
+  color: var(--danger);
+  margin: 0;
+}
+
+/* The one-time phrase. It is the wallet, so it gets the loudest treatment. */
+.wallet-phrase-card {
+  border-color: var(--warning-text);
+  background: var(--warning-soft);
+}
+
+.wallet-phrase-words {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: word;
+}
+
+.wallet-phrase-words li {
+  counter-increment: word;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.wallet-phrase-words li::before {
+  content: counter(word);
+  color: var(--text-faint);
+  font-size: 11px;
+  min-width: 1.5ch;
+}
+
+.wallet-phrase-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
+}
+
+.wallet-balance {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.wallet-address {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+}
+
+.wallet-address code {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.wallet-address .btn-icon-round {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  flex: none;
+}
+
+.wallet-qr {
+  /* Always light, whatever the theme: a scanner reads contrast, not taste. */
+  background: #ffffff;
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  align-self: flex-start;
+}
+
+.wallet-txid {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+/* The clearnet/Tor capsule: the segmented pill, sized to its two labels. */
+.wallet-mode {
+  margin-top: var(--space-2);
+  width: 100%;
+  max-width: 260px;
+}
+
+.wallet-mode button {
+  font-size: 13px;
+}
+
+.wallet-mode button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.wallet-danger {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: #ffffff;
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: var(--space-2) var(--space-5);
+  font-weight: 500;
+  width: auto;
+  align-self: flex-start;
+}
+
+.btn-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Empty state: the wallet needs the desktop app. */
+.wallet-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: var(--space-3);
+  color: var(--text-dim);
+  padding: var(--space-7) var(--space-5);
+}
+
+.wallet-empty-icon svg {
+  width: 48px;
+  height: 48px;
+  color: var(--accent);
+}
+
+.wallet-empty h2 {
+  color: var(--text);
 }

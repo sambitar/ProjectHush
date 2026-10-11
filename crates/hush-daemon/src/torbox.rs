@@ -143,6 +143,34 @@ fn classify(status: u16, env: Option<&Envelope>, retry_after: Option<u64>) -> To
     }
 }
 
+/// Deserialize a list that may arrive as an explicit `null`.
+///
+/// TorBox omits `files` until it has parsed a torrent, and some replies carry
+/// `"files": null` instead — a freshly created one among them. serde's
+/// `default` covers a *missing* field only, so an explicit null must be folded
+/// to an empty list here or the whole reply fails to decode.
+fn nullable_seq<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    let v: Option<Vec<T>> = serde::Deserialize::deserialize(de)?;
+    Ok(v.unwrap_or_default())
+}
+
+/// Deserialize a size that the API may report as negative.
+///
+/// TorBox uses `-1` for "no size known" (a torrent it has not parsed yet), which
+/// cannot land in a `u64` — serde rejects it and the whole reply fails. Fold any
+/// negative to 0, which the rest of the pipeline already treats as "unknown".
+fn lenient_u64<'de, D>(de: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: i64 = serde::Deserialize::deserialize(de)?;
+    Ok(v.max(0) as u64)
+}
+
 /// One file inside a torrent, as TorBox reports it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TorrentFile {
@@ -152,7 +180,7 @@ pub struct TorrentFile {
     pub name: String,
     #[serde(default)]
     pub short_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub size: u64,
     #[serde(default)]
     pub mimetype: Option<String>,
@@ -169,7 +197,7 @@ pub struct TorrentInfo {
     pub hash: String,
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub size: u64,
     #[serde(default)]
     pub active: bool,
@@ -191,7 +219,7 @@ pub struct TorrentInfo {
     pub download_speed: f64,
     #[serde(default)]
     pub eta: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_seq")]
     pub files: Vec<TorrentFile>,
 }
 
@@ -276,11 +304,11 @@ pub fn plan_label(plan: i64) -> &'static str {
 pub struct CachedInfo {
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub size: u64,
     #[serde(default)]
     pub hash: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_seq")]
     pub files: Vec<CachedFile>,
 }
 
@@ -290,12 +318,28 @@ pub struct CachedFile {
     pub id: i64,
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub size: u64,
     #[serde(default)]
     pub mimetype: Option<String>,
     #[serde(default)]
     pub short_name: Option<String>,
+}
+
+/// Decode a `checkcached` reply (`format=object`) into the cached map.
+///
+/// A hash TorBox cannot resolve maps to an explicit `null` in the object; only
+/// the real entries make it into the result, so an uncached hash is simply
+/// absent rather than failing the whole reply.
+fn decode_cached_map(
+    data: serde_json::Value,
+) -> Result<HashMap<String, CachedInfo>, TorboxError> {
+    let raw: HashMap<String, Option<CachedInfo>> =
+        serde_json::from_value(data).map_err(|e| TorboxError::Decode(e.to_string()))?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(hash, info)| info.map(|i| (hash, i)))
+        .collect())
 }
 
 /// A control operation TorBox accepts on a torrent.
@@ -489,7 +533,7 @@ impl TorboxClient {
             ("list_files", "true".to_string()),
         ]);
         let data = self.send(req).await?;
-        serde_json::from_value(data).map_err(|e| TorboxError::Decode(e.to_string()))
+        decode_cached_map(data)
     }
 
     /// `GET /torrents/requestdl` — a direct CDN URL for one file (or the zip).
@@ -735,6 +779,54 @@ mod tests {
         assert_eq!(t.seeds, 12);
         assert_eq!(t.files.len(), 1);
         assert_eq!(t.files[0].name, "a.mkv");
+    }
+
+    #[test]
+    fn torrent_info_tolerates_an_explicit_null_file_list() {
+        // Regression: a torrent TorBox has not parsed yet reports
+        // "files": null, and `default` only covers a *missing* field, so the
+        // whole mylist reply used to fail with
+        // "invalid type: null, expected a sequence".
+        let v: serde_json::Value =
+            serde_json::json!({ "id": 7, "name": "Example", "files": null });
+        let t: TorrentInfo = serde_json::from_value(v).unwrap();
+        assert!(t.files.is_empty());
+
+        let c: CachedInfo = serde_json::from_value(serde_json::json!({ "files": null })).unwrap();
+        assert!(c.files.is_empty());
+    }
+
+    #[test]
+    fn negative_sizes_mean_unknown_not_a_decode_error() {
+        // Regression: TorBox reports size -1 for a torrent it has not parsed
+        // yet; a u64 field rejects it and the whole reply failed with
+        // "invalid value: integer -1, expected u64".
+        let t: TorrentInfo = serde_json::from_value(
+            serde_json::json!({ "id": 7, "name": "Example", "size": -1,
+                               "files": [{ "id": 1, "name": "a.mkv", "size": -1 }] }),
+        )
+        .unwrap();
+        assert_eq!(t.size, 0);
+        assert_eq!(t.files[0].size, 0);
+
+        let c: CachedInfo =
+            serde_json::from_value(serde_json::json!({ "name": "C", "size": -1 })).unwrap();
+        assert_eq!(c.size, 0);
+        let cf: CachedFile = serde_json::from_value(serde_json::json!({ "id": 1, "size": -1 }))
+            .unwrap();
+        assert_eq!(cf.size, 0);
+    }
+
+    #[test]
+    fn cached_map_skips_hashes_that_map_to_null() {
+        let v: serde_json::Value = serde_json::json!({
+            "cached-hash": { "name": "Cached", "size": 10, "hash": "cached-hash", "files": null },
+            "uncached-hash": null
+        });
+        let map = decode_cached_map(v).unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("cached-hash"));
+        assert!(map["cached-hash"].files.is_empty());
     }
 
     #[test]

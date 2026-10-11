@@ -18,6 +18,11 @@ import type {
   ReadsStoryDto,
   TorboxUserDto,
   TorrentsStateDto,
+  WalletAddressDto,
+  WalletCreateDto,
+  WalletNetworkMode,
+  WalletSendDto,
+  WalletStateDto,
 } from "./types";
 
 type Transport =
@@ -427,4 +432,33 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ onion }),
     }),
+  // --- Wallet (self-custody Bitcoin). The phrase and the change set are sealed
+  // in the vault sidecar, and the daemon serves these routes only over the Unix
+  // socket, so a TCP-only daemon answers 404 here. ---
+  walletState: () => request<WalletStateDto>("/api/wallet"),
+  walletCreate: (network: string) =>
+    request<WalletCreateDto>("/api/wallet/create", {
+      method: "POST",
+      body: JSON.stringify({ network }),
+    }),
+  walletRestore: (mnemonic: string, network: string) =>
+    request<WalletStateDto>("/api/wallet/restore", {
+      method: "POST",
+      body: JSON.stringify({ mnemonic, network }),
+    }),
+  walletAddress: () =>
+    request<WalletAddressDto>("/api/wallet/address", { method: "POST" }),
+  walletSync: () =>
+    request<WalletStateDto>("/api/wallet/sync", { method: "POST" }),
+  walletSend: (to: string, amount: number, fee_rate: number | null) =>
+    request<WalletSendDto>("/api/wallet/send", {
+      method: "POST",
+      body: JSON.stringify({ to, amount, fee_rate }),
+    }),
+  walletSetMode: (mode: WalletNetworkMode) =>
+    request<WalletStateDto>("/api/wallet/mode", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    }),
+  walletWipe: () => request<null>("/api/wallet/wipe", { method: "POST" }),
 };

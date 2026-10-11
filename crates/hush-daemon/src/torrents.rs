@@ -636,6 +636,8 @@ impl TorrentsManager {
                     return;
                 };
                 let mut s = self.state.lock().await;
+                let state = info.download_state.to_ascii_lowercase();
+                let mut terminal = false;
                 if let Some(item) = s.item_mut(id) {
                     item.progress = info.progress_fraction();
                     item.speed = info.download_speed;
@@ -645,19 +647,43 @@ impl TorrentsManager {
                     if !info.name.is_empty() {
                         item.name = info.name.clone();
                     }
-                    if info.download_state.eq_ignore_ascii_case("paused") {
+                    if state == "paused" {
                         item.status = ItemStatus::Paused;
+                        item.message = None;
                     } else if info.is_ready() {
                         item.files = info.files.iter().map(item_file_from_torbox).collect();
                         item.progress = 1.0;
                         item.speed = 0.0;
                         item.refresh_download_totals(0);
                         item.status = ItemStatus::Ready;
+                        item.remote_state = None;
+                        item.message = None;
+                    } else if matches!(state.as_str(), "failed" | "not downloadable") {
+                        // TorBox gave up on this torrent; waiting longer cannot
+                        // help. Keep its own word so the reason is not lost.
+                        item.status = ItemStatus::Error;
+                        item.message = Some(format!(
+                            "TorBox gave up on this torrent ({}).",
+                            info.download_state
+                        ));
+                        terminal = true;
+                    } else {
+                        // Still caching. Record TorBox's own state so a stalled
+                        // item says why — a slot queue on their side looks like
+                        // a hang here.
+                        item.remote_state = if info.download_state.is_empty() {
+                            None
+                        } else {
+                            Some(info.download_state.clone())
+                        };
+                        item.message = None;
                     }
-                    item.message = None;
                 }
                 drop(s);
                 self.mark_dirty().await;
+                if terminal {
+                    let _ = self.persist().await;
+                }
             }
             Err(e) => {
                 let transient = e.is_transient();

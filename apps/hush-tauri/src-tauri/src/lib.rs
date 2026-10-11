@@ -58,6 +58,86 @@ fn hush_open_file(file_name: String, bytes: Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
+/// A decoded daemon `MaterializeResponse`.
+#[derive(serde::Deserialize)]
+struct MaterializeReply {
+    path: String,
+}
+
+/// Ask the daemon to decrypt a stored blob to a temp file and return its path.
+///
+/// This is the streaming egress: the daemon writes chunk by chunk, so a
+/// multi-GB file never materialises in the webview or crosses IPC as bytes.
+async fn materialize_blob(
+    state: &tauri::State<'_, ProxyState>,
+    id: &str,
+    name: &str,
+) -> Result<std::path::PathBuf, String> {
+    let client = state.client.as_ref().ok_or_else(|| {
+        "opening vault files needs the desktop Unix-socket transport".to_string()
+    })?;
+    let body = serde_json::json!({ "name": name }).to_string();
+    let reply = client
+        .request("POST", &format!("/api/blob/{id}/materialize"), Some(body))
+        .await?;
+    if !(200..300).contains(&reply.status) {
+        return Err(daemon_error(&reply));
+    }
+    let parsed: MaterializeReply =
+        serde_json::from_str(&reply.body).map_err(|e| format!("bad materialize reply: {e}"))?;
+    Ok(std::path::PathBuf::from(parsed.path))
+}
+
+/// The daemon's `{ "error": "..." }` body as a human string, or the raw body.
+fn daemon_error(reply: &ApiReply) -> String {
+    serde_json::from_str::<serde_json::Value>(&reply.body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("daemon returned HTTP {}", reply.status))
+}
+
+/// Open a vault blob in the user's OS handler without pulling the bytes into
+/// the webview. The daemon materializes the file; the shell opens the path.
+#[tauri::command]
+async fn hush_open_blob(
+    state: tauri::State<'_, ProxyState>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    let path = materialize_blob(&state, &id, &name).await?;
+    open::that(&path).map_err(|e| e.to_string())
+}
+
+/// Save a vault blob to a user-chosen path, again without the webview holding
+/// the bytes: the daemon materializes, the shell copies to the chosen path.
+#[tauri::command]
+async fn hush_save_blob(
+    state: tauri::State<'_, ProxyState>,
+    id: String,
+    name: String,
+    default_name: String,
+) -> Result<(), String> {
+    let path = materialize_blob(&state, &id, &name).await?;
+    let suggested = if default_name.trim().is_empty() {
+        sanitize_file_name(&name)
+    } else {
+        sanitize_file_name(&default_name)
+    };
+    let dest = rfd::FileDialog::new()
+        .set_file_name(&suggested)
+        .save_file()
+        .ok_or_else(|| "Save cancelled".to_string())?;
+    let copied = std::fs::copy(&path, &dest).map_err(|e| e.to_string());
+    // The materialized copy has served its purpose once it is on disk.
+    let _ = std::fs::remove_file(&path);
+    copied.map(|_| ())
+}
+
 /// Open one URL in the user's browser, after the UI's own confirm step.
 /// Only http(s) is passed through: the webview must never become a launcher
 /// for file:// or other schemes a hostile page might have snuck into a link.
@@ -110,6 +190,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             hush_save_file,
             hush_open_file,
+            hush_open_blob,
+            hush_save_blob,
             hush_open_url,
             hush_api,
             drops::drops_open,

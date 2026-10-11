@@ -8,6 +8,7 @@ mod torbox;
 mod torrents;
 mod torrents_store;
 mod ui_prefs;
+mod wallet;
 
 use std::path::PathBuf;
 use std::sync::{
@@ -59,6 +60,8 @@ struct App {
     reads: reads::ReadsClient,
     /// The Torrents pane's TorBox pipeline: add → cache → download into vault.
     torrents: Arc<torrents::TorrentsManager>,
+    /// The self-custody wallet: one per vault, sealed with the vault master key.
+    wallet: Arc<wallet::WalletManager>,
     unlocked: Mutex<bool>,
     unlocked_at: Mutex<Option<Instant>>,
     /// The SOCKS proxy the desktop shell reported its Tor to be listening on,
@@ -212,7 +215,11 @@ fn local_ui_cors() -> CorsLayer {
 /// The daemon's whole HTTP surface, extracted so tests can exercise the real
 /// routes against a worker without binding a socket.
 fn api_router(state: Arc<App>) -> Router {
-    Router::new()
+    // The wallet can move funds, so it is only reachable over the Unix socket
+    // (DR-02) — never over the optional TCP listener.
+    let wallet_routes = state.socket.is_some();
+
+    let mut router = Router::new()
         .route("/api/status", get(status))
         .route("/api/unlock", post(unlock))
         .route("/api/lock", post(lock))
@@ -281,6 +288,7 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/recv", post(recv))
         .route("/api/messages", get(messages))
         .route("/api/blob/{id}", get(blob))
+        .route("/api/blob/{id}/materialize", post(blob_materialize))
         .route("/api/backup/export", post(backup_export))
         .route("/api/backup/import", post(backup_import))
         .route("/api/recovery/pending", get(recovery_pending))
@@ -288,9 +296,21 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/relay", get(get_relay))
         .route("/api/relay/mode", post(put_relay_mode))
         .route("/api/relay/onion", post(put_relay_onion))
-        .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs))
-        .layer(local_ui_cors())
-        .with_state(state)
+        .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs));
+
+    if wallet_routes {
+        router = router
+            .route("/api/wallet", get(wallet_state))
+            .route("/api/wallet/create", post(wallet_create))
+            .route("/api/wallet/restore", post(wallet_restore))
+            .route("/api/wallet/address", post(wallet_address))
+            .route("/api/wallet/sync", post(wallet_sync))
+            .route("/api/wallet/send", post(wallet_send))
+            .route("/api/wallet/mode", post(wallet_mode))
+            .route("/api/wallet/wipe", post(wallet_wipe));
+    }
+
+    router.layer(local_ui_cors()).with_state(state)
 }
 
 async fn vault_mount_watch(state: Arc<App>) {
@@ -337,6 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker.clone(),
         &vault_dir,
     ));
+    let wallet = Arc::new(wallet::WalletManager::new(worker.clone(), &vault_dir));
     let app = App {
         dir: vault_dir,
         socket: if args.no_socket {
@@ -348,6 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker,
         reads: reads::ReadsClient::new(&reads_cache),
         torrents: torrents.clone(),
+        wallet: wallet.clone(),
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
         relay_socks: Mutex::new(None),
@@ -744,6 +766,22 @@ async fn unlock(
 /// the very first request. A failure to apply (no address on file for a
 /// switch that is on) is not an unlock failure; the relay endpoints surface
 /// the state and the fail-closed relay client holds the line.
+/// Keep the wallet's own routing in step with the relay switch.
+///
+/// The wallet reads the switch fresh on every request (`relay_is_tor`), but the
+/// BDK client's own mode is set only through `apply_relay`. A switch flipped on
+/// a path that forgot to tell the wallet would leave the wallet talking to its
+/// chain source in the clear while the UI said Tor — the one thing it must
+/// never do. Every path that can change the switch calls this.
+async fn sync_wallet_relay(state: &Arc<App>) {
+    let relay_tor = ui_prefs::load(&state.dir).relay_tor;
+    let socks = state.relay_socks.lock().await.clone();
+    state
+        .wallet
+        .apply_relay(relay_tor, if relay_tor { socks } else { None })
+        .await;
+}
+
 async fn apply_relay_prefs(state: &Arc<App>) {
     let prefs = ui_prefs::load(&state.dir);
     let socks = state.relay_socks.lock().await.clone();
@@ -755,6 +793,8 @@ async fn apply_relay_prefs(state: &Arc<App>) {
         .worker
         .relay_apply(prefs.relay_tor, onion, socks)
         .await;
+    // The wallet follows the same switch, and is locked on while it is.
+    sync_wallet_relay(state).await;
     // The path may have just changed; a reachability answer from the old path
     // would be a lie about the new one.
     *state.relay_health.lock().await = None;
@@ -1830,6 +1870,8 @@ async fn put_relay_mode(
     } else {
         *state.relay_socks.lock().await = None;
     }
+    // The wallet follows the relay's Tor choice, and is locked on while it is.
+    sync_wallet_relay(&state).await;
     // Apply the choice to the live vault, but do not fail the request when
     // that cannot happen yet (no onion address on file): the switch is a
     // preference, and whether it is in effect is what `applied` in
@@ -1927,12 +1969,19 @@ async fn put_ui_prefs(
             }),
         ));
     }
+    let relay_changed = ui_prefs::load(&state.dir).relay_tor != body.relay_tor;
     ui_prefs::save(&state.dir, &body).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError { error: e }),
         )
     })?;
+    // The pre-login screen flips the relay switch through this route, so the
+    // wallet has to hear about it here too. Only when it actually moved: a
+    // theme change must not rebuild the wallet.
+    if relay_changed {
+        sync_wallet_relay(&state).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1953,6 +2002,42 @@ async fn blob(
         WorkResult::Blob(data) => Ok(Json(BlobResponse {
             data_base64: STANDARD.encode(data),
         })),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct MaterializeRequest {
+    /// The original file name; its extension drives the OS open handler.
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Serialize)]
+struct MaterializeResponse {
+    path: String,
+}
+
+/// Decrypt a stored blob to a temp file and return its path, so the desktop
+/// shell can open or save it without the bytes ever entering the webview.
+///
+/// The write streams chunk by chunk (see `materialize_blob`), so peak memory is
+/// one chunk regardless of file size — unlike `GET /api/blob/{id}`, which
+/// base64-encodes the whole file into one JSON body.
+async fn blob_materialize(
+    State(state): State<Arc<App>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<MaterializeRequest>,
+) -> Result<Json<MaterializeResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.blob_materialize(&id, &body.name).await)?;
+    match result {
+        WorkResult::Path(path) => Ok(Json(MaterializeResponse { path })),
         _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
@@ -2326,6 +2411,127 @@ fn torrents_err(msg: String) -> (StatusCode, Json<ApiError>) {
     }
 }
 
+// --- Wallet -----------------------------------------------------------------
+
+fn wallet_err(msg: String) -> (StatusCode, Json<ApiError>) {
+    if msg == "locked" {
+        (StatusCode::UNAUTHORIZED, Json(ApiError { error: msg }))
+    } else {
+        (StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))
+    }
+}
+
+/// Whether the relay is switched to Tor. The wallet follows it, and is locked
+/// on while it is, so this is read fresh on every wallet request.
+fn relay_is_tor(state: &App) -> bool {
+    ui_prefs::load(&state.dir).relay_tor
+}
+
+async fn wallet_state(
+    State(state): State<Arc<App>>,
+) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let tor = relay_is_tor(&state);
+    state
+        .wallet
+        .public_state(tor)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+async fn wallet_create(
+    State(state): State<Arc<App>>,
+    Json(body): Json<wallet::CreateRequest>,
+) -> Result<Json<wallet::CreateResult>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let tor = relay_is_tor(&state);
+    state
+        .wallet
+        .create(&body.network, body.mode, tor)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+async fn wallet_restore(
+    State(state): State<Arc<App>>,
+    Json(body): Json<wallet::RestoreRequest>,
+) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let tor = relay_is_tor(&state);
+    state
+        .wallet
+        .restore(&body.mnemonic, &body.network, body.mode, tor)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+async fn wallet_address(
+    State(state): State<Arc<App>>,
+) -> Result<Json<wallet::AddressResult>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .wallet
+        .receive_address()
+        .await
+        .map(|address| Json(wallet::AddressResult { address }))
+        .map_err(wallet_err)
+}
+
+async fn wallet_sync(
+    State(state): State<Arc<App>>,
+) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let tor = relay_is_tor(&state);
+    state
+        .wallet
+        .sync(tor)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+async fn wallet_send(
+    State(state): State<Arc<App>>,
+    Json(body): Json<wallet::SendRequest>,
+) -> Result<Json<wallet::SendResult>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .wallet
+        .send(body.to, body.amount, body.fee_rate)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+async fn wallet_mode(
+    State(state): State<Arc<App>>,
+    Json(body): Json<wallet::ModeRequest>,
+) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let tor = relay_is_tor(&state);
+    state
+        .wallet
+        .set_mode(body.mode, tor)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+async fn wallet_wipe(
+    State(state): State<Arc<App>>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    state
+        .wallet
+        .wipe()
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(wallet_err)
+}
+
 #[derive(Deserialize)]
 struct TorrentsKeyRequest {
     key: String,
@@ -2540,13 +2746,15 @@ mod drops_api_tests {
     }
 
     fn test_app(dir: &std::path::Path) -> Arc<App> {
+        let worker = AccountWorker::spawn();
         Arc::new(App {
             dir: dir.to_path_buf(),
             socket: None,
             tcp_addr: None,
-            worker: AccountWorker::spawn(),
+            worker: worker.clone(),
             reads: reads::ReadsClient::new(&dir.join("reads-cache")),
-            torrents: Arc::new(torrents::TorrentsManager::new(AccountWorker::spawn(), dir)),
+            torrents: Arc::new(torrents::TorrentsManager::new(worker.clone(), dir)),
+            wallet: Arc::new(wallet::WalletManager::new(worker, dir)),
             unlocked: Mutex::new(false),
             unlocked_at: Mutex::new(None),
             relay_socks: Mutex::new(None),
@@ -2699,5 +2907,369 @@ mod drops_api_tests {
         // A second drain finds nothing.
         let (_, report) = post_json(&app, "/api/drops/drain", "{}").await;
         assert_eq!(report["hit_slots"].as_array().unwrap().len(), 0);
+    }
+
+    /// The blob egress used by the Library's Open / Save as…: the daemon
+    /// decrypts a stored blob to a temp file and returns the path, so the
+    /// bytes never enter the webview. Regression guard for the OOM that
+    /// killed the UI opening a 1.65 GiB torrent through the base64 route.
+    #[tokio::test]
+    async fn the_blob_route_materializes_a_file_for_open() {
+        let vault_dir = TempDir::new().unwrap();
+        {
+            hush_core::Account::create(vault_dir.path(), "member-pass", "http://127.0.0.1:9")
+                .await
+                .unwrap();
+        }
+
+        let state = test_app(vault_dir.path());
+        let worker = state.worker.clone();
+        assert!(matches!(
+            worker
+                .unlock(&vault_dir.path().to_path_buf(), "member-pass")
+                .await,
+            WorkResult::Ok
+        ));
+
+        // Store a file the way the torrents pipeline does. It spans more than
+        // one 8 MiB chunk so the streaming read loop is exercised, not just a
+        // single short read.
+        let src = TempDir::new().unwrap();
+        let src_path = src.path().join("payload.bin");
+        let data: Vec<u8> = (0..(8 * 1024 * 1024 + 12_345u32))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&src_path, &data).unwrap();
+        let blob_id = match worker.blob_store_file(&src_path).await {
+            WorkResult::BlobId(id) => id,
+            _ => panic!("storing the blob failed"),
+        };
+
+        let app = api_router(state);
+        let (status, json) = post_json(
+            &app,
+            &format!("/api/blob/{blob_id}/materialize"),
+            r#"{"name":"Folder/Movie.mkv"}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let path = std::path::PathBuf::from(json["path"].as_str().unwrap());
+        // The base name survives (extension drives the OS handler); the
+        // directory part of the torrent path is dropped, not trusted.
+        assert_eq!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .split_once('-')
+                .unwrap()
+                .1,
+            "Movie.mkv"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            data,
+            "materialized bytes match the stored blob"
+        );
+
+        // The same blob materializes to a distinct path each time, so two
+        // torrents with the same file name never overwrite each other.
+        let (_, json2) = post_json(
+            &app,
+            &format!("/api/blob/{blob_id}/materialize"),
+            r#"{"name":"Movie.mkv"}"#,
+        )
+        .await;
+        assert_ne!(json["path"], json2["path"]);
+
+        // A hash with no blob is a clean error, not a panic or an empty file.
+        let missing = "0".repeat(64);
+        let (status, err) = post_json(
+            &app,
+            &format!("/api/blob/{missing}/materialize"),
+            r#"{"name":"x"}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("no such file"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(json2["path"].as_str().unwrap());
+    }
+}
+
+/// The wallet API: create, receive, and the relay lock. Runs against a real
+/// unlocked vault so the sealed sidecar round trip is exercised for real.
+#[cfg(test)]
+mod wallet_api_tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    fn wallet_app(
+        dir: &std::path::Path,
+        worker: AccountWorker,
+        socket: Option<PathBuf>,
+    ) -> Arc<App> {
+        Arc::new(App {
+            dir: dir.to_path_buf(),
+            socket,
+            tcp_addr: None,
+            worker: worker.clone(),
+            reads: reads::ReadsClient::new(&dir.join("reads-cache")),
+            torrents: Arc::new(torrents::TorrentsManager::new(worker.clone(), dir)),
+            wallet: Arc::new(wallet::WalletManager::new(worker, dir)),
+            unlocked: Mutex::new(true),
+            unlocked_at: Mutex::new(None),
+            relay_socks: Mutex::new(None),
+            relay_health: Mutex::new(None),
+            relay_probe_inflight: AtomicBool::new(false),
+        })
+    }
+
+    async fn request(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(b) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, json)
+    }
+
+    /// A created, unlocked vault plus the worker that holds it.
+    async fn unlocked(dir: &std::path::Path) -> AccountWorker {
+        hush_core::Account::create(dir, "pw", "http://127.0.0.1:9")
+            .await
+            .unwrap();
+        let worker = AccountWorker::spawn();
+        assert!(matches!(
+            worker.unlock(&dir.to_path_buf(), "pw").await,
+            WorkResult::Ok
+        ));
+        worker
+    }
+
+    #[tokio::test]
+    async fn wallet_routes_are_not_mounted_without_a_unix_socket() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        // A TCP-only daemon must not expose endpoints that can move funds.
+        let app = wallet_app(dir.path(), worker, None);
+        let router = api_router(app);
+        let (status, _) = request(&router, "GET", "/api/wallet", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_then_state_then_a_fresh_address() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        let socket = Some(dir.path().join("daemon.sock"));
+        let router = api_router(wallet_app(dir.path(), worker, socket));
+
+        // Before creation: no wallet, no address.
+        let (status, json) = request(&router, "GET", "/api/wallet", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["exists"], false);
+        assert!(json["address"].is_null());
+
+        // Create returns the phrase exactly once.
+        let (status, json) = request(
+            &router,
+            "POST",
+            "/api/wallet/create",
+            Some(r#"{"network":"mainnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["mnemonic"].as_str().unwrap().split_whitespace().count(),
+            12
+        );
+        assert_eq!(json["state"]["exists"], true);
+        // Creation reveals one receive address for the UI to show. The phrase
+        // is freshly generated, so only the shape is checkable here; the fixed
+        // vector is asserted on the restore path below.
+        let first = json["state"]["address"].as_str().unwrap().to_string();
+        assert!(
+            first.starts_with("bc1q") && first.len() == 42,
+            "expected a mainnet P2WPKH address, got {first}"
+        );
+
+        // A second create is refused rather than overwriting the phrase.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/wallet/create",
+            Some(r#"{"network":"mainnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A new receive address is fresh, not a repeat, and becomes the one
+        // the state route hands out.
+        let (status, json) = request(&router, "POST", "/api/wallet/address", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let second = json["address"].as_str().unwrap().to_string();
+        assert_ne!(second, first);
+
+        let (_, json) = request(&router, "GET", "/api/wallet", None).await;
+        assert_eq!(json["address"].as_str().unwrap(), second);
+
+        // The phrase is never handed out again by the state route.
+        let (_, json) = request(&router, "GET", "/api/wallet", None).await;
+        assert!(json.get("mnemonic").is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_bad_phrase_and_the_relay_locks_tor_on() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        let socket = Some(dir.path().join("daemon.sock"));
+        let app = wallet_app(dir.path(), worker, socket);
+        let router = api_router(app.clone());
+
+        // A bad phrase is refused with a 400, and leaves no wallet behind.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/wallet/restore",
+            Some(r#"{"mnemonic":"not a real phrase at all","network":"mainnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Restore the canonical vector.
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let (status, json) = request(
+            &router,
+            "POST",
+            "/api/wallet/restore",
+            Some(&format!(r#"{{"mnemonic":"{phrase}","network":"mainnet"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        // The first BIP84 mainnet address is a fixed value.
+        assert_eq!(
+            json["address"].as_str().unwrap(),
+            "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+        );
+
+        // Turn the relay onto Tor; the wallet is locked on and clearnet is
+        // refused.
+        let prefs = ui_prefs::UiPrefs {
+            relay_tor: true,
+            ..Default::default()
+        };
+        ui_prefs::save(dir.path(), &prefs).unwrap();
+
+        let (status, json) = request(&router, "GET", "/api/wallet", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["mode"], "tor");
+        assert_eq!(json["mode_locked"], true);
+
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/wallet/mode",
+            Some(r#"{"mode":"clearnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("Tor"));
+
+        // Turning the relay off lets the user choose clearnet again.
+        let prefs = ui_prefs::UiPrefs {
+            relay_tor: false,
+            ..Default::default()
+        };
+        ui_prefs::save(dir.path(), &prefs).unwrap();
+        let (status, json) = request(
+            &router,
+            "POST",
+            "/api/wallet/mode",
+            Some(r#"{"mode":"clearnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["mode"], "clearnet");
+        assert_eq!(json["mode_locked"], false);
+    }
+
+    #[tokio::test]
+    async fn the_relay_switch_on_the_prefs_route_also_locks_the_wallet() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        let socket = Some(dir.path().join("daemon.sock"));
+        let router = api_router(wallet_app(dir.path(), worker, socket));
+
+        // A wallet the user put on clearnet.
+        let (status, json) = request(
+            &router,
+            "POST",
+            "/api/wallet/create",
+            Some(r#"{"network":"mainnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let (status, json) = request(
+            &router,
+            "POST",
+            "/api/wallet/mode",
+            Some(r#"{"mode":"clearnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["mode"], "clearnet");
+
+        // The pre-login screen flips the relay switch through the prefs route,
+        // not through /api/relay/mode. The wallet has to follow that path too,
+        // or it would keep talking in the clear while the UI said Tor.
+        let (status, _) = request(
+            &router,
+            "PUT",
+            "/api/ui-prefs",
+            Some(r#"{"relay_tor":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, json) = request(&router, "GET", "/api/wallet", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["mode"], "tor");
+        assert_eq!(json["mode_locked"], true);
+
+        // And back to clearnet is refused while the relay is on Tor.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/wallet/mode",
+            Some(r#"{"mode":"clearnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("Tor"));
     }
 }

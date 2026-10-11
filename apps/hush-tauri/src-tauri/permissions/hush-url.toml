@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-hush-url"
+description = "Open external http(s) links in the user's browser"
+commands.allow = ["hush_open_url"]

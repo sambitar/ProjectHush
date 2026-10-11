@@ -107,6 +107,11 @@ pub struct TorrentItem {
     pub size: u64,
     #[serde(default)]
     pub cached: bool,
+    /// TorBox's own `download_state` for this torrent, verbatim ("queued",
+    /// "downloading", …). Shown while Caching so a stalled item says why —
+    /// a slot queue on TorBox's side looks identical to a hang otherwise.
+    #[serde(default)]
+    pub remote_state: Option<String>,
     /// A human sentence when `status == Error`.
     #[serde(default)]
     pub message: Option<String>,
@@ -143,6 +148,7 @@ impl TorrentItem {
             seeds: 0,
             size: 0,
             cached: false,
+            remote_state: None,
             message: None,
             files: Vec::new(),
             dl_done: 0,
