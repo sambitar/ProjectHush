@@ -313,6 +313,56 @@ export interface ReadsFeedResponse {
   done: boolean;
 }
 
+// --- Notes (private sticky-paper board) ----------------------------------------
+
+/** One tickable line on a note. */
+export interface NoteChecklistItemDto {
+  id: string;
+  text: string;
+  done: boolean;
+}
+
+/** One sticky note. `x`/`y`/`z` are unused until the canvas step lands. */
+export interface NoteDto {
+  id: string;
+  board_id: string;
+  title: string;
+  body: string;
+  color: string;
+  x: number;
+  y: number;
+  z: number;
+  created_at: number;
+  updated_at: number;
+  checklist: NoteChecklistItemDto[];
+}
+
+/** A labelled rectangle that gathers notes by position (canvas step). */
+export interface NoteRegionDto {
+  id: string;
+  board_id: string;
+  label: string;
+  color: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  collapsed: boolean;
+}
+
+/** `GET /api/notes/state` — the whole board. */
+export interface NotesStateDto {
+  board_id: string;
+  notes: NoteDto[];
+  regions: NoteRegionDto[];
+}
+
+/** `POST /api/notes/note` — the new state plus the note that changed. */
+export interface NotesNoteResponse {
+  state: NotesStateDto;
+  id: string;
+}
+
 // --- Torrents (TorBox-powered client) ------------------------------------------
 
 /** Where a queued item's data came from. */

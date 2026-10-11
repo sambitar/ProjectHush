@@ -13,6 +13,58 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — Notes dashboard 16.1 (store, routes, Vault tile)
+
+Slice goal: land step 16.1 of the Notes task — the encrypted sidecar store, the `/api/notes/*`
+routes, and the Vault tile that opens a full-screen list/editor with a Back button.
+
+### [FIXED] First `notes_store.rs` draft emitted dead-code warnings for parts 16.1 does not use
+
+- **Attempted:** wrote the store with the whole documented schema plus `REGIONS_CAP`,
+  `CHECKLIST_CAP`, a `note()` accessor and a `newest_first()` helper, on the "schema-ready"
+  decision that later steps (regions, checklists, canvas) would need them.
+- **Symptom:** `cargo check -p hush-daemon` reported `constant REGIONS_CAP is never used`,
+  `constant CHECKLIST_CAP is never used`, `methods note and newest_first are never used`. The
+  serde fields themselves were fine (the derives read them); the constants and helpers were not.
+- **Fix:** kept the struct fields so no migration is needed later, and removed the unused
+  constants and helpers; the tests now use a local `find` helper. `cargo check` is clean of
+  notes_store warnings.
+- **Lesson:** "schema-ready" justifies keeping serialized fields, not dead code around them.
+  Fields are consumed by the serde derives; free-standing constants and accessors are not.
+
+### [FIXED] The Notes API test module was not `#[cfg(test)]`, so the release build failed after `cargo test` passed
+
+- **Attempted:** added `mod notes_api_tests` (with `use http_body_util`, `tempfile`, `tower`) and
+  verified with `cargo test -p hush-daemon` — 72/72 green.
+- **Symptom:** the preview script's `cargo build --release -p hush-daemon` failed with
+  `error[E0432]: unresolved import http_body_util` / `tempfile` / `tower`. Those are
+  dev-dependencies, linked for `cargo test` but not for a normal build, and the module had no
+  `#[cfg(test)]` (its siblings `drops_api_tests` / `wallet_api_tests` do).
+- **Fix:** added `#[cfg(test)]` above the module; `cargo check -p hush-daemon` (non-test) and
+  `cargo test -p hush-daemon notes` both pass.
+- **Lesson:** `cargo test` does not build the plain binary, so it cannot catch a test module that
+  leaked into it. After adding a module meant to be test-only, run a non-test `cargo check` or a
+  build as well — the preview script's release build is what caught this one.
+
+### [FIXED] The Notes UI was not exercised in a running app this session
+
+- **Attempted:** verify the Vault tile, the list and the editor end to end.
+- **Symptom:** the daemon the app was running was the stale `target/release/hush-daemon`
+  (started 16:25), which predates `/api/notes`; opening Notes against it would 404, and its vault
+  (`instances/peer-a`) cannot be opened a second time.
+- **Resolution:** rebuilt the daemon and ran the two-peer dev stack
+  (`./scripts/run-two-ui.sh --dev`), then exercised it live. Over TCP the routes returned 401
+  while locked, 204 on unlock, an empty board, `{state, id}` on create, the note on re-read
+  (decoded from the encrypted sidecar), 200 on delete, and 401 after re-lock. In the browser
+  (Alice, `?api=http://127.0.0.1:9876`) the Vault tile opened the board; a note was created,
+  saved, listed with its preview and "Just now" time, reopened, and deleted through the confirm
+  row back to the empty state.
+- **Lesson:** the stale-daemon trap is real — the UI is compiled against an API the running
+  daemon may not serve. Restart the daemon with the current build before claiming a UI feature
+  works.
+
+---
+
 ## 2026-10-11 — Auto-update close-out (icons, verification, commit)
 
 Slice goal: close the auto-update work out — generate the missing macOS/Windows icons, verify

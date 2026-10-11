@@ -410,10 +410,11 @@ first real tagged release (the workflow has never run on a runner — see `RELEA
 
 ---
 
-### Task 16: Notes dashboard (sticky papers — planning only)
+### Task 16: Notes dashboard (sticky papers — 16.1 landed)
 
-**Status:** **Spec resolved 2026-10-11** (all decisions settled — see the task doc); **not
-implemented**. **Phase F** (before **11** Articles).
+**Status:** **Spec resolved 2026-10-11**; **16.1 implemented** 2026-10-11 (encrypted sidecar
+store, `/api/notes/*`, and the Vault tile opening a full-screen list/editor). **16.2–16.5
+(canvas, regions, checklists, search) remain.** **Phase F** (before **11** Articles).
 
 **Goal:** Private **sticky-note** board in the capsule: papers on a bounded canvas or gathered into
 **regions**, **drag-and-drop** layout, **checklists** with check-off — encrypted local store, backup

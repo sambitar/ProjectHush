@@ -12,6 +12,7 @@ import type {
   TorrentItemDto,
   TorrentLibraryEntryDto,
   TorrentsStateDto,
+  NotesStateDto,
   WalletChain,
   WalletChainDto,
   WalletNetworkMode,
@@ -33,6 +34,15 @@ import {
   toggleHidden as toggleReadsHidden,
   toggleSaved as toggleReadsSaved,
 } from "./lib/readsStore";
+import {
+  clearNotesStore,
+  deleteNote as deleteNoteRecord,
+  getNotesState,
+  newestFirst as notesNewestFirst,
+  notePreview,
+  peekNotesState,
+  saveNote,
+} from "./lib/notesStore";
 import {
   addTorrent,
   addTorrentFile,
@@ -449,6 +459,22 @@ export class App {
   private readsCollapsed = new Set<string>();
   /** Set while the open-original confirm modal is up. */
   private readsConfirmUrl: string | null = null;
+  // --- Notes (private sticky-paper board, reached from the Vault pane) ---
+  /** True while the Vault pane is showing the board instead of the bento. */
+  private notesOpen = false;
+  private notesState: NotesStateDto | null = null;
+  private notesLoading = false;
+  private notesError: string | null = null;
+  /** The note open in the editor, or null for the list. */
+  private notesEditingId: string | null = null;
+  /** True while the board is showing the note editor rather than the list. */
+  private notesEditorOpen = false;
+  /** Draft fields for the open editor, kept in state so re-renders keep typing. */
+  private notesDraftTitle = "";
+  private notesDraftBody = "";
+  private notesSaving = false;
+  /** The note awaiting delete confirmation. */
+  private notesDeleteId: string | null = null;
   // --- Torrents (TorBox client pane) ---
   /** Which tab the Torrents pane shows. */
   private torrentsView: "active" | "library" = "active";
@@ -1160,6 +1186,7 @@ export class App {
     clearMailStore();
     clearConclaveStore();
     clearReadsStore();
+    clearNotesStore();
     clearTorrentsStore();
     clearWalletStore();
     this.walletPhrase = null;
@@ -1178,6 +1205,15 @@ export class App {
     this.readsDetail = null;
     this.readsReaderHtml = null;
     this.readsConfirmUrl = null;
+    this.notesOpen = false;
+    this.notesEditorOpen = false;
+    this.notesEditingId = null;
+    this.notesState = null;
+    this.notesLoading = false;
+    this.notesError = null;
+    this.notesDraftTitle = "";
+    this.notesDraftBody = "";
+    this.notesDeleteId = null;
     this.selectedNick = null;
     this.filesContactNick = null;
     this.mailThreadId = null;
@@ -1264,7 +1300,7 @@ export class App {
     } else if (this.rail === "files") {
       shell.appendChild(this.renderFiles());
     } else if (this.rail === "vault") {
-      shell.appendChild(this.renderVault());
+      shell.appendChild(this.notesOpen ? this.renderNotes() : this.renderVault());
     } else {
       shell.appendChild(this.renderSettings());
     }
@@ -1510,6 +1546,10 @@ export class App {
         void refreshTorrents().then(() => {
           if (this.rail === "torrents") this.render();
         });
+      }
+      if (id === "vault") {
+        // Keep the Notes tile's count fresh without a request per render.
+        void this.notesEnsureLoaded();
       }
       if (id === "drops") {
         // Tor state lives in the shell, so poll it while the rail is up.
@@ -8103,9 +8143,311 @@ export class App {
       this.rail = "torrents";
       this.render();
     });
-    grid.append(storage, lock, backup, filesTile, torrentsTile);
+    const notesCount = peekNotesState().notes.length;
+    const notesTile = document.createElement("div");
+    notesTile.className = "tile";
+    const notesHint =
+      notesCount === 0
+        ? "Private sticky notes, encrypted in your vault"
+        : `${notesCount} note${notesCount === 1 ? "" : "s"} on your private board`;
+    notesTile.innerHTML = `<div class="text-15">Notes</div><div class="muted text-13">${notesHint}</div><button type="button" class="btn-secondary pressable notes-tile-btn" style="margin-top:12px">Open Notes</button>`;
+    notesTile.querySelector(".notes-tile-btn")!.addEventListener("click", () => {
+      this.notesOpenNotes();
+    });
+    grid.append(storage, lock, backup, filesTile, torrentsTile, notesTile);
     pane.append(h, grid);
     return pane;
+  }
+
+  // --- Notes (private sticky-paper board) ---------------------------------
+  //
+  // Reached from the Vault bento tile. The board renders in the Vault pane
+  // (full-bleed, with a Back button) rather than a rail of its own; the list
+  // and a plain editor are all 16.1 ships. Canvas, regions and checklists
+  // come later.
+
+  /** Load the board once, then repaint if the vault pane is still up. */
+  private notesEnsureLoaded(): void {
+    if (this.notesState || this.notesLoading) return;
+    this.notesLoad();
+  }
+
+  private notesLoad(): void {
+    this.notesLoading = true;
+    this.notesError = null;
+    void getNotesState()
+      .then((state) => {
+        this.notesState = state;
+      })
+      .catch((e) => {
+        this.notesError = e instanceof Error ? e.message : String(e);
+      })
+      .finally(() => {
+        this.notesLoading = false;
+        if (this.rail === "vault") this.render();
+      });
+  }
+
+  /** Open the board from the Vault tile: full-bleed, list first. */
+  private notesOpenNotes(): void {
+    this.notesOpen = true;
+    this.notesEditorOpen = false;
+    this.notesEditingId = null;
+    this.notesError = null;
+    this.render();
+    this.notesEnsureLoaded();
+  }
+
+  private notesBackToVault(): void {
+    this.notesOpen = false;
+    this.notesEditorOpen = false;
+    this.notesEditingId = null;
+    this.notesDeleteId = null;
+    this.render();
+  }
+
+  private notesBackToList(): void {
+    this.notesEditorOpen = false;
+    this.notesEditingId = null;
+    this.notesDraftTitle = "";
+    this.notesDraftBody = "";
+    this.notesDeleteId = null;
+    this.render();
+  }
+
+  /** Open a blank editor; the note is created on first save, not here. */
+  private notesNewNote(): void {
+    this.notesEditorOpen = true;
+    this.notesEditingId = null;
+    this.notesDraftTitle = "";
+    this.notesDraftBody = "";
+    this.notesDeleteId = null;
+    this.render();
+  }
+
+  private notesOpenNote(id: string): void {
+    const note = (this.notesState?.notes ?? []).find((n) => n.id === id);
+    if (!note) return;
+    this.notesEditorOpen = true;
+    this.notesEditingId = id;
+    this.notesDraftTitle = note.title;
+    this.notesDraftBody = note.body;
+    this.notesDeleteId = null;
+    this.render();
+  }
+
+  private notesSaveDraft(): void {
+    if (this.notesSaving) return;
+    this.notesSaving = true;
+    this.notesError = null;
+    this.render();
+    void saveNote({
+      id: this.notesEditingId ?? undefined,
+      title: this.notesDraftTitle,
+      body: this.notesDraftBody,
+    })
+      .then(({ state }) => {
+        this.notesState = state;
+        this.notesSaving = false;
+        this.notesEditorOpen = false;
+        this.notesEditingId = null;
+        this.notesDraftTitle = "";
+        this.notesDraftBody = "";
+        this.render();
+        showToast("Note saved", { kind: "success" });
+      })
+      .catch((e) => {
+        this.notesSaving = false;
+        this.notesError = e instanceof Error ? e.message : String(e);
+        this.render();
+      });
+  }
+
+  private notesRequestDelete(id: string): void {
+    this.notesDeleteId = id;
+    this.render();
+  }
+
+  private notesCancelDelete(): void {
+    this.notesDeleteId = null;
+    this.render();
+  }
+
+  private notesConfirmDelete(): void {
+    const id = this.notesDeleteId;
+    if (!id) return;
+    this.notesDeleteId = null;
+    void deleteNoteRecord(id)
+      .then((state) => {
+        this.notesState = state;
+        if (this.notesEditingId === id) {
+          this.notesBackToList();
+        } else {
+          this.render();
+        }
+        showToast("Note deleted");
+      })
+      .catch((e) => {
+        this.notesError = e instanceof Error ? e.message : String(e);
+        this.render();
+      });
+  }
+
+  private renderNotes(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane notes-pane";
+
+    const header = document.createElement("div");
+    header.className = "notes-header";
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-secondary pressable notes-back";
+    back.textContent = "← Vault";
+    back.addEventListener("click", () => this.notesBackToVault());
+    const title = document.createElement("h1");
+    title.className = "text-22";
+    title.textContent = "Notes";
+    header.append(back, title);
+    if (!this.notesEditorOpen) {
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "btn-primary pressable notes-new";
+      add.textContent = "New note";
+      add.addEventListener("click", () => this.notesNewNote());
+      header.appendChild(add);
+    }
+    pane.appendChild(header);
+
+    if (this.notesError) {
+      const err = document.createElement("div");
+      err.className = "notes-error text-13";
+      err.textContent = this.notesError;
+      pane.appendChild(err);
+    }
+
+    if (this.notesLoading && !this.notesState) {
+      const loading = document.createElement("div");
+      loading.className = "muted text-13 notes-loading";
+      loading.textContent = "Loading notes…";
+      pane.appendChild(loading);
+      return pane;
+    }
+
+    pane.appendChild(this.notesEditorOpen ? this.notesEditor() : this.notesList());
+    return pane;
+  }
+
+  private notesList(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "notes-list";
+    const notes = notesNewestFirst(this.notesState ?? peekNotesState());
+    if (!notes.length) {
+      const empty = document.createElement("div");
+      empty.className = "notes-empty";
+      const msg = document.createElement("div");
+      msg.className = "muted text-15";
+      msg.textContent = "No notes yet.";
+      const cta = document.createElement("button");
+      cta.type = "button";
+      cta.className = "btn-primary pressable";
+      cta.textContent = "New note";
+      cta.addEventListener("click", () => this.notesNewNote());
+      empty.append(msg, cta);
+      wrap.appendChild(empty);
+      return wrap;
+    }
+    for (const note of notes) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `note-row pressable paper-${note.color}`;
+      const t = document.createElement("div");
+      t.className = "note-row-title text-15";
+      t.textContent = note.title.trim() || "Untitled";
+      const p = document.createElement("div");
+      p.className = "note-row-preview muted text-13";
+      p.textContent = notePreview(note) || "Empty note";
+      const meta = document.createElement("div");
+      meta.className = "note-row-meta muted text-12";
+      meta.textContent = formatRelative(note.updated_at * 1000);
+      row.append(t, p, meta);
+      row.addEventListener("click", () => this.notesOpenNote(note.id));
+      wrap.appendChild(row);
+    }
+    return wrap;
+  }
+
+  private notesEditor(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "notes-editor";
+
+    const titleInput = document.createElement("input");
+    titleInput.type = "text";
+    titleInput.className = "notes-title-input";
+    titleInput.placeholder = "Title";
+    titleInput.value = this.notesDraftTitle;
+    titleInput.addEventListener("input", () => {
+      this.notesDraftTitle = titleInput.value;
+    });
+
+    const bodyInput = document.createElement("textarea");
+    bodyInput.className = "notes-body-input";
+    bodyInput.placeholder = "Write a note…";
+    bodyInput.value = this.notesDraftBody;
+    bodyInput.addEventListener("input", () => {
+      this.notesDraftBody = bodyInput.value;
+    });
+
+    const actions = document.createElement("div");
+    actions.className = "notes-editor-actions";
+
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-secondary pressable";
+    back.textContent = "Back to list";
+    back.addEventListener("click", () => this.notesBackToList());
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn-primary pressable";
+    save.textContent = this.notesSaving ? "Saving…" : "Save";
+    save.disabled = this.notesSaving;
+    save.addEventListener("click", () => this.notesSaveDraft());
+
+    actions.append(back, save);
+
+    if (this.notesEditingId) {
+      if (this.notesDeleteId === this.notesEditingId) {
+        const confirm = document.createElement("div");
+        confirm.className = "notes-confirm";
+        const q = document.createElement("span");
+        q.className = "text-13";
+        q.textContent = "Delete this note?";
+        const yes = document.createElement("button");
+        yes.type = "button";
+        yes.className = "btn-danger pressable";
+        yes.textContent = "Delete";
+        yes.addEventListener("click", () => this.notesConfirmDelete());
+        const no = document.createElement("button");
+        no.type = "button";
+        no.className = "btn-secondary pressable";
+        no.textContent = "Cancel";
+        no.addEventListener("click", () => this.notesCancelDelete());
+        confirm.append(q, yes, no);
+        actions.appendChild(confirm);
+      } else {
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "btn-secondary pressable notes-delete";
+        del.textContent = "Delete";
+        del.addEventListener("click", () => this.notesRequestDelete(this.notesEditingId!));
+        actions.appendChild(del);
+      }
+    }
+
+    wrap.append(titleInput, bodyInput, actions);
+    // On a fresh note, start typing in the title.
+    if (!this.notesEditingId) queueMicrotask(() => titleInput.focus());
+    return wrap;
   }
 
   /**

@@ -1,4 +1,5 @@
 mod account_worker;
+mod notes_store;
 mod paths;
 mod reads;
 mod reads_store;
@@ -252,6 +253,9 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/reads/saved", post(reads_save_toggle))
         .route("/api/reads/hidden", post(reads_hidden_toggle))
         .route("/api/reads/read", post(reads_mark_read))
+        .route("/api/notes/state", get(notes_state))
+        .route("/api/notes/note", post(notes_save_note))
+        .route("/api/notes/note/{id}", delete(notes_delete_note))
         .route("/api/torrents/state", get(torrents_state))
         .route("/api/torrents/key", post(torrents_set_key))
         .route("/api/torrents/test", post(torrents_test_key))
@@ -2527,6 +2531,96 @@ async fn reads_mark_read(
 }
 
 // ---------------------------------------------------------------------------
+// Notes — the private sticky-paper board behind `/api/notes/*`.
+//
+// Personal state only: every route round-trips through the account worker so
+// the encrypted sidecar is touched only by the holder of the master key. A
+// locked vault answers 401 on all of them, matching Reads. There is no network
+// path — notes never leave the device.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct NotesNoteResponse {
+    state: notes_store::NotesState,
+    /// The id of the note just created or updated, so the UI can open it
+    /// without guessing which one changed.
+    id: String,
+}
+
+/// Fetch the raw notes sidecar bytes through the worker.
+async fn notes_state_raw(state: &App) -> Result<Option<Vec<u8>>, (StatusCode, Json<ApiError>)> {
+    match state.worker.secret_read(notes_store::STATE_FILE).await {
+        WorkResult::Secret(raw) => Ok(raw),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Load and decode the notes state (an empty default until first saved).
+async fn notes_decode(
+    state: &App,
+) -> Result<notes_store::NotesState, (StatusCode, Json<ApiError>)> {
+    let raw = notes_state_raw(state).await?;
+    notes_store::decode(raw.as_deref()).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })
+}
+
+/// Persist a notes state wholesale, replacing the sidecar.
+async fn notes_persist(
+    state: &App,
+    parsed: &notes_store::NotesState,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let bytes = parsed.encode().map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    match state.worker.secret_write(notes_store::STATE_FILE, bytes).await {
+        WorkResult::Ok => Ok(()),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn notes_state(
+    State(state): State<Arc<App>>,
+) -> Result<Json<notes_store::NotesState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    Ok(Json(notes_decode(&state).await?))
+}
+
+/// Create (no `id`) or update (matching `id`) a note, returning the new state
+/// and the note's id so the UI can open the editor on it.
+async fn notes_save_note(
+    State(state): State<Arc<App>>,
+    Json(draft): Json<notes_store::NoteDraft>,
+) -> Result<Json<NotesNoteResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = notes_decode(&state).await?;
+    let id = parsed
+        .upsert_note(draft)
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    notes_persist(&state, &parsed).await?;
+    Ok(Json(NotesNoteResponse { state: parsed, id }))
+}
+
+async fn notes_delete_note(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<notes_store::NotesState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = notes_decode(&state).await?;
+    parsed.delete_note(&id);
+    notes_persist(&state, &parsed).await?;
+    Ok(Json(parsed))
+}
+
+// ---------------------------------------------------------------------------
 // Torrents — the TorBox-powered pipeline behind `/api/torrents/*`.
 //
 // Every call goes through [`torrents::TorrentsManager`]; the API key lives in
@@ -3718,5 +3812,134 @@ mod wallet_api_tests {
         // Nothing is persisted about a balance; a fresh wallet reads zero.
         assert_eq!(json["state"]["chains"][1]["confirmed"], "0");
         assert_eq!(json["state"]["tokens"].as_array().unwrap().len(), 0);
+    }
+}
+
+/// The Notes routes driven end to end over a real unlocked vault, through
+/// `api_router` so no socket is bound.
+#[cfg(test)]
+mod notes_api_tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    fn build_app(dir: &std::path::Path, worker: AccountWorker, unlocked: bool) -> Arc<App> {
+        Arc::new(App {
+            dir: dir.to_path_buf(),
+            socket: None,
+            tcp_addr: None,
+            worker: worker.clone(),
+            reads: reads::ReadsClient::new(&dir.join("reads-cache")),
+            torrents: Arc::new(torrents::TorrentsManager::new(worker.clone(), dir)),
+            wallet: Arc::new(wallet::WalletManager::new(worker, dir)),
+            unlocked: Mutex::new(unlocked),
+            unlocked_at: Mutex::new(None),
+            relay_socks: Mutex::new(None),
+            wallet_socks: Mutex::new(None),
+            relay_health: Mutex::new(None),
+            relay_probe_inflight: AtomicBool::new(false),
+        })
+    }
+
+    /// A created vault plus the worker that holds it, unlocked.
+    async fn unlocked_app(dir: &std::path::Path) -> Arc<App> {
+        hush_core::Account::create(dir, "pw", "http://127.0.0.1:9")
+            .await
+            .unwrap();
+        let worker = AccountWorker::spawn();
+        assert!(matches!(
+            worker.unlock(&dir.to_path_buf(), "pw").await,
+            WorkResult::Ok
+        ));
+        build_app(dir, worker, true)
+    }
+
+    async fn request(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(b) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+            })
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn notes_routes_round_trip_a_note() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        // The board starts empty.
+        let (status, state) = request(&router, "GET", "/api/notes/state", None).await;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert_eq!(state["board_id"], "default");
+        assert_eq!(state["notes"].as_array().unwrap().len(), 0);
+
+        // Create.
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/notes/note",
+            Some(r#"{"title":"Groceries","body":"milk"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["state"]["notes"].as_array().unwrap().len(), 1);
+
+        // Update in place: same id, one note, new body.
+        let update = format!(r#"{{"id":"{id}","title":"Groceries","body":"milk and eggs"}}"#);
+        let (status, updated) = request(&router, "POST", "/api/notes/note", Some(&update)).await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["id"], id);
+        assert_eq!(updated["state"]["notes"][0]["body"], "milk and eggs");
+
+        // Persisted: a fresh read re-decodes the sidecar.
+        let (status, state) = request(&router, "GET", "/api/notes/state", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state["notes"][0]["id"], id);
+        assert_eq!(state["notes"][0]["body"], "milk and eggs");
+
+        // Delete.
+        let (status, state) =
+            request(&router, "DELETE", &format!("/api/notes/note/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert_eq!(state["notes"].as_array().unwrap().len(), 0);
+
+        // Updating a deleted id is refused, not silently re-created.
+        let ghost = format!(r#"{{"id":"{id}","title":"x","body":""}}"#);
+        let (status, _) = request(&router, "POST", "/api/notes/note", Some(&ghost)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn notes_state_is_401_while_locked() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+        let (status, _) = request(&router, "GET", "/api/notes/state", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

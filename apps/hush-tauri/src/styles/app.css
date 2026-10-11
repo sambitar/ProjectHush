@@ -3435,3 +3435,145 @@ button.library-item-main {
 .wallet-empty h2 {
   color: var(--text);
 }
+
+/* --- Notes (private sticky-paper board, reached from the Vault pane) --------- */
+
+.notes-pane {
+  padding: var(--space-5);
+  gap: var(--space-4);
+}
+
+.notes-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.notes-header h1 {
+  flex: 1;
+  margin: 0;
+}
+
+/* .btn-primary is full-width by default; header and action buttons are inline. */
+.notes-header .btn-primary,
+.notes-header .btn-secondary,
+.notes-editor-actions .btn-primary,
+.notes-editor-actions .btn-secondary,
+.notes-editor-actions .btn-danger,
+.notes-empty .btn-primary {
+  width: auto;
+}
+
+.notes-error {
+  color: var(--danger);
+}
+
+.notes-loading {
+  padding: var(--space-6);
+  text-align: center;
+}
+
+.notes-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-3);
+  align-content: start;
+}
+
+.note-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  text-align: left;
+  padding: var(--space-4);
+  min-height: 120px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+  cursor: pointer;
+}
+
+.note-row-title {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-row-preview {
+  flex: 1;
+  overflow: hidden;
+}
+
+.note-row-meta {
+  color: var(--text-faint);
+}
+
+/* Paper colours: a tinted spine, not a loud fill, to keep Soft Daylight calm. */
+.paper-yellow { border-left: 4px solid #e8c547; }
+.paper-blue   { border-left: 4px solid #6aa9e9; }
+.paper-green  { border-left: 4px solid #74c69d; }
+.paper-pink   { border-left: 4px solid #e79fb0; }
+.paper-white  { border-left: 4px solid var(--border); }
+
+.notes-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-7) var(--space-5);
+  text-align: center;
+}
+
+.notes-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-width: 720px;
+}
+
+.notes-title-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.notes-body-input {
+  width: 100%;
+  min-height: 260px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  line-height: 1.5;
+}
+
+.notes-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+/* Delete (or its confirm) sits on the right, away from Save. */
+.notes-editor-actions .notes-delete,
+.notes-editor-actions .notes-confirm {
+  margin-left: auto;
+}
+
+.notes-confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+

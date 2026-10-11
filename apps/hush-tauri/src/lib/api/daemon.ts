@@ -5,6 +5,8 @@ import type {
   ContactDto,
   InviteResponse,
   MailboxDto,
+  NotesNoteResponse,
+  NotesStateDto,
   ConclaveDto,
   PendingInviteDto,
   RecvResponse,
@@ -361,6 +363,23 @@ export const api = {
     request<ReadsStateDto>("/api/reads/read", {
       method: "POST",
       body: JSON.stringify({ id, title }),
+    }),
+  // --- Notes (private sticky-paper board). State routes answer 401 until
+  // unlocked; there is no network path. ---
+  notesState: () => request<NotesStateDto>("/api/notes/state"),
+  notesSaveNote: (draft: {
+    id?: string;
+    title: string;
+    body: string;
+    color?: string;
+  }) =>
+    request<NotesNoteResponse>("/api/notes/note", {
+      method: "POST",
+      body: JSON.stringify(draft),
+    }),
+  notesDeleteNote: (id: string) =>
+    request<NotesStateDto>(`/api/notes/note/${encodeURIComponent(id)}`, {
+      method: "DELETE",
     }),
   // --- Torrents (TorBox-powered client). The API key lives in the vault
   // sidecar and is never sent back; the daemon does all TorBox traffic. ---

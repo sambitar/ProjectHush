@@ -1,6 +1,8 @@
 # Notes dashboard (sticky papers)
 
-**Status:** Spec resolved 2026-10-11; **not implemented**. **Index:** Task **16** in
+**Status:** Spec resolved 2026-10-11; **16.1 implemented** 2026-10-11 (encrypted sidecar store,
+`/api/notes/*`, and the Vault tile opening a full-screen list/editor). **16.2–16.5 not started.**
+**Index:** Task **16** in
 [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md) (Phase **F**).
 
 **Goal:** A **private** notes surface inside the capsule: looks like real sticky papers on a desk —
@@ -99,15 +101,22 @@ Region { id, board_id, label, color, x, y, w, h, collapsed }
 NotesState { board_id, notes: [Note], regions: [Region] }
 ```
 
-### API (indicative, all under `/api/notes`)
+### API (all under `/api/notes`)
+
+Implemented in 16.1:
 
 | Route | Body | Returns |
 |-------|------|---------|
 | `GET /state` | — | `NotesState` |
-| `POST /note` | `{id?, title, body, color}` | `NotesState` (create when `id` absent) |
+| `POST /note` | `{id?, title, body, color?}` | `{ state: NotesState, id }` — create when `id` is absent; the `id` is returned so the UI can open the note it just made |
+| `DELETE /note/{id}` | — | `NotesState` |
+
+Planned for later steps (not yet mounted):
+
+| Route | Body | Returns |
+|-------|------|---------|
 | `POST /note/position` | `{id, x, y, z}` | `NotesState` |
 | `POST /note/checklist` | `{note_id, items}` | `NotesState` |
-| `DELETE /note/{id}` | — | `NotesState` |
 | `POST /region` | `{id?, label, color, x, y, w, h}` | `NotesState` |
 | `POST /region/geometry` | `{id, x, y, w, h, collapsed}` | `NotesState` |
 | `DELETE /region/{id}` | — | `NotesState` |
@@ -118,7 +127,7 @@ NotesState { board_id, notes: [Note], regions: [Region] }
 
 | Step | Deliverable |
 |------|-------------|
-| **16.1** | `notes_store.rs` + sidecar; CRUD; the Vault tile and the full-screen view with Back; a plain list |
+| **16.1** | **Done 2026-10-11** — `notes_store.rs` + sidecar; note CRUD; the Vault tile and the full-screen view with Back; a plain list |
 | **16.2** | Bounded canvas, drag, `x`/`y`/`z` persisted on pointer-up |
 | **16.3** | Regions: create, drag-into, collapse, and moving a region moves its notes |
 | **16.4** | Checklists: add / edit / reorder / toggle without opening the editor |
@@ -137,6 +146,12 @@ NotesState { board_id, notes: [Note], regions: [Region] }
 - [ ] A checklist item can be added and toggled without opening the note editor, with no data loss.
 - [ ] Restore from backup recovers notes, positions, regions and checklists.
 - [ ] No note content in relay logs, and no plaintext on disk at rest.
+
+**Progress (16.1):** the store, routes and list/editor are in and tested
+(`notes_store::notes_store_tests`, `notes_api_tests`), so a created note is sealed in the vault
+and re-reads after a restart. The canvas, region and checklist criteria below stay unchecked
+until 16.2–16.5 land; the UI itself has not yet been exercised in a running app (see
+`DEEPSEEKPROBLEMS.MD`, 2026-10-11 Notes slice).
 
 ---
 
