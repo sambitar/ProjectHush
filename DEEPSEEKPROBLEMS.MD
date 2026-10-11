@@ -13,6 +13,132 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — Auto-update close-out (icons, verification, commit)
+
+Slice goal: close the auto-update work out — generate the missing macOS/Windows icons, verify
+the tree, and commit.
+
+### [FIXED] `cargo check` failed with `Text file busy` while nothing was running, and the earlier entry's diagnosis was incomplete
+
+- **Attempted:** `cargo check -p hush-tauri` to verify before committing. Stopped the leftover
+  preview UI first (`kill 849766`) exactly as the auto-update entry above recommends.
+- **Symptom:** the build script still died: `error: failed to run custom build command for
+  hush-tauri ... Text file busy (os error 26)`, after emitting every `cargo:` line and no
+  `rustc` line. Retried once — same error, ~1s, so it was the cached build-script binary, not a
+  race. The daemon (`target/release/hush-daemon`) was the only hush process left.
+- **Resolution:** `touch apps/hush-tauri/src-tauri/build.rs` to force the build script to be
+  rebuilt. The next `cargo check` finished clean in 20.8s and a follow-up run exited 0.
+- **Lesson:** `Text file busy` on a Tauri crate is not always the preview UI. When no
+  `target/debug/hush-tauri` process exists, the busy file is the freshly written, still-mapped
+  `target/debug/build/.../build-script-build`; forcing a rebuild of the build script clears it.
+  The auto-update entry above ("`cargo check` died with `Text file busy` because a preview
+  instance was up") attributes this to the UI, which is true only when the UI is actually up —
+  it is one cause, not the cause. Recorded here so the next person does not chase a process that
+  is not there.
+
+---
+
+## 2026-10-11 — Auto-update infrastructure (Tauri updater, GitHub Releases)
+
+Slice goal: let an installed copy update itself. `tauri-plugin-updater` + `tauri-plugin-process`
+registered desktop-only, `createUpdaterArtifacts` on, a frontend updater module and prompt, a
+tag-triggered release workflow, and `RELEASING.md`.
+
+### [FIXED] `RELEASING.md` asserted that MSI and deb installs have no update path. Both were wrong
+
+- **Attempted:** wrote the platform notes from memory — "on Windows only NSIS self-updates", "a
+  deb-installed copy has no update path" — and then went looking for a source to cite.
+- **Symptom:** the Tauri v2 updater docs list updater artifacts for **both** MSI and NSIS
+  (`myapp.msi.zip`, `myapp-setup.nsis.zip`), and `tauri-plugin-updater`'s `install_inner` has a
+  `Deb` and an `Rpm` arm (`dpkg -i` / `rpm -U`) reached via
+  `installer_for_bundle_type(bundle_type())`. Neither claim survived.
+- **Fix:** the notes were rewritten from the lookup order in `Updater::get_urls`, which tries
+  `{os}-{arch}-{installer}` and then falls back to `{os}-{arch}`. The corrected text says what
+  actually happens: a deb install asks for `linux-x86_64-deb`, falls back to the AppImage entry,
+  and is then refused by `install_deb` because the payload is not a deb.
+- **Lesson:** "I know how this works" is not evidence. Both claims were plausible, both were
+  wrong, and both were about to be committed as instructions someone would follow. Reading the
+  plugin source cost two tool calls and settled it. For any behaviour that ends up in a runbook,
+  read the code that implements it.
+
+### [FIXED] The version-sync premise did not hold: `package.json` had no `version` field
+
+- **Attempted:** wrote `scripts/bump-version.mjs` against the brief's premise that
+  `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` all carry the version.
+- **Symptom:** `node scripts/bump-version.mjs --check` printed `package.json undefined` and
+  failed. The frontend `package.json` is `"private": true` and had never had a version.
+- **Fix:** added `"version": "0.1.0"` to it, then exercised the script end to end (check, no-op
+  bump, real bump and revert, rejected bad input).
+- **Lesson:** the premise in a task description is a claim about the repo like any other. Verify
+  it before building on it — the check mode of the script is what caught it, which is the
+  argument for writing the verification into the tool rather than doing it by eye.
+
+### [FIXED] `cargo check` died with `Text file busy` because a preview instance was up
+
+- **Attempted:** `cargo check -p hush-tauri` after adding the plugins, with the user's preview
+  window (`target/debug/hush-tauri`, pid 705512) still running from an earlier session.
+- **Symptom:** the build script failed and printed `Text file busy (os error 26)`.
+- **Fix:** stopped the UI process only (the daemon was left up so the vault session survived);
+  the retry finished in 19s. This is the case already recorded in the IRC slice above — the
+  entry there stands, and this is a second confirmation of it rather than a new finding.
+- **Lesson:** `scripts/run-one-ui.sh` leaves the window up by design. Check for a running
+  `target/debug/hush-tauri` before any workspace-wide cargo command, not after it fails.
+
+### [FIXED] `npm run tauri build` now exits 1 without a signing key, even for a bundle with no updater artifact
+
+- **Attempted:** an end-to-end bundle build to prove the config and capabilities were accepted —
+  `npm run tauri -- build --debug --bundles deb`, deliberately avoiding the AppImage path so no
+  network-fetched AppImage tooling was involved.
+- **Symptom:** the deb was produced (83 MiB, tor resources included), then:
+  `A public key has been found, but no private key. Make sure to set TAURI_SIGNING_PRIVATE_KEY
+  environment variable.` Re-run without a pipe to `tail` to get the real status: **exit 1**.
+- **Resolution:** not a bug to fix — it is what `createUpdaterArtifacts` means. Documented in
+  `RELEASING.md` under "Building locally", with the note that `scripts/run-one-ui.sh` is
+  unaffected because it calls `cargo build`, which does not sign.
+- **Lesson:** enabling `createUpdaterArtifacts` is not a purely additive config change; it makes
+  the signing key a hard requirement for `tauri build` on every platform, including bundle types
+  that produce no updater artifact at all. Worth stating in the docs rather than leaving as a
+  surprise for the next person who builds a deb.
+
+### [OPEN] The release workflow cannot be verified in this environment
+
+- **Attempted:** validate `.github/workflows/release.yml` as far as the environment allows.
+- **Verified:** the YAML parses; the matrix, permissions, step list, and trigger are as intended;
+  `npm ci` succeeds against the updated `package-lock.json`; the updater and process permission
+  namespaces resolve (`tauri-build` rewrote `gen/schemas/acl-manifests.json` to include them, and
+  `updater:default` = check/download/install/download-and-install, `process:allow-restart`
+  present); the CLI accepts `--bundles deb` on this host.
+- **Not verified:** anything requiring GitHub or a macOS/Windows runner — that
+  `tauri-action@v0` forwards `--bundles` and `--target` correctly through `npm run tauri`, that
+  the action's `projectPath` resolves the nested `apps/hush-tauri` layout, the exact platform
+  keys the action writes into `latest.json`, whether the mac/Windows legs build at all, and the
+  actual update round trip. There is no git remote configured, no signing key (and generating one
+  is out of scope for this task), and no non-Linux runner available.
+- **Needed to close:** push to a GitHub repo with the two secrets set, run the workflow on a
+  `v*` tag, and inspect the published `latest.json` before flipping the draft.
+
+### [FIXED] macOS and Windows bundles would fail: only PNG icons existed
+
+- **Attempted:** checked whether `tauri build` could bundle for the three platforms in the matrix.
+- **Symptom:** `src-tauri/icons/` held `icon.png`, `32x32.png`, `128x128.png`, and
+  `128x128@2x.png` — no `icon.icns` and no `icon.ico`. macOS and Windows bundling need those, so
+  two of the four matrix legs were expected to fail.
+- **Fix (2026-10-11, close-out):** generated the full set into a temp dir and copied in only the
+  two missing files — `npm run tauri icon src-tauri/icons/icon.png -o /tmp/hush-icons`, then
+  `cp /tmp/hush-icons/{icon.icns,icon.ico} src-tauri/icons/`. The PNGs were left untouched so the
+  diff is two new binaries and nothing else. Verified the magic bytes (`icns`, and `00 00 01 00`
+  with 6 images for the ico). `RELEASING.md` step 6 was rewritten from "add these" to "these are
+  present; regenerate if the icon changes".
+- **Residual:** the source `icon.png` is only 512×512, so the `.icns` is upscaled rather than
+  native; a larger source is the fix if a crisper icon is wanted. And the mac/Windows bundles
+  still cannot be built or inspected here — that is the same gap as the release-workflow `OPEN`
+  entry above, not a separate one.
+- **Lesson:** a bundle matrix that spans platforms has prerequisites per platform, not just per
+  repository. `cargo build` succeeding locally says nothing about whether a macOS or Windows
+  bundle can be produced.
+
+---
+
 ## 2026-10-11 — Libera onion: SASL EXTERNAL with a device certificate
 
 Slice goal: make the Tor onion entry actually usable. Libera's onion rejects password SASL, so the

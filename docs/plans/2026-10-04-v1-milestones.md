@@ -25,7 +25,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **G — Articles** | After notes or parallel late | **11** Nostr pen names | Planned |
 | **H — Knowledge layer** | After 11 dogfood | **12–15** (see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)) | Backlog |
 | **I — Confidential** | Heavy; spec early, code late | **10** TPM + lease rail | Planning only |
-| **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | **Deferred** |
+| **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | Partly started — **updater + release workflow landed 2026-10-11** (branch `feature/auto-update`); `hush-verify` extraction, `rust-toolchain.toml`, `cargo deny`/`audit` still open |
 | **K — Member calls** | After **C** stabilizes | **17** P2P audio/video between contacts | Planning only |
 | **L — Shared surface** | After **17** Phase 4 (video) | **18** live screen share / co-browse in a conclave | Planning only |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
@@ -392,7 +392,12 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 
 ### Task 7: Signed builds (ship path)
 
-**Status:** **Deferred** — **Phase J** when producing installers/updater (not required for feature dogfood).
+**Status:** **Partly started** (2026-10-11, branch `feature/auto-update`) — the self-update path is
+in: `tauri-plugin-updater` + `tauri-plugin-process`, `createUpdaterArtifacts`, a Settings → About
+check/install UI, a tag-triggered draft-release workflow, `scripts/bump-version.mjs`, and
+`RELEASING.md`. **Still open (Phase J):** the `hush-verify` crate/CLI extraction (**DR-11**),
+`rust-toolchain.toml` and CI `cargo deny`/`audit` (**DR-10**), a reproducible-release doc, and the
+first real tagged release (the workflow has never run on a runner — see `RELEASING.md` step 7).
 
 **Files:** CI or a `scripts/` sign+verify helper, Tauri updater config
 

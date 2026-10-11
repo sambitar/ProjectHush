@@ -1541,6 +1541,46 @@
   width: auto;
 }
 
+/* Update prompt: the release notes, the progress bar, and the About controls */
+.update-notes {
+  margin-top: var(--space-4);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.update-bar {
+  height: 6px;
+  margin-top: var(--space-5);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.update-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width var(--dur-base) var(--ease-out);
+}
+
+.update-bar-fill.is-indeterminate {
+  width: 35%;
+  animation: update-indeterminate 1.2s var(--ease-out) infinite;
+}
+
+.update-controls {
+  margin-top: var(--space-4);
+}
+
+.update-controls .btn-secondary {
+  width: auto;
+}
+
 .trust-delete-field {
   display: flex;
   flex-direction: column;

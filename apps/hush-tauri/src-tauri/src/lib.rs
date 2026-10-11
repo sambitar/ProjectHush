@@ -186,7 +186,7 @@ pub fn run() {
         serde_json::to_string(&transport).expect("transport json")
     );
 
-    let app = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .manage(proxy)
         .manage(irc::IrcState::new())
         .invoke_handler(tauri::generate_handler![
@@ -220,7 +220,18 @@ pub fn run() {
             irc::commands::irc_cert_generate,
             irc::commands::irc_cert_forget,
             irc::commands::irc_cert_authorize
-        ])
+        ]);
+
+    // Updating in place is a desktop concern: the mobile targets ship through
+    // their own stores, so the plugins are compiled and registered only here.
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init());
+    }
+
+    let app = builder
         .setup(move |app| {
             // Tor lives under the app's local data dir, not in the vault, and is
             // owned by this process. It is managed at the app level: the relay
