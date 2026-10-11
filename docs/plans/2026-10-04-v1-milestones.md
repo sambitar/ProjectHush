@@ -21,7 +21,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **C — Messaging polish** | Next dogfood | **5b.3** (optional), remaining `API_GAPS.md` | 🔜 **In progress** (DR-01–09, 14; 5c.4; remove contact; device link; passphrase change done; multi-device **1–4 of 7 done** — per-device keys, signed device list, relay device directory + revocation, contacts as device sets with send/recv fan-out verified end-to-end. Phase 5's linking core landed with it, so a linked device now works; its daemon/CLI endpoints and Phase 6–7 remain) |
 | **D — Async member mail** | When live chat feels solid | **5d** internal `@myserver.com` mail (replaces “message while offline”) | ✅ Done (threads, compose, multi-attachment, offline delivery; Cc/Bcc + out-of-band attachments deferred) |
 | **E — Outsider delivery** | After 5d | **5e** inbound drop, **5f** outbound to outsiders | Planned |
-| **F — Local notes** | Before public layer | **16** sticky-notes dashboard | Planned |
+| **F — Local notes** | Before public layer | **16** sticky-notes dashboard | Spec resolved 2026-10-11; not implemented |
 | **G — Articles** | After notes or parallel late | **11** Nostr pen names | Planned |
 | **H — Knowledge layer** | After 11 dogfood | **12–15** (see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)) | Backlog |
 | **I — Confidential** | Heavy; spec early, code late | **10** TPM + lease rail | Planning only |
@@ -412,9 +412,13 @@ first real tagged release (the workflow has never run on a runner — see `RELEA
 
 ### Task 16: Notes dashboard (sticky papers — planning only)
 
-**Status:** Planned — **Phase F** (before **11** Articles).
+**Status:** **Spec resolved 2026-10-11** (all decisions settled — see the task doc); **not
+implemented**. **Phase F** (before **11** Articles).
 
-**Goal:** Private **sticky-note** board in the capsule: papers on a dashboard or **grouped** stacks, **drag-and-drop** layout, **checklists** with check-off — encrypted local store, backup via Task **6**. Visual metaphor: real note paper (Soft Daylight), not a collaborative whiteboard.
+**Goal:** Private **sticky-note** board in the capsule: papers on a bounded canvas or gathered into
+**regions**, **drag-and-drop** layout, **checklists** with check-off — encrypted local store, backup
+via Task **6**. Visual metaphor: real note paper (Soft Daylight), not a collaborative whiteboard.
+Reached from a **Vault bento tile** that opens the board full-bleed.
 
 → **[`docs/tasks/notes-dashboard.md`](../tasks/notes-dashboard.md)**
 
