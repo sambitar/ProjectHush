@@ -608,6 +608,13 @@ impl Account {
         self.vault.write_encrypted_file(name, plaintext)
     }
 
+    /// Delete a named encrypted vault sidecar (see
+    /// [`Vault::remove_encrypted_file`]). `false` means there was nothing to
+    /// delete.
+    pub fn remove_vault_sidecar(&self, name: &str) -> Result<bool, Error> {
+        self.vault.remove_encrypted_file(name)
+    }
+
     /// Store a file from disk into the vault as a chunked, content-addressed
     /// blob without buffering the whole file in memory. See
     /// [`Vault::put_blob_stream`].

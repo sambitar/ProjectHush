@@ -8,6 +8,10 @@
  */
 
 import {
+  certAuthorize,
+  certForget,
+  certGenerate,
+  certStatus,
   changeNick,
   clearWindowLines,
   connectServer,
@@ -47,6 +51,9 @@ const HELP_LINES = [
   "/ban [nick]              ban a user (no nick: list bans)",
   "/op /deop /voice /devoice <nick>",
   "/server <host> [port]    open another connection",
+  "/cert                    show this device's certificate fingerprint",
+  "/cert authorize          register the fingerprint with NickServ",
+  "/cert forget             delete the certificate from the vault",
   "/clear                   clear this window",
   "/raw <line>              send a raw IRC line",
   "/quit [message]          disconnect",
@@ -225,6 +232,76 @@ export function runSlashCommand(input: string, ctx: SlashContext): boolean {
         use_tor: false,
         nick: "",
       }).catch((e) => fail(serverId, target, e));
+      return true;
+    }
+    case "cert": {
+      // SASL EXTERNAL authenticates with this device's certificate, and EXTERNAL
+      // is the only mechanism Libera's Tor onion accepts. Authorizing it has to
+      // happen over a connection that is already identified (the account's own
+      // password), which is why this is a command against a live server rather
+      // than something the connect dialog can do on its own.
+      //
+      // Every acknowledgement goes to the window the command was typed in. It
+      // used to go to the server's status window, so `/cert authorize` in a
+      // channel produced no visible output at all and read as a command that did
+      // nothing. NickServ's own answer still arrives where the client puts a
+      // service notice: its own query window, opened on arrival.
+      const action = rest.split(/\s+/)[0].toLowerCase();
+      if (action === "authorize") {
+        certAuthorize(serverId)
+          .then((fingerprint) =>
+            pushLocalLine(
+              serverId,
+              target,
+              "status",
+              `Sent: PRIVMSG NickServ :CERT ADD ${fingerprint} — NickServ's reply opens a NickServ window.`,
+            ),
+          )
+          .catch((e) => fail(serverId, target, e));
+        return true;
+      }
+      if (action === "forget") {
+        certForget()
+          .then(() =>
+            pushLocalLine(
+              serverId,
+              target,
+              "status",
+              "This device's certificate was deleted from the vault. NickServ still has it authorized until /msg NickServ CERT DEL <fingerprint>.",
+            ),
+          )
+          .catch((e) => fail(serverId, target, e));
+        return true;
+      }
+      if (action) {
+        usage(serverId, target, "Usage: /cert [authorize|forget]");
+        return true;
+      }
+      certStatus()
+        .then((status) => {
+          if (!status.exists || !status.fingerprint_sha512) {
+            pushLocalLine(
+              serverId,
+              target,
+              "status",
+              "This device has no certificate. Generate one in the connect dialog before using SASL EXTERNAL.",
+            );
+            return;
+          }
+          pushLocalLine(
+            serverId,
+            target,
+            "status",
+            `This device's certificate fingerprint: ${status.fingerprint_sha512}`,
+          );
+          pushLocalLine(
+            serverId,
+            target,
+            "status",
+            "Authorize it with /cert authorize, from a connection that is already identified.",
+          );
+        })
+        .catch((e) => fail(serverId, target, e));
       return true;
     }
     case "clear": {

@@ -215,6 +215,25 @@ enum Work {
         bytes: Vec<u8>,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Read a named encrypted vault sidecar for a feature that owns both the
+    /// name and the schema inside it. Unlike the pane stores above, the name
+    /// comes from the caller — the vault validates it (no separators, no
+    /// traversal) before anything touches disk.
+    SecretRead {
+        name: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Write a named encrypted vault sidecar.
+    SecretWrite {
+        name: String,
+        data: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Delete a named encrypted vault sidecar.
+    SecretRemove {
+        name: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// Torrents pane: load the encrypted sidecar state (None when never saved).
     TorrentsStateGet {
         reply: oneshot::Sender<WorkResult>,
@@ -434,6 +453,12 @@ pub enum WorkResult {
     Drops(Vec<ChatRecord>),
     /// The Reads pane's encrypted sidecar state; `None` until first saved.
     ReadsState(Option<Vec<u8>>),
+    /// A named vault sidecar's bytes; `None` when nothing is stored under that
+    /// name yet.
+    Secret(Option<Vec<u8>>),
+    /// A named vault sidecar was deleted. Deleting is idempotent, so this
+    /// carries no "did it exist" flag: either way the name is now absent.
+    SecretRemoved,
     /// The record id of the saved draft.
     DraftSaved(String),
     Blob(Vec<u8>),
@@ -823,6 +848,36 @@ impl AccountWorker {
                                     .write_vault_sidecar(crate::reads_store::STATE_FILE, &bytes)
                                 {
                                     Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SecretRead { name, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.read_vault_sidecar(&name) {
+                                    Ok(data) => WorkResult::Secret(data),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SecretWrite { name, data, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.write_vault_sidecar(&name, &data) {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SecretRemove { name, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.remove_vault_sidecar(&name) {
+                                    Ok(_) => WorkResult::SecretRemoved,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
@@ -1418,6 +1473,35 @@ impl AccountWorker {
     pub async fn reads_state_put(&self, bytes: Vec<u8>) -> WorkResult {
         self.call(|reply| Work::ReadsStatePut { bytes, reply })
             .await
+    }
+
+    /// Read a named encrypted vault sidecar. The caller owns the name and the
+    /// schema inside; `WorkResult::Secret(None)` means the name is unused.
+    pub async fn secret_read(&self, name: &str) -> WorkResult {
+        self.call(|reply| Work::SecretRead {
+            name: name.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Write a named encrypted vault sidecar.
+    pub async fn secret_write(&self, name: &str, data: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::SecretWrite {
+            name: name.to_string(),
+            data,
+            reply,
+        })
+        .await
+    }
+
+    /// Delete a named encrypted vault sidecar.
+    pub async fn secret_remove(&self, name: &str) -> WorkResult {
+        self.call(|reply| Work::SecretRemove {
+            name: name.to_string(),
+            reply,
+        })
+        .await
     }
 
     /// The Torrents pane's encrypted sidecar state, raw bytes (None until first

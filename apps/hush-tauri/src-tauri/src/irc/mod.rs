@@ -11,11 +11,13 @@
 //! - [`nicklist`] parses and sorts `NAMES` entries by prefix.
 //! - [`socks`] dials through Tor.
 //! - [`tls`] builds the rustls client config (and the onion-only relaxed one).
+//! - [`cert`] mints and seals this device's client certificate (SASL EXTERNAL).
 //! - [`state`] holds the per-server snapshot and emits events to the UI.
 //! - [`client`] runs one connection: dial, register, read loop, reconnect.
 //! - [`settings`] persists non-secret settings under the app's data dir.
 //! - [`commands`] is the Tauri command surface.
 
+pub mod cert;
 pub mod client;
 pub mod commands;
 pub mod format;
@@ -46,18 +48,39 @@ pub const DEFAULT_PORT: u16 = 6697;
 /// Libera's Tor onion service. Connecting here keeps the whole conversation
 /// inside Tor (no exit node sees it), which is the strongest IP protection
 /// available; the onion name itself authenticates the service.
+///
+/// A v3 name is exactly 56 base32 characters: a 32-byte public key, a 2-byte
+/// checksum over that key, and a version byte. Tor rejects anything else as an
+/// invalid hostname before it ever tries to connect, which reaches the user as
+/// an opaque SOCKS failure, so the value is pinned by the test at the bottom of
+/// this module. Take the address from Libera's own guide when changing it:
+/// <https://libera.chat/guides/connect#accessing-liberachat-via-tor>
 pub const LIBERA_ONION_HOST: &str =
-    "libera75jm6of4wxpxt4aynol3xjmbtxgfyjpu34ss4d2q7r2uqw6xy.onion";
+    "libera75jm6of4wxpxt4aynol3xjmbtxgfyjpu34ss4d7r7q2v5zrpyd.onion";
 
 /// The sentinel target for a server's own status window. Channels and queries
 /// use their own name as the target; everything server-wide uses this.
 pub const STATUS_TARGET: &str = "*";
 
-/// A user's credentials for SASL PLAIN. Never written to disk.
+/// How the client authenticates to services.
+///
+/// `Plain` sends a password, which is memory-only and never written to disk.
+/// `External` sends no secret at all: the device's certificate is presented in
+/// the TLS handshake, and the account's authorized fingerprint is what matches.
+/// Libera's Tor onion accepts only public-key mechanisms, and `External` is the
+/// one this client implements — see <https://libera.chat/guides/connect>.
 #[derive(Clone, Debug, Deserialize)]
-pub struct SaslConfig {
-    pub account: String,
-    pub password: String,
+#[serde(tag = "mechanism", rename_all = "snake_case")]
+pub enum SaslConfig {
+    Plain { account: String, password: String },
+    External { account: String },
+}
+
+impl SaslConfig {
+    /// Whether this mechanism needs the device's certificate on the connection.
+    pub fn needs_certificate(&self) -> bool {
+        matches!(self, SaslConfig::External { .. })
+    }
 }
 
 /// Everything needed to open one connection. Built from a [`ConnectRequest`]
@@ -75,6 +98,10 @@ pub struct ServerConfig {
     pub realname: String,
     pub server_password: Option<String>,
     pub sasl: Option<SaslConfig>,
+    /// The device's certificate, loaded from the vault when the request asked
+    /// for one. Held for the life of the connection: a reconnect presents it
+    /// again, and EXTERNAL cannot authenticate without it.
+    pub client_cert: Option<Arc<cert::ClientIdentity>>,
     pub auto_join: Vec<String>,
 }
 
@@ -143,6 +170,9 @@ impl ConnectRequest {
             realname,
             server_password: self.server_password,
             sasl: self.sasl,
+            // Filled in by `connect_server` from the vault, which the client
+            // task has no access to.
+            client_cert: None,
             auto_join: self.auto_join,
         }
     }
@@ -233,5 +263,106 @@ impl IrcState {
         map.values()
             .map(|e| e.snapshot.lock().expect("snapshot poisoned").clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settings::LEGACY_LIBERA_ONION_HOST;
+    use super::*;
+
+    /// Check a name the way Tor does before it connects: length, alphabet,
+    /// version byte, then the checksum over the public key.
+    fn validate_v3_onion(host: &str) -> Result<(), String> {
+        let base = host
+            .strip_suffix(".onion")
+            .ok_or_else(|| format!("{host} does not end in .onion"))?;
+        if base.len() != 56 {
+            return Err(format!("{base} is {} characters, not 56", base.len()));
+        }
+        if !base
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c))
+        {
+            return Err(format!("{base} is not lowercase base32"));
+        }
+        let raw = data_encoding::BASE32_NOPAD
+            .decode(base.to_ascii_uppercase().as_bytes())
+            .map_err(|e| format!("{base} does not decode as base32: {e}"))?;
+        if raw.len() != 35 {
+            return Err(format!("decoded to {} bytes, not 35", raw.len()));
+        }
+        let (pubkey, tail) = raw.split_at(32);
+        let (checksum, version) = tail.split_at(2);
+        if version[0] != 3 {
+            return Err(format!("version byte is {}, not 3", version[0]));
+        }
+
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+        hasher.update(b".onion checksum");
+        hasher.update(pubkey);
+        hasher.update(version);
+        let digest = hasher.finalize();
+        if checksum != &digest[..2] {
+            return Err("checksum does not match the public key".into());
+        }
+        Ok(())
+    }
+
+    /// Tor answers a malformed name with a bare SOCKS "general failure" and
+    /// logs only `Invalid hostname [scrubbed]; rejecting` on its own side, so
+    /// the user sees an unexplained refusal to connect. Worth proving, then,
+    /// rather than eyeballing: the address only has to be wrong once.
+    #[test]
+    fn the_shipped_onion_address_is_a_valid_v3_name() {
+        validate_v3_onion(LIBERA_ONION_HOST).expect("the shipped address must be valid");
+    }
+
+    /// A guard is only worth having if it rejects the address that actually
+    /// shipped broken, so this pins the failure the first version hit (one
+    /// base32 character short). The migration in `settings` keys off the same
+    /// constant.
+    #[test]
+    fn the_validator_rejects_the_address_that_shipped_broken() {
+        let error = validate_v3_onion(LEGACY_LIBERA_ONION_HOST)
+            .expect_err("the legacy address must not validate");
+        assert!(error.contains("55 characters"), "unexpected error: {error}");
+    }
+
+    /// The connect dialog builds this JSON by hand, so the shape is a contract:
+    /// the mechanism is the tag, and only `external` asks for the certificate.
+    #[test]
+    fn sasl_configs_deserialize_the_way_the_connect_dialog_sends_them() {
+        let plain: SaslConfig =
+            serde_json::from_str(r#"{"mechanism":"plain","account":"bluejeans","password":"pw"}"#)
+                .expect("a plain config parses");
+        assert!(matches!(
+            &plain,
+            SaslConfig::Plain { account, password } if account == "bluejeans" && password == "pw"
+        ));
+        assert!(!plain.needs_certificate());
+
+        let external: SaslConfig =
+            serde_json::from_str(r#"{"mechanism":"external","account":"bluejeans"}"#)
+                .expect("an external config parses");
+        assert!(matches!(
+            &external,
+            SaslConfig::External { account } if account == "bluejeans"
+        ));
+        assert!(external.needs_certificate());
+
+        // Switching the mechanism in the dialog must not require clearing the
+        // password field: a leftover one is ignored, not rejected.
+        let switched: SaslConfig = serde_json::from_str(
+            r#"{"mechanism":"external","account":"bluejeans","password":"stale"}"#,
+        )
+        .expect("a leftover password is ignored");
+        assert!(matches!(switched, SaslConfig::External { .. }));
+        assert!(switched.needs_certificate());
+
+        // Without a mechanism there is no way to know which credential is
+        // meant, so this must fail rather than guess.
+        assert!(serde_json::from_str::<SaslConfig>(r#"{"account":"bluejeans"}"#).is_err());
     }
 }

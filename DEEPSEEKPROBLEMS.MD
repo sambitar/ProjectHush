@@ -13,6 +13,203 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — Libera onion: SASL EXTERNAL with a device certificate
+
+Slice goal: make the Tor onion entry actually usable. Libera's onion rejects password SASL, so the
+client generates an ECDSA P-256 certificate on the device, seals it in the vault, presents it in the
+TLS handshake, and authenticates with `AUTHENTICATE EXTERNAL`. Enrollment (registering the
+fingerprint with NickServ) is a guided one-time step over a normal password session.
+
+### [FIXED] `CAP LS` was parsed for a bare `sasl` token, so the client never asked Libera to authenticate it
+
+- **Attempted:** the first live probe of the onion after the address fix, expecting the client to
+  reach `AUTHENTICATE`.
+- **Symptom:** the probe's `CAP LS` reply came back as
+  `sasl=ECDSA-NIST256P-CHALLENGE,EXTERNAL,PLAIN,SCRAM-SHA-512` — a capability **value**, not the bare
+  token the code compared against (`offered.contains(&"sasl")`). Nothing matched, so the client sent
+  `CAP REQ :multi-prefix` and no `sasl` at all. On the onion that is indistinguishable from a client
+  with no credentials: the server closes the link with the public-key-SASL notice, and the failure
+  looks like a server-side policy refusal rather than a client that never asked.
+- **Fix:** `offers_sasl` now accepts both spellings (`c == "sasl" || c.starts_with("sasl=")`) and
+  `caps_to_request` was split out of `handle_cap` so the negotiation is testable. Unit tests pin the
+  captured Libera line, plus `sasl2` (a capability that merely starts with the same letters) and the
+  offered-but-not-configured case.
+- **Lesson:** capability tokens are not always bare names. Solanum advertises SASL with its mechanism
+  list attached, so a client that only compares whole tokens silently degrades to "no SASL" against
+  exactly the servers that require it. This is a parser bug that no unit test written from the spec
+  would have caught — it needed a real `CAP LS` line.
+
+### [FIXED] The live desktop instance held `target/debug/hush-tauri`, so `cargo test --workspace` died with `Text file busy`
+
+- **Attempted:** `cargo test --workspace` at the end of this slice, with the instance started earlier
+  by `scripts/run-one-ui.sh` still up.
+- **Symptom:** the run failed at `hush-tauri`'s build script with
+  `process didn't exit successfully: .../build-script-build` … `Text file busy (os error 26)`, after
+  compiling everything else.
+- **Fix:** stopped the UI process and the daemon, re-ran — green.
+- **Correction to an earlier entry:** the IRC-pane section above records `Text file busy` as
+  "disproved … not the running binary" and calls it a transient race. That conclusion was wrong for
+  this case: here the cause was plainly the running `target/debug/hush-tauri`, and stopping it fixed
+  it on the first try. The earlier run may have hit a different cause, but the "it is not the running
+  binary" claim should not be relied on. `scripts/run-one-ui.sh` leaves the window up by design, so
+  any workspace-wide `cargo` command needs the instance stopped first.
+- **Lesson:** when `run-one-ui.sh` (or any preview) is up, `target/debug/hush-tauri` is mapped and
+  cargo cannot relink it. Kill the instance before a workspace build, not after a failed one.
+
+### [FIXED] `handle_cap` could not compile: it cleared `cap_ls` while `offered` still borrowed it
+
+- **Attempted:** the first build of the split `handle_cap`.
+- **Symptom:** `error[E0502]: cannot borrow 'self.cap_ls' as mutable because it is also borrowed as
+  immutable` — `let offered: Vec<&str> = self.cap_ls.split_whitespace().collect();` followed by
+  `self.cap_ls.clear();`, with `offered` used afterwards.
+- **Fix:** `let offered_raw = std::mem::take(&mut self.cap_ls);` then split the owned string. The
+  accumulated `CAP LS` fragments still reset correctly for the next connection.
+- **Lesson:** `Vec<&str>` into a field keeps the field borrowed; take the string by value instead of
+  clearing underneath the borrow.
+
+### [FIXED] Two warnings from the new code: an unused `SaslConfig::account` and an unread `SecretRemoved(bool)`
+
+- **Attempted:** `cargo clippy --workspace --all-targets` after the feature was green.
+- **Symptom:** `method 'account' is never used` (it was only reachable from a test) and
+  `field '0' is never read` on `WorkResult::SecretRemoved(bool)`. The `DELETE /api/vault/secret/{name}`
+  handler matched `SecretRemoved(_)` and ignored the flag.
+- **Fix:** dropped the helper and asserted the deserialized shape with `matches!` in the test instead;
+  made `SecretRemoved` a unit variant, since deleting is idempotent and the HTTP layer answers 204
+  either way. `Vault::remove_encrypted_file`'s `bool` stays — it is documented and covered by
+  `hush-core`'s own test.
+- **Lesson:** a helper that only a test calls is dead code in the shipped crate. Either use it on the
+  real path or delete it and test the behaviour directly.
+
+### [OPEN] Daemon requests that touch the account worker stopped answering while `/api/ui-prefs` kept working
+
+- **Attempted:** reading the sealed certificate out of the vault over the daemon socket
+  (`GET /api/vault/secret/irc-client-cert.json`) to compare its fingerprint with what NickServ had been
+  told, instead of asking the user to read it off the UI.
+- **Symptom:** that request, and then `GET /api/status` and `GET /api/relay`, hung past 6 s, 12 s and
+  150 s with the connection accepted and no response line. `GET /api/ui-prefs` answered `200` on the
+  same socket in the same second, so the HTTP server and the socket were fine.
+- **What that points at:** `ui-prefs` reads a file directly, while `status` and `relay` both go through
+  `AccountWorker::call`, which pushes onto an unbounded queue and awaits a `oneshot` with **no
+  timeout** (`account_worker.rs`, `call`). One slow item therefore stalls everything behind it. The
+  daemon also runs timers that enqueue relay work while the vault is unlocked, and relay requests carry
+  a 15 s timeout (`relay_client.rs`, `REQUEST_TIMEOUT`) — a reachable-but-slow relay would keep the
+  single worker saturated.
+- **Why it is not confirmed:** the app itself read the vault successfully at 14:44, a minute before the
+  150 s hang, so the worker was demonstrably serving `SecretRead` then. The sandbox denies
+  `/proc/<pid>/task/*/wchan` and `/proc/<pid>/fd`, so the worker could not be sampled. Nothing here
+  rules out my probes being the problem.
+- **Needed to resolve:** a `tracing`-instrumented run that logs each `Work` variant's queue wait and
+  service time, or a timeout on `call`. Until then this is an observation, not a diagnosis, and no
+  claim about the app being wedged should be made from it.
+
+### [FIXED] `/cert authorize` succeeded against a certificate that was replaced a minute later, so the authorized fingerprint no longer matched the device
+
+- **Attempted:** enrollment against a real Libera account, the one step this slice had never been able to
+  run. First pass: `/cert authorize` sent `CERT ADD 13049c0a…` at 14:40 and NickServ confirmed it.
+  One minute later `/cert` printed a different fingerprint, `bc3d5543…`.
+- **Symptom:** two different SHA-512 fingerprints for "this device's certificate" inside a minute, with
+  no error anywhere. Had the user connected to the onion in that state, SASL EXTERNAL would have failed
+  with `904` — indistinguishable from never having enrolled at all, which is the worst possible failure
+  for a one-time manual step.
+- **Cause:** the certificate had been regenerated between the two commands. The vault sidecar's mtime
+  and size tell the story: 686 bytes at 13:53, rewritten 682 bytes at 14:43:10, with the fingerprint
+  changing between 14:40 and 14:41 as well. `generate` mints a brand-new keypair every time, so each
+  press of "Generate certificate" / "Replace certificate" silently orphans whatever fingerprint the
+  account had authorized. Nothing in the UI says so, and `/cert authorize` happily sends the new
+  fingerprint to an account that is still holding the old one.
+- **Resolution:** the user re-ran `/cert authorize` at 14:44, which sent the current fingerprint
+  (`2827b2f3…`) and NickServ confirmed the same value back. Device and account agree again. The
+  orphaned `13049c0a…` is still on the account until `/msg NickServ CERT DEL 13049c0a…`.
+- **Open follow-up:** the "Replace certificate" button should warn that it invalidates the account's
+  authorized fingerprint and needs a fresh `/cert authorize`, and the certificate section should show
+  the fingerprint that was last *sent* rather than only the one on disk. Neither is implemented.
+- **Lesson:** I first suspected a bug in `fingerprint_sha512` — two different hashes for one stored
+  certificate. It is deterministic over the DER, and the sidecar's mtime was the evidence that settled
+  it. Checking the file's timestamps before reading the hash code would have saved the detour.
+
+### [FIXED] `/cert authorize` looked like it did nothing: every acknowledgement went to the server status window, not the window it was typed in
+
+- **Attempted:** the user, connected to Libera clearnet and identified, ran `/cert authorize` in a
+  channel window.
+- **Symptom:** "didn't do anything" — no line, no error, no window. The certificate itself was fine:
+  `instances/peer-a/irc-client-cert.json` exists, sealed, 686 bytes, written when the dialog's
+  Generate button was clicked.
+- **Cause:** the `cert` case in `ircCommands.ts` reported through `pushLocalStatus`, which writes to
+  `STATUS_TARGET` — the server's own status window — while `usage` and `fail` write to the window the
+  command came from. Typed in a channel, the command therefore produced no output anywhere the user
+  was looking. The wire side was correct: `irc_cert_authorize` reads the vault secret, sends
+  `PRIVMSG NickServ :CERT ADD <fingerprint>` via `OutCmd::Raw` → `Session::send`, and `send` writes
+  unconditionally.
+- **Fix:** all four `/cert` acknowledgements now go to the window the command was typed in, and the
+  authorize reply echoes the exact line sent (`Sent: PRIVMSG NickServ :CERT ADD <fp> — NickServ's
+  reply opens a NickServ window.`). `/cert forget` now also says that NickServ keeps the fingerprint
+  until `CERT DEL`.
+- **Lesson:** local feedback for a user-typed command belongs in the window that command was typed in.
+  Sending it to a canonical "status" window is only right for events the user did not ask for. The
+  failure mode is indistinguishable from the command not existing, which is the worst kind of
+  ambiguity for a feature whose whole point is a one-time manual step.
+
+### [FIXED] The four IRC certificate commands were registered but not permitted, so the webview got `irc_cert_generate not allowed. Command not found`
+
+- **Attempted:** clicking "Generate certificate" in the connect dialog, in a live instance.
+- **Symptom:** `irc_cert_generate not allowed. Command not found`. The command existed in
+  `generate_handler![...]`, the frontend called the right name, and `tsc` and `cargo test` were both
+  green — Tauri's capability gate rejected the call at runtime and nowhere else.
+- **Cause:** `permissions/irc.toml` listed the IRC commands but the four added by this slice
+  (`irc_cert_status`, `irc_cert_generate`, `irc_cert_forget`, `irc_cert_authorize`) were never added
+  to `commands.allow`. This is the third time the same omission has shipped (Drops, the chat sound,
+  and now these), and it is invisible to every automated check the repo had.
+- **Fix:** added the four names to `allow-irc`, and added
+  `tests::every_registered_command_is_named_by_a_permission` in `src/lib.rs`, which parses
+  `generate_handler![...]` and every `permissions/*.toml` and fails if a registered command is not
+  named by any permission. Verified to fail when the four names are removed, and to pass with them:
+  the failure message names all four.
+- **Also recorded:** the guard test could not run while the desktop instance was up —
+  `cargo test -p hush-tauri --lib` failed at `hush-tauri`'s build script with `Text file busy`
+  until the instance was stopped, then passed. So the running app blocks even a `--lib` test build,
+  not only a workspace-wide one; the earlier entries in this log understated that.
+- **Lesson:** a `#[tauri::command]` needs three things — the function, the `generate_handler!` entry,
+  and a permission naming it in a capability-referenced file. The third is the one that is forgotten,
+  and its only symptom is a UI click. It is now mechanical to check.
+
+### [FIXED] Reconnecting a saved EXTERNAL server prefilled the dialog with PLAIN, which the onion refuses
+
+- **Attempted:** reading the connect dialog's prefill path after wiring the mechanism selector, to check
+  that reopening a saved server reproduces its settings.
+- **Symptom:** every other field was seeded from the prefill (`host`, `port`, `tls`, `use_tor`, `nick`,
+  `auto_join`) but the SASL mechanism was not, so the `<select>` kept its first option, PLAIN. The
+  "Reconnect" item on a server's tree menu opens the dialog prefilled from the **live** server, so a
+  user reconnecting the Libera onion would see the password field and, pressing Connect, send
+  `AUTHENTICATE PLAIN` to a service that rejects passwords. The failure would look like a Libera policy
+  refusal, not a stale form field.
+- **Fix:** seed the select from the saved entry whose id matches the prefill (`host:port`, the same id
+  the client derives in `into_config`). The first attempt read `prefill.sasl_mechanism`, which does not
+  exist on the live-server type — `tsc` caught it (`Property 'sasl_mechanism' does not exist on type
+  'IrcServer'`) — and the mechanism is a property of the saved entry anyway.
+- **Lesson:** when a dialog gains a field, the prefill path and the `serverSelect` change handler are two
+  separate code paths that both have to learn about it. A field that is seeded on one and not the other
+  silently reverts to its default, and the default here was a credential the server rejects.
+
+### [OPEN] Enrollment and a real EXTERNAL login are still unverified end-to-end
+
+- **Attempted:** the full path — generate a certificate, register its fingerprint with NickServ, then
+  log in to the onion with no password.
+- **Symptom:** the wire protocol half is verified by a live probe against
+  `libera75jm6of4wxpxt4aynol3xjmbtxgfyjpu34ss4d7r7q2v5zrpyd.onion:6697` over a real SOCKS circuit:
+  TLS 1.3 handshake with the generated client certificate, `CAP REQ :sasl` acknowledged, the server
+  sent `AUTHENTICATE +`, and the base64 authzid drew `904 :SASL authentication failed`. That 904 is
+  the **expected** answer for a fingerprint NickServ has not been told about — it is evidence the
+  request reached the right place, not evidence the login works.
+- **Status:** the enrollment step (`/msg NickServ CERT ADD <sha512 fingerprint>`) and a subsequent
+  password-free login cannot be exercised here: there is no Libera account for this project and no
+  NickServ password to enroll with. No test in the workspace covers it.
+- **Needed to resolve:** a human with a registered Libera account running the guided enrollment once
+  and then connecting to the onion. Until then the certificate generation, sealing, fingerprint
+  computation, and TLS client-auth wiring are covered by unit tests, and the SASL exchange is covered
+  up to the point the server validates the fingerprint — not past it.
+
+---
+
 ## 2026-10-11 — IRC rail pane (Rust client, mIRC UI, Tor-capable)
 
 Slice goal: a new left-rail IRC tab with a classic mIRC UI, backed by a hand-written `tokio`
@@ -80,6 +277,87 @@ structured segments.
   walking the smoke-test list. Until then, every claim about the *UI* behaviour of this slice is
   unverified: registration, SASL, auto-join, rate limiting, and reconnect all run only against a
   real server.
+
+### [FIXED] The Libera onion address in the IRC defaults was one base32 character short, so Tor refused every onion connect
+
+- **Attempted:** the live IRC pass, clicking Connect on the seeded "Libera.Chat (Tor onion)" server.
+- **Symptom:** the pane showed `Tor could not reach
+  libera75jm6of4wxpxt4aynol3xjmbtxgfyjpu34ss4d2q7r2uqw6xy.onion:6667 — Tor refused the connection
+  (SOCKS code 1)`. Tor's own log said only `[warn] Invalid hostname [scrubbed]; rejecting`, once per
+  attempt.
+- **Cause:** `LIBERA_ONION_HOST` was 55 characters. A v3 onion name is a 32-byte key, a 2-byte
+  checksum and a version byte — exactly 56 base32 characters — and Tor rejects anything else *before*
+  it opens a circuit. That is why the failure was instant and why the message named no reason: a raw
+  SOCKS5 connect to the shipped string returned `reply=1 (general failure)` in 0.0s.
+- **Resolution:** the constant now carries Libera's published address (`…ss4d7r7q2v5zrpyd.onion`,
+  from <https://libera.chat/guides/connect#accessing-liberachat-via-tor>), and the same raw SOCKS5
+  probe returns `reply=0 (succeeded)` in 5.8s with the server greeting as `:palladium.libera.chat`.
+  Two tests pin it: one decodes the name and checks the v3 checksum, the other proves that same
+  validator rejects the 55-character string. `settings.rs` also repairs a saved server (and the
+  remembered active server) that still carries the old address, because the seeded server list is
+  persisted on first run and would otherwise keep the broken copy for existing installs.
+- **Lesson:** an address that *is* the authentication (a `.onion` name) has to be verified
+  mechanically. Eyeballing 56 base32 characters catches nothing, and Tor's failure mode for a
+  malformed one is indistinguishable from a network problem.
+
+### [FIXED] Libera's onion requires public-key SASL; the client only implements SASL PLAIN
+
+- **Attempted:** after fixing the address, registering on the onion to confirm the pane works.
+- **Symptom:** the socket connects, the server greets, then closes the link:
+  `NOTICE … :*** Notice -- Public-key (NOT password) SASL authentication is required to connect to
+  the Tor onion service.` followed by `ERROR :Closing Link: gateway/tor-sasl/account (Public-key
+  (NOT password) SASL authentication is required…)`.
+- **Consequence:** the corrected address gets a user to a clean TCP connection and then a refusal.
+  `SaslConfig` is `{account, password}` and `handle_cap` requests `AUTHENTICATE PLAIN`, so the onion
+  cannot be used until one of Libera's public-key mechanisms is implemented: SASL EXTERNAL with a
+  client certificate (the onion does serve TLS on 6697 — verified, TLS 1.3) or
+  ECDSA-NIST256P-CHALLENGE. Both require the user to register the cert/key with NickServ from a
+  clearnet session first, which is outside the client.
+- **Needed to resolve:** a decision on which mechanism to implement, and where the key material
+  lives — there is no OS keychain integration, so secrets are memory-only today.
+- **Status:** the shipped onion server entry stays as it is until that decision; connecting to it
+  now produces the server's own explanation rather than an opaque SOCKS failure.
+- **Resolution (2026-10-11, later the same day):** the decision was SASL `EXTERNAL` with an
+  app-generated client certificate, sealed in the vault rather than left in memory. Implemented and
+  verified up to the server's fingerprint check by a live probe over Tor — see the "Libera onion:
+  SASL EXTERNAL with a device certificate" section at the top of this log. Enrollment against a real
+  NickServ account remains open there; that is a separate, still-`OPEN` item, not this one.
+
+### [OPEN] `tauri-build` exited with `Text file busy` twice, then succeeded on an unchanged retry
+
+- **Attempted:** `cargo test -p hush-tauri --lib irc` (twice), after adding `data-encoding` and
+  `sha3` as dev-dependencies to `hush-tauri`.
+- **Symptom:** both runs failed at the same point — `failed to run custom build command for
+  hush-tauri`, the build script's stdout ending in `Text file busy (os error 26)`, and
+  `warning: build failed, waiting for other jobs to finish...`.
+- **Disproved explanation:** the first reading was that the running desktop binary
+  (`target/debug/hush-tauri`) held the file. Killing the app and the daemon and re-running reproduced
+  the identical failure, so that was not it; a scan of every `/proc/*/exe` showed no process
+  executing anything under the repo.
+- **Resolution:** none needed. The third identical invocation — run under `strace`, which was added
+  to find the file — succeeded with no source change, and the suite went green. No `ETXTBSY` appears
+  anywhere in the strace output.
+- **Lesson:** read this as a transient race around cargo re-running a freshly linked build script,
+  not a repo problem. The cost was two wasted runs plus a confident wrong explanation given to the
+  user mid-investigation, which is the part worth recording.
+- **Correction (2026-10-11, later the same day):** the same error recurred during a workspace
+  `cargo test`, and there the cause **was** the running `target/debug/hush-tauri` from
+  `scripts/run-one-ui.sh`; stopping the instance fixed it immediately. The "not the running binary"
+  conclusion above does not generalise — see the top section of this log. Treat `Text file busy` as
+  "a live instance is holding the binary" until `ps` says otherwise.
+
+### [WORKED AROUND] `pkill -f` killed the invoking shell a fourth time
+
+- **Attempted:** stopping the running instance with `pkill -f 'scripts/run-one-ui.sh'; kill 331322
+  331306` inside one shell call.
+- **Symptom:** the call returned after 107ms with only its first `echo` printed and exit code 0 — the
+  pattern matched the shell's own command line, which contained that literal string, and killed it
+  mid-command. The app and the daemon were both still running.
+- **Resolution:** killed by PID only, and used a bracketed pattern (`run-one[-]ui`) for the status
+  checks that followed.
+- **Lesson:** the mitigation is already written down three times in this log; what failed is reaching
+  for `pkill -f` with a pattern copied from the command being run. When the target's path appears in
+  the command text, use PIDs.
 
 ---
 

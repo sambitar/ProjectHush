@@ -215,7 +215,11 @@ pub fn run() {
             irc::commands::list_channels,
             irc::commands::get_state,
             irc::commands::irc_settings_load,
-            irc::commands::irc_settings_save
+            irc::commands::irc_settings_save,
+            irc::commands::irc_cert_status,
+            irc::commands::irc_cert_generate,
+            irc::commands::irc_cert_forget,
+            irc::commands::irc_cert_authorize
         ])
         .setup(move |app| {
             // Tor lives under the app's local data dir, not in the vault, and is
@@ -247,4 +251,110 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// The command names in the `generate_handler![...]` list, with any
+    /// `module::` prefix stripped — a permission names the command alone.
+    fn registered_commands(lib_rs: &str) -> BTreeSet<String> {
+        let open = lib_rs
+            .find("generate_handler![")
+            .expect("lib.rs registers its commands with generate_handler!");
+        let body = &lib_rs[open..];
+        let close = body
+            .find("])")
+            .expect("the generate_handler list ends with `])`");
+        body[..close]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("generate_handler"))
+            .map(|line| {
+                line.trim_end_matches(',')
+                    .rsplit("::")
+                    .next()
+                    .expect("rsplit always yields one item")
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The commands named by every `commands.allow` under `permissions/`.
+    ///
+    /// Hand-parsed rather than with a TOML crate: the value is a flat array of
+    /// quoted strings, and the shape is asserted below so a parser that silently
+    /// matched nothing fails loudly instead of passing.
+    fn permitted_commands(dir: &Path) -> BTreeSet<String> {
+        let mut files: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("permissions/ at {dir:?} is readable: {e}"))
+            .map(|entry| entry.expect("a readable directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no permission files found in {dir:?}");
+
+        let mut allowed = BTreeSet::new();
+        for path in files {
+            let text = fs::read_to_string(&path).expect("a permission file reads");
+            let Some(start) = text.find("commands.allow") else {
+                continue;
+            };
+            let open = text[start..]
+                .find('[')
+                .map(|i| start + i)
+                .unwrap_or_else(|| panic!("{}: commands.allow has no array", path.display()));
+            let close = text[open..]
+                .find(']')
+                .map(|i| open + i)
+                .unwrap_or_else(|| panic!("{}: commands.allow array is unclosed", path.display()));
+
+            let before = allowed.len();
+            for entry in text[open + 1..close].split('"').skip(1).step_by(2) {
+                let name = entry.trim();
+                assert!(
+                    !name.is_empty(),
+                    "{}: an empty command name in commands.allow",
+                    path.display()
+                );
+                allowed.insert(name.to_string());
+            }
+            assert!(
+                allowed.len() > before,
+                "{}: commands.allow parsed to nothing — the parser is out of date \
+                 with the file, not the file with the parser",
+                path.display()
+            );
+        }
+        allowed
+    }
+
+    /// Tauri refuses a command the webview was never granted, with
+    /// `"command not found"` — at click time, in the UI only. Nothing else
+    /// catches it: the command is registered, the frontend type-checks, and
+    /// `cargo test` has no opinion. This has now shipped three times (Drops, the
+    /// chat sound, the IRC certificate commands), so it is checked mechanically.
+    #[test]
+    fn every_registered_command_is_named_by_a_permission() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_rs = fs::read_to_string(manifest.join("src/lib.rs")).expect("lib.rs reads");
+        let registered = registered_commands(&lib_rs);
+        let permitted = permitted_commands(&manifest.join("permissions"));
+
+        let ungranted: Vec<&String> = registered.difference(&permitted).collect();
+        assert!(
+            ungranted.is_empty(),
+            "these commands are registered but no permission allows them, so the \
+             webview gets \"command not found\" when it calls them: {ungranted:?}"
+        );
+        assert!(
+            registered.len() > 10,
+            "the handler list parsed to {} entries — the parser is out of date",
+            registered.len()
+        );
+    }
 }

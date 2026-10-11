@@ -49,6 +49,10 @@ export interface IrcServerSnapshot {
   queries: IrcQueryState[];
 }
 
+/** Which SASL mechanism a saved server uses. `external` is the device's
+ * certificate, the only public-key mechanism the client implements. */
+export type SaslMechanism = "plain" | "external";
+
 export interface SavedServer {
   id: string;
   name: string;
@@ -59,6 +63,7 @@ export interface SavedServer {
   nick: string;
   alt_nick: string;
   auto_join: string[];
+  sasl_mechanism: SaslMechanism;
 }
 
 export interface LayoutSettings {
@@ -101,8 +106,17 @@ export interface ConnectRequest {
   username?: string;
   realname?: string;
   server_password?: string;
-  sasl?: { account: string; password: string };
+  /** `mechanism` is the tag the Rust side matches on. EXTERNAL ignores
+   * `password` and needs this device's certificate instead. */
+  sasl?: { mechanism: SaslMechanism; account: string; password?: string };
   auto_join?: string[];
+}
+
+/** What `irc_cert_status` returns. The fingerprint is public: it is what
+ * `WHOIS` prints and what `NickServ CERT ADD` takes. */
+export interface CertStatus {
+  exists: boolean;
+  fingerprint_sha512: string | null;
 }
 
 // --- Event payloads (each tagged with server_id and a target) ---

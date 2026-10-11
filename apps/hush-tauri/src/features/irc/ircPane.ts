@@ -13,6 +13,9 @@ import { isSlashCommand, runSlashCommand } from "./ircCommands";
 import { nickColor, renderSegments } from "./ircFormat";
 import {
   activeIrcWindow,
+  certForget,
+  certGenerate,
+  certStatus,
   channelList,
   closeWindow,
   connectServer,
@@ -36,7 +39,7 @@ import {
   type IrcServer,
   type IrcWindow,
 } from "./ircStore";
-import type { IrcNickEntry, SavedServer } from "./ircTypes";
+import type { IrcNickEntry, SaslMechanism, SavedServer } from "./ircTypes";
 
 /** Row height of the virtualized nick list, in pixels. */
 const NICK_ROW_H = 16;
@@ -889,6 +892,99 @@ export class IrcPane {
     const saslPassword = el("input", "irc-field");
     saslPassword.type = "password";
     saslPassword.placeholder = "SASL password (not saved)";
+    const saslMechanism = el("select", "irc-field");
+    for (const [value, label] of [
+      ["plain", "Password (PLAIN)"],
+      ["external", "This device's certificate (EXTERNAL)"],
+    ] as const) {
+      const option = el("option", undefined, label);
+      option.value = value;
+      saslMechanism.appendChild(option);
+    }
+    // A reconnect prefills this dialog from the live server, whose id is the
+    // same `host:port` the saved entry uses. The mechanism decides which
+    // credential is sent, so it has to come from the saved entry: defaulting
+    // the select to PLAIN would send a password to a server saved as EXTERNAL
+    // (the Libera onion), which refuses passwords outright.
+    const savedMechanism = saved.find((s) => s.id === prefill?.id)?.sasl_mechanism;
+    saslMechanism.value = savedMechanism === "external" ? "external" : "plain";
+
+    // The certificate section. Libera's Tor onion accepts only public-key SASL,
+    // so EXTERNAL is the only way in there, and the fingerprint below is the one
+    // thing the account has to authorize (once, from an identified connection).
+    const certRow = el("div", "irc-cert");
+    const certText = el("p", "irc-cert-text");
+    const certFingerprint = el("code", "irc-cert-fingerprint");
+    const certActions = el("div", "irc-cert-actions");
+    const generateButton = el("button", "irc-btn pressable", "Generate certificate");
+    generateButton.type = "button";
+    const forgetButton = el("button", "irc-btn pressable", "Forget");
+    forgetButton.type = "button";
+    certActions.append(generateButton, forgetButton);
+    certRow.append(certText, certFingerprint, certActions);
+
+    const refreshCert = async (): Promise<void> => {
+      try {
+        const status = await certStatus();
+        if (status.exists && status.fingerprint_sha512) {
+          certText.textContent =
+            "Authorize this fingerprint once, from a connection that is already identified: open that server's status window and run /cert authorize.";
+          certFingerprint.textContent = status.fingerprint_sha512;
+          generateButton.textContent = "Replace certificate";
+          forgetButton.hidden = false;
+        } else {
+          certText.textContent =
+            "This device has no certificate yet. Libera's Tor onion refuses passwords, so it needs one before it will let you in.";
+          certFingerprint.textContent = "";
+          generateButton.textContent = "Generate certificate";
+          forgetButton.hidden = true;
+        }
+      } catch (e) {
+        certText.textContent = `This device's certificate is unavailable: ${String(e)}`;
+        certFingerprint.textContent = "";
+        forgetButton.hidden = true;
+      }
+    };
+
+    generateButton.addEventListener("click", () => {
+      generateButton.disabled = true;
+      generateButton.textContent = "Generating…";
+      certGenerate()
+        .then(() => refreshCert())
+        .catch((e) => {
+          certText.textContent = String(e);
+        })
+        .finally(() => {
+          generateButton.disabled = false;
+        });
+    });
+
+    forgetButton.addEventListener("click", () => {
+      forgetButton.disabled = true;
+      certForget()
+        .then(() => refreshCert())
+        .catch((e) => {
+          certText.textContent = String(e);
+        })
+        .finally(() => {
+          forgetButton.disabled = false;
+        });
+    });
+
+    const saslAccountRow = labelled("SASL account", saslAccount);
+    const saslPasswordRow = labelled("SASL password", saslPassword);
+
+    // Only one of the two credentials applies at a time, so the dialog shows
+    // exactly the one the chosen mechanism will use.
+    const syncMechanism = (): void => {
+      const external = saslMechanism.value === "external";
+      saslPasswordRow.hidden = external;
+      certRow.hidden = !external;
+      saslAccount.placeholder = external
+        ? "NickServ account (optional: the fingerprint identifies you)"
+        : "NickServ account (optional)";
+    };
+    saslMechanism.addEventListener("change", syncMechanism);
 
     const tlsToggle = checkbox("Use TLS (port 6697)");
     tlsToggle.input.checked = prefill?.tls ?? true;
@@ -903,12 +999,16 @@ export class IrcPane {
       labelled("Port", portInput),
       labelled("Nickname", nickInput),
       labelled("Server password", passInput),
-      labelled("SASL account", saslAccount),
-      labelled("SASL password", saslPassword),
+      labelled("SASL mechanism", saslMechanism),
+      saslAccountRow,
+      saslPasswordRow,
+      certRow,
       labelled("Auto-join channels", autoJoinInput),
       tlsToggle.wrap,
       torToggle.wrap,
     );
+    syncMechanism();
+    void refreshCert();
 
     serverSelect.addEventListener("change", () => {
       const chosen = saved.find((s) => s.id === serverSelect.value);
@@ -919,6 +1019,8 @@ export class IrcPane {
       torToggle.input.checked = chosen.use_tor;
       nickInput.value = chosen.nick || nickInput.value;
       autoJoinInput.value = chosen.auto_join.join(" ");
+      saslMechanism.value = chosen.sasl_mechanism === "external" ? "external" : "plain";
+      syncMechanism();
     });
 
     modal.appendChild(form);
@@ -945,8 +1047,17 @@ export class IrcPane {
         .map((s) => s.trim())
         .filter(Boolean);
       const account = saslAccount.value.trim();
+      const mechanism: SaslMechanism =
+        saslMechanism.value === "external" ? "external" : "plain";
+      // EXTERNAL sends no secret, so it is configured even with an empty
+      // account (the authzid is optional: the fingerprint is the identity).
+      // PLAIN without both halves would be a silent no-op, so it is left off.
       const sasl =
-        account && saslPassword.value ? { account, password: saslPassword.value } : undefined;
+        mechanism === "external"
+          ? { mechanism, account }
+          : account && saslPassword.value
+            ? { mechanism, account, password: saslPassword.value }
+            : undefined;
       this.closeOverlay();
       connectServer({
         host,

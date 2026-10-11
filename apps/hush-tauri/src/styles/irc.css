@@ -477,6 +477,38 @@
   font-size: 12px;
 }
 
+/* The certificate section of the connect dialog: the EXTERNAL credential. */
+.irc-cert {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border: 2px solid;
+  border-color: #ffffff #808080 #808080 #ffffff;
+  background: #ffffff;
+}
+
+.irc-cert-text {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #404040;
+}
+
+/* The fingerprint is 128 hex characters, so it has to wrap rather than
+   stretch the dialog. */
+.irc-cert-fingerprint {
+  font-family: monospace;
+  font-size: 10px;
+  word-break: break-all;
+  user-select: text;
+}
+
+.irc-cert-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .irc-modal-actions {
   display: flex;
   justify-content: flex-end;

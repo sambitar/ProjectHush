@@ -15,6 +15,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { isTauriShell } from "../../lib/tauriEnv";
 import type {
+  CertStatus,
   ConnectRequest,
   IrcDefaults,
   IrcJoinEvent,
@@ -490,6 +491,35 @@ export async function refreshIrcState(): Promise<void> {
 
 export async function connectServer(request: ConnectRequest): Promise<string> {
   return invoke<string>("connect_server", { request });
+}
+
+/**
+ * This device's certificate, as the connect dialog and `/cert` need it.
+ *
+ * Only the public half crosses this boundary: the private key stays in the
+ * vault until a connection is opened, and never reaches the webview.
+ */
+export async function certStatus(): Promise<CertStatus> {
+  return invoke<CertStatus>("irc_cert_status");
+}
+
+/** Mint a certificate and seal it in the vault. Returns its fingerprint. */
+export async function certGenerate(): Promise<string> {
+  return invoke<string>("irc_cert_generate");
+}
+
+/** Delete this device's certificate from the vault. */
+export async function certForget(): Promise<void> {
+  await invoke("irc_cert_forget");
+}
+
+/**
+ * Ask NickServ to authorize this device's certificate, over a connection that
+ * is already identified. The reply arrives in that server's status window.
+ * Returns the fingerprint that was sent.
+ */
+export async function certAuthorize(serverId: string): Promise<string> {
+  return invoke<string>("irc_cert_authorize", { serverId });
 }
 
 export async function disconnectServer(serverId: string, reason?: string): Promise<void> {

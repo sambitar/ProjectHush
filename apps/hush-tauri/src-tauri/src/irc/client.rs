@@ -18,8 +18,8 @@ use tauri::AppHandle;
 use crate::irc::protocol::{parse_ctcp, ParsedLine};
 use crate::irc::state::{mentions_me, Events, ServerSnapshot};
 use crate::irc::{
-    format, nicklist, socks, tls, OutCmd, ServerConfig, LIBERA_ONION_HOST, LOBBY_CHANNEL,
-    STATUS_TARGET,
+    format, nicklist, socks, tls, OutCmd, SaslConfig, ServerConfig, LIBERA_ONION_HOST,
+    LOBBY_CHANNEL, STATUS_TARGET,
 };
 use crate::tor::{TorManager, DEFAULT_BOOTSTRAP_TIMEOUT};
 
@@ -137,6 +137,7 @@ async fn serve(
         sasl_requested: false,
         registered: false,
         nick_attempts: 0,
+        cap_ls: String::new(),
         names_accum: HashMap::new(),
     };
 
@@ -216,11 +217,7 @@ async fn dial(
         return Ok(Box::new(tcp));
     }
 
-    let config = if tls::is_onion(&cfg.host) {
-        tls::onion_config()
-    } else {
-        tls::client_config()
-    };
+    let config = tls::config_for(&cfg.host, cfg.client_cert.as_deref())?;
     let connector = tokio_rustls::TlsConnector::from(config);
     let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
         .map_err(|e| format!("invalid server name {}: {e}", cfg.host))?;
@@ -282,6 +279,30 @@ fn mark_disconnected(snapshot: &Arc<Mutex<ServerSnapshot>>, events: &Events, pha
     events.server(&snap);
 }
 
+/// Whether an advertised capability list offers SASL.
+///
+/// Two forms are in the wild: the bare `sasl` of older ircds, and the value form
+/// `sasl=ECDSA-NIST256P-CHALLENGE,EXTERNAL,PLAIN,SCRAM-SHA-512` that solanum —
+/// which Libera runs — sends. Looking for the bare name alone silently skips
+/// authentication on Libera, and the only symptom is a connection that is
+/// refused with no explanation of why.
+fn offers_sasl(offered: &[&str]) -> bool {
+    offered.iter().any(|c| *c == "sasl" || c.starts_with("sasl="))
+}
+
+/// The capabilities to request: SASL when it is both wanted and offered, plus
+/// the prefix display the nick list needs.
+fn caps_to_request(offered: &[&str], want_sasl: bool) -> Vec<&'static str> {
+    let mut req = Vec::new();
+    if offered.contains(&"multi-prefix") {
+        req.push("multi-prefix");
+    }
+    if want_sasl && offers_sasl(offered) {
+        req.push("sasl");
+    }
+    req
+}
+
 /// Whether a host is Libera (clearnet or its onion), which auto-joins the lobby.
 fn is_libera(host: &str) -> bool {
     let h = host.to_ascii_lowercase();
@@ -298,6 +319,8 @@ struct Session<'a> {
     sasl_requested: bool,
     registered: bool,
     nick_attempts: u32,
+    /// Accumulates the fragments of a multi-line `CAP LS` before negotiating.
+    cap_ls: String,
     names_accum: HashMap<String, Vec<nicklist::NickEntry>>,
 }
 
@@ -404,8 +427,19 @@ impl Session<'_> {
             }
             "903" => self.end_cap(),
             "904" | "905" | "906" | "907" => {
-                self.events
-                    .error(STATUS_TARGET, "SASL authentication failed; continuing unauthenticated.");
+                // EXTERNAL fails for exactly one reason worth naming: the
+                // account has not authorized this device's fingerprint. The
+                // server's own text ("SASL authentication failed") says nothing
+                // about which of the two credentials was rejected.
+                let message = match self.cfg.sasl.as_ref() {
+                    Some(SaslConfig::External { account }) => format!(
+                        "SASL EXTERNAL failed: {account} has not authorized this device's \
+                         certificate. Connect once with your password and authorize the \
+                         fingerprint shown in the certificate section, then reconnect."
+                    ),
+                    _ => "SASL authentication failed; continuing unauthenticated.".into(),
+                };
+                self.events.error(STATUS_TARGET, &message);
                 self.end_cap();
             }
             "001" => self.handle_welcome(&p),
@@ -454,25 +488,39 @@ impl Session<'_> {
         let caps = p.last().unwrap_or("");
         match sub.as_str() {
             "LS" => {
-                let offered: Vec<&str> = caps.split_whitespace().collect();
-                let want_sasl = self.cfg.sasl.is_some() && offered.contains(&"sasl");
-                let mut req = Vec::new();
-                if offered.contains(&"multi-prefix") {
-                    req.push("multi-prefix");
+                // A long capability list arrives in several `CAP * LS * :` lines,
+                // and only the last of them has no `*`. Negotiating from the
+                // first fragment would miss whatever else was advertised —
+                // including SASL, which is the whole reason to negotiate with
+                // Libera at all.
+                if !self.cap_ls.is_empty() {
+                    self.cap_ls.push(' ');
                 }
-                if want_sasl {
-                    req.push("sasl");
+                self.cap_ls.push_str(caps);
+                if p.param(2) == Some("*") {
+                    return;
                 }
+                let offered_raw = std::mem::take(&mut self.cap_ls);
+                let offered: Vec<&str> = offered_raw.split_whitespace().collect();
+                let want_sasl = self.cfg.sasl.is_some();
+                let req = caps_to_request(&offered, want_sasl);
                 if req.is_empty() {
                     self.end_cap();
                 } else {
-                    self.sasl_requested = want_sasl;
+                    self.sasl_requested = want_sasl && offers_sasl(&offered);
                     self.send(format!("CAP REQ :{}", req.join(" ")));
                 }
             }
             "ACK" => {
                 if self.sasl_requested && caps.split_whitespace().any(|c| c == "sasl") {
-                    self.send("AUTHENTICATE PLAIN".into());
+                    // The mechanism names the credential: PLAIN carries a
+                    // password, EXTERNAL carries none because the certificate
+                    // was already presented in the TLS handshake.
+                    let mechanism = match self.cfg.sasl.as_ref() {
+                        Some(SaslConfig::External { .. }) => "EXTERNAL",
+                        _ => "PLAIN",
+                    };
+                    self.send(format!("AUTHENTICATE {mechanism}"));
                 } else {
                     self.end_cap();
                 }
@@ -488,13 +536,26 @@ impl Session<'_> {
         }
     }
 
+    /// Answer the server's `AUTHENTICATE +`.
+    ///
+    /// PLAIN sends `authzid\0authcid\0password`. EXTERNAL sends the authzid
+    /// alone (the account name, or an empty authzid as `+`), because the proof
+    /// of identity is the certificate the handshake already carried. Both are
+    /// chunked at 400 characters, per the SASL capability.
     fn send_sasl(&self) {
-        let Some(sasl) = self.cfg.sasl.as_ref() else {
-            self.send("AUTHENTICATE +".into());
-            return;
+        let payload = match self.cfg.sasl.as_ref() {
+            None => {
+                self.send("AUTHENTICATE +".into());
+                return;
+            }
+            Some(SaslConfig::Plain { account, password }) => {
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("\0{account}\0{password}").as_bytes())
+            }
+            Some(SaslConfig::External { account }) => {
+                base64::engine::general_purpose::STANDARD.encode(account.as_bytes())
+            }
         };
-        let raw = format!("\0{}\0{}", sasl.account, sasl.password);
-        let payload = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
         let mut rest = payload.as_str();
         while rest.len() >= 400 {
             let (chunk, tail) = rest.split_at(400);
@@ -916,6 +977,37 @@ mod tests {
         assert!(is_libera("irc.libera.chat"));
         assert!(is_libera(LIBERA_ONION_HOST));
         assert!(!is_libera("irc.oftc.net"));
+    }
+
+    /// The exact capability line Libera's onion answered with, captured from a
+    /// live connection. SASL arrives in its value form, and an earlier version
+    /// of this client looked only for a bare `sasl` token — so it never asked
+    /// for authentication at all, and the onion simply refused the connection.
+    const LIBERA_CAPS: &str = "account-notify away-notify batch chghost extended-join \
+         multi-prefix sasl=ECDSA-NIST256P-CHALLENGE,EXTERNAL,PLAIN,SCRAM-SHA-512 tls \
+         account-tag cap-notify echo-message invite-notify labeled-response message-tags \
+         no-implicit-names server-time solanum.chat/identify-msg solanum.chat/oper \
+         solanum.chat/realhost";
+
+    #[test]
+    fn the_sasl_capability_is_found_in_the_value_form_libera_sends() {
+        let offered: Vec<&str> = LIBERA_CAPS.split_whitespace().collect();
+        assert!(offers_sasl(&offered));
+        // The bare form older ircds send still counts.
+        assert!(offers_sasl(&["multi-prefix", "sasl"]));
+        assert!(!offers_sasl(&["multi-prefix", "tls"]));
+        // A capability whose name merely starts with the letters must not.
+        assert!(!offers_sasl(&["sasl2"]));
+    }
+
+    #[test]
+    fn sasl_is_requested_only_when_configured_and_offered() {
+        let offered: Vec<&str> = LIBERA_CAPS.split_whitespace().collect();
+        assert_eq!(caps_to_request(&offered, true), vec!["multi-prefix", "sasl"]);
+        // No credentials configured: asking for the capability would be noise.
+        assert_eq!(caps_to_request(&offered, false), vec!["multi-prefix"]);
+        // Offered but not wanted, or wanted but not offered: no SASL request.
+        assert_eq!(caps_to_request(&["tls"], true), Vec::<&str>::new());
     }
 
     #[test]

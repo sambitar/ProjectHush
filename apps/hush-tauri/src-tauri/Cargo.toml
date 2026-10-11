@@ -34,6 +34,14 @@ webpki-roots = "0.26"
 base64 = "0.22"
 rand = "0.8"
 
+# The Libera client certificate (SASL EXTERNAL). `rcgen` mints the self-signed
+# certificate on the device; `ring` is named explicitly so the key generation
+# goes through the same provider as the TLS stack above rather than dragging in
+# a second crypto backend. `sha2` computes the SHA-512 fingerprint NickServ
+# matches on.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+sha2 = "0.11"
+
 # Signalling a Tor child left behind by a previous run. See `tor::clear_stale`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -49,3 +57,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [dev-dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+# Used by the IRC onion-address test, which decodes the base32 name and checks
+# the v3 checksum. Both are already in the dependency graph (alloy pulls them
+# in), so this adds no build cost.
+data-encoding = "2"
+sha3 = "0.11"

@@ -353,6 +353,21 @@ impl Vault {
         Ok(())
     }
 
+    /// Delete a named encrypted sidecar file, reporting whether one was there.
+    ///
+    /// The counterpart to [`Vault::write_encrypted_file`]: a feature that mints
+    /// a credential can also forget it, instead of leaving a secret in the vault
+    /// with no path to removal. `Ok(false)` means there was nothing to delete,
+    /// which is not an error for a caller that wanted it gone either way.
+    pub fn remove_encrypted_file(&self, name: &str) -> Result<bool, Error> {
+        let path = self.sidecar_path(name)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Sidecar names come from daemon code, but treat them as untrusted
     /// anyway: no separators, no traversal, nothing to escape the vault dir.
     fn sidecar_path(&self, name: &str) -> Result<PathBuf, Error> {
@@ -642,6 +657,12 @@ mod tests {
             reopened.read_encrypted_file("reads-state.enc").unwrap(),
             Some(b"{\"saved\":[1]}".to_vec())
         );
+
+        // Removal forgets it, and removing it twice is not an error.
+        assert!(reopened.remove_encrypted_file("reads-state.enc").unwrap());
+        assert_eq!(reopened.read_encrypted_file("reads-state.enc").unwrap(), None);
+        assert!(!reopened.remove_encrypted_file("reads-state.enc").unwrap());
+        assert!(!d.join("reads-state.enc").exists(), "the file is gone");
     }
 
     #[test]
@@ -655,6 +676,10 @@ mod tests {
                 "name {bad:?} must be refused"
             );
             assert!(vault.read_encrypted_file(bad).is_err());
+            assert!(
+                vault.remove_encrypted_file(bad).is_err(),
+                "removal must refuse {bad:?} too"
+            );
         }
         // Nothing written, nothing escaped: the dir is untouched.
         let after: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();

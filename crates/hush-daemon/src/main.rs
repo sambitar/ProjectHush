@@ -303,6 +303,10 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/relay", get(get_relay))
         .route("/api/relay/mode", post(put_relay_mode))
         .route("/api/relay/onion", post(put_relay_onion))
+        .route(
+            "/api/vault/secret/{name}",
+            get(get_secret).put(put_secret).delete(delete_secret),
+        )
         .route("/api/ui-prefs", get(get_ui_prefs).put(put_ui_prefs));
 
     if wallet_routes {
@@ -1727,6 +1731,118 @@ async fn recovery_acknowledge(
     touch(&state).await;
     map_err(state.worker.recovery_ack().await)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The longest sidecar name the API accepts. The vault rejects separators and
+/// traversal on its own; this cap is only so a client cannot name a file purely
+/// to fill the vault directory.
+const SECRET_NAME_MAX: usize = 64;
+
+/// Check a sidecar name before it reaches the worker, so a bad one comes back
+/// as a 400 with something the UI can show instead of a vault error string.
+fn check_secret_name(name: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let allowed = !name.is_empty()
+        && name.len() <= SECRET_NAME_MAX
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if allowed {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error:
+                    "a secret name may only use letters, digits, '-', '_' and '.', 1-64 characters"
+                        .into(),
+            }),
+        ))
+    }
+}
+
+#[derive(Serialize)]
+struct SecretResponse {
+    /// Base64 of the sealed sidecar's plaintext.
+    value_base64: String,
+}
+
+#[derive(Deserialize)]
+struct SecretPutRequest {
+    value_base64: String,
+}
+
+/// Read a named encrypted vault sidecar. 404 means the name is unused, which a
+/// client must be able to tell from "stored, and empty".
+async fn get_secret(
+    State(state): State<Arc<App>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<Json<SecretResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    check_secret_name(&name)?;
+    match map_err(state.worker.secret_read(&name).await)? {
+        WorkResult::Secret(Some(bytes)) => Ok(Json(SecretResponse {
+            value_base64: STANDARD.encode(bytes),
+        })),
+        WorkResult::Secret(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("no secret named {name}"),
+            }),
+        )),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+/// Store a named encrypted vault sidecar, replacing any previous value.
+async fn put_secret(
+    State(state): State<Arc<App>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(body): Json<SecretPutRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    check_secret_name(&name)?;
+    let bytes = STANDARD.decode(&body.value_base64).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("value_base64 is not base64: {e}"),
+            }),
+        )
+    })?;
+    match map_err(state.worker.secret_write(&name, bytes).await)? {
+        WorkResult::Ok => Ok(StatusCode::NO_CONTENT),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+/// Delete a named encrypted vault sidecar. Removing an unused name succeeds:
+/// the caller wanted it gone, and it is.
+async fn delete_secret(
+    State(state): State<Arc<App>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    check_secret_name(&name)?;
+    match map_err(state.worker.secret_remove(&name).await)? {
+        WorkResult::SecretRemoved => Ok(StatusCode::NO_CONTENT),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
 }
 
 async fn get_ui_prefs(State(state): State<Arc<App>>) -> Json<ui_prefs::UiPrefs> {
@@ -3175,6 +3291,75 @@ mod wallet_api_tests {
         let router = api_router(app);
         let (status, _) = request(&router, "GET", "/api/wallet", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_named_vault_secret_round_trips_sealed_and_can_be_forgotten() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        let router = api_router(wallet_app(dir.path(), worker, None).await);
+
+        // An unused name is a 404, which a client must be able to tell apart
+        // from "stored, and empty".
+        let (status, _) = request(&router, "GET", "/api/vault/secret/irc-client-cert", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let body =
+            serde_json::json!({ "value_base64": STANDARD.encode(b"pem-bytes") }).to_string();
+        let (status, _) = request(
+            &router,
+            "PUT",
+            "/api/vault/secret/irc-client-cert",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, json) =
+            request(&router, "GET", "/api/vault/secret/irc-client-cert", None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["value_base64"], STANDARD.encode(b"pem-bytes"));
+
+        // The sidecar on disk is sealed: the plaintext we sent must not appear.
+        let on_disk = std::fs::read(dir.path().join("irc-client-cert")).unwrap();
+        assert!(
+            !on_disk
+                .windows(b"pem-bytes".len())
+                .any(|w| w == &b"pem-bytes"[..]),
+            "the sidecar must not hold the plaintext"
+        );
+
+        let (status, _) =
+            request(&router, "DELETE", "/api/vault/secret/irc-client-cert", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = request(&router, "GET", "/api/vault/secret/irc-client-cert", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_secret_name_that_could_escape_the_vault_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        let router = api_router(wallet_app(dir.path(), worker, None).await);
+
+        // `..` and a separator are both refused before the vault sees them. An
+        // empty name never reaches the handler at all (no path segment to
+        // match), so it comes back as a plain 404.
+        for name in ["..%2Fescape", "a%2Fb", ""] {
+            let (status, json) = request(
+                &router,
+                "GET",
+                &format!("/api/vault/secret/{name}"),
+                None,
+            )
+            .await;
+            assert!(
+                status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
+                "{name} should be refused, got {status}: {json}"
+            );
+        }
+        // And nothing was written outside the vault.
+        assert!(!dir.path().parent().unwrap().join("escape").exists());
     }
 
     #[tokio::test]

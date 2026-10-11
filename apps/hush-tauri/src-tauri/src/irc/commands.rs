@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, State};
 
+use crate::irc::cert;
 use crate::irc::client;
 use crate::irc::settings::{self, IrcSettings, SettingsBundle};
 use crate::irc::state::ServerSnapshot;
-use crate::irc::{ConnectRequest, IrcState, OutCmd, ServerEntry};
+use crate::irc::{ConnectRequest, IrcState, OutCmd, SaslConfig, ServerEntry};
 use crate::tor::TorManager;
+use crate::ProxyState;
 
 /// Open a connection. Returns the server id the UI uses for every later call
 /// and every event. The connection runs in the background; failures surface as
@@ -24,11 +26,32 @@ pub async fn connect_server(
     app: AppHandle,
     state: State<'_, IrcState>,
     tor: State<'_, TorManager>,
+    proxy: State<'_, ProxyState>,
     request: ConnectRequest,
 ) -> Result<String, String> {
-    let cfg = request.into_config();
+    let mut cfg = request.into_config();
     if state.snapshot(&cfg.id).is_some() {
         return Err(format!("already connected to {}", cfg.id));
+    }
+
+    // The certificate is a vault secret, so it is read here rather than in the
+    // client task: a missing or unreadable one is a connect error the user can
+    // act on, not a connection that fails later in the TLS handshake.
+    if cfg.sasl.as_ref().is_some_and(SaslConfig::needs_certificate) {
+        if !cfg.tls {
+            return Err(
+                "SASL EXTERNAL needs TLS: the certificate is presented in the handshake".into(),
+            );
+        }
+        let client = proxy.client.as_ref().ok_or_else(|| {
+            "this device's certificate lives in the vault, which needs the desktop transport"
+                .to_string()
+        })?;
+        let identity = cert::load(client).await?.ok_or_else(|| {
+            "this device has no certificate yet: generate one in the connect dialog first"
+                .to_string()
+        })?;
+        cfg.client_cert = Some(Arc::new(identity));
     }
 
     let snapshot = Arc::new(Mutex::new(ServerSnapshot {
@@ -169,4 +192,90 @@ pub fn irc_settings_load(app: AppHandle) -> SettingsBundle {
 #[tauri::command]
 pub fn irc_settings_save(app: AppHandle, settings: IrcSettings) -> Result<(), String> {
     settings::save(&app, &settings)
+}
+
+/// What the connect dialog's certificate section renders.
+#[derive(serde::Serialize)]
+pub struct CertStatus {
+    /// Whether this vault holds a certificate.
+    pub exists: bool,
+    /// The SHA-512 fingerprint the user authorizes with NickServ, when there is
+    /// one. Public on purpose: it is what `WHOIS` prints and what `CERT ADD`
+    /// takes, so showing it is not a leak.
+    pub fingerprint_sha512: Option<String>,
+}
+
+/// Whether this device has a certificate, and its fingerprint. The private key
+/// is never part of the reply — it stays in the vault until a connection needs
+/// it.
+#[tauri::command]
+pub async fn irc_cert_status(proxy: State<'_, ProxyState>) -> Result<CertStatus, String> {
+    let client = proxy.client.as_ref().ok_or_else(|| {
+        "the certificate lives in the vault, which needs the desktop transport".to_string()
+    })?;
+    match cert::load(client).await? {
+        Some(identity) => Ok(CertStatus {
+            exists: true,
+            fingerprint_sha512: Some(identity.fingerprint_sha512),
+        }),
+        None => Ok(CertStatus {
+            exists: false,
+            fingerprint_sha512: None,
+        }),
+    }
+}
+
+/// Mint a certificate for this device and seal it in the vault, replacing any
+/// previous one. Returns the fingerprint to authorize.
+///
+/// Replacing is deliberate rather than additive: an account that has several
+/// fingerprints authorized is harder to reason about than one, and the caller
+/// is the user asking for a new certificate.
+#[tauri::command]
+pub async fn irc_cert_generate(proxy: State<'_, ProxyState>) -> Result<String, String> {
+    let client = proxy.client.as_ref().ok_or_else(|| {
+        "the certificate lives in the vault, which needs the desktop transport".to_string()
+    })?;
+    let identity = cert::generate()?;
+    cert::store(client, &identity).await?;
+    Ok(identity.fingerprint_sha512)
+}
+
+/// Forget this device's certificate. The account keeps its authorized
+/// fingerprint until it is removed with `NickServ CERT DEL`, which only matters
+/// when the key is being retired rather than replaced.
+#[tauri::command]
+pub async fn irc_cert_forget(proxy: State<'_, ProxyState>) -> Result<(), String> {
+    let client = proxy.client.as_ref().ok_or_else(|| {
+        "the certificate lives in the vault, which needs the desktop transport".to_string()
+    })?;
+    cert::forget(client).await
+}
+
+/// Authorize this device's certificate on the account, over a connection the
+/// user already has open.
+///
+/// This is a raw NickServ line rather than a flow of its own because adding a
+/// fingerprint to an account requires being logged in as that account: the
+/// connection the user has open (identified with their password) is the one
+/// that can do it. NickServ's answer arrives in that server's status window, so
+/// the user reads the outcome from Libera rather than from us. Returns the
+/// fingerprint that was sent.
+#[tauri::command]
+pub async fn irc_cert_authorize(
+    state: State<'_, IrcState>,
+    proxy: State<'_, ProxyState>,
+    server_id: String,
+) -> Result<String, String> {
+    let client = proxy.client.as_ref().ok_or_else(|| {
+        "the certificate lives in the vault, which needs the desktop transport".to_string()
+    })?;
+    let identity = cert::load(client)
+        .await?
+        .ok_or_else(|| "this device has no certificate yet".to_string())?;
+    state.send(
+        &server_id,
+        OutCmd::Raw(cert::authorize_line(&identity.fingerprint_sha512)),
+    )?;
+    Ok(identity.fingerprint_sha512)
 }

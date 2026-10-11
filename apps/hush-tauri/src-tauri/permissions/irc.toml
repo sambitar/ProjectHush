@@ -14,4 +14,8 @@ commands.allow = [
     "get_state",
     "irc_settings_load",
     "irc_settings_save",
+    "irc_cert_status",
+    "irc_cert_generate",
+    "irc_cert_forget",
+    "irc_cert_authorize",
 ]
