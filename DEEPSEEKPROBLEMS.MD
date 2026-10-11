@@ -13,6 +13,224 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — Wallet, part 2: Ethereum and ERC-20 tokens on the same phrase
+
+Slice goal: derive a second chain from the phrase the Bitcoin wallet already stores, at the
+interoperable BIP44 path `m/44'/60'/0'/0/i`, and let the wallet hold, receive, send, and track
+ERC-20 tokens — with the same privacy rule as Bitcoin: while the relay is on Tor the wallet is on
+Tor, and a missing proxy is an error, never a quiet fallback to clearnet. Amounts gain a second
+unit (wei) that does not fit in a JSON number, so every amount on the wire becomes a decimal string
+in base units.
+
+### [FIXED] `spqr`'s build script panicked with a message that never named the missing tool: `protoc`
+
+- **Attempted:** `cargo build --features ethereum`, which rebuilt the workspace's Signal-protocol
+  dependencies as well as the new wallet crate.
+- **Symptom:** the build died inside `spqr`'s build script with
+  `Protobufs in src are valid` — the string in its
+  `.expect("Protobufs in src are valid")` around `prost_build::compile_protos(...)`. `prost-build`
+  shells out to `protoc`; there was none on `PATH`, and the panic message names neither `protoc` nor
+  `prost`. `libsignal`'s build scripts (`rust/protocol`, `rust/account-keys`, `rust/keytrans`,
+  `rust/message-backup`, `rust/svrb`) fail the same way.
+- **Fix:** this repo already ships protoc at `.tools/protoc-dist/bin/protoc` and every
+  `scripts/*.sh` exports `PROTOC` to it. The same 29.3 build was placed at `~/.local/bin/protoc` —
+  same version, same 9623664 bytes — so that a bare `cargo build` also works, not just the scripts.
+  `protoc --version` now reports `libprotoc 29.3`.
+- **Pre-existing, not caused by `alloy`.** `spqr` is a dependency of `libsignal`, which
+  `hush-relay` uses; the repo already logs a fresh-`target` build failing for this reason. What is
+  new is only that this slice's dependency change forced those build scripts to run again.
+- **Lesson:** a build script's `.expect()` string is the symptom, not the cause. When a Rust build
+  dies inside a third-party `build.rs` with a domain-shaped message, look for an external binary it
+  shells out to before looking at the crate's own code.
+
+### [FIXED] A doc comment on a `sol!` item is a rustdoc warning, and `&str + &str` does not concatenate
+
+- **Attempted:** document each ERC-20 function with `///` inside the `sol!` macro body, and build an
+  expected calldata suffix in a test with `"0".repeat(63) + "1"`.
+- **Symptom:** two compile-time complaints, both in the new file. rustdoc warns about the doc
+  comment attached to the macro invocation (`unused doc comment`, because the attribute is not on an
+  item rustdoc can name), and `binary operation `+` cannot be applied to type `&str`` on the test's
+  string concatenation.
+- **Fix:** plain `//` inside `sol!`, with the documentation on the module and the wrapper methods
+  that call the generated types; and `format!` for the test's expected suffix. `cargo build` is
+  warning-free.
+- **Lesson:** a declarative macro that generates items owns their attributes — documentation for
+  generated code belongs on the hand-written wrapper. And `String + &str` works where `&str + &str`
+  does not; the error names the operator, not the types that would have worked.
+
+### [FIXED] `#[cfg(feature = "ethereum")]` in the daemon was an `unexpected_cfgs` warning and a dead branch
+
+- **Attempted:** gate the Ethereum half of `crates/hush-daemon/src/wallet.rs` on
+  `feature = "ethereum"`.
+- **Symptom:** `warning: unexpected cfg condition value: ethereum` from the `unexpected_cfgs` lint —
+  the daemon crate declared no such feature, so the "off" branch was the only one that could ever
+  compile, and the whole Ethereum path would have been dead code with no error to say so.
+- **Fix:** declared it: `[features] default = ["ethereum"]` and
+  `ethereum = ["hush-wallet/ethereum"]` in `crates/hush-daemon/Cargo.toml`.
+- **Lesson:** a `cfg` on a feature that does not exist is not an error in Rust; it is a silently
+  disabled branch. The `unexpected_cfgs` lint is the only thing that catches it.
+
+### [FIXED] A failed rebuild after a mode switch left the Bitcoin wallet on its previous connection
+
+- **Attempted:** make the wallet follow the relay's Tor switch by rebuilding it on every change.
+- **Symptom:** no loud failure, which is the problem. `rebuild_eth` already failed closed — it set
+  its handle to `None` and recorded why — but `rebuild_btc` only reported the error and left
+  `*btc` holding the wallet built for the *previous* mode. If a switch to Tor could not be built
+  (for instance the shell had not yet reported its SOCKS port), the wallet stayed on its clearnet
+  configuration while the UI said Tor.
+- **Fix:** `rebuild_btc` now mirrors `rebuild_eth`: on failure `*btc = None` and `btc_error` records
+  the reason, so the wallet is unavailable rather than wrongly connected.
+- **Lesson:** when two sibling functions implement the same invariant, the invariant belongs in the
+  shared shape. The Ethereum side was written correctly first and the Bitcoin side was not
+  revisited; a reviewer comparing them would have caught it, a test would not have.
+
+### [FIXED] The wallet's HTTPS transport only had TLS because `alloy`'s defaults happened to bring it
+
+- **Attempted:** give the adapter its own `reqwest` with `default-features = false, features =
+  ["socks", "json"]`, so no system proxy or native-tls is picked up behind its back, and depend on
+  `alloy` with an explicit feature list.
+- **Symptom:** nothing failed — which is the defect. The wallet talks to `https://…` RPC endpoints
+  and its own manifest never asks for a TLS backend; it works today only because the `alloy` features
+  left on by default include `reqwest-rustls-tls`. Confirmed with
+  `cargo tree -e features -p hush-wallet --features ethereum -i reqwest@0.13.5`: `reqwest`'s
+  `rustls` feature arrives solely through `alloy-provider/reqwest-rustls-tls`. Setting
+  `default-features = false` on `alloy` — a reasonable future cleanup — would have removed TLS and
+  turned every balance read and send into a runtime failure.
+- **Fix:** name `rustls` in the wallet's own `reqwest` features, with a comment saying why it is
+  named twice.
+- **Lesson:** a crate that makes HTTPS calls should declare its TLS backend. Inheriting one from a
+  dependency's defaults is a latent runtime failure that no compiler and no test on this box can see.
+
+### [OPEN] A debug relink of the daemon test binary exceeded 40 minutes on this box
+
+- **Attempted:** `cargo test -p hush-daemon wallet`, the only test command that exercises the wallet
+  routes end to end.
+- **Symptom:** the final `rust-lld` link of `hush_daemon`'s test binary produced a 403 MB executable
+  and sat at roughly 70% written for tens of minutes. `vmstat` showed the machine fully swapped
+  (`swpd` 8.2 GB of 8.0 GB, `si/so` active, 180 MB of 15.9 GB free); the linker's user CPU time did
+  not advance between samples while its system time crept up, i.e. it was faulting pages in and out,
+  not computing. `date` and the temp file's mtime did advance, so it was progressing, only far slower
+  than the work warrants.
+- **Not a repo defect.** It is the dev profile (`debug = 2`, no `[profile]` section anywhere in the
+  workspace) linking a binary that now contains alloy + rustls + aws-lc-sys + ring, on a machine
+  where the user's own applications hold about 14 GB. Adding `alloy` to the daemon is what pushed
+  this test binary over the edge; `hush-wallet`'s own test binary links quickly.
+- **What is needed:** free memory at build time, or a lighter dev profile for this work. Setting
+  `[profile.dev] debug = "line-tables-only"` in the workspace root would cut the link cost sharply,
+  but it changes the debug artifacts of every crate in the repo and was not applied unilaterally.
+- **Lesson:** a dependency added for one crate is paid for by every test binary that links that
+  crate. Before adding a heavy tree to a crate with integration tests, check what the final link
+  costs, not just what `cargo check` costs.
+
+### [OPEN] Ethereum's network paths are untested in this environment
+
+- **What is unverified:** `verify_chain()`, `balance()`, `token_metadata()`, `token_balance()`,
+  `send()`, and `send_token()` have never run against a real JSON-RPC endpoint, and no Ethereum
+  request has ever crossed the shell's Tor SOCKS proxy. The tests cover derivation against the
+  published vector, EIP-55 checksumming, the four ERC-20 selectors and the `transfer` calldata's
+  argument order, chain-id and network-name validation, the Tor-without-a-proxy refusal, the
+  `u128`-saturating balance conversion, and the balance snapshot's per-token bookkeeping — all
+  offline, all against no network.
+- **What is needed:** one live read against a mainnet or Sepolia endpoint over clearnet and then
+  through Tor, and one signed send on a funded Sepolia account. Until then, treat the Ethereum
+  send path as unproven, exactly as the Bitcoin one is.
+
+### [OPEN] The multi-chain Wallet pane has been type-checked, not looked at
+
+- **What is unverified:** the chain capsule, the token list, the token picker on the send form, and
+  the live unit hint (`= … wei` / `= … of the smallest USDC unit`) have been compiled and
+  type-checked (`npx tsc --noEmit` clean) but never rendered. The Bitcoin pane's rendering was
+  checked against a mock daemon in a browser (see the 2026-10-10 entry); the Ethereum additions to
+  that pane have not been through even that.
+- **What is needed:** the same mock-daemon browser pass the Bitcoin pane got, extended to a
+  `tokens` array and an `ethereum` chain entry, or a real window run. The CSS for the new classes
+  (`.wallet-chains`, `.wallet-token-list`, `.wallet-token-row`, `.wallet-token-symbol`,
+  `.wallet-token-balance`, `.wallet-token-address`, `.wallet-token-picker`) is new and likewise
+  unrendered.
+
+### [FIXED] The Bitcoin adapter checked its Tor proxy when it first synced, not when it was built
+
+- **Attempted:** make both chains refuse to exist without a route in Tor mode. The Ethereum adapter
+  builds its HTTP client in `EthereumWallet::create`, so a missing proxy is an error there. The
+  Bitcoin adapter builds its electrum client lazily, inside `make_client()`, which only runs on the
+  first network call.
+- **Symptom:** `BitcoinWallet::create(config, mnemonic)` returned `Ok` with `mode: Tor, socks: None`.
+  The refusal did happen — no clearnet fallback ever occurred, because every network entry point
+  goes through `make_client()` — but it happened later, as a sync error. So the daemon held a
+  wallet object it treated as ready, reported it to the UI as ready, and the two chains disagreed
+  about whether a wallet existed at all for the same configuration: `build_wallet` said yes,
+  `build_eth` said no.
+- **Fix:** `BitcoinConfig::validate()` (a thin wrapper over the new `socks_addr()`) is called from
+  both `create` and `load`, so the invariant is "a wallet object in memory has a correctly routed
+  client" rather than "…will have one eventually". `make_client()` still checks too.
+- **Lesson:** when two implementations of one invariant live in the same module, put the check where
+  it makes the illegal state unrepresentable, not where the failure happens to surface. A lazy
+  client turns a construction-time refusal into a runtime one, and the two are not equivalent.
+
+### [FIXED] The wallet's Tor was wired to the relay's switch, so choosing Tor with the relay on clearnet left the wallet with no route
+
+- **Attempted:** let the user pick clearnet or Tor for the wallet while the relay is on clearnet,
+  the way the UI already offered.
+- **Symptom:** `sync_wallet_relay` passed the shell's SOCKS port to the wallet only
+  `if relay_tor`, and `POST /api/relay/mode {onion: false}` cleared it. With the relay on clearnet
+  and the wallet's mode set to Tor — the daemon's own default, `NetworkMode::default()` being Tor —
+  the wallet had no proxy and could not be built. The UI offered a choice that could not work, and
+  with the construction-time refusal above in place, a wallet could not even be created.
+- **Fix:** the wallet's route is its own: `App.wallet_socks`, reported by the shell through a new
+  `POST /api/wallet/proxy`, and `sync_wallet_relay` prefers it over the relay's. The UI brings the
+  shell's Tor up when the user picks Tor (`ensureWalletTor`), reports the port, and the status poll
+  re-announces it after a daemon restart. Turning the relay off no longer stops Tor while the wallet
+  still needs it.
+- **Lesson:** two features sharing one process is not the same as two features sharing one switch.
+  The relay's switch was reused as the wallet's route because both name the same Tor, and that made
+  one feature's off-state break the other.
+
+### [FIXED] A test asserted the Tor-without-proxy refusal using an invalid mnemonic, so it passed for the wrong reason
+
+- **Attempted:** `an_unknown_ethereum_network_is_refused_rather_than_defaulted` built a
+  `WalletState::new("x".into(), …)` and asserted `build_eth(...).is_err()`.
+- **Symptom:** the assertion passed, but on the phrase, not the network: `"x"` is not a BIP39
+  mnemonic, so `build_eth` failed before it ever looked at `state.ethereum.network`. The second half
+  of the test — setting the network to a valid `"sepolia"` and expecting `Ok` — then failed, which is
+  what exposed it. The test had been asserting nothing about network validation.
+- **Fix:** use the canonical all-`abandon` vector phrase, so a failure can only come from the name.
+- **Lesson:** a negative assertion needs a control that proves the input reaches the code under test.
+  `is_err()` on a state that cannot be built for an unrelated reason is not evidence.
+
+### [FIXED] The API test helper panicked on axum's own rejections instead of reading their status
+
+- **Attempted:** `request(&router, "POST", "/api/wallet/send", Some(r#"{"chain":"litecoin",…}"#))`
+  to check that an unknown chain is refused.
+- **Symptom:** the test panicked inside the helper at `serde_json::from_slice(&bytes).unwrap()`,
+  not at its own assertion. A body axum's `Json` extractor rejects — an unknown enum variant is a
+  422 — never reaches a handler and so is a plain-text body, not JSON.
+- **Fix:** the helper falls back to the raw body as a `Value::String` when it does not parse.
+- **Lesson:** a test helper that `unwrap`s a parse is asserting that the response is well-formed,
+  which is a different claim from the one the test is making. Extractors own their rejections; a
+  handler-level test has to expect them.
+
+### [WORKED AROUND] The full daemon suite could not be run through `cargo`: the target-dir lock was held by another build
+
+- **Attempted:** `cargo test --features ethereum -p hush-daemon` after the wallet tests passed, to
+  check the relay and drops paths for regressions.
+- **Symptom:** the command sat in `locks_lock_inode_wait` for 35 minutes with no compiler child of
+  its own. `ps` showed the lock holder was a different `cargo test -p hush-tauri` (from another
+  Cursor terminal, not this session), whose `collect2`/`rust-lld` child was alive but advancing at
+  roughly 0.9 s of CPU per minute — the same swap-exhaustion link stall already logged above, not a
+  deadlock. Nothing was wrong with the command; it was simply queued behind a build it could not
+  influence.
+- **Fix:** ran the already-linked test binary directly —
+  `./target/debug/deps/hush_daemon-ed06aec28782b97f` — which needs no lock and no relink. 60 tests
+  passed in 24 s. The blocked `cargo` was then killed so it would not seize the lock for a pointless
+  relink once the other build finished. The other build was left alone: it belongs to the user.
+- **Lesson:** `cargo test` is two things — a build and a run — and the run half does not need the
+  target directory. When the build half is queued behind someone else's, run the binary. The
+  `.d`/`deps` names and a mtime check are enough to confirm it is the current one (the terminal
+  metadata timestamps are UTC while `ls` shows local time; the same build looked 5 hours stale until
+  that was noticed).
+
+---
+
 ## 2026-10-10 — Self-custody wallet: BDK, sealed in the vault, locked to the relay's Tor
 
 Slice goal: embed a wallet in Hush with no third party. Bitcoin first (BIP84 over electrum), with

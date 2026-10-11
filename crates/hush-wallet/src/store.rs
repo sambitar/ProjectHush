@@ -41,6 +41,11 @@ pub struct WalletState {
     /// Bitcoin-specific state, absent until the chain is first used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bitcoin: Option<BitcoinState>,
+    /// Ethereum-specific state. Always present in memory; a state file written
+    /// before Ethereum existed decodes to the empty default, which is a wallet
+    /// with no tokens on mainnet, account 0.
+    #[serde(default)]
+    pub ethereum: EthereumState,
 }
 
 fn default_network() -> String {
@@ -57,6 +62,43 @@ pub struct BitcoinState {
     pub changeset: Option<serde_json::Value>,
 }
 
+/// Ethereum state that must survive a restart.
+///
+/// There is no local chain data to keep, so this is only what the user chose:
+/// which network, which account, and which tokens to watch. Balances are read
+/// from the node and are never stored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EthereumState {
+    /// `"mainnet"` or `"sepolia"`.
+    #[serde(default = "default_network")]
+    pub network: String,
+    /// The BIP44 account (`m/44'/60'/0'/0/{index}`) this wallet spends from.
+    #[serde(default)]
+    pub account_index: u32,
+    /// ERC-20 tokens to track, with the metadata read from each contract once.
+    #[serde(default)]
+    pub tokens: Vec<TokenEntry>,
+}
+
+impl Default for EthereumState {
+    fn default() -> Self {
+        Self {
+            network: default_network(),
+            account_index: 0,
+            tokens: Vec::new(),
+        }
+    }
+}
+
+/// One tracked ERC-20 token.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenEntry {
+    /// The contract address, checksummed.
+    pub address: String,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
 impl WalletState {
     /// A brand-new wallet holding `mnemonic`, on `network`, in `mode`.
     pub fn new(mnemonic: String, network: &str, mode: NetworkMode) -> Self {
@@ -68,6 +110,7 @@ impl WalletState {
             label: None,
             created_at: now_secs(),
             bitcoin: None,
+            ethereum: EthereumState::default(),
         }
     }
 
@@ -98,6 +141,7 @@ impl Default for WalletState {
             label: None,
             created_at: 0,
             bitcoin: None,
+            ethereum: EthereumState::default(),
         }
     }
 }
@@ -171,5 +215,38 @@ mod tests {
         assert!(matches!(state.mnemonic(), Err(WalletError::NoWallet)));
         state.mnemonic = Some("   ".into());
         assert!(!state.has_wallet());
+    }
+
+    #[test]
+    fn a_file_written_before_ethereum_existed_decodes_to_the_empty_default() {
+        // The shape a v1 file had: no `ethereum` key at all.
+        let old = r#"{"version":1,"mnemonic":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about","network":"mainnet","mode":"tor","created_at":1}"#;
+        let state = decode(Some(old.as_bytes())).unwrap();
+        assert!(state.has_wallet());
+        assert_eq!(state.ethereum.network, "mainnet");
+        assert_eq!(state.ethereum.account_index, 0);
+        assert!(state.ethereum.tokens.is_empty());
+    }
+
+    #[test]
+    fn tokens_and_the_account_index_round_trip() {
+        let mut state = WalletState::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(),
+            "mainnet",
+            NetworkMode::Tor,
+        );
+        state.ethereum.network = "sepolia".into();
+        state.ethereum.account_index = 2;
+        state.ethereum.tokens.push(TokenEntry {
+            address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
+            symbol: "USDC".into(),
+            decimals: 6,
+        });
+        let back = decode(Some(&state.encode().unwrap())).unwrap();
+        assert_eq!(back.ethereum.network, "sepolia");
+        assert_eq!(back.ethereum.account_index, 2);
+        assert_eq!(back.ethereum.tokens.len(), 1);
+        assert_eq!(back.ethereum.tokens[0].symbol, "USDC");
+        assert_eq!(back.ethereum.tokens[0].decimals, 6);
     }
 }

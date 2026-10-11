@@ -3107,7 +3107,7 @@ button.library-item-main {
   }
 }
 
-/* Wallet pane: one self-custody Bitcoin wallet per vault. */
+/* Wallet pane: one self-custody wallet per vault, on Bitcoin and Ethereum. */
 .wallet-pane {
   padding: var(--space-5);
   gap: var(--space-4);
@@ -3281,6 +3281,76 @@ button.library-item-main {
 .wallet-mode button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* The chain capsule. A chain this build has no adapter for is shown disabled
+   rather than hidden, so a user is not left wondering where their money is. */
+.wallet-chains {
+  margin-top: var(--space-2);
+  width: 100%;
+  max-width: 320px;
+}
+
+.wallet-chains button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* The token list: symbol and balance on one line, contract address beneath. */
+.wallet-token-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.wallet-token-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.wallet-token-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wallet-token-symbol {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.wallet-token-balance {
+  font-size: 13px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.wallet-token-address {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.wallet-token-row .btn-secondary {
+  width: auto;
+  flex: none;
+}
+
+.wallet-token-picker {
+  width: 100%;
+  max-width: 320px;
 }
 
 .wallet-danger {

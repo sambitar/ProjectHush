@@ -68,6 +68,13 @@ struct App {
     /// when the relay switch is on. Runtime-only: the shell posts it after
     /// starting Tor and the daemon hands it to the account's relay client.
     relay_socks: Mutex<Option<String>>,
+    /// The SOCKS proxy the shell reported for the *wallet's* Tor.
+    ///
+    /// Separate from `relay_socks` because the two are not the same switch: the
+    /// wallet may be on Tor while the relay is not (the UI offers that), and
+    /// turning the relay off stops Tor only when nothing else needs it. The
+    /// wallet keeps its route either way.
+    wallet_socks: Mutex<Option<String>>,
     /// The last relay reachability probe: `(reachable, when)`. The UI's
     /// connection light is only honest if it reflects this rather than Tor's
     /// bootstrap phase, which stays "ready" long after the network is gone.
@@ -307,6 +314,9 @@ fn api_router(state: Arc<App>) -> Router {
             .route("/api/wallet/sync", post(wallet_sync))
             .route("/api/wallet/send", post(wallet_send))
             .route("/api/wallet/mode", post(wallet_mode))
+            .route("/api/wallet/proxy", post(wallet_proxy))
+            .route("/api/wallet/token", post(wallet_token_add))
+            .route("/api/wallet/token/remove", post(wallet_token_remove))
             .route("/api/wallet/wipe", post(wallet_wipe));
     }
 
@@ -373,6 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         unlocked: Mutex::new(false),
         unlocked_at: Mutex::new(None),
         relay_socks: Mutex::new(None),
+        wallet_socks: Mutex::new(None),
         relay_health: Mutex::new(None),
         relay_probe_inflight: AtomicBool::new(false),
     };
@@ -775,11 +786,15 @@ async fn unlock(
 /// never do. Every path that can change the switch calls this.
 async fn sync_wallet_relay(state: &Arc<App>) {
     let relay_tor = ui_prefs::load(&state.dir).relay_tor;
-    let socks = state.relay_socks.lock().await.clone();
-    state
-        .wallet
-        .apply_relay(relay_tor, if relay_tor { socks } else { None })
-        .await;
+    // The wallet's Tor is whichever proxy the shell reported for it; the relay
+    // switch is the other source, and either names the same Tor process. When
+    // neither is known the wallet is left without a route, which in Tor mode is
+    // a refusal rather than a direct connection.
+    let socks = match state.wallet_socks.lock().await.clone() {
+        Some(socks) => Some(socks),
+        None => state.relay_socks.lock().await.clone(),
+    };
+    state.wallet.apply_relay(relay_tor, socks).await;
 }
 
 async fn apply_relay_prefs(state: &Arc<App>) {
@@ -2448,7 +2463,7 @@ async fn wallet_create(
     let tor = relay_is_tor(&state);
     state
         .wallet
-        .create(&body.network, body.mode, tor)
+        .create(&body.network, &body.ethereum_network, body.mode, tor)
         .await
         .map(Json)
         .map_err(wallet_err)
@@ -2462,7 +2477,13 @@ async fn wallet_restore(
     let tor = relay_is_tor(&state);
     state
         .wallet
-        .restore(&body.mnemonic, &body.network, body.mode, tor)
+        .restore(
+            &body.mnemonic,
+            &body.network,
+            &body.ethereum_network,
+            body.mode,
+            tor,
+        )
         .await
         .map(Json)
         .map_err(wallet_err)
@@ -2470,24 +2491,26 @@ async fn wallet_restore(
 
 async fn wallet_address(
     State(state): State<Arc<App>>,
+    Json(body): Json<wallet::ChainRequest>,
 ) -> Result<Json<wallet::AddressResult>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     state
         .wallet
-        .receive_address()
+        .receive_address(body.chain)
         .await
-        .map(|address| Json(wallet::AddressResult { address }))
+        .map(Json)
         .map_err(wallet_err)
 }
 
 async fn wallet_sync(
     State(state): State<Arc<App>>,
+    Json(body): Json<wallet::ChainRequest>,
 ) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let tor = relay_is_tor(&state);
     state
         .wallet
-        .sync(tor)
+        .sync(body.chain, tor)
         .await
         .map(Json)
         .map_err(wallet_err)
@@ -2495,15 +2518,10 @@ async fn wallet_sync(
 
 async fn wallet_send(
     State(state): State<Arc<App>>,
-    Json(body): Json<wallet::SendRequest>,
+    Json(body): Json<hush_wallet::chain::SendRequest>,
 ) -> Result<Json<wallet::SendResult>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    state
-        .wallet
-        .send(body.to, body.amount, body.fee_rate)
-        .await
-        .map(Json)
-        .map_err(wallet_err)
+    state.wallet.send(body).await.map(Json).map_err(wallet_err)
 }
 
 async fn wallet_mode(
@@ -2515,6 +2533,61 @@ async fn wallet_mode(
     state
         .wallet
         .set_mode(body.mode, tor)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+/// The shell reports the SOCKS proxy its Tor is listening on, for the wallet.
+///
+/// The wallet's Tor is the shell's Tor, the same process the relay and the
+/// Drop window use, so this is a port announcement rather than a setting. It is
+/// a separate route from the relay's because the wallet may be on Tor while the
+/// relay is not.
+async fn wallet_proxy(
+    State(state): State<Arc<App>>,
+    Json(body): Json<wallet::ProxyRequest>,
+) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    if let Some(socks) = body.socks.as_deref() {
+        // Validated here rather than trusted: a proxy string the wallet cannot
+        // parse would fail the build later, with a worse error.
+        hush_core::validate_socks_proxy(socks).map_err(|e| wallet_err(e.to_string()))?;
+    }
+    *state.wallet_socks.lock().await = body.socks;
+    sync_wallet_relay(&state).await;
+    let tor = relay_is_tor(&state);
+    state
+        .wallet
+        .public_state(tor)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+async fn wallet_token_add(
+    State(state): State<Arc<App>>,
+    Json(body): Json<wallet::TokenRequest>,
+) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let tor = relay_is_tor(&state);
+    state
+        .wallet
+        .add_token(&body.address, tor)
+        .await
+        .map(Json)
+        .map_err(wallet_err)
+}
+
+async fn wallet_token_remove(
+    State(state): State<Arc<App>>,
+    Json(body): Json<wallet::TokenRequest>,
+) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let tor = relay_is_tor(&state);
+    state
+        .wallet
+        .remove_token(&body.address, tor)
         .await
         .map(Json)
         .map_err(wallet_err)
@@ -2758,6 +2831,7 @@ mod drops_api_tests {
             unlocked: Mutex::new(false),
             unlocked_at: Mutex::new(None),
             relay_socks: Mutex::new(None),
+            wallet_socks: Mutex::new(None),
             relay_health: Mutex::new(None),
             relay_probe_inflight: AtomicBool::new(false),
         })
@@ -3008,12 +3082,22 @@ mod wallet_api_tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    fn wallet_app(
+    /// The proxy the shell reports once its Tor is listening. Nothing connects
+    /// to it here: building a client is not a request.
+    const TEST_SOCKS: &str = "socks5h://127.0.0.1:9050";
+
+    /// A daemon holding the route the shell reports once its Tor is listening.
+    ///
+    /// Async because priming the wallet is what `unlock` does — it applies the
+    /// relay prefs, which hand the wallet its proxy. A wallet that defaults to
+    /// Tor cannot be built before that, so a test that skipped it would be
+    /// testing a state the real daemon never reaches.
+    async fn wallet_app(
         dir: &std::path::Path,
         worker: AccountWorker,
         socket: Option<PathBuf>,
     ) -> Arc<App> {
-        Arc::new(App {
+        let app = Arc::new(App {
             dir: dir.to_path_buf(),
             socket,
             tcp_addr: None,
@@ -3024,9 +3108,14 @@ mod wallet_api_tests {
             unlocked: Mutex::new(true),
             unlocked_at: Mutex::new(None),
             relay_socks: Mutex::new(None),
+            wallet_socks: Mutex::new(Some(TEST_SOCKS.to_string())),
             relay_health: Mutex::new(None),
             relay_probe_inflight: AtomicBool::new(false),
-        })
+        });
+        app.wallet
+            .apply_relay(false, Some(TEST_SOCKS.to_string()))
+            .await;
+        app
     }
 
     async fn request(
@@ -3050,10 +3139,16 @@ mod wallet_api_tests {
             .unwrap();
         let status = res.status();
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        // A rejected body is plain text, not JSON: axum's own extractor
+        // rejection (the 422 for a chain it cannot parse) never reaches a
+        // handler. Parsing with `unwrap` turned that into a panic instead of
+        // the status the test is asking about.
         let json = if bytes.is_empty() {
             serde_json::Value::Null
         } else {
-            serde_json::from_slice(&bytes).unwrap()
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
+            })
         };
         (status, json)
     }
@@ -3076,7 +3171,7 @@ mod wallet_api_tests {
         let dir = TempDir::new().unwrap();
         let worker = unlocked(dir.path()).await;
         // A TCP-only daemon must not expose endpoints that can move funds.
-        let app = wallet_app(dir.path(), worker, None);
+        let app = wallet_app(dir.path(), worker, None).await;
         let router = api_router(app);
         let (status, _) = request(&router, "GET", "/api/wallet", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -3087,13 +3182,20 @@ mod wallet_api_tests {
         let dir = TempDir::new().unwrap();
         let worker = unlocked(dir.path()).await;
         let socket = Some(dir.path().join("daemon.sock"));
-        let router = api_router(wallet_app(dir.path(), worker, socket));
+        let router = api_router(wallet_app(dir.path(), worker, socket).await);
 
         // Before creation: no wallet, no address.
         let (status, json) = request(&router, "GET", "/api/wallet", None).await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["exists"], false);
-        assert!(json["address"].is_null());
+        assert!(json["chains"][0]["address"].is_null());
+        // Both chains are always reported, so the UI can show a tab per chain.
+        assert_eq!(json["chains"][0]["chain"], "bitcoin");
+        assert_eq!(json["chains"][0]["unit"], "sat");
+        assert_eq!(json["chains"][1]["chain"], "ethereum");
+        assert_eq!(json["chains"][1]["unit"], "wei");
+        assert_eq!(json["chains"][1]["available"], cfg!(feature = "ethereum"));
+        assert_eq!(json["tokens"].as_array().unwrap().len(), 0);
 
         // Create returns the phrase exactly once.
         let (status, json) = request(
@@ -3112,11 +3214,19 @@ mod wallet_api_tests {
         // Creation reveals one receive address for the UI to show. The phrase
         // is freshly generated, so only the shape is checkable here; the fixed
         // vector is asserted on the restore path below.
-        let first = json["state"]["address"].as_str().unwrap().to_string();
+        let first = json["state"]["chains"][0]["address"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(
             first.starts_with("bc1q") && first.len() == 42,
             "expected a mainnet P2WPKH address, got {first}"
         );
+        // A fresh wallet shows a zero balance on both chains, as strings: wei
+        // is past what a JSON number can carry exactly.
+        assert_eq!(json["state"]["chains"][0]["confirmed"], "0");
+        assert_eq!(json["state"]["chains"][1]["confirmed"], "0");
+        assert!(json["state"]["chains"][1]["confirmed"].is_string());
 
         // A second create is refused rather than overwriting the phrase.
         let (status, _) = request(
@@ -3130,13 +3240,20 @@ mod wallet_api_tests {
 
         // A new receive address is fresh, not a repeat, and becomes the one
         // the state route hands out.
-        let (status, json) = request(&router, "POST", "/api/wallet/address", None).await;
+        let (status, json) = request(
+            &router,
+            "POST",
+            "/api/wallet/address",
+            Some(r#"{"chain":"bitcoin"}"#),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["chain"], "bitcoin");
         let second = json["address"].as_str().unwrap().to_string();
         assert_ne!(second, first);
 
         let (_, json) = request(&router, "GET", "/api/wallet", None).await;
-        assert_eq!(json["address"].as_str().unwrap(), second);
+        assert_eq!(json["chains"][0]["address"].as_str().unwrap(), second);
 
         // The phrase is never handed out again by the state route.
         let (_, json) = request(&router, "GET", "/api/wallet", None).await;
@@ -3148,7 +3265,7 @@ mod wallet_api_tests {
         let dir = TempDir::new().unwrap();
         let worker = unlocked(dir.path()).await;
         let socket = Some(dir.path().join("daemon.sock"));
-        let app = wallet_app(dir.path(), worker, socket);
+        let app = wallet_app(dir.path(), worker, socket).await;
         let router = api_router(app.clone());
 
         // A bad phrase is refused with a 400, and leaves no wallet behind.
@@ -3171,10 +3288,15 @@ mod wallet_api_tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
-        // The first BIP84 mainnet address is a fixed value.
+        // The first BIP84 mainnet address is a fixed value, and so is the
+        // first BIP44 Ethereum account: the same phrase, both chains.
         assert_eq!(
-            json["address"].as_str().unwrap(),
+            json["chains"][0]["address"].as_str().unwrap(),
             "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"
+        );
+        assert_eq!(
+            json["chains"][1]["address"].as_str().unwrap(),
+            "0x9858EfFD232B4033E47d90003D41EC34EcaEda94"
         );
 
         // Turn the relay onto Tor; the wallet is locked on and clearnet is
@@ -3223,7 +3345,7 @@ mod wallet_api_tests {
         let dir = TempDir::new().unwrap();
         let worker = unlocked(dir.path()).await;
         let socket = Some(dir.path().join("daemon.sock"));
-        let router = api_router(wallet_app(dir.path(), worker, socket));
+        let router = api_router(wallet_app(dir.path(), worker, socket).await);
 
         // A wallet the user put on clearnet.
         let (status, json) = request(
@@ -3271,5 +3393,145 @@ mod wallet_api_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(err["error"].as_str().unwrap().contains("Tor"));
+    }
+
+    /// A wallet with a known phrase, so every derived address is a fixed value.
+    async fn restored(dir: &std::path::Path, worker: AccountWorker) -> axum::Router {
+        let socket = Some(dir.join("daemon.sock"));
+        let router = api_router(wallet_app(dir, worker, socket).await);
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let (status, json) = request(
+            &router,
+            "POST",
+            "/api/wallet/restore",
+            Some(&format!(r#"{{"mnemonic":"{phrase}","network":"mainnet"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        router
+    }
+
+    #[tokio::test]
+    async fn ethereum_refuses_a_bad_contract_and_a_bad_amount_before_any_network_use() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        let router = restored(dir.path(), worker).await;
+
+        // A contract address that is not an address is refused without a
+        // request being made.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/wallet/token",
+            Some(r#"{"address":"not-an-address"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!err["error"].as_str().unwrap().is_empty());
+
+        // Removing a token that is not tracked says so.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/wallet/token/remove",
+            Some(r#"{"address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A send with an amount that is not a whole number of base units never
+        // reaches the signing path.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/wallet/send",
+            Some(r#"{"chain":"ethereum","to":"0x9858EfFD232B4033E47d90003D41EC34EcaEda94","amount":"1.5"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("whole number"));
+
+        // Bitcoin has no tokens, and saying so is cheaper than a confusing
+        // failure deeper in.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/wallet/send",
+            Some(r#"{"chain":"bitcoin","to":"bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu","amount":"1000","token":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("no tokens"));
+
+        // An amount past u64 is refused rather than truncated into the signer.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/wallet/send",
+            Some(r#"{"chain":"bitcoin","to":"bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu","amount":"18446744073709551616"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("larger than"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_network_or_chain_is_refused_at_create() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        let socket = Some(dir.path().join("daemon.sock"));
+        let router = api_router(wallet_app(dir.path(), worker, socket).await);
+
+        // A typo in the Ethereum network must not be read as mainnet.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/wallet/create",
+            Some(r#"{"network":"mainnet","ethereum_network":"sepoliaa"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        // And nothing was created by the failed attempt.
+        let (_, json) = request(&router, "GET", "/api/wallet", None).await;
+        assert_eq!(json["exists"], false);
+
+        // A chain that does not exist is refused by name.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/wallet/create",
+            Some(r#"{"network":"mainnet"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/wallet/send",
+            Some(r#"{"chain":"litecoin","to":"x","amount":"1"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_state_names_the_ethereum_network_the_wallet_was_created_on() {
+        let dir = TempDir::new().unwrap();
+        let worker = unlocked(dir.path()).await;
+        let socket = Some(dir.path().join("daemon.sock"));
+        let router = api_router(wallet_app(dir.path(), worker, socket).await);
+        let (status, json) = request(
+            &router,
+            "POST",
+            "/api/wallet/create",
+            Some(r#"{"network":"mainnet","ethereum_network":"sepolia"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        // The Ethereum account is the same phrase, on the network asked for.
+        assert_eq!(json["state"]["chains"][1]["address"].as_str().unwrap().len(), 42);
+        // Nothing is persisted about a balance; a fresh wallet reads zero.
+        assert_eq!(json["state"]["chains"][1]["confirmed"], "0");
+        assert_eq!(json["state"]["tokens"].as_array().unwrap().len(), 0);
     }
 }

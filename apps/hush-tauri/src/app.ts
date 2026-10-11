@@ -12,8 +12,11 @@ import type {
   TorrentItemDto,
   TorrentLibraryEntryDto,
   TorrentsStateDto,
+  WalletChain,
+  WalletChainDto,
   WalletNetworkMode,
   WalletStateDto,
+  WalletTokenDto,
 } from "./lib/api/types";
 import {
   HK_NEWS,
@@ -52,19 +55,29 @@ import {
 } from "./lib/torrentsStore";
 import { showToast } from "./lib/toast";
 import {
+  CHAINS,
+  DEFAULT_ETHEREUM_NETWORK,
   DEFAULT_FEE_RATE,
+  addToken,
+  chainState,
   clearWalletStore,
   createWallet,
+  formatBase,
   formatBtc,
-  formatSats,
+  formatEth,
+  formatToken,
+  formatUnits,
   getWalletLoadError,
   getWalletState,
   isWalletLoaded,
   newReceiveAddress,
+  parseUnits,
+  removeToken,
   restoreWallet,
   sendPayment,
   setWalletMode,
   setWalletPaneOpen,
+  setWalletProxy,
   subscribeWallet,
   syncWallet,
   wipeWallet,
@@ -560,20 +573,38 @@ export class App {
   private walletPhrase: string | null = null;
   /** Network chosen for create/restore; only `mainnet` is offered in the UI. */
   private walletNetwork = "mainnet";
+  /** Which chain the pane is showing. Bitcoin first: it is the default. */
+  private walletChain: WalletChain = "bitcoin";
   /** What the user has typed into the restore field. */
   private walletRestoreInput = "";
-  /** Send form fields. `walletSendAmount` is in satoshi, as typed. */
+  /** Send form fields. `walletSendAmount` is in the unit named by the field. */
   private walletSendTo = "";
   private walletSendAmount = "";
   private walletSendFee = String(DEFAULT_FEE_RATE);
+  /**
+   * The ERC-20 contract to send, or null for the native coin. Held per pane
+   * rather than per token, because the field is a single selector.
+   */
+  private walletSendToken: string | null = null;
+  /** What the user has typed into the add-token field. */
+  private walletTokenInput = "";
   /** The txid of the last successful send, shown until the pane is left. */
-  private walletLastTx: { txid: string; fee_sat: number } | null = null;
+  private walletLastTx: {
+    chain: WalletChain;
+    txid: string;
+    fee_sat: number | null;
+  } | null = null;
   /** The last wallet error, shown inline rather than as a toast. */
   private walletError: string | null = null;
   /** What the user has typed to confirm wiping the wallet. */
   private walletWipeConfirm = "";
   /** A wallet operation is in flight; the pane's actions are disabled. */
   private walletBusy = false;
+  /** The proxy last reported to the daemon for the wallet, so the status poll
+   *  does not repost the same port every tick. */
+  private walletProxy: string | null = null;
+  /** A wallet-requested Tor start is in flight, so the poll does not stack them. */
+  private walletTorBusy = false;
 
   /** Read/star/archive/trash, straight from `ui-prefs.json`. */
   private mailPrefs(): MailFlags {
@@ -1112,6 +1143,7 @@ export class App {
   private railBtn(id: Rail, label: string, ic: IconName, badge: boolean | number = false): HTMLElement {
     const b = document.createElement("button");
     b.className = `rail-btn pressable${this.rail === id ? " active" : ""}`;
+    b.dataset.rail = id;
     b.appendChild(icon(ic));
     const span = document.createElement("span");
     span.textContent = label;
@@ -1633,6 +1665,31 @@ export class App {
     this.torReachable = reachable;
     if (changed) this.updateTorPill();
 
+    // The wallet's Tor is this same shell process, so it heals on this poll
+    // too. A daemon restart wipes the port it was given, and a fresh Tor gets a
+    // fresh one: either way the wallet would be left with no route, which in
+    // Tor mode is a refusal. Announce the live port, and bring Tor up if the
+    // user chose Tor for the wallet and it is not running.
+    const wallet = getWalletState();
+    if (wallet.exists && wallet.mode === "tor") {
+      if (tor.phase === "ready" && tor.socks_port) {
+        const live = `socks5h://127.0.0.1:${tor.socks_port}`;
+        if (this.walletProxy !== live) {
+          try {
+            await setWalletProxy(live);
+            this.walletProxy = live;
+          } catch {
+            /* the next poll retries */
+          }
+        }
+      } else if (tor.phase === "stopped" && !this.walletTorBusy) {
+        this.walletTorBusy = true;
+        void torStart().finally(() => {
+          this.walletTorBusy = false;
+        });
+      }
+    }
+
     // The switch being on is the whole instruction — nothing else is asked
     // of the user, ever. Two ways that can be true while traffic is not yet
     // protected, and both heal here on their own:
@@ -1715,9 +1772,12 @@ export class App {
     this.torActionError = null;
     if (!on) {
       await api.setRelayMode(false, null);
-      // Tor serves the Drop window too; stop it only when nothing needs it.
+      // Tor serves the Drop window and the wallet too; stop it only when
+      // nothing else needs it.
       const open = await openState();
-      if (!open.open) await torStop();
+      const wallet = getWalletState();
+      const walletWantsTor = wallet.exists && wallet.mode === "tor";
+      if (!open.open && !walletWantsTor) await torStop();
       await this.refreshStatus();
       this.render();
       return;
@@ -5753,17 +5813,22 @@ export class App {
   // ------------------------------------------------------------------
 
   /**
-   * The Wallet pane: one self-custody Bitcoin wallet per vault.
+   * The Wallet pane: one self-custody wallet per vault, on two chains.
    *
    * The phrase is generated and sealed by the daemon; this pane sees it exactly
    * once, at creation, and is responsible for making the user write it down.
-   * Everything else — the balance, the address, sending — is the daemon's
+   * Everything else — the balances, the addresses, sending — is the daemon's
    * state rendered back.
+   *
+   * The chain capsule switches which chain the cards below describe. One
+   * phrase backs both, so there is no separate "create" per chain: the tabs
+   * are a view, not two wallets.
    */
   private renderWallet(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane wallet-pane";
     const state = getWalletState();
+    const view = chainState(state, this.walletChain);
 
     const head = document.createElement("div");
     head.className = "wallet-head";
@@ -5775,9 +5840,16 @@ export class App {
       const sync = document.createElement("button");
       sync.type = "button";
       sync.className = "btn-secondary text-13 pressable";
-      sync.textContent = this.walletBusy ? "Working…" : "Sync";
-      sync.disabled = this.walletBusy;
-      sync.title = "Scan the chain for payments to this wallet";
+      sync.textContent = this.walletBusy
+        ? "Working…"
+        : this.walletChain === "bitcoin"
+          ? "Sync"
+          : "Refresh";
+      sync.disabled = this.walletBusy || !view.available;
+      sync.title =
+        this.walletChain === "bitcoin"
+          ? "Scan the chain for payments to this wallet"
+          : "Read the balance and every tracked token from the node";
       sync.onclick = () => void this.walletSyncNow();
       head.appendChild(sync);
     }
@@ -5807,19 +5879,75 @@ export class App {
     }
 
     if (!state.exists) {
-      pane.appendChild(this.walletSetup());
+      pane.appendChild(this.walletSetup(state));
       return pane;
     }
 
     if (this.walletPhrase) {
       pane.appendChild(this.walletPhraseCard(this.walletPhrase));
     }
-    pane.appendChild(this.walletBalanceCard(state));
-    pane.appendChild(this.walletReceiveCard(state));
-    pane.appendChild(this.walletSendCard(state));
+    pane.appendChild(this.walletChainCard(state));
+    pane.appendChild(this.walletBalanceCard(view, state));
+    pane.appendChild(this.walletReceiveCard(view));
+    if (this.walletChain === "ethereum") {
+      pane.appendChild(this.walletSendCard(view, state));
+      pane.appendChild(this.walletTokensCard(state));
+    } else {
+      pane.appendChild(this.walletSendCard(view, state));
+    }
     pane.appendChild(this.walletModeCard(state));
     pane.appendChild(this.walletDangerCard());
     return pane;
+  }
+
+  /**
+   * The chain capsule: which chain the cards below describe.
+   *
+   * A chain this daemon was not built with is shown, but disabled and named as
+   * unavailable — hiding it would leave a user wondering where their money is.
+   */
+  private walletChainCard(state: WalletStateDto): HTMLElement {
+    const card = document.createElement("section");
+    card.className = "wallet-card";
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Chains";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent =
+      "One recovery phrase, both chains. Bitcoin and Ethereum are derived from the same twelve words.";
+    card.append(h, p);
+
+    const capsule = document.createElement("div");
+    capsule.className = "segmented wallet-chains";
+    capsule.setAttribute("role", "group");
+    capsule.setAttribute("aria-label", "Wallet chain");
+    const labels: { id: WalletChain; label: string }[] = [
+      { id: "bitcoin", label: "Bitcoin" },
+      { id: "ethereum", label: "Ethereum" },
+    ];
+    for (const opt of labels) {
+      const chain = chainState(state, opt.id);
+      const active = this.walletChain === opt.id;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = `pressable${active ? " active" : ""}`;
+      b.textContent = opt.label;
+      b.disabled = !chain.available;
+      b.setAttribute("aria-pressed", active ? "true" : "false");
+      if (!chain.available) {
+        b.title = "This build of Hush has no adapter for this chain.";
+      }
+      b.onclick = () => {
+        if (active || !chain.available) return;
+        this.walletChain = opt.id;
+        this.walletError = null;
+        this.render();
+      };
+      capsule.appendChild(b);
+    }
+    card.appendChild(capsule);
+    return card;
   }
 
   /** The wallet routes live on the daemon's Unix socket only (DR-02). */
@@ -5840,18 +5968,18 @@ export class App {
   }
 
   /** No wallet yet: create one, or restore from a phrase. */
-  private walletSetup(): HTMLElement {
+  private walletSetup(state: WalletStateDto): HTMLElement {
     const wrap = document.createElement("div");
     wrap.className = "wallet-setup";
 
     const intro = document.createElement("p");
     intro.className = "muted text-13";
     intro.textContent =
-      "Hush holds the keys, not a company. The recovery phrase is sealed into this vault with your master key and never leaves it — but a wallet you cannot restore from a phrase is a wallet you cannot recover, so write it down when it is shown.";
+      "Hush holds the keys, not a company. The recovery phrase is sealed into this vault with your master key and never leaves it — but a wallet you cannot restore from a phrase is a wallet you cannot recover, so write it down when it is shown. One phrase covers Bitcoin and Ethereum.";
 
     const createCard = document.createElement("section");
     createCard.className = "wallet-card";
-    createCard.innerHTML = `<h2 class="text-18">Create a wallet</h2><p class="muted text-13">A new Bitcoin wallet, derived from a fresh 12-word phrase.</p>`;
+    createCard.innerHTML = `<h2 class="text-18">Create a wallet</h2><p class="muted text-13">A new Bitcoin and Ethereum wallet, derived from one fresh 12-word phrase.</p>`;
     const createBtn = document.createElement("button");
     createBtn.type = "button";
     createBtn.className = "btn-primary pressable";
@@ -5862,7 +5990,7 @@ export class App {
 
     const restoreCard = document.createElement("section");
     restoreCard.className = "wallet-card";
-    restoreCard.innerHTML = `<h2 class="text-18">Restore from a phrase</h2><p class="muted text-13">Bring back a wallet you already hold the phrase for. Nothing is overwritten — a vault holds one wallet.</p>`;
+    restoreCard.innerHTML = `<h2 class="text-18">Restore from a phrase</h2><p class="muted text-13">Bring back a wallet you already hold the phrase for, on both chains. Nothing is overwritten — a vault holds one wallet.</p>`;
     const input = document.createElement("textarea");
     input.className = "input-field wallet-phrase-input";
     input.rows = 3;
@@ -5881,7 +6009,11 @@ export class App {
     restoreBtn.onclick = () => void this.walletRestoreNow();
     restoreCard.append(input, restoreBtn);
 
-    wrap.append(intro, createCard, restoreCard);
+    // The posture is chosen here, before the wallet exists, because a Tor
+    // wallet cannot be created until the shell's Tor is listening. Creating
+    // first and offering the switch afterwards would mean either a clearnet
+    // wallet nobody asked for or a create that fails after the fact.
+    wrap.append(intro, this.walletModeCard(state), createCard, restoreCard);
     return wrap;
   }
 
@@ -5895,7 +6027,7 @@ export class App {
     const p = document.createElement("p");
     p.className = "text-13";
     p.textContent =
-      "These twelve words are the wallet. Anyone who has them can spend the money, and nobody — including Hush — can restore them for you. This is the only time they are shown.";
+      "These twelve words are both wallets — Bitcoin and Ethereum. Anyone who has them can spend the money, and nobody — including Hush — can restore them for you. This is the only time they are shown.";
     const words = document.createElement("ol");
     words.className = "wallet-phrase-words";
     for (const w of phrase.split(/\s+/)) {
@@ -5926,35 +6058,61 @@ export class App {
     return card;
   }
 
-  private walletBalanceCard(state: WalletStateDto): HTMLElement {
+  /** The balance of the chain on screen, in its own unit. */
+  private walletBalanceCard(
+    view: WalletChainDto,
+    state: WalletStateDto,
+  ): HTMLElement {
     const card = document.createElement("section");
     card.className = "wallet-card";
     const h = document.createElement("h2");
     h.className = "text-18";
-    h.textContent = "Balance";
+    h.textContent = this.walletChain === "bitcoin" ? "Bitcoin balance" : "Ether balance";
     const amount = document.createElement("p");
     amount.className = "wallet-balance";
-    amount.textContent = `${formatBtc(state.confirmed_sat)} BTC`;
-    const sats = document.createElement("p");
-    sats.className = "faint text-12";
-    sats.textContent = formatSats(state.confirmed_sat);
-    card.append(h, amount, sats);
-    if (state.pending_sat > 0) {
+    amount.textContent =
+      this.walletChain === "bitcoin"
+        ? `${formatBtc(view.confirmed)} BTC`
+        : `${formatEth(view.confirmed)} ETH`;
+    const base = document.createElement("p");
+    base.className = "faint text-12";
+    base.textContent = formatBase(view.confirmed, view.unit);
+    card.append(h, amount, base);
+    if (view.pending !== "0") {
       const pending = document.createElement("p");
       pending.className = "text-13";
       pending.style.color = "var(--warning-text)";
-      pending.textContent = `Waiting to confirm: ${formatBtc(state.pending_sat)} BTC (${formatSats(state.pending_sat)})`;
+      pending.textContent = `Waiting to confirm: ${formatBase(view.pending, view.unit)}`;
       card.appendChild(pending);
+    }
+    if (this.walletChain === "ethereum" && state.tokens.length > 0) {
+      const list = document.createElement("ul");
+      list.className = "wallet-token-list";
+      for (const token of state.tokens) {
+        const li = document.createElement("li");
+        li.className = "wallet-token-row";
+        const symbol = document.createElement("span");
+        symbol.className = "wallet-token-symbol";
+        symbol.textContent = token.symbol;
+        const value = document.createElement("span");
+        value.className = "wallet-token-balance";
+        value.textContent = formatToken(token.balance, token.decimals, "");
+        li.append(symbol, value);
+        list.appendChild(li);
+      }
+      card.appendChild(list);
     }
     const note = document.createElement("p");
     note.className = "faint text-12";
     note.textContent =
-      "A balance only moves when the wallet scans the chain. Press Sync after you expect a payment.";
+      this.walletChain === "bitcoin"
+        ? "A balance only moves when the wallet scans the chain. Press Sync after you expect a payment."
+        : "A balance is read from the node, and is only as fresh as the last refresh.";
     card.appendChild(note);
     return card;
   }
 
-  private walletReceiveCard(state: WalletStateDto): HTMLElement {
+  private walletReceiveCard(view: WalletChainDto): HTMLElement {
     const card = document.createElement("section");
     card.className = "wallet-card";
     const h = document.createElement("h2");
@@ -5963,10 +6121,12 @@ export class App {
     const p = document.createElement("p");
     p.className = "muted text-13";
     p.textContent =
-      "Share this address to be paid. It is the next unused one, so it changes after a payment arrives.";
+      this.walletChain === "bitcoin"
+        ? "Share this address to be paid. It is the next unused one, so it changes after a payment arrives."
+        : "This is the wallet's Ethereum account. Unlike Bitcoin it does not change — every payment to it lands in the same place.";
     card.append(h, p);
 
-    const address = state.address;
+    const address = view.address;
     if (!address) {
       const none = document.createElement("p");
       none.className = "faint text-13";
@@ -6000,17 +6160,28 @@ export class App {
     });
     card.appendChild(qr);
 
-    const fresh = document.createElement("button");
-    fresh.type = "button";
-    fresh.className = "btn-secondary text-13 pressable";
-    fresh.textContent = "New address";
-    fresh.disabled = this.walletBusy;
-    fresh.onclick = () => void this.walletNewAddress();
-    card.appendChild(fresh);
+    if (this.walletChain === "bitcoin") {
+      const fresh = document.createElement("button");
+      fresh.type = "button";
+      fresh.className = "btn-secondary text-13 pressable";
+      fresh.textContent = "New address";
+      fresh.disabled = this.walletBusy;
+      fresh.onclick = () => void this.walletNewAddress();
+      card.appendChild(fresh);
+    }
     return card;
   }
 
-  private walletSendCard(state: WalletStateDto): HTMLElement {
+  /**
+   * The send form, in the unit of whatever is being sent.
+   *
+   * Bitcoin takes satoshi, as it always has. Ethereum takes ether or the
+   * token's own units, because typing wei is not a thing anyone can do: one
+   * ether is 1e18 of them. The conversion to base units is exact integer
+   * arithmetic, and a value the unit cannot represent is refused rather than
+   * rounded away.
+   */
+  private walletSendCard(view: WalletChainDto, state: WalletStateDto): HTMLElement {
     const card = document.createElement("section");
     card.className = "wallet-card";
     const h = document.createElement("h2");
@@ -6018,47 +6189,81 @@ export class App {
     h.textContent = "Send";
     const p = document.createElement("p");
     p.className = "muted text-13";
-    p.textContent = "Bitcoin only, on the wallet's own network. The fee is what the miners take.";
+    p.textContent =
+      this.walletChain === "bitcoin"
+        ? "Bitcoin only, on the wallet's own network. The fee is what the miners take."
+        : "Ether, or one of the tokens this wallet tracks. The fee is set by the node's own estimate.";
     card.append(h, p);
 
     const to = document.createElement("input");
     to.className = "input-field";
-    to.placeholder = "Destination address";
+    to.placeholder =
+      this.walletChain === "bitcoin" ? "Destination address" : "Destination 0x address";
     to.spellcheck = false;
     to.value = this.walletSendTo;
     to.oninput = () => {
       this.walletSendTo = to.value;
     };
 
+    // The token selector comes before the amount: the amount's unit is
+    // whatever the selector says, so it has to be known first.
+    let token: WalletTokenDto | null = null;
+    if (this.walletChain === "ethereum") {
+      const picker = document.createElement("select");
+      picker.className = "input-field wallet-token-picker";
+      picker.setAttribute("aria-label", "What to send");
+      const native = document.createElement("option");
+      native.value = "";
+      native.textContent = "Ether (ETH)";
+      picker.appendChild(native);
+      for (const t of state.tokens) {
+        const opt = document.createElement("option");
+        opt.value = t.address;
+        opt.textContent = `${t.symbol} — ${formatUnits(t.balance, t.decimals)}`;
+        picker.appendChild(opt);
+      }
+      token =
+        state.tokens.find((t) => t.address === this.walletSendToken) ?? null;
+      picker.value = token?.address ?? "";
+      picker.onchange = () => {
+        this.walletSendToken = picker.value || null;
+        // The amount's unit just changed, so what is typed is no longer the
+        // amount the user meant.
+        this.walletSendAmount = "";
+        this.render();
+      };
+      card.appendChild(picker);
+    }
+
+    const unit = token ? token.symbol : this.walletChain === "bitcoin" ? "sat" : "ETH";
+    const decimals = token ? token.decimals : this.walletChain === "bitcoin" ? 0 : 18;
     const amount = document.createElement("input");
     amount.className = "input-field";
-    amount.placeholder = "Amount in satoshi";
-    amount.inputMode = "numeric";
+    amount.placeholder = `Amount (${unit})`;
+    amount.inputMode = "decimal";
     amount.value = this.walletSendAmount;
-    amount.oninput = () => {
-      this.walletSendAmount = amount.value;
-      const n = Number.parseInt(amount.value, 10);
-      hint.textContent =
-        Number.isFinite(n) && n > 0
-          ? `= ${formatBtc(n)} BTC`
-          : "Satoshi, not BTC. 100,000,000 sat = 1 BTC.";
-    };
     const hint = document.createElement("p");
     hint.className = "faint text-12";
-    const typed = Number.parseInt(this.walletSendAmount, 10);
-    hint.textContent =
-      Number.isFinite(typed) && typed > 0
-        ? `= ${formatBtc(typed)} BTC`
-        : "Satoshi, not BTC. 100,000,000 sat = 1 BTC.";
-
-    const fee = document.createElement("input");
-    fee.className = "input-field";
-    fee.placeholder = "Fee rate (sat/vB)";
-    fee.inputMode = "numeric";
-    fee.value = this.walletSendFee;
-    fee.oninput = () => {
-      this.walletSendFee = fee.value;
+    const describe = (): string => {
+      const base = parseUnits(this.walletSendAmount, decimals);
+      if (base === null) {
+        return this.walletSendAmount.trim() === ""
+          ? `Amount in ${unit}.`
+          : `That is more precision than ${unit} has.`;
+      }
+      if (this.walletChain === "bitcoin") {
+        return `= ${formatBtc(base)} BTC`;
+      }
+      if (token) {
+        return `= ${formatBase(base, `of the smallest ${token.symbol} unit`)}`;
+      }
+      return `= ${formatBase(base, "wei")}`;
     };
+    amount.oninput = () => {
+      this.walletSendAmount = amount.value;
+      hint.textContent = describe();
+    };
+    hint.textContent = describe();
 
     const send = document.createElement("button");
     send.type = "button";
@@ -6067,25 +6272,113 @@ export class App {
     send.disabled = this.walletBusy;
     send.onclick = () => void this.walletSendNow();
 
-    card.append(to, amount, hint, fee, send);
+    card.append(to, amount, hint);
+    if (this.walletChain === "bitcoin") {
+      const fee = document.createElement("input");
+      fee.className = "input-field";
+      fee.placeholder = "Fee rate (sat/vB)";
+      fee.inputMode = "numeric";
+      fee.value = this.walletSendFee;
+      fee.oninput = () => {
+        this.walletSendFee = fee.value;
+      };
+      card.appendChild(fee);
+    }
+    card.appendChild(send);
 
-    if (this.walletLastTx) {
+    if (this.walletLastTx && this.walletLastTx.chain === this.walletChain) {
       const done = document.createElement("p");
       done.className = "text-13";
       done.style.color = "var(--success-text)";
-      done.textContent = `Sent. Fee ${formatSats(this.walletLastTx.fee_sat)}.`;
+      done.textContent = this.walletLastTx.fee_sat
+        ? `Sent. Fee ${formatBase(String(this.walletLastTx.fee_sat), "sat")}.`
+        : "Sent. The fee is whatever the transaction was mined with.";
       const txid = document.createElement("code");
       txid.className = "wallet-txid";
       txid.textContent = this.walletLastTx.txid;
       card.append(done, txid);
     }
 
-    if (state.confirmed_sat === 0) {
+    const hasFunds =
+      view.confirmed !== "0" ||
+      (this.walletChain === "ethereum" &&
+        state.tokens.some((t) => t.balance !== "0"));
+    if (!hasFunds) {
       const none = document.createElement("p");
       none.className = "faint text-12";
-      none.textContent = "There is nothing to send until the wallet holds a confirmed balance.";
+      none.textContent =
+        "There is nothing to send until the wallet holds a confirmed balance.";
       card.appendChild(none);
     }
+    return card;
+  }
+
+  /**
+   * The ERC-20 tokens this wallet tracks.
+   *
+   * Adding a token reads its symbol and decimals from the contract, so the
+   * wallet never takes the user's word for how many decimals a token has —
+   * that number is what turns a balance into a displayed amount.
+   */
+  private walletTokensCard(state: WalletStateDto): HTMLElement {
+    const card = document.createElement("section");
+    card.className = "wallet-card";
+    const h = document.createElement("h2");
+    h.className = "text-18";
+    h.textContent = "Tokens";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.textContent =
+      "ERC-20 tokens to watch. Hush reads the symbol and decimals from the contract, so a wrong number is never trusted.";
+    card.append(h, p);
+
+    if (state.tokens.length === 0) {
+      const none = document.createElement("p");
+      none.className = "faint text-13";
+      none.textContent = "No tokens yet. Add one by its contract address.";
+      card.appendChild(none);
+    }
+
+    for (const token of state.tokens) {
+      const row = document.createElement("div");
+      row.className = "wallet-token-row";
+      const info = document.createElement("div");
+      info.className = "wallet-token-info";
+      const symbol = document.createElement("span");
+      symbol.className = "wallet-token-symbol";
+      symbol.textContent = token.symbol;
+      const balance = document.createElement("span");
+      balance.className = "wallet-token-balance";
+      balance.textContent = formatUnits(token.balance, token.decimals);
+      const address = document.createElement("code");
+      address.className = "wallet-token-address";
+      address.textContent = token.address;
+      info.append(symbol, balance, address);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-secondary text-13 pressable";
+      remove.textContent = "Remove";
+      remove.disabled = this.walletBusy;
+      remove.onclick = () => void this.walletRemoveToken(token.address);
+      row.append(info, remove);
+      card.appendChild(row);
+    }
+
+    const input = document.createElement("input");
+    input.className = "input-field";
+    input.placeholder = "Token contract address (0x…)";
+    input.spellcheck = false;
+    input.value = this.walletTokenInput;
+    input.oninput = () => {
+      this.walletTokenInput = input.value;
+    };
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "btn-secondary pressable";
+    add.textContent = this.walletBusy ? "Reading…" : "Add token";
+    add.disabled = this.walletBusy || !this.walletTokenInput.trim();
+    add.onclick = () => void this.walletAddToken();
+    card.append(input, add);
     return card;
   }
 
@@ -6094,7 +6387,8 @@ export class App {
    *
    * The rule the daemon enforces and this mirrors: while Hush's relay is on Tor
    * the wallet is on Tor and clearnet is not offered. On clearnet the user may
-   * choose, and the choice sticks until the relay moves.
+   * choose, and the choice sticks until the relay moves. It applies to both
+   * chains at once: one wallet, one network posture.
    */
   private walletModeCard(state: WalletStateDto): HTMLElement {
     const card = document.createElement("section");
@@ -6106,7 +6400,7 @@ export class App {
     p.className = "muted text-13";
     p.textContent = state.mode_locked
       ? "Hush is routing through Tor, so the wallet is too. It is never less private than the rest of the app."
-      : "Clearnet reaches the chain source directly, so it sees your IP. Tor hides it. Your balance and address are the same either way.";
+      : "Clearnet reaches the chain source directly, so it sees your IP. Tor hides it. Your balance and addresses are the same either way.";
     card.append(h, p);
 
     const capsule = document.createElement("div");
@@ -6178,7 +6472,13 @@ export class App {
     this.walletError = null;
     this.render();
     try {
-      this.walletPhrase = await createWallet(this.walletNetwork);
+      const mode = getWalletState().mode;
+      if (mode === "tor") await this.ensureWalletTor();
+      this.walletPhrase = await createWallet(
+        this.walletNetwork,
+        DEFAULT_ETHEREUM_NETWORK,
+        mode,
+      );
     } catch (e) {
       this.walletError =
         e instanceof AppError ? e.message : "The wallet could not be created.";
@@ -6199,7 +6499,14 @@ export class App {
     this.walletError = null;
     this.render();
     try {
-      await restoreWallet(phrase, this.walletNetwork);
+      const mode = getWalletState().mode;
+      if (mode === "tor") await this.ensureWalletTor();
+      await restoreWallet(
+        phrase,
+        this.walletNetwork,
+        DEFAULT_ETHEREUM_NETWORK,
+        mode,
+      );
       this.walletRestoreInput = "";
       showToast("Wallet restored. Press Sync to find your balance.", {
         kind: "success",
@@ -6218,7 +6525,7 @@ export class App {
     this.walletError = null;
     this.render();
     try {
-      await newReceiveAddress();
+      await newReceiveAddress(this.walletChain);
     } catch (e) {
       this.walletError =
         e instanceof AppError ? e.message : "A new address could not be made.";
@@ -6233,11 +6540,16 @@ export class App {
     this.walletError = null;
     this.render();
     try {
-      const state = await syncWallet();
+      const state = await syncWallet(this.walletChain);
+      const view = chainState(state, this.walletChain);
       showToast(
-        state.confirmed_sat > 0
-          ? `Balance: ${formatBtc(state.confirmed_sat)} BTC`
-          : "Synced. No confirmed balance yet.",
+        view.confirmed !== "0"
+          ? this.walletChain === "bitcoin"
+            ? `Balance: ${formatBtc(view.confirmed)} BTC`
+            : `Balance: ${formatEth(view.confirmed)} ETH`
+          : this.walletChain === "bitcoin"
+            ? "Synced. No confirmed balance yet."
+            : "Refreshed. No balance yet.",
         { kind: "success" },
       );
     } catch (e) {
@@ -6251,14 +6563,31 @@ export class App {
 
   private async walletSendNow(): Promise<void> {
     const to = this.walletSendTo.trim();
-    const amountSat = Number.parseInt(this.walletSendAmount, 10);
     if (!to) {
       this.walletError = "Enter a destination address.";
       this.render();
       return;
     }
-    if (!Number.isFinite(amountSat) || amountSat <= 0) {
-      this.walletError = "Enter an amount in satoshi, greater than zero.";
+    const state = getWalletState();
+    const token =
+      this.walletChain === "ethereum"
+        ? (state.tokens.find((t) => t.address === this.walletSendToken) ?? null)
+        : null;
+    const decimals = token ? token.decimals : this.walletChain === "bitcoin" ? 0 : 18;
+    const unit = token ? token.symbol : this.walletChain === "bitcoin" ? "sat" : "ETH";
+    // The amount is converted to base units here, exactly: a value the unit
+    // cannot represent is refused rather than rounded into a different amount.
+    const amount = parseUnits(this.walletSendAmount, decimals);
+    if (amount === null) {
+      this.walletError =
+        this.walletSendAmount.trim() === ""
+          ? `Enter an amount in ${unit}.`
+          : `That amount is not a number of ${unit} this wallet can send exactly.`;
+      this.render();
+      return;
+    }
+    if (amount === "0") {
+      this.walletError = "Enter an amount greater than zero.";
       this.render();
       return;
     }
@@ -6267,11 +6596,16 @@ export class App {
     this.walletError = null;
     this.render();
     try {
-      this.walletLastTx = await sendPayment(
+      this.walletLastTx = await sendPayment({
+        chain: this.walletChain,
         to,
-        amountSat,
-        Number.isFinite(feeRate) && feeRate > 0 ? feeRate : null,
-      );
+        amount,
+        feeRate:
+          this.walletChain === "bitcoin" && Number.isFinite(feeRate) && feeRate > 0
+            ? feeRate
+            : null,
+        token: token?.address ?? null,
+      });
       this.walletSendTo = "";
       this.walletSendAmount = "";
       showToast("Sent.", { kind: "success" });
@@ -6284,11 +6618,69 @@ export class App {
     }
   }
 
+  private async walletAddToken(): Promise<void> {
+    const address = this.walletTokenInput.trim();
+    if (!address) return;
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      await addToken(address);
+      this.walletTokenInput = "";
+      showToast("Token added.", { kind: "success" });
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "That token could not be added.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
+
+  private async walletRemoveToken(address: string): Promise<void> {
+    this.walletBusy = true;
+    this.walletError = null;
+    this.render();
+    try {
+      await removeToken(address);
+      // A token that is no longer tracked must not stay selected for a send.
+      if (this.walletSendToken === address) this.walletSendToken = null;
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "That token could not be removed.";
+    } finally {
+      this.walletBusy = false;
+      this.render();
+    }
+  }
+
+  /**
+   * Make sure the shell's Tor is up and tell the daemon where it listens.
+   *
+   * The daemon cannot start Tor — the shell owns the process — so a wallet that
+   * wants Tor asks for it here and then reports the port. Refuses rather than
+   * falling back: a Tor wallet that quietly went direct is the one outcome this
+   * must never produce, so a Tor that will not come up is an error, not a
+   * downgrade.
+   */
+  private async ensureWalletTor(): Promise<void> {
+    const st = await torStart();
+    if (st.phase !== "ready" || !st.socks_port) {
+      throw new AppError(
+        st.message ?? "Tor could not connect, so the wallet cannot route through it.",
+      );
+    }
+    await setWalletProxy(`socks5h://127.0.0.1:${st.socks_port}`);
+  }
+
   private async walletChangeMode(mode: WalletNetworkMode): Promise<void> {
     this.walletBusy = true;
     this.walletError = null;
     this.render();
     try {
+      // Tor first: the daemon refuses to build a Tor wallet without a route,
+      // so switching the mode before the proxy is known would fail the switch.
+      if (mode === "tor") await this.ensureWalletTor();
       await setWalletMode(mode);
     } catch (e) {
       this.walletError =

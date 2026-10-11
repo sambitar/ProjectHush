@@ -4307,12 +4307,12 @@ name = "hush-wallet"
 version = "0.1.0"
 dependencies = [
  "alloy",
- "async-trait",
  "bdk_chain",
  "bdk_electrum",
  "bdk_wallet",
  "hex",
  "hush-core",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "tempfile",

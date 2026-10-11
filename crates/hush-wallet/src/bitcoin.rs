@@ -60,15 +60,35 @@ impl BitcoinConfig {
         }
     }
 
+    /// The `host:port` the electrum client routes through, when there is one.
+    ///
+    /// A missing proxy in Tor mode is an error, never a silent fallback to a
+    /// direct connection: the wallet must not be less private than the app.
+    fn socks_addr(&self) -> Result<Option<String>> {
+        if self.mode != NetworkMode::Tor {
+            return Ok(None);
+        }
+        let proxy = self.socks.as_deref().ok_or_else(|| {
+            WalletError::Network("Tor mode needs the shell's SOCKS proxy, and none was given".into())
+        })?;
+        socks_addr_from_proxy(proxy).map(Some)
+    }
+
+    /// Refuse a configuration that could only ever talk in the clear.
+    ///
+    /// Checked when the wallet is built, not when it first syncs: a wallet
+    /// object that exists is a wallet the daemon hands to the UI as ready, so
+    /// one that cannot honour its mode must never come into being. Checking
+    /// only in `make_client` left a Tor-mode wallet alive with no proxy, and
+    /// the failure surfaced later as a sync error rather than as the refusal
+    /// it is.
+    fn validate(&self) -> Result<()> {
+        self.socks_addr().map(|_| ())
+    }
+
     fn make_client(&self) -> Result<BdkElectrumClient<Client>> {
         let mut builder = ConfigBuilder::new();
-        if self.mode == NetworkMode::Tor {
-            let proxy = self.socks.as_deref().ok_or_else(|| {
-                WalletError::Network(
-                    "Tor mode needs the shell's SOCKS proxy, and none was given".into(),
-                )
-            })?;
-            let addr = socks_addr_from_proxy(proxy)?;
+        if let Some(addr) = self.socks_addr()? {
             builder = builder.socks5(Some(Socks5Config {
                 addr,
                 credentials: None,
@@ -131,6 +151,7 @@ impl BitcoinWallet {
     /// immediately and the first "new address" the user asks for is genuinely
     /// new rather than a repeat of the one already on screen.
     pub fn create(config: BitcoinConfig, mnemonic: &Mnemonic) -> Result<Self> {
+        config.validate()?;
         let (external, internal) = descriptors(mnemonic, config.network)?;
         let params = Wallet::create(external, internal).network(config.network);
         let mut persister = MemPersister::default();
@@ -153,6 +174,7 @@ impl BitcoinWallet {
         mnemonic: &Mnemonic,
         changeset: Option<ChangeSet>,
     ) -> Result<Self> {
+        config.validate()?;
         let (external, internal) = descriptors(mnemonic, config.network)?;
         let params = Wallet::load()
             .descriptor(KeychainKind::External, Some(external))
@@ -425,5 +447,26 @@ mod tests {
             socks: None,
         };
         assert!(matches!(cfg.make_client(), Err(WalletError::Network(_))));
+    }
+
+    /// The refusal has to happen at construction, not at the first sync: a
+    /// wallet the daemon holds is one the UI reports as ready.
+    #[test]
+    fn tor_mode_without_a_proxy_refuses_to_build_a_wallet() {
+        let m = parse_mnemonic(VECTOR).unwrap();
+        let mut cfg = config(Network::Bitcoin);
+        cfg.mode = NetworkMode::Tor;
+        cfg.socks = None;
+        assert!(matches!(
+            BitcoinWallet::create(cfg.clone(), &m),
+            Err(WalletError::Network(_))
+        ));
+        assert!(matches!(
+            BitcoinWallet::load(cfg.clone(), &m, None),
+            Err(WalletError::Network(_))
+        ));
+        // A proxy makes it buildable, and the wallet keeps Tor mode.
+        cfg.socks = Some("socks5h://127.0.0.1:9050".into());
+        assert!(BitcoinWallet::create(cfg, &m).is_ok());
     }
 }

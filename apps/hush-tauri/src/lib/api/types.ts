@@ -396,7 +396,7 @@ export interface TorboxUserDto {
   expires: string | null;
 }
 
-// --- Wallet (self-custody Bitcoin) ---------------------------------------------
+// --- Wallet (self-custody, Bitcoin and Ethereum) --------------------------------
 
 /**
  * How the wallet reaches its chain-data source. Tor is forced on while the
@@ -404,23 +404,55 @@ export interface TorboxUserDto {
  */
 export type WalletNetworkMode = "clearnet" | "tor";
 
+/** A chain the wallet holds value on. */
+export type WalletChain = "bitcoin" | "ethereum";
+
+/**
+ * One chain's state.
+ *
+ * Amounts are decimal strings in the chain's base unit, not numbers: one ether
+ * is 1e18 wei, far past what a JSON number can carry exactly, so a number here
+ * would be a rounded balance. Bitcoin's satoshi fits in a number, but it uses
+ * the same shape so both chains render through one path.
+ */
+export interface WalletChainDto {
+  chain: WalletChain;
+  /** False when this daemon was built without an adapter for the chain. */
+  available: boolean;
+  /** The address to receive on; null before a wallet exists. */
+  address: string | null;
+  /** The base unit name: `"sat"` or `"wei"`. */
+  unit: string;
+  /** Spendable now, base units. */
+  confirmed: string;
+  /** Seen but not yet confirmed, base units. */
+  pending: string;
+}
+
+/** An ERC-20 token the wallet tracks, with the balance from the last sync. */
+export interface WalletTokenDto {
+  address: string;
+  symbol: string;
+  decimals: number;
+  /** Balance in the token's smallest unit. */
+  balance: string;
+}
+
 /** `GET /api/wallet` — everything the pane renders. Never carries the phrase. */
 export interface WalletStateDto {
   exists: boolean;
-  /** `"mainnet"`, `"testnet"`, `"signet"`, or `"regtest"`. */
+  /** The Bitcoin network name (`"mainnet"`, `"testnet"`, …). */
   network: string;
   /** The mode in effect: Tor whenever the relay is on Tor. */
   mode: WalletNetworkMode;
   /** True while the relay pins the wallet to Tor, so the toggle is locked on. */
   mode_locked: boolean;
   label: string | null;
-  /** The address to show for receiving; null before a wallet exists. */
-  address: string | null;
-  /** Satoshi. */
-  confirmed_sat: number;
-  pending_sat: number;
   /** Unix seconds. */
   created_at: number;
+  /** One entry per chain, always in the same order: Bitcoin, then Ethereum. */
+  chains: WalletChainDto[];
+  tokens: WalletTokenDto[];
 }
 
 /** `POST /api/wallet/create` — the phrase is returned exactly once, here. */
@@ -429,13 +461,16 @@ export interface WalletCreateDto {
   mnemonic: string;
 }
 
+/** `POST /api/wallet/address` */
 export interface WalletAddressDto {
+  chain: WalletChain;
   address: string;
 }
 
-/** `POST /api/wallet/send` — the broadcast txid and the fee actually paid. */
+/** `POST /api/wallet/send` — the broadcast txid, and Bitcoin's fee. */
 export interface WalletSendDto {
+  chain: WalletChain;
   txid: string;
-  /** Satoshi. */
-  fee_sat: number;
+  /** Satoshi, and only for Bitcoin: an Ethereum fee is unknown until it mines. */
+  fee_sat: number | null;
 }

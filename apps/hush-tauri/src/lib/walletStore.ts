@@ -1,5 +1,7 @@
 import { api } from "./api/daemon";
 import type {
+  WalletChain,
+  WalletChainDto,
   WalletNetworkMode,
   WalletSendDto,
   WalletStateDto,
@@ -8,10 +10,10 @@ import type {
 /**
  * The Wallet pane's client-side store.
  *
- * All the real work — key derivation, sealing the phrase into the vault,
- * electrum sync, signing — happens in the daemon. This store is only a small
- * cache plus the mutation wrappers, so the pane can render from one object and
- * re-render on change.
+ * All the real work — key derivation, sealing the phrase into the vault, the
+ * electrum scan, the RPC calls, signing — happens in the daemon. This store is
+ * only a small cache plus the mutation wrappers, so the pane can render from
+ * one object and re-render on change.
  *
  * Polling is deliberately slow: reading the wallet state does not touch the
  * network (a sync is an explicit action), so the only thing a poll can pick up
@@ -21,16 +23,30 @@ import type {
 
 const OPEN_POLL_MS = 20000;
 
+/** The two chains the pane shows, in the order it shows them. */
+export const CHAINS: WalletChain[] = ["bitcoin", "ethereum"];
+
+/** A chain with no wallet behind it, used before the daemon has answered. */
+function emptyChain(chain: WalletChain): WalletChainDto {
+  return {
+    chain,
+    available: true,
+    address: null,
+    unit: chain === "bitcoin" ? "sat" : "wei",
+    confirmed: "0",
+    pending: "0",
+  };
+}
+
 const EMPTY: WalletStateDto = {
   exists: false,
   network: "mainnet",
   mode: "tor",
   mode_locked: false,
   label: null,
-  address: null,
-  confirmed_sat: 0,
-  pending_sat: 0,
   created_at: 0,
+  chains: [emptyChain("bitcoin"), emptyChain("ethereum")],
+  tokens: [],
 };
 
 type Listener = (state: WalletStateDto) => void;
@@ -51,6 +67,15 @@ const listeners = new Set<Listener>();
 
 export function getWalletState(): WalletStateDto {
   return cached ?? EMPTY;
+}
+
+/** The named chain's entry. Falls back to an empty one, so a caller that runs
+ * before the first load still renders something shaped correctly. */
+export function chainState(
+  state: WalletStateDto,
+  chain: WalletChain,
+): WalletChainDto {
+  return state.chains.find((c) => c.chain === chain) ?? emptyChain(chain);
 }
 
 export function isWalletLoaded(): boolean {
@@ -160,9 +185,14 @@ export function clearWalletStore(): void {
 // --- Mutations: each applies the daemon's new state at once. ---
 
 /** Create a wallet. The returned phrase is the only time it is ever shown. */
-export async function createWallet(network: string): Promise<string> {
-  const result = await api.walletCreate(network);
-  if (!result) throw new Error("The wallet was created but the daemon sent no state.");
+export async function createWallet(
+  network: string,
+  ethereumNetwork: string,
+  mode: WalletNetworkMode,
+): Promise<string> {
+  const result = await api.walletCreate(network, ethereumNetwork, mode);
+  if (!result)
+    throw new Error("The wallet was created but the daemon sent no state.");
   apply(result.state);
   return result.mnemonic;
 }
@@ -171,13 +201,22 @@ export async function createWallet(network: string): Promise<string> {
 export async function restoreWallet(
   mnemonic: string,
   network: string,
+  ethereumNetwork: string,
+  mode: WalletNetworkMode,
 ): Promise<WalletStateDto> {
-  return apply(await api.walletRestore(mnemonic, network));
+  return apply(
+    await api.walletRestore(mnemonic, network, ethereumNetwork, mode),
+  );
 }
 
-/** Reveal a fresh receive address, so the shown one is never reused. */
-export async function newReceiveAddress(): Promise<string> {
-  const result = await api.walletAddress();
+/**
+ * Reveal a fresh receive address, so the shown one is never reused.
+ *
+ * Bitcoin only: an Ethereum account is one address for the life of the wallet,
+ * and the daemon returns it unchanged rather than pretending to rotate.
+ */
+export async function newReceiveAddress(chain: WalletChain): Promise<string> {
+  const result = await api.walletAddress(chain);
   if (!result) throw new Error("The daemon sent no address.");
   // The keychain has already advanced, so the address is real whether or not
   // the state read that follows it succeeds. A failed read must not be
@@ -187,17 +226,26 @@ export async function newReceiveAddress(): Promise<string> {
   return result.address;
 }
 
-/** Full-scan the chain and refresh the balance. */
-export async function syncWallet(): Promise<WalletStateDto> {
-  return apply(await api.walletSync());
+/** Read the chain's balances again — an electrum scan, or an RPC read. */
+export async function syncWallet(chain: WalletChain): Promise<WalletStateDto> {
+  return apply(await api.walletSync(chain));
 }
 
-export async function sendPayment(
-  to: string,
-  amountSat: number,
-  feeRate: number | null,
-): Promise<WalletSendDto> {
-  const result = await api.walletSend(to, amountSat, feeRate);
+/** Send value, or a token. `amount` is base units, as a decimal string. */
+export async function sendPayment(send: {
+  chain: WalletChain;
+  to: string;
+  amount: string;
+  feeRate: number | null;
+  token?: string | null;
+}): Promise<WalletSendDto> {
+  const result = await api.walletSend({
+    chain: send.chain,
+    to: send.to,
+    amount: send.amount,
+    fee_rate: send.feeRate,
+    token: send.token ?? null,
+  });
   if (!result) throw new Error("The daemon sent no transaction id.");
   // Same reasoning as the address, with more at stake: the money has already
   // moved, so a failed state read must never surface as "the payment could not
@@ -206,11 +254,34 @@ export async function sendPayment(
   return result;
 }
 
+/** Track an ERC-20 token by contract address. */
+export async function addToken(address: string): Promise<WalletStateDto> {
+  return apply(await api.walletTokenAdd(address));
+}
+
+/** Stop tracking a token. */
+export async function removeToken(address: string): Promise<WalletStateDto> {
+  return apply(await api.walletTokenRemove(address));
+}
+
 /** Switch the wallet's network. Refused by the daemon while the relay is on Tor. */
 export async function setWalletMode(
   mode: WalletNetworkMode,
 ): Promise<WalletStateDto> {
   return apply(await api.walletSetMode(mode));
+}
+
+/**
+ * Report the shell's Tor SOCKS port to the daemon, for the wallet.
+ *
+ * The wallet's Tor is the shell's Tor — the same process the relay and the Drop
+ * window use — so this is an announcement, not a setting. Until one arrives a
+ * Tor-mode wallet has no route, and says so rather than going direct.
+ */
+export async function setWalletProxy(
+  socks: string | null,
+): Promise<WalletStateDto> {
+  return apply(await api.walletSetProxy(socks));
 }
 
 /** Forget the wallet: the sealed sidecar is overwritten with an empty state. */
@@ -231,29 +302,72 @@ export async function wipeWallet(): Promise<WalletStateDto> {
   }
 }
 
-// --- Formatting ---------------------------------------------------------------
-
-const SATS_PER_BTC = 100_000_000;
+// --- Amounts ------------------------------------------------------------------
+//
+// Every amount on the wire is a decimal string in base units, and every
+// conversion here is integer arithmetic on that string. A float would round:
+// 0.1 ether is not representable in binary, and one wei of rounding is one wei
+// of someone's money.
 
 /**
- * Satoshi as BTC, trimmed to a readable number of decimals.
+ * A base-unit amount as a human number, truncated (never rounded up) to
+ * `maxFrac` decimal places.
  *
- * Bitcoin amounts are small enough that a fixed 8 decimals is noise: 0.00012345
- * reads better than 0.00012345 (which is the same) but 1.00000000 does not read
- * better than 1. Trailing zeros are dropped, and the value is never rounded up
- * into a different amount of money.
+ * Truncation matters: rounding a balance up shows money the user does not
+ * have, and rounding a fee down shows less than they will pay.
  */
-export function formatBtc(sats: number): string {
-  if (!Number.isFinite(sats)) return "0";
-  const btc = sats / SATS_PER_BTC;
-  const fixed = btc.toFixed(8);
-  return fixed.replace(/\.?0+$/, "") || "0";
+export function formatUnits(value: string, decimals: number, maxFrac = 6): string {
+  if (!/^\d+$/.test(value)) return "0";
+  const padded = value.padStart(decimals + 1, "0");
+  const whole = padded.slice(0, padded.length - decimals) || "0";
+  const frac = decimals === 0 ? "" : padded.slice(padded.length - decimals);
+  const shown = frac.slice(0, maxFrac).replace(/0+$/, "");
+  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  if (shown) return `${grouped}.${shown}`;
+  // A balance too small to show at this precision is not zero; saying "0"
+  // would be a lie the user cannot see through.
+  return value !== "0" && whole === "0" ? `<0.${"0".repeat(maxFrac - 1)}1` : grouped;
 }
 
-/** A satoshi count with thousands separators, e.g. "1,250,000 sat". */
-export function formatSats(sats: number): string {
-  return `${sats.toLocaleString()} sat`;
+/**
+ * A human amount in the display unit as base units, or null when it cannot be
+ * represented exactly at that precision.
+ *
+ * Exact or nothing: a user who types 0.0000000001 ether has typed less than a
+ * wei, and sending "0" instead would be sending nothing while saying otherwise.
+ */
+export function parseUnits(value: string, decimals: number): string | null {
+  const trimmed = value.trim();
+  if (!/^\d+(\.\d*)?$|^\.\d+$/.test(trimmed)) return null;
+  const [whole = "", frac = ""] = trimmed.split(".");
+  if (frac.length > decimals) return null;
+  const digits = `${whole || "0"}${frac.padEnd(decimals, "0")}`.replace(/^0+(?=\d)/, "");
+  return digits === "" ? "0" : digits;
+}
+
+/** Satoshi as BTC. */
+export function formatBtc(sats: string): string {
+  return formatUnits(sats, 8);
+}
+
+/** Wei as ETH, shown to six places: the seventh is noise for a human. */
+export function formatEth(wei: string): string {
+  return formatUnits(wei, 18);
+}
+
+/** A base-unit amount with its unit name, e.g. "1,250,000 sat". */
+export function formatBase(value: string, unit: string): string {
+  if (!/^\d+$/.test(value)) return `0 ${unit}`;
+  return `${value.replace(/\B(?=(\d{3})+(?!\d))/g, ",")} ${unit}`;
+}
+
+/** A token balance in its own units, e.g. "12.5 USDC". */
+export function formatToken(balance: string, decimals: number, symbol: string): string {
+  return `${formatUnits(balance, decimals)} ${symbol}`;
 }
 
 /** The default fee rate the daemon assumes when the UI sends none. */
 export const DEFAULT_FEE_RATE = 2;
+
+/** The Ethereum network the UI creates wallets on. Mainnet, like Bitcoin's. */
+export const DEFAULT_ETHEREUM_NETWORK = "mainnet";

@@ -30,6 +30,14 @@ pub enum WalletError {
     #[error("electrum: {0}")]
     Electrum(String),
 
+    /// An Ethereum-layer failure (RPC, signing, transaction build).
+    #[error("ethereum: {0}")]
+    Ethereum(String),
+
+    /// The chain named in a request is not one this wallet knows.
+    #[error("chain: {0}")]
+    Chain(String),
+
     /// The destination address did not parse, or is for the wrong network.
     #[error("address: {0}")]
     Address(String),

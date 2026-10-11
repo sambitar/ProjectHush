@@ -7,6 +7,12 @@ edition = "2021"
 name = "hush-daemon"
 path = "src/main.rs"
 
+[features]
+default = ["ethereum"]
+# Ethereum + ERC-20 support. On by default because the app offers both chains;
+# a Bitcoin-only build turns it off and skips the whole alloy tree.
+ethereum = ["hush-wallet/ethereum"]
+
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 clap = { version = "4", features = ["derive", "env"] }

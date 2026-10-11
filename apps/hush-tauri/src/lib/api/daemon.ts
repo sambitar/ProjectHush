@@ -19,6 +19,7 @@ import type {
   TorboxUserDto,
   TorrentsStateDto,
   WalletAddressDto,
+  WalletChain,
   WalletCreateDto,
   WalletNetworkMode,
   WalletSendDto,
@@ -432,33 +433,87 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ onion }),
     }),
-  // --- Wallet (self-custody Bitcoin). The phrase and the change set are sealed
-  // in the vault sidecar, and the daemon serves these routes only over the Unix
-  // socket, so a TCP-only daemon answers 404 here. ---
+  // --- Wallet (self-custody, Bitcoin and Ethereum). The phrase and the change
+  // set are sealed in the vault sidecar, and the daemon serves these routes only
+  // over the Unix socket, so a TCP-only daemon answers 404 here. ---
   walletState: () => request<WalletStateDto>("/api/wallet"),
-  walletCreate: (network: string) =>
+  /** `mode` is the posture the wallet is created in. Sent explicitly because
+   *  the daemon's own default is Tor, and a Tor wallet cannot be built before
+   *  the shell has Tor listening. */
+  walletCreate: (
+    network: string,
+    ethereumNetwork: string,
+    mode: WalletNetworkMode,
+  ) =>
     request<WalletCreateDto>("/api/wallet/create", {
       method: "POST",
-      body: JSON.stringify({ network }),
+      body: JSON.stringify({
+        network,
+        ethereum_network: ethereumNetwork,
+        mode,
+      }),
     }),
-  walletRestore: (mnemonic: string, network: string) =>
+  walletRestore: (
+    mnemonic: string,
+    network: string,
+    ethereumNetwork: string,
+    mode: WalletNetworkMode,
+  ) =>
     request<WalletStateDto>("/api/wallet/restore", {
       method: "POST",
-      body: JSON.stringify({ mnemonic, network }),
+      body: JSON.stringify({
+        mnemonic,
+        network,
+        ethereum_network: ethereumNetwork,
+        mode,
+      }),
     }),
-  walletAddress: () =>
-    request<WalletAddressDto>("/api/wallet/address", { method: "POST" }),
-  walletSync: () =>
-    request<WalletStateDto>("/api/wallet/sync", { method: "POST" }),
-  walletSend: (to: string, amount: number, fee_rate: number | null) =>
+  walletAddress: (chain: WalletChain) =>
+    request<WalletAddressDto>("/api/wallet/address", {
+      method: "POST",
+      body: JSON.stringify({ chain }),
+    }),
+  walletSync: (chain: WalletChain) =>
+    request<WalletStateDto>("/api/wallet/sync", {
+      method: "POST",
+      body: JSON.stringify({ chain }),
+    }),
+  /** Amounts are base units as decimal strings: satoshi, wei, or a token's
+   * smallest unit. See `walletStore.parseUnits` for the conversion. */
+  walletSend: (send: {
+    chain: WalletChain;
+    to: string;
+    amount: string;
+    fee_rate?: number | null;
+    token?: string | null;
+  }) =>
     request<WalletSendDto>("/api/wallet/send", {
       method: "POST",
-      body: JSON.stringify({ to, amount, fee_rate }),
+      body: JSON.stringify(send),
     }),
   walletSetMode: (mode: WalletNetworkMode) =>
     request<WalletStateDto>("/api/wallet/mode", {
       method: "POST",
       body: JSON.stringify({ mode }),
+    }),
+  /** Tell the daemon where the shell's Tor is listening, for the wallet.
+   *  `null` says Tor is down; the wallet keeps its mode and refuses to reach
+   *  the chain rather than falling back to a direct connection. */
+  walletSetProxy: (socks: string | null) =>
+    request<WalletStateDto>("/api/wallet/proxy", {
+      method: "POST",
+      body: JSON.stringify({ socks }),
+    }),
+  /** Track an ERC-20 token; the daemon reads its symbol and decimals. */
+  walletTokenAdd: (address: string) =>
+    request<WalletStateDto>("/api/wallet/token", {
+      method: "POST",
+      body: JSON.stringify({ address }),
+    }),
+  walletTokenRemove: (address: string) =>
+    request<WalletStateDto>("/api/wallet/token/remove", {
+      method: "POST",
+      body: JSON.stringify({ address }),
     }),
   walletWipe: () => request<null>("/api/wallet/wipe", { method: "POST" }),
 };

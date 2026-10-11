@@ -8,7 +8,7 @@ default = []
 # The Ethereum + ERC-20 adapter pulls `alloy`, which is a large dependency
 # tree. Off by default so a Bitcoin-only build stays lean; the daemon enables
 # it explicitly when it wants the second chain.
-ethereum = ["dep:alloy", "dep:async-trait"]
+ethereum = ["dep:alloy", "dep:reqwest"]
 
 [dependencies]
 hush-core = { path = "../hush-core" }
@@ -26,8 +26,31 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # Ethereum adapter (feature `ethereum`). Optional so the default build does not
 # compile the alloy tree.
-alloy = { version = "2", optional = true, features = ["signer-local", "provider-http", "rpc-types", "network"] }
-async-trait = { version = "0.1", optional = true }
+#
+# The feature set is the smallest one that covers the adapter: a local signer,
+# an HTTP provider, the transaction types, the `Ethereum` network (so the
+# builder's fillers can fill nonce/gas/chain-id and sign), and `sol!` for the
+# ERC-20 ABI. `contract`/`ens` are deliberately not pulled in.
+alloy = { version = "2", optional = true, features = [
+  "provider-http",
+  "rpc-types",
+  "signer-local",
+  "network",
+  "sol-types",
+] }
+# The Tor route: alloy's HTTP transport takes a caller-built `reqwest::Client`,
+# and `reqwest` only speaks SOCKS5 with the `socks` feature. Pinned to the
+# reqwest that alloy's transport uses (0.13) so the two share one build, and
+# with default features off so no system proxy is picked up behind our back.
+#
+# `rustls` is named even though alloy's default features already pull it in:
+# the wallet talks to an HTTPS endpoint, and this crate should say so itself
+# rather than break silently if alloy's defaults ever change.
+reqwest = { version = "0.13", optional = true, default-features = false, features = [
+  "socks",
+  "json",
+  "rustls",
+] }
 
 [dev-dependencies]
 tempfile = "3"
