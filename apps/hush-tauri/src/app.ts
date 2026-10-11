@@ -6369,15 +6369,19 @@ export class App {
     input.placeholder = "Token contract address (0x…)";
     input.spellcheck = false;
     input.value = this.walletTokenInput;
-    input.oninput = () => {
-      this.walletTokenInput = input.value;
-    };
     const add = document.createElement("button");
     add.type = "button";
     add.className = "btn-secondary pressable";
     add.textContent = this.walletBusy ? "Reading…" : "Add token";
     add.disabled = this.walletBusy || !this.walletTokenInput.trim();
     add.onclick = () => void this.walletAddToken();
+    input.oninput = () => {
+      this.walletTokenInput = input.value;
+      // The button is enabled by having an address, so its state has to follow
+      // the field. Patched in place rather than re-rendered: a full render
+      // would drop the caret out of the field mid-address.
+      add.disabled = this.walletBusy || !input.value.trim();
+    };
     card.append(input, add);
     return card;
   }

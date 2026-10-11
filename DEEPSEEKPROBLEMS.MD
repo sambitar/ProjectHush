@@ -122,31 +122,53 @@ in base units.
   crate. Before adding a heavy tree to a crate with integration tests, check what the final link
   costs, not just what `cargo check` costs.
 
-### [OPEN] Ethereum's network paths are untested in this environment
+### [OPEN] Ethereum's network paths are half-tested: reads are live, sends and Tor are not
 
-- **What is unverified:** `verify_chain()`, `balance()`, `token_metadata()`, `token_balance()`,
-  `send()`, and `send_token()` have never run against a real JSON-RPC endpoint, and no Ethereum
-  request has ever crossed the shell's Tor SOCKS proxy. The tests cover derivation against the
-  published vector, EIP-55 checksumming, the four ERC-20 selectors and the `transfer` calldata's
-  argument order, chain-id and network-name validation, the Tor-without-a-proxy refusal, the
-  `u128`-saturating balance conversion, and the balance snapshot's per-token bookkeeping — all
-  offline, all against no network.
-- **What is needed:** one live read against a mainnet or Sepolia endpoint over clearnet and then
-  through Tor, and one signed send on a funded Sepolia account. Until then, treat the Ethereum
+- **What was unverified:** `verify_chain()`, `balance()`, `token_metadata()`, `token_balance()`,
+  `send()`, and `send_token()` had never run against a real JSON-RPC endpoint, and no Ethereum
+  request had ever crossed a SOCKS proxy.
+- **What is now verified, live, over clearnet** (2026-10-11, `crates/hush-wallet/tests/live_ethereum.rs`,
+  `cargo test -p hush-wallet --features ethereum --test live_ethereum -- --ignored --nocapture`):
+  `verify_chain()` against `ethereum-rpc.publicnode.com` reported chain 1 for the derived vector
+  account; `balance()` returned `0` for it; `token_metadata(USDC)` decoded a real contract's
+  `symbol()` as `USDC` and `decimals()` as `6`; `token_balance(USDC)` returned `0`. A config holding
+  mainnet's chain id but pointed at Sepolia's endpoint was refused with
+  `the RPC endpoint is on chain 11155111, but this wallet is set to chain 1`. This also closes the
+  earlier worry that the wallet's HTTPS transport only had TLS because `alloy`'s defaults happened
+  to bring it: the requests above went out over rustls and came back.
+- **What is still unverified:** `send()` and `send_token()` have never signed and broadcast anything
+  — that needs a funded Sepolia account. No Ethereum request has crossed a Tor SOCKS proxy: there is
+  no `tor` binary on this box, and the shell's managed Tor was not started for this. The Tor-mode
+  tests in `live_ethereum.rs` skip unless `HUSH_LIVE_SOCKS` names a proxy, so the `socks5h://` route
+  is still only covered by the unit test that refuses a missing proxy and by the `http://`-is-not-SOCKS
+  refusal.
+- **What is needed:** a funded Sepolia account for the send path, and a Tor SOCKS proxy
+  (`HUSH_LIVE_SOCKS=socks5h://127.0.0.1:9050 …`) for the Tor route. Until then, treat the Ethereum
   send path as unproven, exactly as the Bitcoin one is.
 
-### [OPEN] The multi-chain Wallet pane has been type-checked, not looked at
+### [FIXED] The multi-chain Wallet pane was type-checked, not looked at
 
-- **What is unverified:** the chain capsule, the token list, the token picker on the send form, and
-  the live unit hint (`= … wei` / `= … of the smallest USDC unit`) have been compiled and
+- **What was unverified:** the chain capsule, the token list, the token picker on the send form, and
+  the live unit hint (`= … wei` / `= … of the smallest USDC unit`) had been compiled and
   type-checked (`npx tsc --noEmit` clean) but never rendered. The Bitcoin pane's rendering was
   checked against a mock daemon in a browser (see the 2026-10-10 entry); the Ethereum additions to
-  that pane have not been through even that.
-- **What is needed:** the same mock-daemon browser pass the Bitcoin pane got, extended to a
-  `tokens` array and an `ethereum` chain entry, or a real window run. The CSS for the new classes
-  (`.wallet-chains`, `.wallet-token-list`, `.wallet-token-row`, `.wallet-token-symbol`,
-  `.wallet-token-balance`, `.wallet-token-address`, `.wallet-token-picker`) is new and likewise
-  unrendered.
+  that pane had not been through even that.
+- **Resolution:** the same mock-daemon browser pass, extended to an `ethereum` chain entry and a
+  `tokens` array, on 2026-10-11. It caught a real defect — see the next entry — so it was worth doing
+  rather than assuming.
+- **What was seen, for real:** the chain capsule renders as a `.segmented` pill with `aria-pressed`
+  moving between Bitcoin and Ethereum; the Ethereum side shows `1.5 ETH` over
+  `1,500,000,000,000,000,000 wei`; the token list renders one row per token (`USDC 2.5`, `DAI 1.2`);
+  the send form's picker lists `Ether (ETH), USDC — 2.5, DAI — 1.2` and switching it relabels the
+  amount field to `Amount (USDC)` and clears the amount; typing `0.25` under Ether gives
+  `= 250,000,000,000,000,000 wei` and typing `2.5` under USDC gives
+  `= 2,500,000 of the smallest USDC unit`; adding `0xC02a…6Cc2` puts `WETH 0.5` in the list and
+  `WETH — 0.5` in the picker, and clears the field.
+- **Still not verified:** this is a mock daemon in a browser, not the Tauri window, and the balances
+  are fixtures. Nothing here says the daemon's own routes return these shapes — the API tests cover
+  that separately. The CSS classes (`.wallet-chains`, `.wallet-token-list`, `.wallet-token-row`,
+  `.wallet-token-symbol`, `.wallet-token-balance`, `.wallet-token-address`, `.wallet-token-picker`)
+  rendered, but only against this fixture.
 
 ### [FIXED] The Bitcoin adapter checked its Tor proxy when it first synced, not when it was built
 
@@ -228,6 +250,63 @@ in base units.
   `.d`/`deps` names and a mtime check are enough to confirm it is the current one (the terminal
   metadata timestamps are UTC while `ls` shows local time; the same build looked 5 hours stale until
   that was noticed).
+
+### [FIXED] The Add token button could never be enabled by typing
+
+- **Found by:** the mock-daemon pane pass above, not by any test or by `tsc`. The button was
+  rendered disabled (its `disabled` came from `this.walletTokenInput.trim()`) and the field's
+  `oninput` only stored the value, so nothing recomputed the button. Typing a valid contract address
+  left it greyed out forever; it would only enable after some unrelated repaint.
+- **Symptom:** typing `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` left `Add token` with
+  `states: [disabled]` in the accessibility snapshot. Before the fix the button was unreachable by
+  the normal path; after it, the same type enables the button, the click adds `WETH 0.5` to the list
+  and `WETH — 0.5` to the picker, and the field clears.
+- **Fix:** the field's `oninput` now also sets `add.disabled = this.walletBusy || !input.value.trim()`,
+  patching the button in place rather than re-rendering — the same shape the amount field already
+  uses for its live hint, and for the same reason: a full render would drop the caret out of the
+  field mid-address. The `oninput` assignment moved below the button's creation so it can close over
+  it.
+- **Lesson:** a control whose enabled state is derived from a field has to be updated where that
+  field changes. Rendering the state once and never revisiting it is invisible to the type checker
+  and to every unit test that does not drive the DOM — only rendering the pane catches it. This is
+  the second defect of that shape in this pane (the first was the pinned receive address), so treat
+  "the control only updates on a full repaint" as a pattern to look for here.
+
+### [FIXED] The pane fixture stopped rendering: the IRC slice put `await initIrcStore()` before the first render
+
+- **Attempted:** reuse the mock-daemon browser recipe that worked for the Bitcoin pane on 2026-10-10
+  — inject `window.__TAURI__ = {}` so `isTauriShell()` is true and the Wallet pane draws instead of
+  its "needs the desktop app" empty state.
+- **Symptom:** the page loaded and the module ran (a `/api/ui-prefs` request went out, and the
+  live-region `div` appeared), but `#app` stayed empty. Two causes, stacked. First, `app.start()`
+  now does `await initIrcStore()` before its first `this.render()`, and that store calls Tauri's
+  `listen()` thirteen times; with `__TAURI__` set to a bare `{}` there is no
+  `__TAURI_INTERNALS__`, so `transformCallback`/`invoke` are undefined and the `await` rejects —
+  `start()` never reaches `render()`. Second, once that was fixed, the fixture's own mock answered
+  `/api/status`, `/api/contacts`, `/api/relay` with `{}`, and `render()` threw on the shapes.
+- **Fix:** the fixture now injects `__TAURI_INTERNALS__` with a no-op `invoke` and a
+  `transformCallback` that registers the callback and returns an id, and the mock answers the boot
+  routes with the shapes the previous session's mock already used (`/api/contacts` as `[]`, a real
+  `/api/status` object, and so on) instead of `{}`.
+- **Tooling, not a repo defect.** Nothing here is wrong with the app; the recipe is what aged. Worth
+  knowing that `isTauriShell()` alone is no longer enough to stand the shell up in a browser.
+- **Lesson:** a fixture that fakes a shell has to keep up with what the shell is asked for. When a
+  page loads but nothing renders, check whether the first render is behind an `await` that a newly
+  added store owns before suspecting the pane.
+
+### [FIXED] Killing `npm run build` mid-flight left `ui/dist` empty
+
+- **Attempted:** rebuild the frontend while the box was swap-thrashing; when the build sat with no
+  output for several minutes it was killed to free memory.
+- **Symptom:** `apps/hush-tauri/ui/dist/index.html` was gone afterwards. `vite.config.ts` sets
+  `emptyOutDir: true`, so the output directory is emptied before the new bundle is written; killing
+  the build in that window leaves it empty rather than leaving the previous bundle in place.
+- **Fix:** rebuilt once memory had recovered (`✓ built in 2.86s`, against the same command hanging
+  for minutes under memory pressure). `dist` is a build artifact and is regenerated by
+  `npm run build` / `tauri build`, so nothing was lost.
+- **Lesson:** killing a build is not always as safe as killing a test run — check whether the tool
+  clears its output directory first. Here the cost was one rebuild, but on a tool that emptied and
+  then failed to rewrite, it would be a broken artifact.
 
 ---
 
