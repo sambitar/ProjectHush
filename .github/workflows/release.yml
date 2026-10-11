@@ -1,0 +1,112 @@
+# Build the desktop bundles for a release tag and publish them, plus the
+# updater manifest, as a draft GitHub Release.
+#
+# The app is not at the repository root: the frontend lives in apps/hush-tauri
+# and the Tauri project in apps/hush-tauri/src-tauri. That path is threaded
+# through `projectPath`, the npm steps, and the cache key.
+#
+# The release is created as a draft on purpose. Nothing reaches an installed
+# copy until the draft is published, because the updater endpoint is
+# `releases/latest`, which skips drafts.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    strategy:
+      # One platform failing should not cancel the others: the draft release
+      # is assembled from every job, and a half-uploaded manifest is worse than
+      # a clearly incomplete one.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            # Apple Silicon.
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            # Intel.
+            args: "--target x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            # The AppImage is the only Linux bundle the updater can replace in
+            # place; the deb is published alongside it for a first install.
+            args: "--bundles appimage,deb"
+          - platform: windows-latest
+            # One Windows installer type only, so the updater manifest cannot
+            # disagree with how a copy was installed. See RELEASING.md.
+            args: "--bundles nsis"
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev
+
+      - name: setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: apps/hush-tauri/package-lock.json
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Only the macOS runners need a cross target, and only they can build
+          # one; the expression keeps the other two legs on the host triple.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          # The cargo workspace root is the repository root (apps/hush-tauri is
+          # a member), and its target directory is `target`.
+          workspaces: ". -> target"
+          key: ${{ matrix.platform }}-${{ matrix.args }}
+
+      - name: install frontend dependencies
+        working-directory: apps/hush-tauri
+        run: npm ci
+
+      - name: build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signing is what makes an update installable: the plugin refuses any
+          # artifact whose signature does not match the public key baked into
+          # the app. The key itself never enters the repository.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/hush-tauri
+          tauriScript: npm run tauri
+          args: ${{ matrix.args }}
+          # The draft is created by the first job to get here; the rest attach
+          # their bundles to it. `latest.json` is regenerated from whichever
+          # updater artifacts have been uploaded.
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false

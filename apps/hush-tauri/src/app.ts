@@ -103,10 +103,18 @@ import {
   toggleReaction,
   unreadTotal,
 } from "./lib/chatStore";
-import { MAX_FILE_BYTES, RECV_POLL_MS } from "./lib/constants";
+import { MAX_FILE_BYTES, RECV_POLL_MS, STARTUP_UPDATE_DELAY_MS } from "./lib/constants";
 import { invoke } from "@tauri-apps/api/core";
 import { isTauriShell } from "./lib/tauriEnv";
 import { playChatSound } from "./lib/chatSound";
+import {
+  checkForUpdates,
+  discardPendingUpdate,
+  downloadAndInstallUpdate,
+  getCurrentVersion,
+  type AvailableUpdate,
+  type UpdateProgress,
+} from "./lib/updater";
 import {
   clearMailStore,
   draftById,
@@ -329,6 +337,21 @@ function torPhaseLabel(phase: TorPhase): string {
     default:
       return "Tor Disconnected";
   }
+}
+
+/**
+ * The line under the update bar. The plugin reports bytes, not time, so the
+ * copy stays with what is actually known: a percentage while the total is
+ * known, raw bytes when it is not, and a plain "installing" once the download
+ * is done and the signature check is running.
+ */
+function updateProgressLabel(p: UpdateProgress): string {
+  if (p.installing) return "Installing… Hush will restart when it is done.";
+  if (p.total !== null && p.percent !== null) {
+    return `Downloading… ${Math.round(p.percent)}% of ${formatBytes(p.total)}`;
+  }
+  if (p.downloaded > 0) return `Downloading… ${formatBytes(p.downloaded)}`;
+  return "Starting the download…";
 }
 
 export class App {
@@ -620,6 +643,29 @@ export class App {
   /** A wallet-requested Tor start is in flight, so the poll does not stack them. */
   private walletTorBusy = false;
 
+  /** The running build's version, for Settings → About. Null until asked for. */
+  private appVersion: string | null = null;
+  /** The update waiting on the user's choice, from the startup probe or a manual check. */
+  private pendingUpdate: AvailableUpdate | null = null;
+  /** Download progress while an update installs; null when no install is running. */
+  private updateProgress: UpdateProgress | null = null;
+  /** A manual check is in flight, so its button stays disabled. */
+  private updateCheckBusy = false;
+  /**
+   * The updater's own line in Settings → About: the outcome of the last manual
+   * check. The startup probe writes nothing here — it is silent by design.
+   */
+  private updateNote: { text: string; error: boolean } | null = null;
+  /**
+   * The open prompt's progress nodes, patched in place as chunks arrive.
+   * A full `render()` per chunk would rebuild the whole app several times a
+   * second; holding these two nodes keeps the download smooth.
+   */
+  private updateProgressEl: {
+    fill: HTMLElement;
+    label: HTMLElement;
+  } | null = null;
+
   /** Read/star/archive/trash, straight from `ui-prefs.json`. */
   private mailPrefs(): MailFlags {
     return mailFlags();
@@ -710,6 +756,13 @@ export class App {
         this.render();
       }
       if (e.key === "Escape") {
+        // The update prompt is the topmost layer when it is up, so Escape
+        // belongs to it first. A download in progress is not cancellable, so
+        // it keeps the dialog rather than closing it over a running install.
+        if (this.pendingUpdate && !this.updateProgress) {
+          void this.dismissUpdatePrompt();
+          return;
+        }
         this.paletteOpen = false;
         this.addFriendOpen = false;
         this.readsAddOpen = false;
@@ -732,6 +785,221 @@ export class App {
     await initIrcStore();
     await this.refreshStatus();
     this.render();
+    this.startUpdateProbe();
+  }
+
+  /**
+   * The launch-time half of the updater: ask for the running version (About
+   * shows it), then wait out a short delay and probe once for a newer release.
+   *
+   * Both are deliberately off the critical path. The probe is silent: offline,
+   * a 404, or an unconfigured public key all end with nothing on screen,
+   * because the user never asked for this check. Only a real update surfaces,
+   * and even then it waits its turn — `render` shows the prompt whenever the
+   * next paint happens, which keeps it off the unlock screen.
+   */
+  private startUpdateProbe(): void {
+    if (!isTauriShell()) return;
+    void getCurrentVersion().then((version) => {
+      if (!version) return;
+      this.appVersion = version;
+      if (this.rail === "settings" && this.settingsSection === "about") {
+        this.render();
+      }
+    });
+    window.setTimeout(() => {
+      void checkForUpdates({ silent: true }).then((outcome) => {
+        if (outcome.kind !== "available") return;
+        this.pendingUpdate = outcome.update;
+        this.render();
+      });
+    }, STARTUP_UPDATE_DELAY_MS);
+  }
+
+  /** A manual "Check for updates": the outcome is always shown, either way. */
+  private async runManualUpdateCheck(): Promise<void> {
+    if (this.updateCheckBusy) return;
+    this.updateCheckBusy = true;
+    this.updateNote = null;
+    this.render();
+    const outcome = await checkForUpdates();
+    this.updateCheckBusy = false;
+    if (outcome.kind === "available") {
+      this.pendingUpdate = outcome.update;
+      this.updateNote = null;
+    } else if (outcome.kind === "up-to-date") {
+      this.updateNote = { text: "You're on the latest version.", error: false };
+    } else {
+      this.updateNote = {
+        text: outcome.kind === "failed" ? outcome.message : outcome.reason,
+        error: true,
+      };
+    }
+    this.render();
+  }
+
+  /**
+   * Start the download the prompt announced. The prompt stays up and becomes
+   * the progress view, so the dialog never jumps out from under the cursor.
+   *
+   * A failure here — offline, a bad endpoint, a signature that does not match
+   * the configured key — leaves the running app untouched: the plugin verifies
+   * the artifact before it replaces anything, so there is no half-installed
+   * state to recover from. The message goes to the About line and a toast, and
+   * the prompt closes.
+   */
+  private async beginUpdateInstall(): Promise<void> {
+    this.updateProgress = {
+      downloaded: 0,
+      total: null,
+      percent: null,
+      installing: false,
+    };
+    this.render();
+    try {
+      await downloadAndInstallUpdate((p) => {
+        this.updateProgress = p;
+        this.patchUpdateProgress(p);
+      });
+      // `relaunch` replaces this process, so this line is only reached on the
+      // way out. Nothing to clean up.
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "The update failed.";
+      this.closeUpdatePrompt();
+      this.updateNote = { text: message, error: true };
+      this.render();
+      showToast(message, { kind: "error" });
+      await discardPendingUpdate();
+    }
+  }
+
+  /** Close the prompt and let go of the backend's update handle. */
+  private async dismissUpdatePrompt(): Promise<void> {
+    this.closeUpdatePrompt();
+    this.render();
+    await discardPendingUpdate();
+  }
+
+  private closeUpdatePrompt(): void {
+    this.pendingUpdate = null;
+    this.updateProgress = null;
+    this.updateProgressEl = null;
+  }
+
+  /**
+   * Move the bar and its label without a repaint. `downloadAndInstall` fires
+   * once per chunk — several times a second on a fast link — and rebuilding the
+   * whole app that often would make the download stutter.
+   */
+  private patchUpdateProgress(p: UpdateProgress): void {
+    const el = this.updateProgressEl;
+    if (!el) return;
+    if (p.percent === null) {
+      el.fill.classList.add("is-indeterminate");
+      el.fill.style.width = "";
+    } else {
+      el.fill.classList.remove("is-indeterminate");
+      el.fill.style.width = `${p.percent}%`;
+    }
+    el.label.textContent = updateProgressLabel(p);
+  }
+
+  /**
+   * The update prompt. Two states in one dialog: what is available (with the
+   * two ways out), then the download and install in place of those buttons.
+   */
+  private renderUpdatePrompt(): HTMLElement {
+    const update = this.pendingUpdate!;
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Software update");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = `Hush ${update.version} is available`;
+    const sub = document.createElement("p");
+    sub.className = "muted text-13";
+    sub.style.marginTop = "var(--space-2)";
+    sub.textContent = `You are running ${update.currentVersion}.`;
+    modal.append(h, sub);
+
+    if (update.notes) {
+      const notes = document.createElement("div");
+      notes.className = "update-notes text-13";
+      notes.textContent = update.notes;
+      modal.appendChild(notes);
+    }
+
+    if (this.updateProgress) {
+      const track = document.createElement("div");
+      track.className = "update-bar";
+      const fill = document.createElement("div");
+      fill.className = "update-bar-fill";
+      const pct = this.updateProgress.percent;
+      if (pct === null) {
+        // No content length from the server: an indeterminate sweep rather
+        // than a bar pinned at zero, which reads as a stall.
+        fill.classList.add("is-indeterminate");
+      } else {
+        fill.style.width = `${pct}%`;
+      }
+      track.appendChild(fill);
+      const label = document.createElement("p");
+      label.className = "muted text-13";
+      label.style.marginTop = "var(--space-2)";
+      label.textContent = updateProgressLabel(this.updateProgress);
+      // Held for `patchUpdateProgress`, which updates these in place.
+      this.updateProgressEl = { fill, label };
+      modal.append(track, label);
+    } else {
+      const row = document.createElement("div");
+      row.className = "modal-actions";
+      const later = document.createElement("button");
+      later.type = "button";
+      later.className = "btn-secondary pressable";
+      later.textContent = "Later";
+      later.onclick = () => void this.dismissUpdatePrompt();
+      const now = document.createElement("button");
+      now.type = "button";
+      now.className = "btn-primary pressable";
+      now.textContent = "Update now";
+      now.onclick = () => void this.beginUpdateInstall();
+      row.append(later, now);
+      modal.appendChild(row);
+    }
+
+    back.appendChild(modal);
+    return back;
+  }
+
+  /**
+   * Settings → About: the manual half of the updater. The startup probe is
+   * invisible by design, so this is the only place a user can ask — and the
+   * only place that can answer "you're on the latest version".
+   */
+  private renderUpdateControls(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "update-controls";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-secondary pressable";
+    btn.textContent = this.updateCheckBusy ? "Checking…" : "Check for updates";
+    btn.disabled = this.updateCheckBusy || this.updateProgress !== null;
+    btn.onclick = () => void this.runManualUpdateCheck();
+    wrap.appendChild(btn);
+    if (this.updateNote) {
+      const note = document.createElement("p");
+      note.className = "text-13";
+      note.style.marginTop = "var(--space-2)";
+      if (this.updateNote.error) note.style.color = "var(--danger)";
+      note.textContent = this.updateNote.text;
+      wrap.appendChild(note);
+    }
+    return wrap;
   }
 
   private announce(msg: string): void {
@@ -1030,6 +1298,7 @@ export class App {
     if (this.conclaveDeleteId) this.root.appendChild(this.renderConclaveDeleteModal());
     if (this.readsConfirmUrl) this.root.appendChild(this.renderReadsConfirm());
     if (this.torrentsDeleteId) this.root.appendChild(this.renderTorrentsDeleteModal());
+    if (this.pendingUpdate) this.root.appendChild(this.renderUpdatePrompt());
   }
 
   private async maybeShowRecoveryCode(): Promise<void> {
@@ -8227,6 +8496,7 @@ export class App {
     } else if (this.settingsSection === "about") {
       body.innerHTML = `<h2 class="text-22">About</h2><p class="muted text-13">Where this client sends ciphertext, and where your vault lives. The relay value comes from the vault once it is unlocked; while locked it shows the configured default.</p>`;
       const rows: [string, string][] = [
+        ["Version", this.appVersion ?? "—"],
         ["Relay", this.status?.relay ?? "—"],
         ["Relay source", this.status?.relay_source ?? "—"],
         ["Vault", this.status?.vault_dir ?? "—"],
@@ -8255,7 +8525,7 @@ export class App {
       hint.style.marginTop = "var(--space-4)";
       hint.textContent =
         "Change the default with: hush-cli config set --relay <url>. Existing vaults keep the relay they were created with.";
-      body.append(list, hint);
+      body.append(list, hint, this.renderUpdateControls());
     } else if (this.settingsSection === "drops") {
       this.renderDropsSettingsInto(body);
     } else {

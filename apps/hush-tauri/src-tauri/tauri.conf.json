@@ -23,11 +23,20 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "createUpdaterArtifacts": true,
     "resources": {
       "resources/tor/tor": "tor/tor",
       "resources/tor/libevent-2.1.so.7": "tor/libevent-2.1.so.7",
       "resources/tor/LICENSE": "tor/LICENSE"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "REPLACE_WITH_PUBLIC_KEY",
+      "endpoints": [
+        "https://github.com/OWNER/REPO/releases/latest/download/latest.json"
+      ]
     }
   }
 }

@@ -104,6 +104,18 @@
   animation: spin 0.8s linear infinite;
 }
 
+/* Sweeps across the update bar while the server has not said how large the
+   download is. A bar pinned at zero reads as a stall; a moving one reads as
+   work. */
+@keyframes update-indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .breathe,
   .skeleton,
@@ -112,5 +124,12 @@
   }
   .shake {
     opacity: 0.7;
+  }
+  /* The sweep is motion for its own sake; the label below the bar already says
+     what is happening, so reduced motion gets a dimmed full bar instead. */
+  .update-bar-fill.is-indeterminate {
+    animation: none;
+    width: 100%;
+    opacity: 0.6;
   }
 }

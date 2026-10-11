@@ -12,3 +12,10 @@ instances/
 apps/hush-tauri/node_modules/
 crates/hush-relay/node_modules/
 .cursor/
+
+# Updater signing keys. A leaked private key lets anyone publish an update the
+# app will happily install, so these never enter the repository. The default
+# location is ~/.tauri, outside the tree, but a key generated in here must not
+# be committable either.
+*.key
+.tauri/
