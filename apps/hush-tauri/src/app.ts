@@ -195,6 +195,14 @@ import { RichTextEditor } from "./components/ui/RichTextEditor";
 import { ContactPicker } from "./components/ui/ContactPicker";
 import { bodyToDisplayHtml, isBlankHtml } from "./lib/richText";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
+import { IrcPane } from "./features/irc/ircPane";
+import {
+  getIrcState,
+  initIrcStore,
+  ircMentionCount,
+  ircUnreadTotal,
+  subscribeIrc,
+} from "./features/irc/ircStore";
 import QRCode from "qrcode";
 
 type Rail =
@@ -204,6 +212,7 @@ type Rail =
   | "reads"
   | "torrents"
   | "wallet"
+  | "irc"
   | "mail"
   | "drops"
   | "files"
@@ -328,6 +337,11 @@ export class App {
   private contacts: ContactDto[] = [];
   private rail: Rail = "chats";
   private selectedNick: string | null = null;
+  /** The mounted IRC pane, kept so its store subscription is torn down when
+   * the rail changes instead of patching a detached DOM. */
+  private ircPane: IrcPane | null = null;
+  /** Last IRC unread total, so the rail badge repaints only on a change. */
+  private lastIrcUnread = -1;
   /** Scroll state of the thread pane from the render that is being replaced.
    * Keyed by the conversation the old DOM was showing: a position only makes
    * sense within one conversation. */
@@ -662,7 +676,34 @@ export class App {
       if (this.walletPhrase) return;
       this.render();
     });
+    // IRC: the pane patches its own DOM, so this only keeps the rail badge
+    // honest. While the rail is up the badge is patched in place; otherwise a
+    // repaint refreshes it along with everything else.
+    subscribeIrc(() => {
+      const total = ircUnreadTotal();
+      const mentions = ircMentionCount();
+      const key = total + mentions * 100000;
+      if (key === this.lastIrcUnread) return;
+      this.lastIrcUnread = key;
+      if (this.rail === "irc") {
+        this.updateIrcRailBadge(total, mentions);
+      } else {
+        this.render();
+      }
+    });
     document.addEventListener("keydown", (e) => {
+      // IRC keeps its own shortcuts while its rail is up: Ctrl+Tab cycles
+      // windows, Ctrl+W closes the active one.
+      if (this.rail === "irc" && (e.ctrlKey || e.metaKey) && e.key === "Tab") {
+        e.preventDefault();
+        this.ircPane?.cycle(e.shiftKey ? -1 : 1);
+        return;
+      }
+      if (this.rail === "irc" && (e.ctrlKey || e.metaKey) && (e.key === "w" || e.key === "W")) {
+        e.preventDefault();
+        this.ircPane?.closeActive();
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
         e.preventDefault();
         this.paletteOpen = !this.paletteOpen;
@@ -681,9 +722,14 @@ export class App {
         this.closeConclaveDelete();
         if (this.filesContactNick) this.filesContactNick = null;
         this.torrentsDeleteId = null;
-        this.render();
+        // The IRC pane owns its own dialogs and menus; a repaint would drop
+        // the caret out of its input for no reason.
+        if (this.rail !== "irc") this.render();
       }
     });
+    // IRC runs its own sockets; wiring it up here (rather than on first visit
+    // to the rail) means unread counts and live connections survive a switch.
+    await initIrcStore();
     await this.refreshStatus();
     this.render();
   }
@@ -903,6 +949,10 @@ export class App {
           top: prevMsgs.scrollTop,
         }
       : null;
+    // The IRC pane holds a live store subscription; tear it down before its
+    // DOM is discarded, or it would keep patching a detached tree.
+    this.ircPane?.unmount();
+    this.ircPane = null;
     this.root.innerHTML = "";
     if (!this.status || this.status.locked) {
       this.stopDropsPoll();
@@ -934,6 +984,8 @@ export class App {
       shell.appendChild(this.renderReadsMain());
     } else if (this.rail === "torrents") {
       shell.appendChild(this.renderTorrents());
+    } else if (this.rail === "irc") {
+      shell.appendChild(this.renderIrc());
     } else if (this.rail === "wallet") {
       shell.appendChild(this.renderWallet());
     } else if (this.rail === "mail") {
@@ -1232,6 +1284,7 @@ export class App {
         activeTorrentCount(getTorrentsState()),
       ),
     );
+    rail.appendChild(this.railBtn("irc", "IRC", "irc", ircUnreadTotal()));
     rail.appendChild(this.railBtn("wallet", "Wallet", "wallet"));
     rail.appendChild(this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())));
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
@@ -6710,6 +6763,36 @@ export class App {
     } finally {
       this.walletBusy = false;
       this.render();
+    }
+  }
+
+  /** The IRC rail. The pane builds and patches its own subtree; the app mounts
+   *  it once and otherwise leaves it alone. */
+  private renderIrc(): HTMLElement {
+    const host = document.createElement("div");
+    host.className = "main-pane irc-pane";
+    this.ircPane = new IrcPane(host);
+    this.ircPane.mount();
+    return host;
+  }
+
+  /** Patch the IRC rail badge in place while the rail is already up. */
+  private updateIrcRailBadge(total: number, mentions: number): void {
+    const btn = this.root.querySelector<HTMLElement>('.rail-btn[data-rail="irc"]');
+    if (!btn) return;
+    btn.querySelector(".rail-count")?.remove();
+    btn.querySelector(".rail-badge")?.remove();
+    if (total > 0) {
+      const pill = document.createElement("span");
+      pill.className = "rail-count";
+      pill.textContent = total > 99 ? "99+" : String(total);
+      btn.appendChild(pill);
+    }
+    if (mentions > 0) {
+      const dot = document.createElement("span");
+      dot.className = "rail-badge";
+      dot.setAttribute("aria-label", "You were mentioned");
+      btn.appendChild(dot);
     }
   }
 

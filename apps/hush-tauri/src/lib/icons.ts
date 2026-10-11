@@ -7,6 +7,7 @@ import {
   Shield,
   Settings,
   Plus,
+  Terminal,
   Search,
   Send,
   Paperclip,
@@ -149,6 +150,7 @@ const ICONS = {
   wallet: Wallet,
   bitcoin: Bitcoin,
   copy: Copy,
+  irc: Terminal,
 } satisfies Record<string, IconNode>;
 
 /**

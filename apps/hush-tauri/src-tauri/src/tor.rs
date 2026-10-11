@@ -1,9 +1,11 @@
 //! Local Tor lifecycle for the Drops feature.
 //!
 //! Hush starts Tor as a child process that listens on loopback only. The SOCKS
-//! port it opens is handed to exactly one webview — the Drop view — and never to
-//! the main window, the daemon proxy, or anything else. That is the whole point:
-//! the Hush relay is not in the path, and neither is any other part of Hush.
+//! port it opens is handed to the Drop view (a webview) and, from the Rust
+//! side, to the IRC client when a connection is routed through Tor; it is never
+//! given to the main window, the daemon proxy, or anything else. That is the
+//! whole point: the Hush relay is not in the path, and neither is any other
+//! part of Hush.
 //!
 //! Nothing in this module records a destination. Tor's log is scanned in
 //! memory for the bootstrap marker (and teed to `tor.log` in Tor's private

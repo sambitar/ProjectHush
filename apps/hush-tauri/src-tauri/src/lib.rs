@@ -2,6 +2,7 @@ use tauri::Manager;
 
 mod daemon_client;
 mod drops;
+mod irc;
 mod sound;
 mod tor;
 
@@ -187,6 +188,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(proxy)
+        .manage(irc::IrcState::new())
         .invoke_handler(tauri::generate_handler![
             hush_save_file,
             hush_open_file,
@@ -201,7 +203,19 @@ pub fn run() {
             drops::drops_tor_status,
             drops::drops_tor_start,
             drops::drops_tor_stop,
-            sound::play_chat_sound
+            sound::play_chat_sound,
+            irc::commands::connect_server,
+            irc::commands::disconnect_server,
+            irc::commands::join_channel,
+            irc::commands::part_channel,
+            irc::commands::send_message,
+            irc::commands::send_raw,
+            irc::commands::change_nick,
+            irc::commands::open_query,
+            irc::commands::list_channels,
+            irc::commands::get_state,
+            irc::commands::irc_settings_load,
+            irc::commands::irc_settings_save
         ])
         .setup(move |app| {
             // Tor lives under the app's local data dir, not in the vault, and is

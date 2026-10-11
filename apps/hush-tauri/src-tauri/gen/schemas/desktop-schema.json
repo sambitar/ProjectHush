@@ -207,6 +207,12 @@
           "markdownDescription": "Open external http(s) links in the user's browser"
         },
         {
+          "description": "IRC: multi-server connections, channel and query windows, and non-secret settings",
+          "type": "string",
+          "const": "allow-irc",
+          "markdownDescription": "IRC: multi-server connections, channel and query windows, and non-secret settings"
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

@@ -21,8 +21,18 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["net", "rt"] }
+tokio = { version = "1", features = ["net", "rt", "io-util", "time", "sync", "macros"] }
 tower-service = "0.3"
+
+# The IRC client. TLS is mandatory for the default servers, so the rustls stack
+# is a hard dependency; the `ring` provider is used explicitly (see `irc::tls`)
+# so the build never depends on the workspace's other rustls consumers.
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
+base64 = "0.22"
+rand = "0.8"
 
 # Signalling a Tor child left behind by a previous run. See `tor::clear_stale`.
 [target.'cfg(unix)'.dependencies]

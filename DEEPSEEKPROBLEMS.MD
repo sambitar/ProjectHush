@@ -13,6 +13,76 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — IRC rail pane (Rust client, mIRC UI, Tor-capable)
+
+Slice goal: a new left-rail IRC tab with a classic mIRC UI, backed by a hand-written `tokio`
+client in Rust (TLS via `tokio-rustls`, optional Tor routing through the existing managed
+`TorManager`), with all line/mIRC-format/nick-sort parsing in Rust and the UI built from
+structured segments.
+
+### [FIXED] The first `cargo check` never started: the target-dir lock was held by a deadlocked build from an earlier session
+
+- **Attempted:** `cargo check -p hush-tauri` at the start of the slice.
+- **Symptom:** the command sat for ~17 minutes with no compiler output. It had **no child
+  `rustc`** at all. `lsof target/debug/.cargo-lock` showed the lock held by a different cargo,
+  `cargo test -p hush-daemon wallet` (PID 4084550), left over from earlier work on this tree. Its
+  single `rustc` child (PID 4102951) had accumulated only 38 s of CPU in 55 minutes, was sleeping
+  in `futex_do_wait`, and showed **0 jiffies of CPU over a 5-second sample** — a deadlock, not a
+  slow compile.
+- **Fix:** killed the wedged `rustc` child. Its cargo exited, the lock freed, and the check that
+  was already waiting acquired it and finished (lib + bin) with only dead-code warnings.
+- **Lesson:** a cargo command that produces no output and has no child `rustc` is blocked on the
+  target lock, not compiling. Check `lsof <target>/debug/.cargo-lock` and sample the holder's CPU
+  before assuming the build is merely slow. Also: `cargo test` of an unrelated workspace member
+  locks the whole target directory, so an abandoned one stalls everything else.
+
+### [WORKED AROUND] `rustls` needs an explicit provider in this workspace
+
+- **Attempted:** the obvious `ClientConfig::builder()` for the IRC client's TLS.
+- **Symptom:** not a compile error — the workspace already builds `aws-lc-sys` (via another
+  consumer of rustls), so more than one crypto provider can be compiled in. With two providers
+  present, `ClientConfig::builder()` **panics at runtime**, on the first connection, far from the
+  cause.
+- **Fix:** the IRC module names its provider (`rustls::crypto::ring`) and builds with
+  `ClientConfig::builder_with_provider(...)`, so it is independent of whatever the rest of the
+  workspace enables. `tokio-rustls` itself pulls rustls with `default-features = false`, so the
+  provider choice is ours.
+- **Lesson:** in a multi-crate workspace, never rely on a library's process-default provider.
+  Name it explicitly.
+
+### [FIXED] A user-typed `/quit` reconnected the user to the server they had just left
+
+- **Attempted:** `/quit` was implemented as `send_raw("QUIT :bye")`, which is the literal IRC
+  spelling of the command.
+- **Symptom:** the client's read loop treats socket EOF as a dropped connection and starts the
+  auto-reconnect backoff, so a deliberate quit came back online seconds later. Not visible in any
+  unit test — only in a live session.
+- **Fix:** `disconnect_server` gained an optional `reason`; the Rust side sends
+  `OutCmd::Quit(reason)` and marks the connection user-initiated so the read loop returns instead
+  of reconnecting. `/quit [reason]` and the toolbar's Disconnect button both go through it.
+- **Lesson:** "the server closed the socket" and "the user asked to stop" arrive as the same EOF.
+  Intent has to be recorded on the client side; it cannot be inferred from the wire.
+
+### [OPEN] The live IRC session cannot be exercised from this environment
+
+- **Attempted:** the plan's verification step is a `tauri dev` smoke test: connect to
+  `irc.libera.chat` (clearnet and through Tor), join `#your-lobby`, send/receive, check `/help`,
+  the nick list, context menus, and the channel list.
+- **Symptom:** not attempted. Driving a Tauri window, the managed Tor process, and a real network
+  session to Libera is not something the agent can do here; `cargo test` and `npm run build` only
+  cover the parsers, the nick sort, the SOCKS request encoder, and the type surface.
+- **Status of the automated half (2026-10-11):** the debug desktop binary was built and links clean
+  (`cargo build -p hush-tauri`, 1m 28s, with the IRC event names and the current `ui/dist` embedded),
+  `cargo test -p hush-tauri` is green (56 passed, 1 ignored — the ignored one needs a real Tor), and
+  `cargo check -p hush-tauri --tests` is warning-free. The user chose to run the interactive pass
+  themselves rather than have the agent launch a window on their display.
+- **Needed to resolve:** a human running `npx tauri dev` (a display is present, `DISPLAY=:0`) and
+  walking the smoke-test list. Until then, every claim about the *UI* behaviour of this slice is
+  unverified: registration, SASL, auto-join, rate limiting, and reconnect all run only against a
+  real server.
+
+---
+
 ## 2026-10-11 — Wallet, part 2: Ethereum and ERC-20 tokens on the same phrase
 
 Slice goal: derive a second chain from the phrase the Bitcoin wallet already stores, at the
@@ -121,6 +191,12 @@ in base units.
 - **Lesson:** a dependency added for one crate is paid for by every test binary that links that
   crate. Before adding a heavy tree to a crate with integration tests, check what the final link
   costs, not just what `cargo check` costs.
+- **Seen again on the IRC slice (2026-10-11):** the `hush-tauri` test link took 53 minutes for about
+  30 s of CPU, and `wchan` read `futex_do_wait` with the CPU time frozen — the same signature as the
+  genuinely deadlocked build logged at the top of this file. The way to tell them apart is to sample
+  twice: `/proc/<pid>/io` `read_bytes` **rising** (~17 MB/s here) with `/proc/<pid>/stat` jiffies
+  barely moving means swap thrash; both flat means deadlock. It finished on its own once memory
+  recovered (the next link took 1m 28s).
 
 ### [OPEN] Ethereum's network paths are half-tested: reads are live, sends and Tor are not
 
@@ -307,6 +383,13 @@ in base units.
 - **Lesson:** killing a build is not always as safe as killing a test run — check whether the tool
   clears its output directory first. Here the cost was one rebuild, but on a tool that emptied and
   then failed to rewrite, it would be a broken artifact.
+- **The same gap seen from the Rust side (2026-10-11):** a `cargo check -p hush-tauri` that ran while
+  `vite build` was replacing the bundle failed with
+  `lib.rs:240:16: error: couldn't read .../ui/dist/assets/index-Ch2VSQBg.js: No such file or
+  directory` — `tauri::generate_context!()` embeds the dist at compile time, so for a few seconds the
+  directory held neither the old asset nor a settled `index.html`. Re-running `npm run build` to
+  completion and then re-running the check passed with zero warnings. Treat an embed error naming an
+  `index-<hash>.js` as a partial dist, not a code defect, and never run the two builds at once.
 
 ---
 
