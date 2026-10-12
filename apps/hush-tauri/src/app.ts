@@ -2442,7 +2442,7 @@ export class App {
     return pane;
   }
 
-  /** One Drop as a card, matching the Trusts card rhythm. */
+  /** One Drop as a card: an app tile with its own identity, not a person. */
   private dropCard(d: Drop): HTMLElement {
     const card = document.createElement("div");
     card.className = `tile drop-card${d.devOnly ? " is-dev" : ""}`;
@@ -2593,11 +2593,12 @@ export class App {
   // --------------------------------------------------------------- trusts
 
   /**
-   * The Trusts rail: every contact as a card rather than a row.
+   * The Trusts rail: the contact list, one person per row.
    *
-   * A card is a person, so it carries the same avatar and presence the Chats
-   * rail already renders for them, and its actions are built from a list. Adding
-   * an action is one entry in that list, not a layout change.
+   * Rows speak the same visual language as the Chats rail's list — a person is
+   * a row there, so a person is a row here. The actions live in an overflow
+   * menu, so a long list stays scannable instead of repeating a button row
+   * down the pane. Adding an action is one menu entry, not a layout change.
    */
   private renderTrusts(): HTMLElement {
     const pane = document.createElement("div");
@@ -2612,11 +2613,9 @@ export class App {
     const sub = document.createElement("p");
     sub.className = "muted text-13";
     sub.style.marginTop = "var(--space-2)";
-    sub.textContent = this.contacts.length
-      ? `${this.contacts.length} ${
-          this.contacts.length === 1 ? "trustee" : "trustees"
-        } in your circle.`
-      : "No trustees in your circle.";
+    sub.textContent = `${this.contacts.length} ${
+      this.contacts.length === 1 ? "contact" : "contacts"
+    }`;
     titles.append(h, sub);
     const add = document.createElement("button");
     add.type = "button";
@@ -2636,8 +2635,8 @@ export class App {
     filter.className = "search-pill trusts-filter";
     const filterInput = document.createElement("input");
     filterInput.type = "search";
-    filterInput.placeholder = "Filter trusts";
-    filterInput.setAttribute("aria-label", "Filter trusts");
+    filterInput.placeholder = "Filter contacts";
+    filterInput.setAttribute("aria-label", "Filter contacts");
     filter.append(icon("search"), filterInput);
 
     if (!this.contacts.length) {
@@ -2645,10 +2644,10 @@ export class App {
       empty.className = "empty-state";
       const t = document.createElement("h2");
       t.className = "text-22";
-      t.textContent = "No trusts yet";
+      t.textContent = "No contacts yet";
       const p = document.createElement("p");
       p.className = "muted";
-      p.textContent = "Add someone and they will appear here as a card.";
+      p.textContent = "Add someone to start a chat or send mail.";
       const b = document.createElement("button");
       b.className = "btn-primary pressable";
       b.textContent = "Add a trust";
@@ -2669,19 +2668,19 @@ export class App {
         sensitivity: "base",
       }),
     );
-    const grid = document.createElement("div");
-    grid.className = "bento trusts-grid";
-    for (const c of ordered) grid.appendChild(this.trustCard(c));
+    const rows = document.createElement("div");
+    rows.className = "trust-rows";
+    for (const c of ordered) rows.appendChild(this.trustRow(c));
 
     const noMatch = document.createElement("p");
     noMatch.className = "muted text-13 trusts-filter-empty";
     noMatch.hidden = true;
-    noMatch.textContent = "No trusts match that filter.";
+    noMatch.textContent = "No contacts match that filter.";
 
     filterInput.oninput = () => {
       const q = filterInput.value.trim().toLocaleLowerCase();
       let shown = 0;
-      for (const el of Array.from(grid.children) as HTMLElement[]) {
+      for (const el of Array.from(rows.children) as HTMLElement[]) {
         const match =
           !q || (el.dataset.trustName ?? "").toLocaleLowerCase().includes(q);
         el.hidden = !match;
@@ -2690,88 +2689,79 @@ export class App {
       noMatch.hidden = shown > 0;
     };
 
-    pane.append(filter, grid, noMatch);
+    pane.append(filter, rows, noMatch);
     return pane;
   }
 
-  /** One contact card: avatar, name, presence, and the action row. */
-  private trustCard(c: ContactDto): HTMLElement {
-    const card = document.createElement("div");
-    card.className = "tile trust-card";
+  /**
+   * One contact as a row: avatar with presence, the names they go by, and the
+   * actions in an overflow menu. The row has one action — its menu. Clicking
+   * anywhere on the row opens it, as a right-click would on a list item, and
+   * the menu carries chat, mail and the destructive ones, so the row never
+   * has to guess which action a click meant.
+   */
+  private trustRow(c: ContactDto): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "trust-row pressable";
     // The name as shown, so the filter matches what the user can see.
-    card.dataset.trustName = displayNick(c.nickname);
+    row.dataset.trustName = displayNick(c.nickname);
 
-    const top = document.createElement("div");
-    top.className = "trust-card-top";
-    top.appendChild(
-      avatarWithPresence(c.protocol_name, c.online, "lg", false, displayNick(c.nickname)),
+    row.appendChild(
+      avatarWithPresence(c.protocol_name, c.online, "sm", false, displayNick(c.nickname)),
     );
 
-    const meta = document.createElement("div");
-    meta.className = "trust-card-meta";
+    const main = document.createElement("div");
+    main.className = "trust-row-main";
     const name = document.createElement("div");
-    name.className = "text-17 trust-card-name";
+    name.className = "text-15 trust-row-name";
     name.textContent = displayNick(c.nickname);
-    const presence = document.createElement("div");
-    presence.className = `presence-label text-13${c.online ? " online" : ""}`;
-    presence.textContent = c.online ? "Online" : "Offline";
-    meta.append(name, presence);
+    main.appendChild(name);
     if (c.mail_handle) {
       const mail = document.createElement("div");
-      mail.className = "muted text-12 trust-card-mail";
+      mail.className = "muted text-13 trust-row-mail";
       mail.textContent = this.contactAddress(c);
-      meta.appendChild(mail);
+      main.appendChild(mail);
     }
-    top.appendChild(meta);
+    row.appendChild(main);
 
-    // The extensible action row. Each action is a label, an icon and a handler;
-    // a future action drops in here without touching the card layout.
-    const actions: {
-      label: string;
-      ic: IconName;
-      run: () => void;
-      danger?: boolean;
-      /**
-       * Destructive actions render icon-only, muted, and pushed away from the
-       * primary ones. A delete that is the easiest thing on the card to hit is
-       * a delete that gets hit by accident.
-       */
-      iconOnly?: boolean;
-    }[] = [
-      { label: "Chat", ic: "chats", run: () => this.openChat(c.nickname) },
-      { label: "Email", ic: "mail", run: () => this.emailContact(c.nickname) },
-      {
-        label: "Delete",
-        ic: "trash",
-        danger: true,
-        iconOnly: true,
-        run: () => this.openTrustDelete(c.nickname),
-      },
-    ];
-    const row = document.createElement("div");
-    row.className = "trust-actions";
-    for (const a of actions) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = `btn-secondary pressable trust-action${a.danger ? " danger" : ""}${
-        a.iconOnly ? " icon-only" : ""
-      }`;
-      // Icon-only buttons still need a name for assistive tech and a tooltip
-      // for everyone else.
-      b.setAttribute("aria-label", a.label);
-      b.title = a.label;
-      b.appendChild(icon(a.ic));
-      if (!a.iconOnly) {
-        const s = document.createElement("span");
-        s.textContent = a.label;
-        b.appendChild(s);
-      }
-      b.onclick = a.run;
-      row.appendChild(b);
-    }
-
-    card.append(top, row);
-    return card;
+    // The extensible action menu, nested so the popup anchors to the dots.
+    // Each action is an entry, not a layout change, and the destructive one is
+    // last and separated: a delete that sits beside a primary action is a
+    // delete that gets hit by accident. The row is the menu's surface, so a
+    // second press on the row closes what the first one opened; clicks that
+    // begin inside the menu toggle on their own and are not re-toggled here.
+    const menu = new OverflowMenu({
+      label: `Contact options for ${displayNick(c.nickname)}`,
+      surface: row,
+      items: [
+        {
+          id: "chat",
+          label: "Chat",
+          icon: "chats",
+          onSelect: () => this.openChat(c.nickname),
+        },
+        {
+          id: "email",
+          label: "Email",
+          icon: "mail",
+          onSelect: () => this.emailContact(c.nickname),
+        },
+        {
+          id: "delete",
+          label: "Delete",
+          icon: "trash",
+          danger: true,
+          separatorBefore: true,
+          onSelect: () => this.openTrustDelete(c.nickname),
+        },
+      ],
+    });
+    row.appendChild(menu.element);
+    row.onclick = (e) => {
+      if (menu.element.contains(e.target as Node)) return;
+      menu.toggleMenu();
+    };
+    return row;
   }
 
   /** Open the chat thread with a contact, from any rail. */

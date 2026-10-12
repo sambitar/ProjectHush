@@ -39,6 +39,13 @@ export interface OverflowMenuOptions {
   items: OverflowMenuItem[];
   /** Accessible name for the trigger, e.g. "Options for Ada". */
   label: string;
+  /**
+   * A container whose presses count as inside the menu: a row whose whole
+   * click is the menu. Without it, the close-on-mousedown would fire before
+   * the row's own click handler, so a row click that opened the menu could
+   * never close it again.
+   */
+  surface?: HTMLElement;
 }
 
 let menuUid = 0;
@@ -49,6 +56,7 @@ export class OverflowMenu {
   private readonly popup: HTMLElement;
   private readonly items: OverflowMenuItem[];
   private readonly menuId: string;
+  private readonly surface: HTMLElement | null;
   private open = false;
 
   /**
@@ -63,11 +71,13 @@ export class OverflowMenu {
       document.removeEventListener("mousedown", this.onOutsideDown, true);
       return;
     }
-    if (!this.element.contains(e.target as Node)) this.close();
+    const scope = this.surface ?? this.element;
+    if (!scope.contains(e.target as Node)) this.close();
   };
 
   constructor(opts: OverflowMenuOptions) {
     this.items = opts.items;
+    this.surface = opts.surface ?? null;
     this.menuId = `overflow-menu-${++menuUid}`;
 
     this.element = document.createElement("div");
@@ -143,6 +153,16 @@ export class OverflowMenu {
   private toggle(): void {
     if (this.open) this.close();
     else this.openMenu();
+  }
+
+  /**
+   * Toggle from outside the trigger, for a `surface` whose whole click is the
+   * menu (a row that opens its actions). The surface is exempt from the
+   * close-on-mousedown, so the click reaches this toggle and a row press
+   * closes what a row press opened.
+   */
+  toggleMenu(): void {
+    this.toggle();
   }
 
   private openMenu(): void {

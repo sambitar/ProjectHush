@@ -1553,8 +1553,8 @@
 
 /* ----------------------------------------------------------------- trusts */
 
-/* The pane scrolls as a whole; the grid itself is the same `.bento` used
-   elsewhere, so cards line up with the rest of the app. */
+/* The pane scrolls as a whole; the rows run full width under the head, in the
+   mail list's row language. */
 .trusts-pane {
   overflow: auto;
 }
@@ -1578,13 +1578,8 @@
   margin: var(--space-4) var(--space-5) 0;
 }
 
-.trusts-grid {
-  align-content: start;
-  padding-top: var(--space-4);
-}
-
-/* `.trust-card` sets its own display, which would otherwise beat [hidden]. */
-.trust-card[hidden] {
+/* A row's own display would beat [hidden]; restate it so the filter works. */
+.trust-row[hidden] {
   display: none;
 }
 
@@ -1592,74 +1587,38 @@
   padding: 0 var(--space-5) var(--space-5);
 }
 
-.trust-card {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
-
-.trust-card-top {
+.trust-row {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  min-width: 0;
-}
-
-.trust-card-meta {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.trust-card-name,
-.trust-card-mail {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Actions share the row, but the destructive one is pushed to the far edge so
-   it is never adjacent to a primary action. */
-.trust-actions {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin-top: auto;
-}
-
-.trust-action {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  width: auto;
-  flex: 0 1 auto;
-  min-width: 0;
-}
-
-.trust-action svg {
-  width: 16px;
-  height: 16px;
-}
-
-.trust-action span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Icon-only, muted, and held apart from the primary actions. */
-.trust-action.icon-only {
-  margin-left: auto;
-  padding: var(--space-2);
-  color: var(--text-faint);
+  width: 100%;
+  padding: var(--space-3) var(--space-5);
+  border: none;
+  border-bottom: 1px solid var(--border);
   background: transparent;
+  cursor: pointer;
 }
 
-.trust-action.icon-only:hover {
-  color: var(--danger);
+.trust-row:hover {
+  background: var(--surface-2);
+}
+
+.trust-row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.trust-row-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trust-row-mail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ----------------------------------------------------------- delete modal */

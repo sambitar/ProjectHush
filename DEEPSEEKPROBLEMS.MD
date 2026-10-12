@@ -13,6 +13,39 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — Trusts pane: cards to rows
+
+Slice goal: the Trusts pane read as AI-designed (marketing copy, a bento card grid for a
+contact lookup list, duplicated presence). Rebuilt as rows in the Chats/mail-list language,
+with the actions moved into the shared `OverflowMenu`.
+
+### [FIXED] CSS edit missed because the rule order was reconstructed from memory
+
+- **Attempted:** replace the `.trust-card`/`.trust-action` block in `app.css` with row styles in
+  one edit, using a block span assembled from an earlier partial read.
+- **Symptom:** `StrReplace` failed with "string to replace was not found" — the actual file has
+  `.trusts-filter-empty` sitting between the `[hidden]` rule and the card rules, which the
+  remembered span omitted.
+- **Resolution:** re-read the section, split into two anchored edits. All landed.
+- **Lesson:** never assemble a multi-block replacement span from memory of a partial read; read
+  the exact span immediately before the edit.
+
+### [WORKED AROUND] The repeated-button noise could not be shown, only argued
+
+- **Attempted:** demonstrate the old card layout's worst tell — a "Chat | Email" button pair
+  repeated identically on every card — with a screenshot before rewriting.
+- **Symptom:** the dev vault (`instances/peer-a`) has exactly one contact. The repeated-button
+  texture needs several, and adding a contact requires a completed invite handshake with a
+  second online peer; `peer-b` is locked and no passphrase is available to this session.
+- **Resolution:** the rewrite proceeded on code reading plus the one-contact screenshot; the
+  claim about how a list of ten cards reads is inferred from the code, not shown. Post-rewrite,
+  the row/menu/path behaviours (menu open/Escape, filter hide + no-match line, row click to
+  chat, delete dialog gating) were all exercised against `peer-a` and pass.
+- **Lesson:** a demo vault with one fixture contact can only ever screenshot the trivial case;
+  if a claim depends on list density, seed the vault before judging design.
+
+---
+
 ## 2026-10-11 — Chat overflow menu, trust invitation code
 
 Slice goal: a professional overflow menu for the chat header, and making the trust invitation
