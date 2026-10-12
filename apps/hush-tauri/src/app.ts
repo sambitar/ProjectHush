@@ -169,6 +169,7 @@ import {
   readFileAsBase64,
   resolveMessageFileBytes,
   saveVaultBlob,
+  type FileBytesSource,
 } from "./lib/fileBytes";
 import { groupMessages, dayLabel } from "./lib/messageGroups";
 import {
@@ -234,7 +235,6 @@ type Rail =
   | "irc"
   | "mail"
   | "drops"
-  | "files"
   | "vault"
   | "settings";
 type SettingsSection =
@@ -248,6 +248,25 @@ type SettingsSection =
   | "recovery"
   | "backup"
   | "about";
+
+/**
+ * One row in the Exchanged-files browser: a chat attachment or a mail one.
+ * Both live as encrypted blobs in the vault, so both are browsed from the
+ * Vault; `via` decides which pane the deep link returns to.
+ */
+interface ExchangedFileRow {
+  name: string;
+  size: number;
+  at: number;
+  via: "chat" | "mail";
+  /** Bytes resolvable on this device, or null if the file is gone. */
+  bytes: FileBytesSource | null;
+  blobId: string | null;
+  /** Mail only: the carrying message's subject, shown for context. */
+  subject?: string;
+  /** Mail only: the carrying message, for the View-in-mail deep link. */
+  mail?: MailMessage;
+}
 
 /** Matches the daemon: at most this many attachments, and this many bytes total. */
 const MAX_MAIL_ATTACHMENTS = 8;
@@ -420,6 +439,8 @@ export class App {
   private addFriendOpen = false;
   private profileNick: string | null = null;
   private paletteOpen = false;
+  /** True while the Vault pane is showing the exchanged-files browser. */
+  private filesOpen = false;
   private filesContactNick: string | null = null;
   private filesDirection: "received" | "sent" = "received";
   private recoveryModalCode: string | null = null;
@@ -806,7 +827,6 @@ export class App {
         this.conclaveInviteOpen = false;
         this.closeConclaveEnd();
         this.closeConclaveDelete();
-        if (this.filesContactNick) this.filesContactNick = null;
         this.torrentsDeleteId = null;
         // The IRC pane owns its own dialogs and menus; a repaint would drop
         // the caret out of its input for no reason.
@@ -1237,6 +1257,7 @@ export class App {
     this.notesViewingId = null;
     this.notesSearch = "";
     this.selectedNick = null;
+    this.filesOpen = false;
     this.filesContactNick = null;
     this.mailThreadId = null;
     this.mailOpenId = null;
@@ -1317,15 +1338,15 @@ export class App {
       shell.appendChild(this.renderMailMain());
     } else if (this.rail === "drops") {
       shell.appendChild(this.renderDrops());
-    } else if (this.rail === "files") {
-      shell.appendChild(this.renderFiles());
     } else if (this.rail === "vault") {
       shell.appendChild(
         this.walletOpen
           ? this.renderWallet()
           : this.notesOpen
             ? this.renderNotes()
-            : this.renderVault(),
+            : this.filesOpen
+              ? this.renderFiles()
+              : this.renderVault(),
       );
     } else {
       shell.appendChild(this.renderSettings());
@@ -1634,7 +1655,6 @@ export class App {
     const flex = document.createElement("div");
     flex.className = "rail-spacer";
     rail.appendChild(flex);
-    rail.appendChild(this.railBtn("files", "Files", "files"));
     rail.appendChild(this.railBtn("vault", "Vault", "vault"));
     rail.appendChild(this.railBtn("settings", "Settings", "settings"));
     return rail;
@@ -3950,7 +3970,10 @@ export class App {
       this.contacts = (await api.contacts()) ?? [];
       setKnownContacts(this.contacts.map((c) => c.nickname));
       if (this.selectedNick === nick) this.selectedNick = null;
-      if (this.filesContactNick === nick) this.filesContactNick = null;
+      if (this.filesContactNick === nick) {
+        this.filesContactNick = null;
+        this.filesOpen = false;
+      }
       if (this.profileNick === nick) this.profileNick = null;
       // The open conversation and composer belong to the person being removed,
       // so neither may keep showing them.
@@ -3975,6 +3998,92 @@ export class App {
     }
   }
 
+  // --- Exchanged files (browser over chat and mail attachments) -----------
+  //
+  // Reached from the Vault bento tile. Like Notes and Wallet, it renders as a
+  // full-bleed sub-pane inside the Vault rather than a rail of its own: the
+  // bytes are sealed in the vault, so the vault is where you browse them.
+  // A file counts as exchanged whether it arrived over a 1:1 chat or as a
+  // mail attachment; both stores are read and merged per contact.
+
+  /** One row in the Exchanged-files browser: a chat attachment or a mail one. */
+  private exchangedRowsFor(
+    nick: string,
+    direction: "received" | "sent",
+  ): ExchangedFileRow[] {
+    const outgoing = direction === "sent";
+    const chat = fileMessagesForContact(nick, direction).map(
+      (m): ExchangedFileRow => ({
+        name: m.fileName ?? "file",
+        size: m.fileSize ?? 0,
+        at: m.createdAt,
+        via: "chat",
+        bytes: m.fileData || m.blobId ? m : null,
+        blobId: m.blobId ?? null,
+      }),
+    );
+    const mail = this.exchangedMailMessages(nick)
+      .filter((m) => m.outgoing === outgoing)
+      .flatMap((m) =>
+        m.attachments.map((a) => ({
+          name: a.name,
+          size: a.size,
+          at: m.createdAt,
+          via: "mail" as const,
+          bytes: a,
+          blobId: a.blobId,
+          subject: m.subject,
+          mail: m,
+        })),
+      );
+    return [...chat, ...mail].sort((a, b) => b.at - a.at);
+  }
+
+  /**
+   * Mail with a contact whose attachments count as exchanged files: inbox and
+   * sent, plus anything archived out of them. Queued (outbox) mail has not
+   * been exchanged yet, trashed mail was disowned, and Drops have no contact.
+   */
+  private exchangedMailMessages(nick: string): MailMessage[] {
+    const flags = this.mailPrefs();
+    const seen = new Set<string>();
+    const out: MailMessage[] = [];
+    for (const m of [
+      ...listFolder("inbox", flags),
+      ...listFolder("sent", flags),
+      ...listFolder("archive", flags),
+    ]) {
+      if (m.contactNick !== nick || seen.has(m.id)) continue;
+      seen.add(m.id);
+      out.push(m);
+    }
+    return out;
+  }
+
+  private mailAttachmentCount(nick: string): number {
+    return this.exchangedMailMessages(nick).reduce(
+      (n, m) => n + m.attachments.length,
+      0,
+    );
+  }
+
+  /** Open the browser from the Vault tile: full-bleed, contact list first. */
+  private filesOpenFiles(): void {
+    this.filesOpen = true;
+    this.walletOpen = false;
+    this.notesOpen = false;
+    this.notesEditorOpen = false;
+    this.notesEditingId = null;
+    this.filesContactNick = null;
+    this.render();
+  }
+
+  private filesBackToVault(): void {
+    this.filesOpen = false;
+    this.filesContactNick = null;
+    this.render();
+  }
+
   private renderFiles(): HTMLElement {
     if (this.filesContactNick) {
       return this.renderFilesForContact(this.filesContactNick);
@@ -3986,8 +4095,16 @@ export class App {
     const pane = document.createElement("div");
     pane.className = "main-pane";
     pane.style.padding = "var(--space-5)";
+
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-secondary text-13 pressable";
+    back.textContent = "← Vault";
+    back.onclick = () => this.filesBackToVault();
+
     const h = document.createElement("h1");
     h.className = "text-22";
+    h.style.marginTop = "var(--space-4)";
     h.textContent = "Files";
     const hint = document.createElement("p");
     hint.className = "muted text-13";
@@ -4008,7 +4125,7 @@ export class App {
     for (const nick of [...nicks, ...also.map((c) => c.nickname)]) {
       const c = this.contacts.find((x) => x.nickname === nick);
       if (!c) continue;
-      const count = fileCountForContact(nick);
+      const count = fileCountForContact(nick) + this.mailAttachmentCount(nick);
       const row = document.createElement("button");
       row.type = "button";
       row.className = "conv-row pressable";
@@ -4048,7 +4165,7 @@ export class App {
       list.appendChild(p);
     }
 
-    pane.append(h, hint, list);
+    pane.append(back, h, hint, list);
     return pane;
   }
 
@@ -4119,32 +4236,49 @@ export class App {
     list.style.flexDirection = "column";
     list.style.gap = "var(--space-3)";
 
-    const files = fileMessagesForContact(nick, this.filesDirection);
-    for (const m of files) {
+    const files = this.exchangedRowsFor(nick, this.filesDirection);
+    for (const f of files) {
       const card = document.createElement("div");
       card.className = "tile";
-      card.innerHTML = `<div class="text-15" style="font-weight:500">${m.fileName}</div><div class="text-13 muted">${formatBytes(m.fileSize ?? 0)} · ${formatRelative(m.createdAt)}</div>`;
-      if (m.fileData || m.blobId) {
-        attachFileActions(
-          card,
-          m.fileName ?? "file",
-          () => resolveMessageFileBytes(m),
-          m.blobId,
-        );
+      const nameEl = document.createElement("div");
+      nameEl.className = "text-15";
+      nameEl.style.fontWeight = "500";
+      nameEl.textContent = f.name;
+      const sub = document.createElement("div");
+      sub.className = "text-13 muted";
+      sub.textContent =
+        `${formatBytes(f.size)} · ${formatRelative(f.at)} · via ${f.via === "mail" ? "Mail" : "chat"}` +
+        (f.subject ? ` — ${f.subject}` : "");
+      card.append(nameEl, sub);
+      const bytes = f.bytes;
+      if (bytes) {
+        attachFileActions(card, f.name, () => resolveMessageFileBytes(bytes), f.blobId);
       }
-      const chatLink = document.createElement("button");
-      chatLink.type = "button";
-      chatLink.className = "text-13 pressable";
-      chatLink.style.marginTop = "var(--space-2)";
-      chatLink.style.color = "var(--accent)";
-      chatLink.textContent = "View in chat";
-      chatLink.onclick = () => {
-        this.rail = "chats";
-        this.selectedNick = nick;
-        this.filesContactNick = null;
-        this.render();
-      };
-      card.appendChild(chatLink);
+      const link = document.createElement("button");
+      link.type = "button";
+      link.className = "text-13 pressable";
+      link.style.marginTop = "var(--space-2)";
+      link.style.color = "var(--accent)";
+      const mail = f.mail;
+      if (mail) {
+        link.textContent = "View in mail";
+        link.onclick = () => {
+          this.rail = "mail";
+          this.filesOpen = false;
+          this.filesContactNick = null;
+          this.openMessage(mail);
+        };
+      } else {
+        link.textContent = "View in chat";
+        link.onclick = () => {
+          this.rail = "chats";
+          this.selectedNick = nick;
+          this.filesOpen = false;
+          this.filesContactNick = null;
+          this.render();
+        };
+      }
+      card.appendChild(link);
       list.appendChild(card);
     }
 
@@ -5769,20 +5903,7 @@ export class App {
     hash.textContent = `SHA-256 ${a.blobId}`;
     hash.title = "The attachment's SHA-256, as saved in the vault";
     chip.append(line, hash);
-    attachFileActions(
-      chip,
-      a.name,
-      async () => {
-        const r = await api.blob(a.blobId);
-        if (!r?.data_base64)
-          throw new Error("Could not load attachment from the vault");
-        const bin = atob(r.data_base64);
-        const out = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-        return out;
-      },
-      a.blobId,
-    );
+    attachFileActions(chip, a.name, () => resolveMessageFileBytes(a), a.blobId);
     return chip;
   }
 
@@ -5796,20 +5917,7 @@ export class App {
     size.className = "text-12 faint";
     size.textContent = formatBytes(a.size);
     chip.append(name, size);
-    attachFileActions(
-      chip,
-      a.name,
-      async () => {
-        const r = await api.blob(a.blobId);
-        if (!r?.data_base64)
-          throw new Error("Could not load attachment from the vault");
-        const bin = atob(r.data_base64);
-        const out = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-        return out;
-      },
-      a.blobId,
-    );
+    attachFileActions(chip, a.name, () => resolveMessageFileBytes(a), a.blobId);
     return chip;
   }
 
@@ -8249,11 +8357,12 @@ export class App {
     });
     const filesTile = document.createElement("div");
     filesTile.className = "tile";
-    const fileCount = allFileMessages().length;
-    filesTile.innerHTML = `<div class="text-15">Exchanged files</div><div class="muted text-13">${fileCount} in your sealed vault (encrypted blobs)</div><button type="button" class="btn-secondary pressable files-rail-btn" style="margin-top:12px">Open Files</button>`;
-    filesTile.querySelector(".files-rail-btn")!.addEventListener("click", () => {
-      this.rail = "files";
-      this.render();
+    const fileCount =
+      allFileMessages().length +
+      this.contacts.reduce((n, c) => n + this.mailAttachmentCount(c.nickname), 0);
+    filesTile.innerHTML = `<div class="text-15">Exchanged files</div><div class="muted text-13">${fileCount} in your sealed vault (encrypted blobs)</div><button type="button" class="btn-secondary pressable files-open-btn" style="margin-top:12px">Open Files</button>`;
+    filesTile.querySelector(".files-open-btn")!.addEventListener("click", () => {
+      this.filesOpenFiles();
     });
     const torrentsState = getTorrentsState();
     const torrentsTile = document.createElement("div");

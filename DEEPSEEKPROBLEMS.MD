@@ -13,6 +13,32 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — Vault absorbs the Files rail pane
+
+Slice goal: remove the Files entry from the rail; the Vault bento already tells the
+storage story. The Files browser now lives in the Vault as a full-bleed sub-pane on the
+Notes/Wallet pattern, reached from the "Exchanged files" tile.
+
+### [FIXED] "Remove the file rail pane" was implemented as "remove the Files browser"
+
+- **Attempted:** the user asked why a Files pane was needed in the rail when "the vault is
+  already doing the job", then chose "remove the file rail pane" from a fix-options prompt.
+- **Symptom:** the removal was implemented literally — rail button, pane renderers, the
+  `chatStore` helpers behind them, and the tile's "Open Files" button all deleted, leaving
+  the Vault tile as a count with no destination. The user had to come back with "Exchanged
+  files is gone now .. we need it back in vault": they had meant remove the rail *entry*,
+  not the browsing capability it carried.
+- **Resolution:** the browser was restored from the git-HEAD copy as a Vault sub-pane
+  (`filesOpen` + `filesOpenFiles`/`filesBackToVault`, "← Vault" back button, "View in chat"
+  also closes the sub-pane), the `chatStore` helpers were restored verbatim, and the tile
+  button rewired to the sub-pane. `tsc --noEmit` and `vite build` pass.
+- **Lesson:** "remove X" where X is a pane answered from a menu is ambiguous between
+  "remove the navigation entry" and "remove the feature"; when the pane is the only
+  surface for a capability, confirm the capability has a home before deleting it.
+  A dead-end tile is the tell.
+
+---
+
 ## 2026-10-11 — Trusts pane: cards to rows
 
 Slice goal: the Trusts pane read as AI-designed (marketing copy, a bento card grid for a
