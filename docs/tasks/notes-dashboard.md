@@ -1,7 +1,8 @@
 # Notes dashboard (sticky papers)
 
 **Status:** Spec resolved 2026-10-11; **16.1 implemented** 2026-10-11 (encrypted sidecar store,
-`/api/notes/*`, and the Vault tile opening a full-screen list/editor). **16.2–16.5 not started.**
+`/api/notes/*`, and the Vault tile opening a full-screen list/editor). **16.5 (search) implemented**
+and a **sticky-note view mode** added 2026-10-11. **16.2–16.4 not started.**
 **Index:** Task **16** in
 [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md) (Phase **F**).
 
@@ -63,6 +64,7 @@ do not start).
 | **Board layout** | Notes have `x`/`y` (and `z`) on a bounded canvas — "papers around the desk." |
 | **Regions** | A labelled rectangle you drag notes into. Notes inside move with it; it collapses to a compact stack. |
 | **Checklists** | Structured items on the note; a box toggles without opening the editor. |
+| **View mode** | Clicking a paper opens it as a centred **sticky** — portrait, squarish at rest, growing with the text — with Edit / Delete / Close. Edit is the only way into the editor. |
 | **Search** | Substring over titles, bodies and checklist text; results jump the board to the note. |
 
 **UX tone:** Calm, tactile, Soft Daylight — physical paper, not a Notion clone or an infinite
@@ -131,7 +133,12 @@ Planned for later steps (not yet mounted):
 | **16.2** | Bounded canvas, drag, `x`/`y`/`z` persisted on pointer-up |
 | **16.3** | Regions: create, drag-into, collapse, and moving a region moves its notes |
 | **16.4** | Checklists: add / edit / reorder / toggle without opening the editor |
-| **16.5** | Substring search over title + body + checklist |
+| **16.5** | **Done 2026-10-11** — substring search over title + body + checklist, filtering the list in place |
+
+**Also 2026-10-11 (not in the original order):** the **view mode** — clicking a note opens a
+read-only sticky popup rather than jumping straight into the editor. The sticky takes the note's
+paper colour as its fill with fixed dark ink, so it reads as a physical sticky in either app theme;
+it holds a squarish portrait minimum and grows with the text up to the viewport, then scrolls.
 
 **Depends on:** Task **5c** (encrypted local store). **Independent** of Task **11** Articles.
 
@@ -147,11 +154,14 @@ Planned for later steps (not yet mounted):
 - [ ] Restore from backup recovers notes, positions, regions and checklists.
 - [ ] No note content in relay logs, and no plaintext on disk at rest.
 
-**Progress (16.1):** the store, routes and list/editor are in and tested
+**Progress (16.1 + 16.5 + view mode):** the store, routes and list/editor are in and tested
 (`notes_store::notes_store_tests`, `notes_api_tests`), so a created note is sealed in the vault
-and re-reads after a restart. The canvas, region and checklist criteria below stay unchecked
-until 16.2–16.5 land; the UI itself has not yet been exercised in a running app (see
-`DEEPSEEKPROBLEMS.MD`, 2026-10-11 Notes slice).
+and re-reads after a restart. Search and the sticky view mode were exercised in a running app
+(2026-10-11): title match, body-only match, no-match and clear all behaved, the search field keeps
+focus while the list re-renders in place, clicking a paper opens the sticky, Edit lands in the
+editor with the note loaded, and Delete-with-confirm from the sticky removed the note. The canvas,
+region and checklist criteria below stay unchecked until 16.2–16.4 land. The canvas, regions and
+checklists are still the unbuilt part of this task.
 
 ---
 

@@ -13,6 +13,53 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — Notes search + sticky view mode
+
+Slice goal: add substring search to the notes list, and make clicking a note open a read-only
+sticky popup (portrait, squarish at rest, growing with the text) whose Edit button is the only
+route into the editor.
+
+### [WORKED AROUND] Accessibility refs went stale on every app re-render, costing repeated snapshots
+
+- **Attempted:** drove the live check with `browser_snapshot` then `browser_click` on the returned
+  refs, as the browser tooling intends.
+- **Symptom:** clicks failed with `Element not found: e18. Take a snapshot to get updated refs.`
+  and, one step later, `Stale element reference: e16 now points to (button, ...) but was expected
+  to be "first note row"`. The app rebuilds the whole shell (`this.root.innerHTML = ""`) on every
+  state change, so any click that changes state invalidates every ref from the previous snapshot.
+  Vite HMR re-rendering on the CSS edits invalidated them too.
+- **Workaround:** re-snapshotted immediately before each single click, and for the chained
+  measurements (open note, read geometry, close, repeat) drove clicks through
+  `Runtime.evaluate` with DOM `.click()` instead of refs. Verified the same paths either way.
+- **Lesson:** this is a tooling/codebase-shape interaction, not a repo defect. For a
+  full-re-render app, plan one snapshot per action, or use `Runtime.evaluate` for sequences.
+
+### [FIXED] A CSS replace merged two rules into `}.note-view-meta {`
+
+- **Attempted:** edited `app.css` with a `StrReplace` whose `old_string` ended on a blank line
+  while the replacement did not, intending to re-add the blank line separately.
+- **Symptom:** the file read back as `}.note-view-meta {` — the blank line between
+  `.note-view-title` and `.note-view-meta` was consumed and the closing brace of the first rule
+  ended up glued to the selector of the second.
+- **Fix:** read the block back, spotted the merge, and re-split the two rules.
+- **Lesson:** `tsc` and `vite build` do not validate CSS structure, so a broken rule ships
+  silently. Read CSS edits back rather than trusting the build to catch them.
+
+### [OPEN] The sticky's appearance was checked by computed style and geometry, not by eye
+
+- **Attempted:** took screenshots of the sticky and read them back to confirm the design.
+- **Symptom:** the image reads returned no visual detail to the agent, so "looks like a sticky
+  note" could not be confirmed from the screenshot itself.
+- **What was actually verified:** computed `background-color` `color(srgb 0.935 0.836 0.480)`
+  (a #EED57A sticky yellow) with ink `rgb(20, 20, 26)` and a slight rotation matrix, at
+  427x476 for a short note (squarish) and grown-to-cap plus internal scroll for a 3350-char
+  note, in a `data-theme="dark"` instance.
+- **Resolution:** the visual judgement came from the user, who reviewed it live and said the
+  design was right. Left open as a note that appearance claims here rest on geometry plus the
+  user's eye, not on an agent-verified screenshot.
+
+---
+
 ## 2026-10-11 — Notes dashboard 16.1 (store, routes, Vault tile)
 
 Slice goal: land step 16.1 of the Notes task — the encrypted sidecar store, the `/api/notes/*`

@@ -3511,12 +3511,18 @@ button.library-item-main {
   color: var(--text-faint);
 }
 
-/* Paper colours: a tinted spine, not a loud fill, to keep Soft Daylight calm. */
-.paper-yellow { border-left: 4px solid #e8c547; }
-.paper-blue   { border-left: 4px solid #6aa9e9; }
-.paper-green  { border-left: 4px solid #74c69d; }
-.paper-pink   { border-left: 4px solid #e79fb0; }
-.paper-white  { border-left: 4px solid var(--border); }
+/* Paper colours are one token per note: the list paints it as a spine, the
+   sticky view paints it as a fill. Kept as variables so the two stay in step. */
+.paper-yellow { --paper: #e8c547; }
+.paper-blue   { --paper: #6aa9e9; }
+.paper-green  { --paper: #74c69d; }
+.paper-pink   { --paper: #e79fb0; }
+.paper-white  { --paper: var(--border); }
+
+/* List: a tinted spine, not a loud fill, to keep Soft Daylight calm. */
+.note-row {
+  border-left: 4px solid var(--paper, var(--border));
+}
 
 .notes-empty {
   display: flex;
@@ -3575,5 +3581,116 @@ button.library-item-main {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+}
+
+/* Search sits above the grid, full width, calm until focused. */
+.notes-search-bar {
+  display: flex;
+}
+
+.notes-search {
+  width: 100%;
+  max-width: 420px;
+}
+
+/* ---- Sticky note (view mode) ------------------------------------------- */
+
+/* The view is a physical sticky: paper fill, black ink, a slight tilt, tape at
+   the top and a lifted corner. The paper keeps its own colour in both app
+   themes (a real sticky does not go dark when the lights do), so the ink is a
+   fixed dark rather than --text. */
+.note-view-modal {
+  --sticky-ink: #14141a;
+  --sticky-ink-dim: rgba(20, 20, 26, 0.58);
+  position: relative;
+  width: min(420px, 100%);
+  /* Portrait but squarish at rest; the note grows it with its text, up to the
+     viewport, after which the body scrolls inside. */
+  min-height: min(58vh, 470px);
+  max-height: min(88vh, 820px);
+  display: flex;
+  flex-direction: column;
+  overflow: visible;
+  padding: var(--space-5) var(--space-5) var(--space-4);
+  border-radius: 4px 4px 16px 4px;
+  background: color-mix(in srgb, var(--paper, #e8c547) 72%, #ffffff);
+  color: var(--sticky-ink);
+  box-shadow:
+    0 26px 52px -18px rgba(20, 20, 40, 0.45),
+    0 6px 14px rgba(20, 20, 40, 0.16);
+  transform: rotate(-0.8deg);
+}
+
+/* Tape holding the note to the wall. */
+.note-view-modal::before {
+  content: "";
+  position: absolute;
+  top: -13px;
+  left: 50%;
+  width: 104px;
+  height: 26px;
+  transform: translateX(-50%) rotate(-2.5deg);
+  background: color-mix(in srgb, #ffffff 45%, transparent);
+  border: 1px solid rgba(20, 20, 40, 0.08);
+  border-radius: 2px;
+  box-shadow: 0 1px 3px rgba(20, 20, 40, 0.1);
+}
+
+/* A corner lifted off the page. */
+.note-view-modal::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 30px;
+  height: 30px;
+  background: linear-gradient(315deg, rgba(20, 20, 40, 0.14) 0 50%, transparent 50%);
+  pointer-events: none;
+}
+
+/* Nothing to show, so no need to hold the squarish minimum. */
+.note-view-modal--empty {
+  min-height: auto;
+}
+
+.note-view-title {
+  margin: 0;
+  color: var(--sticky-ink);
+}
+
+.note-view-meta {
+  margin-top: var(--space-1);
+}
+
+.note-view-modal .note-view-meta {
+  color: var(--sticky-ink-dim);
+}
+
+/* The body fills the note and scrolls inside it, so the title and actions stay
+   put however long the note runs. min-height lets the flex child shrink far
+   enough to scroll instead of stretching the note. */
+.note-view-body {
+  flex: 1;
+  min-height: 0;
+  margin: var(--space-4) 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--sticky-ink);
+}
+
+/* Secondary actions read as ink on paper rather than as app chrome. */
+.note-view-modal .btn-secondary {
+  background: rgba(20, 20, 40, 0.06);
+  border-color: rgba(20, 20, 40, 0.18);
+  color: var(--sticky-ink);
+}
+
+.note-view-modal .notes-confirm {
+  color: var(--sticky-ink);
+}
+
+.note-view-actions {
+  margin-top: auto;
 }
 

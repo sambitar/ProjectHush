@@ -38,10 +38,10 @@ import {
   clearNotesStore,
   deleteNote as deleteNoteRecord,
   getNotesState,
-  newestFirst as notesNewestFirst,
   notePreview,
   peekNotesState,
   saveNote,
+  searchNotes,
 } from "./lib/notesStore";
 import {
   addTorrent,
@@ -475,6 +475,10 @@ export class App {
   private notesSaving = false;
   /** The note awaiting delete confirmation. */
   private notesDeleteId: string | null = null;
+  /** The note shown in the read-only view popup, or null when it is closed. */
+  private notesViewingId: string | null = null;
+  /** The list search query; filters by title, body and checklist text. */
+  private notesSearch = "";
   // --- Torrents (TorBox client pane) ---
   /** Which tab the Torrents pane shows. */
   private torrentsView: "active" | "library" = "active";
@@ -1214,6 +1218,8 @@ export class App {
     this.notesDraftTitle = "";
     this.notesDraftBody = "";
     this.notesDeleteId = null;
+    this.notesViewingId = null;
+    this.notesSearch = "";
     this.selectedNick = null;
     this.filesContactNick = null;
     this.mailThreadId = null;
@@ -1334,6 +1340,7 @@ export class App {
     if (this.conclaveDeleteId) this.root.appendChild(this.renderConclaveDeleteModal());
     if (this.readsConfirmUrl) this.root.appendChild(this.renderReadsConfirm());
     if (this.torrentsDeleteId) this.root.appendChild(this.renderTorrentsDeleteModal());
+    if (this.notesViewingId) this.root.appendChild(this.renderNoteViewModal());
     if (this.pendingUpdate) this.root.appendChild(this.renderUpdatePrompt());
   }
 
@@ -8203,6 +8210,8 @@ export class App {
     this.notesEditorOpen = false;
     this.notesEditingId = null;
     this.notesDeleteId = null;
+    this.notesViewingId = null;
+    this.notesSearch = "";
     this.render();
   }
 
@@ -8212,6 +8221,7 @@ export class App {
     this.notesDraftTitle = "";
     this.notesDraftBody = "";
     this.notesDeleteId = null;
+    this.notesViewingId = null;
     this.render();
   }
 
@@ -8221,6 +8231,24 @@ export class App {
     this.notesEditingId = null;
     this.notesDraftTitle = "";
     this.notesDraftBody = "";
+    this.notesDeleteId = null;
+    this.notesViewingId = null;
+    this.notesSearch = "";
+    this.render();
+  }
+
+  /**
+   * Clicking a note opens the read-only popup, not the editor. The editor is
+   * one more click away, behind the popup's Edit button.
+   */
+  private notesViewNote(id: string): void {
+    this.notesViewingId = id;
+    this.notesDeleteId = null;
+    this.render();
+  }
+
+  private notesCloseView(): void {
+    this.notesViewingId = null;
     this.notesDeleteId = null;
     this.render();
   }
@@ -8233,6 +8261,7 @@ export class App {
     this.notesDraftTitle = note.title;
     this.notesDraftBody = note.body;
     this.notesDeleteId = null;
+    this.notesViewingId = null;
     this.render();
   }
 
@@ -8282,6 +8311,8 @@ export class App {
         this.notesState = state;
         if (this.notesEditingId === id) {
           this.notesBackToList();
+        } else if (this.notesViewingId === id) {
+          this.notesCloseView();
         } else {
           this.render();
         }
@@ -8333,28 +8364,63 @@ export class App {
       return pane;
     }
 
-    pane.appendChild(this.notesEditorOpen ? this.notesEditor() : this.notesList());
+    if (this.notesEditorOpen) {
+      pane.appendChild(this.notesEditor());
+      return pane;
+    }
+
+    // The list is rebuilt in place on each keystroke rather than through a full
+    // app render, so the search field keeps focus while filtering.
+    const list = document.createElement("div");
+    list.className = "notes-list";
+    this.notesRenderRows(list);
+
+    const state = this.notesState ?? peekNotesState();
+    if (state.notes.length) {
+      const bar = document.createElement("div");
+      bar.className = "notes-search-bar";
+      const input = document.createElement("input");
+      input.type = "search";
+      input.className = "input-field notes-search";
+      input.placeholder = "Search notes…";
+      input.value = this.notesSearch;
+      input.setAttribute("aria-label", "Search notes");
+      input.addEventListener("input", () => {
+        this.notesSearch = input.value;
+        this.notesRenderRows(list);
+      });
+      bar.appendChild(input);
+      pane.append(bar, list);
+    } else {
+      pane.appendChild(list);
+    }
     return pane;
   }
 
-  private notesList(): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "notes-list";
-    const notes = notesNewestFirst(this.notesState ?? peekNotesState());
+  /** Fill the list container with rows for the current query, in place. */
+  private notesRenderRows(container: HTMLElement): void {
+    container.innerHTML = "";
+    const state = this.notesState ?? peekNotesState();
+    const notes = searchNotes(state, this.notesSearch);
     if (!notes.length) {
       const empty = document.createElement("div");
       empty.className = "notes-empty";
       const msg = document.createElement("div");
       msg.className = "muted text-15";
-      msg.textContent = "No notes yet.";
-      const cta = document.createElement("button");
-      cta.type = "button";
-      cta.className = "btn-primary pressable";
-      cta.textContent = "New note";
-      cta.addEventListener("click", () => this.notesNewNote());
-      empty.append(msg, cta);
-      wrap.appendChild(empty);
-      return wrap;
+      if (state.notes.length && this.notesSearch.trim()) {
+        msg.textContent = `No notes match “${this.notesSearch.trim()}”.`;
+        empty.appendChild(msg);
+      } else {
+        msg.textContent = "No notes yet.";
+        const cta = document.createElement("button");
+        cta.type = "button";
+        cta.className = "btn-primary pressable";
+        cta.textContent = "New note";
+        cta.addEventListener("click", () => this.notesNewNote());
+        empty.append(msg, cta);
+      }
+      container.appendChild(empty);
+      return;
     }
     for (const note of notes) {
       const row = document.createElement("button");
@@ -8370,10 +8436,109 @@ export class App {
       meta.className = "note-row-meta muted text-12";
       meta.textContent = formatRelative(note.updated_at * 1000);
       row.append(t, p, meta);
-      row.addEventListener("click", () => this.notesOpenNote(note.id));
-      wrap.appendChild(row);
+      row.addEventListener("click", () => this.notesViewNote(note.id));
+      container.appendChild(row);
     }
-    return wrap;
+  }
+
+  /**
+   * The read-only note popup: a centred sticky with the note's full text and
+   * the actions that leave it — Edit (into the editor), Delete, Close. Rendered
+   * at the app root so it sits above the whole shell, like the other modals.
+   */
+  private renderNoteViewModal(): HTMLElement {
+    const id = this.notesViewingId!;
+    const note = (this.notesState?.notes ?? []).find((n) => n.id === id);
+
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.onclick = (e) => {
+      if (e.target === back) this.notesCloseView();
+    };
+
+    const modal = document.createElement("div");
+    // The note's paper colour drives the sticky's fill, like a real pad of
+    // sticky notes where each colour is its own pad.
+    modal.className = `modal note-view-modal${note ? ` paper-${note.color}` : ""}`;
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", note?.title.trim() || "Note");
+
+    if (!note) {
+      // Deleted or rotated away underneath us; offer the only useful exit.
+      modal.classList.add("note-view-modal--empty");
+      const gone = document.createElement("p");
+      gone.className = "muted text-15";
+      gone.textContent = "This note is no longer here.";
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "btn-secondary pressable";
+      close.textContent = "Close";
+      close.addEventListener("click", () => this.notesCloseView());
+      modal.append(gone, close);
+      back.appendChild(modal);
+      return back;
+    }
+
+    const title = document.createElement("h2");
+    title.className = "text-22 note-view-title";
+    title.textContent = note.title.trim() || "Untitled";
+
+    const meta = document.createElement("div");
+    meta.className = "muted text-12 note-view-meta";
+    meta.textContent = `Edited ${formatRelative(note.updated_at * 1000)}`;
+
+    const body = document.createElement("div");
+    body.className = "note-view-body text-15";
+    body.textContent = note.body || "Empty note";
+
+    const actions = document.createElement("div");
+    actions.className = "notes-editor-actions note-view-actions";
+
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "btn-primary pressable";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", () => this.notesOpenNote(id));
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "btn-secondary pressable";
+    close.textContent = "Close";
+    close.addEventListener("click", () => this.notesCloseView());
+
+    actions.append(edit, close);
+
+    if (this.notesDeleteId === id) {
+      const confirm = document.createElement("div");
+      confirm.className = "notes-confirm";
+      const q = document.createElement("span");
+      q.className = "text-13";
+      q.textContent = "Delete this note?";
+      const yes = document.createElement("button");
+      yes.type = "button";
+      yes.className = "btn-danger pressable";
+      yes.textContent = "Delete";
+      yes.addEventListener("click", () => this.notesConfirmDelete());
+      const no = document.createElement("button");
+      no.type = "button";
+      no.className = "btn-secondary pressable";
+      no.textContent = "Cancel";
+      no.addEventListener("click", () => this.notesCancelDelete());
+      confirm.append(q, yes, no);
+      actions.appendChild(confirm);
+    } else {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "btn-secondary pressable notes-delete";
+      del.textContent = "Delete";
+      del.addEventListener("click", () => this.notesRequestDelete(id));
+      actions.appendChild(del);
+    }
+
+    modal.append(title, meta, body, actions);
+    back.appendChild(modal);
+    return back;
   }
 
   private notesEditor(): HTMLElement {

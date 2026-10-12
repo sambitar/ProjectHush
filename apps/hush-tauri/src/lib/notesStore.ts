@@ -64,6 +64,22 @@ export function newestFirst(state: NotesStateDto): NoteDto[] {
   return [...state.notes].sort((a, b) => b.updated_at - a.updated_at);
 }
 
+/**
+ * Newest-edited first, filtered by a case-insensitive substring over title,
+ * body and checklist text. An empty query returns every note.
+ */
+export function searchNotes(state: NotesStateDto, query: string): NoteDto[] {
+  const q = query.trim().toLowerCase();
+  const notes = newestFirst(state);
+  if (!q) return notes;
+  return notes.filter(
+    (n) =>
+      n.title.toLowerCase().includes(q) ||
+      n.body.toLowerCase().includes(q) ||
+      n.checklist.some((item) => item.text.toLowerCase().includes(q)),
+  );
+}
+
 /** A one-line preview of a note body, for a list row. */
 export function notePreview(note: NoteDto, max = 90): string {
   const flat = note.body.replace(/\s+/g, " ").trim();
