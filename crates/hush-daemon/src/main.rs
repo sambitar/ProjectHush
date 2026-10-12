@@ -296,6 +296,7 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/send-file", post(send_file))
         .route("/api/send-file-data", post(send_file_data))
         .route("/api/presence/heartbeat", post(presence_heartbeat))
+        .route("/api/presence/offline", post(presence_offline))
         .route("/api/recv", post(recv))
         .route("/api/messages", get(messages))
         .route("/api/blob/{id}", get(blob))
@@ -646,10 +647,17 @@ async fn auto_lock_loop(state: Arc<App>) {
 /// sends bounce with "offline" even though both people are at their desks. The
 /// daemon owns the session, so it owns the heartbeat; the UI heartbeat stays
 /// and is harmless.
+///
+/// Appear-offline is the one exception: when the user asks to be seen as
+/// offline, this loop skips the heartbeat entirely so the relay's timestamp
+/// goes stale. The UI suppresses its own heartbeat the same way.
 async fn heartbeat_loop(state: Arc<App>) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
         if !*state.unlocked.lock().await {
+            continue;
+        }
+        if ui_prefs::load(&state.dir).appear_offline {
             continue;
         }
         let result = state.worker.heartbeat_presence().await;
@@ -1434,6 +1442,20 @@ async fn presence_heartbeat(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(state.worker.heartbeat_presence().await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Mark this vault offline at the relay at once — the appear-offline switch.
+///
+/// Clearing removes the 90 s freshness window, so peers stop seeing the vault
+/// online the moment the switch flips. A relay that predates the clear route
+/// answers 404/405; the caller treats this as best-effort, and the stopped
+/// heartbeat still takes the vault offline within the window.
+async fn presence_offline(
+    State(state): State<Arc<App>>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.go_offline().await)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

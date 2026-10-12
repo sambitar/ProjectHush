@@ -17,6 +17,8 @@ export interface UiPrefsDto {
   chat_sound: boolean;
   /** Contacts whose arrival sound is off, from the chat's own menu. */
   chat_sound_muted: string[];
+  /** When true, this vault stops heartbeating so every contact sees it offline. */
+  appear_offline: boolean;
 }
 
 const defaultPrefs = (): UiPrefsDto => ({
@@ -32,6 +34,7 @@ const defaultPrefs = (): UiPrefsDto => ({
   mail_trashed: [],
   chat_sound: true,
   chat_sound_muted: [],
+  appear_offline: false,
 });
 
 let cache: UiPrefsDto | null = null;
@@ -72,6 +75,7 @@ export async function patchUiPrefs(
     mail_trashed: patch.mail_trashed ?? base.mail_trashed,
     chat_sound: patch.chat_sound ?? base.chat_sound,
     chat_sound_muted: patch.chat_sound_muted ?? base.chat_sound_muted,
+    appear_offline: patch.appear_offline ?? base.appear_offline,
   };
   await persistUiPrefs(merged);
   return merged;
@@ -141,6 +145,7 @@ function normalize(raw: UiPrefsDto): UiPrefsDto {
     mail_trashed: raw.mail_trashed ?? [],
     chat_sound: raw.chat_sound ?? true,
     chat_sound_muted: raw.chat_sound_muted ?? [],
+    appear_offline: raw.appear_offline ?? false,
   };
 }
 

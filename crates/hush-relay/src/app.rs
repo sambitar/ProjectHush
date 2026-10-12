@@ -106,6 +106,19 @@ async fn touch_presence(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Clear a queue's heartbeat, so peers see it offline immediately. The owner's
+/// own "appear offline" switch drives this; a peer cannot call it (it holds the
+/// delivery token, not the read token).
+async fn clear_presence(
+    State(state): State<Arc<AppState>>,
+    Path(queue_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, RelayError> {
+    let token = bearer_token(&headers)?;
+    state.store.clear_presence(&queue_id, token)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn get_presence(
     State(state): State<Arc<AppState>>,
     Path(queue_id): Path<String>,
@@ -270,7 +283,9 @@ pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> 
         .route("/q/{queue_id}", put(put_blob).get(list_blobs))
         .route(
             "/q/{queue_id}/presence",
-            put(touch_presence).get(get_presence),
+            put(touch_presence)
+                .get(get_presence)
+                .delete(clear_presence),
         )
         .route("/q/{queue_id}/report", post(report_queue))
         .route("/q/{queue_id}/{blob_id}", get(get_blob).delete(delete_blob))

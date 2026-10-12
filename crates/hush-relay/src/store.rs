@@ -235,6 +235,22 @@ impl Store {
         Ok(())
     }
 
+    /// Zero a queue's heartbeat so peers report it offline at once.
+    ///
+    /// Authorized with the read token, the same one that heartbeats: only the
+    /// queue's owner can mark itself offline. A peer holds the delivery token,
+    /// which cannot clear this.
+    pub fn clear_presence(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {
+        self.authorize_read_or_create(queue_id, token)?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        conn.execute(
+            "UPDATE queues SET presence_at = 0 WHERE id = ?1",
+            params![queue_id],
+        )
+        .map_err(|_| RelayError::Internal)?;
+        Ok(())
+    }
+
     /// Read a queue's last heartbeat.
     ///
     /// Authorized with the *delivery* token, not the read token: presence is

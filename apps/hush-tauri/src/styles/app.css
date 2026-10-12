@@ -245,6 +245,31 @@
   gap: var(--space-2);
 }
 
+/* The appear-offline capsule under the Chats title. */
+.conv-offline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 var(--space-4) var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+}
+
+.conv-offline .text-13 {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-offline.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .search-pill {
   margin: 0 var(--space-4) var(--space-3);
   display: flex;
@@ -566,11 +591,30 @@
   border-radius: 50%;
   flex-shrink: 0;
   overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .avatar.lg {
   width: 56px;
   height: 56px;
+}
+
+/* Monogram fallback when no photo is set. White on the gradient, with a faint
+   shadow so it stays legible on the darker stops. */
+.avatar-initials {
+  color: #fff;
+  font-weight: 600;
+  font-size: 16px;
+  line-height: 1;
+  letter-spacing: 0.5px;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.25);
+  user-select: none;
+}
+
+.avatar.lg .avatar-initials {
+  font-size: 20px;
 }
 
 .avatar-ring {
@@ -684,11 +728,17 @@
   padding: var(--space-4);
 }
 
-.qr-tile {
-  background: #fff;
-  border-radius: var(--radius-md);
-  padding: var(--space-3);
-  display: inline-block;
+/* The invitation code itself. It is one long base64 token, so it wraps
+   anywhere rather than forcing the dialog wider, and it is selectable as a
+   whole because it is far too long to drag. */
+.invite-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  resize: vertical;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  user-select: all;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1294,6 +1344,96 @@
 .contact-picker-empty {
   margin: 0;
   padding: var(--space-2) var(--space-3);
+}
+
+/* ---------------------------------------------------------- overflow menu */
+
+/* The three-dots menu: an anchored popover, the same surface as the contact
+   picker's list so the two read as one language. */
+.overflow-menu {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+}
+
+.overflow-popup {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + var(--space-1));
+  right: 0;
+  min-width: 224px;
+  padding: var(--space-1);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+}
+
+/* The `display: flex` above would otherwise beat the `hidden` attribute. */
+.overflow-popup[hidden] {
+  display: none;
+}
+
+.overflow-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.overflow-item:hover,
+.overflow-item:focus-visible {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  outline: none;
+}
+
+.overflow-item.danger {
+  color: var(--danger);
+}
+
+.overflow-item.danger:hover,
+.overflow-item.danger:focus-visible {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.overflow-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The trailing column: a check, a chevron, or nothing. Reserved either way so
+   the labels line up down the list. */
+.overflow-item-mark {
+  display: inline-flex;
+  justify-content: flex-end;
+  width: 16px;
+  color: var(--text-dim);
+}
+
+.overflow-item-mark svg {
+  width: 16px;
+  height: 16px;
+}
+
+.overflow-sep {
+  height: 1px;
+  margin: var(--space-1) var(--space-2);
+  background: var(--border);
 }
 
 /* ------------------------------------------------------------ rich editor */
@@ -2275,6 +2415,8 @@
   margin-top: var(--space-3);
 }
 
+/* A form's refusal, sitting above the action that would retry it. */
+.field-error,
 .reads-add-error {
   margin-top: var(--space-2);
   color: var(--danger, var(--accent-strong));
@@ -3163,6 +3305,16 @@ button.library-item-main {
 .wallet-head .btn-secondary {
   width: auto;
   white-space: nowrap;
+}
+
+/* Embedded in the Vault: a Back control joins the header, title takes the slack. */
+.wallet-head.with-back {
+  justify-content: flex-start;
+}
+
+.wallet-head.with-back h1 {
+  flex: 1;
+  margin: 0;
 }
 
 .wallet-setup {

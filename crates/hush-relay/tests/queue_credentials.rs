@@ -238,3 +238,65 @@ async fn a_peer_can_read_presence_with_the_delivery_token() {
         "a peer holds only the delivery token and still needs the online indicator"
     );
 }
+
+/// Clearing presence is the owner's own move — the "appear offline" switch — so
+/// it rides the read token. A peer's delivery token must not clear it, or
+/// anyone holding an invite could knock the owner offline.
+#[tokio::test]
+async fn only_the_owner_can_clear_presence() {
+    let db = temp_db();
+    let app = app(&db);
+
+    let queue_id = "b7c1f2a4-0000-4000-8000-000000000004".to_string();
+    let read_token = "3333333333333333333333333333333333333333333333333333333333333333";
+    let delivery_token = queue_delivery_token(read_token);
+
+    // Bind the queue and heartbeat it, so a peer would read "online".
+    let (status, _) = request(
+        &app,
+        "PUT",
+        &format!("/q/{queue_id}/presence"),
+        read_token,
+        Vec::new(),
+    )
+    .await;
+    assert!(status.is_success());
+
+    // A peer cannot clear it.
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/q/{queue_id}/presence"),
+        &delivery_token,
+        Vec::new(),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "a peer must not knock the owner offline"
+    );
+
+    // The owner can, and the peer then reads offline at once.
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/q/{queue_id}/presence"),
+        read_token,
+        Vec::new(),
+    )
+    .await;
+    assert!(status.is_success());
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        &format!("/q/{queue_id}/presence"),
+        &delivery_token,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["last_at"], 0);
+    assert_eq!(json["online"], false, "a cleared queue reads offline at once");
+}

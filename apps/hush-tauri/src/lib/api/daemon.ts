@@ -168,6 +168,8 @@ export const api = {
     }),
   presenceHeartbeat: () =>
     request<null>("/api/presence/heartbeat", { method: "POST" }),
+  presenceOffline: () =>
+    request<null>("/api/presence/offline", { method: "POST" }),
   recv: () => request<RecvResponse>("/api/recv", { method: "POST" }),
   messages: () => request<ChatRecordDto[]>("/api/messages"),
   mail: () => request<MailboxDto>("/api/mail"),

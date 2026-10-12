@@ -39,6 +39,10 @@ pub struct UiPrefs {
     /// Contacts whose arrival sound is off, set from the chat's own menu.
     #[serde(default)]
     pub chat_sound_muted: Vec<String>,
+    /// When true, the daemon stops heartbeating presence so every contact sees
+    /// this vault as offline while it is actually online.
+    #[serde(default)]
+    pub appear_offline: bool,
     /// The relay switch: the relay path should use the onion address through
     /// Tor. Lives here rather than only in the vault so the pre-login screen
     /// can read and flip it while the vault is locked; the vault's own copy
@@ -67,6 +71,7 @@ impl Default for UiPrefs {
             mail_trashed: Vec::new(),
             chat_sound: true,
             chat_sound_muted: Vec::new(),
+            appear_offline: false,
             relay_tor: false,
             relay_onion_staged: None,
         }

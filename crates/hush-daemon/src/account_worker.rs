@@ -183,6 +183,9 @@ enum Work {
     HeartbeatPresence {
         reply: oneshot::Sender<WorkResult>,
     },
+    GoOffline {
+        reply: oneshot::Sender<WorkResult>,
+    },
     ChangePassphrase {
         current: String,
         new: String,
@@ -561,6 +564,16 @@ impl AccountWorker {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => match a.heartbeat_presence().await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::GoOffline { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.go_offline().await {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
@@ -1412,6 +1425,10 @@ impl AccountWorker {
 
     pub async fn heartbeat_presence(&self) -> WorkResult {
         self.call(|reply| Work::HeartbeatPresence { reply }).await
+    }
+
+    pub async fn go_offline(&self) -> WorkResult {
+        self.call(|reply| Work::GoOffline { reply }).await
     }
 
     pub async fn change_passphrase(&self, current: &str, new: &str) -> WorkResult {

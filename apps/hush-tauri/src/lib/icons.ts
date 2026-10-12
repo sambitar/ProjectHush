@@ -72,6 +72,8 @@ import {
   Wallet,
   Bitcoin,
   Copy,
+  Bell,
+  BellOff,
   type IconNode,
 } from "lucide";
 
@@ -150,6 +152,8 @@ const ICONS = {
   wallet: Wallet,
   bitcoin: Bitcoin,
   copy: Copy,
+  bell: Bell,
+  bellOff: BellOff,
   irc: Terminal,
 } satisfies Record<string, IconNode>;
 

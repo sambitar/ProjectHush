@@ -13,6 +13,129 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-11 — Chat overflow menu, trust invitation code
+
+Slice goal: a professional overflow menu for the chat header, and making the trust invitation
+code actually available in the "Add a trust" dialog.
+
+### [FIXED] The invitation code was never shown: the QR payload exceeds QR capacity
+
+- **Attempted:** show the vault's invite as a scannable QR in the "Show my invite" tab of the
+  Add-a-trust dialog.
+- **Symptom:** the tab rendered "Couldn't load invite" — no QR, no code, no copy button. The
+  invite itself was fine.
+- **Evidence:** `POST /api/invite` against the running `peer-a` daemon returned HTTP 200 with a
+  9,250-character invite. Feeding that exact string to the bundled `qrcode` 1.5.4:
+  `QRCode.create(invite, {})` throws `The amount of data is too big to be stored in a QR Code`.
+  Measured ceiling in the same library with default options: 2,332 chars OK, 2,953 chars throws.
+- **Cause:** the invite is `base64url(JSON)` of a `PreKeyBundle`, and `InvitePayload` keeps its
+  key material as `Vec<u8>`, which serde writes as JSON arrays of decimal numbers. The
+  1,568-byte Kyber1024 public key alone costs ~5.5 kB of text before base64. The QR path could
+  never have fit it. The failure was masked because `QRCode.toCanvas` sat inside the same `try`
+  as `api.invite()`, so a QR overflow was reported as a fetch failure.
+- **Resolution:** the tab now shows the code itself in a read-only, selectable, monospace field
+  with a "Copy invitation code" button, and reports the copy through the live region. The QR is
+  dropped for invites, and the now-unused `.qr-tile` rule was removed with it.
+- **Lesson:** a render step and a fetch step sharing one `try` make a rendering bug look like a
+  network bug. Check a payload's size against a format's hard limit before designing around it.
+
+### [FIXED] A background poll could wipe a modal's half-typed fields
+
+- **Attempted:** polish the "Add a trust" dialog, which owns two text fields.
+- **Found:** `pollRecv` refuses to repaint while a compose surface is open, but its guard named
+  only the mail composer and the two conclave dialogs. A poll arriving with new mail, a presence
+  flip, or a reloaded mailbox rebuilt the whole shell underneath the Add-a-trust dialog, the
+  profile editor, the Trusts delete confirm, and the Reads add dialog, resetting each one's
+  fields to stored state and dropping whatever was typed.
+- **Resolution:** the guard is now `editing` and covers `addFriendOpen`, `readsAddOpen`,
+  `profileNick`, and `trustDeleteNick` as well.
+- **Lesson:** a "do not repaint while editing" guard has to be extended whenever a new editing
+  surface is added; the list of surfaces is itself the bug surface.
+
+## 2026-10-11 — Appear offline (and a removed per-contact block)
+
+Slice goal: an "appear offline" switch that hides the vault's presence from every contact. A
+per-contact block was built alongside it and then removed at the user's request; the finding
+below is why it could not have done what the request first implied.
+
+### [NO LONGER APPLICABLE] The per-contact block was removed
+
+- **What happened:** the user decided the block was not wanted ("just remove the block button
+  then we dont need that feature"). The block UI, the vault-side drop (`recv_excluding`), and the
+  daemon plumbing were reverted.
+- **Left in place:** the dormant `blocked` pref and the `isBlocked`/`setBlocked` helpers, which
+  predate this slice, so nothing in the ui-prefs schema changed.
+- **Note:** the presence finding below still stands — it is why per-contact invisibility is not
+  expressible today.
+
+### [FIXED] Per-contact presence hiding is not expressible in the current protocol
+
+- **Attempted:** read the invite and queue model to see whether blocking one contact could hide
+  presence from just that contact.
+- **Finding:** `Account::invite` publishes `self.device.queue_id()` — one shared inbox queue per
+  vault — and presence is a single `presence_at` column read with the delivery token every contact
+  holds (`hush-relay/src/store.rs`). The relay cannot tell viewers apart, so it can only answer the
+  same thing to everyone. Hiding presence from one person needs a per-viewer answer (viewer
+  identity on the request plus a suppression list), which is a relay/core protocol change.
+- **Resolution:** the global appear-offline switch covers "everyone sees you offline". The
+  per-contact block that was built to cover the rest has since been removed (see the entry above);
+  presence stays global.
+- **Lesson:** presence is per-queue and the queue is shared, so "invisible to one person" is not
+  representable without a protocol change. The request as first phrased could not be built.
+
+### [WORKED AROUND] Immediate offline depends on a relay route being deployed
+
+- **Attempted:** to make appear-offline take effect at once rather than after the relay's 90 s
+  freshness window.
+- **Symptom:** `touch_presence` only ever sets `presence_at = now`; there was no way to zero it, so
+  a stopped heartbeat left the vault reading "online" for up to 90 s.
+- **Fix:** added `DELETE /q/{queue_id}/presence` (owner's read token) and `Account::go_offline`,
+  called by the daemon when the switch flips on.
+- **Caveat:** this is a relay change. A relay that predates it answers 404/405; the UI treats the
+  clear as best-effort, so the switch still works but falls back to the 90 s window until the relay
+  is redeployed. Recorded so the deployment dependency is not forgotten.
+
+### [OPEN] The appear-offline switch and the block UI were not exercised in the running app
+
+- **Attempted:** to confirm the capsule renders under the Chats title, the switch flips, and a
+  blocked row dims.
+- **Symptom:** the app needs the Tauri shell and an unlock; browser tooling cannot reach the
+  unlocked rails, the same limitation recorded for the avatar slice.
+- **What was verified:** `tsc --noEmit` and `vite build` pass; `cargo check --workspace` passes;
+  `only_the_owner_can_clear_presence` (relay) and
+  `go_offline_hides_presence_from_a_contact_immediately` plus
+  `a_blocked_contact_message_is_dropped_not_filed` (core) pass.
+- **Lesson:** the mechanism is covered by tests; the pixels are not.
+
+---
+
+## 2026-10-11 — Avatar initials (contacts / trustees)
+
+Slice goal: replace the bare gradient avatar disc with a first+last-word monogram, keeping the
+circle so the presence dot and the rest of the layout are untouched.
+
+### [FIXED] Outgoing mail avatar would have shown the recipient's initials on the sender's disc
+
+- **Attempted:** passed `displayNick(m.contactNick)` as the avatar label for every mail message.
+- **Symptom:** caught in review before anything ran. `avatarKeyFor(m)` keys outgoing mail to the
+  user's own `protocol_name` (the disc is "you"), so the label and the colour described two
+  different people — the recipient's monogram on your avatar.
+- **Fix:** the label now follows the same author split as the key: the contact for incoming,
+  `this.mailHandle ?? this.vaultName` for outgoing.
+- **Lesson:** when a helper derives a colour from one identity and a label from another, both
+  must come from the same person. A name that is convenient at the call site is not the name the
+  key represents.
+
+### [OPEN] Avatar initials rendering was not verified visually
+
+- **Attempted:** to confirm the monogram centres and reads on the gradient disc.
+- **Symptom:** the app needs the Tauri shell and an unlock, so the dev server on :5173 shows the
+  lock screen and the browser tooling cannot reach the unlocked rails.
+- **What was verified:** `tsc --noEmit` and `vite build` pass, and `initialsFor` was bundled with
+  esbuild and run directly: `"Ada Lovelace King"->"AK"`, `"bob"->"B"`, `"   "->""` (no initials),
+  `"Émile Zola"->"ÉZ"`, `"🎉 Party"->"🎉P"`.
+- **Resolution:** needs a human to eyeball the disc at 44px and 56px, with and without a photo.
+
 ## 2026-10-11 — Notes search + sticky view mode
 
 Slice goal: add substring search to the notes list, and make clicking a note open a read-only

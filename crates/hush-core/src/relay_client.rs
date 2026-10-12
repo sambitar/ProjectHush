@@ -259,6 +259,27 @@ impl RelayClient {
         Ok(())
     }
 
+    /// Zero this queue's heartbeat, so peers see it offline immediately.
+    ///
+    /// The owner's "appear offline" switch calls this; clearing on top of a
+    /// stopped heartbeat is what removes the 90 s stale window.
+    pub async fn clear_presence(&self, queue_id: &str, token: &str) -> Result<(), Error> {
+        let res = self
+            .http
+            .delete(format!("{}/q/{}/presence", self.base, queue_id))
+            .header("authorization", Self::auth(token))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!(
+                "presence clear failed: {}",
+                res.status()
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn contact_presence_online(
         &self,
         queue_id: &str,

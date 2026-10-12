@@ -82,6 +82,7 @@ import {
   isWalletLoaded,
   newReceiveAddress,
   parseUnits,
+  refreshWallet,
   removeToken,
   restoreWallet,
   sendPayment,
@@ -140,7 +141,6 @@ import {
   listFolder,
   loadMailbox,
   preview,
-  previewText,
   searchMessages,
   setKnownContacts,
   threadSubject,
@@ -157,6 +157,7 @@ import {
   mailFlags,
   patchUiPrefs,
   setMailFlag,
+  uiPrefsSnapshot,
 } from "./lib/api/uiPrefs";
 import { displayNick, getMockSettings, setNickOverride, clearMockLocal, chatSoundEnabled, isChatSoundMuted, setChatSoundMuted, setChatSoundEnabled, refreshContactPrefs } from "./lib/api/mock";
 import { clearContactUiPrefs } from "./lib/api/uiPrefs";
@@ -208,9 +209,10 @@ import {
 } from "./lib/drops/tauri";
 import { hueFromKey } from "./lib/hash";
 import { icon, type IconName } from "./lib/icons";
-import { avatarWithPresence, createAvatarEl } from "./components/ui/Avatar";
+import { avatarWithPresence, createAvatarEl, initialsFor } from "./components/ui/Avatar";
 import { RichTextEditor } from "./components/ui/RichTextEditor";
 import { ContactPicker } from "./components/ui/ContactPicker";
+import { OverflowMenu } from "./components/ui/OverflowMenu";
 import { bodyToDisplayHtml, isBlankHtml } from "./lib/richText";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
 import { IrcPane } from "./features/irc/ircPane";
@@ -229,7 +231,6 @@ type Rail =
   | "conclaves"
   | "reads"
   | "torrents"
-  | "wallet"
   | "irc"
   | "mail"
   | "drops"
@@ -672,6 +673,8 @@ export class App {
   private walletProxy: string | null = null;
   /** A wallet-requested Tor start is in flight, so the poll does not stack them. */
   private walletTorBusy = false;
+  /** True while the Vault pane is showing the wallet instead of the bento. */
+  private walletOpen = false;
 
   /** The running build's version, for Settings → About. Null until asked for. */
   private appVersion: string | null = null;
@@ -740,7 +743,7 @@ export class App {
       this.render();
     });
     subscribeWallet(() => {
-      if (this.rail !== "wallet") return;
+      if (this.rail !== "vault" || !this.walletOpen) return;
       // While an operation is in flight its own handler owns the re-render;
       // this keeps one action from painting twice.
       if (this.walletBusy) return;
@@ -1116,7 +1119,10 @@ export class App {
   private async pollRecv(): Promise<void> {
     if (!this.status || this.status.locked) return;
     try {
-      await api.presenceHeartbeat();
+      // Appear-offline: skip the heartbeat and let the relay's timestamp go
+      // stale, so contacts report offline. The daemon's heartbeat loop is
+      // suppressed the same way.
+      if (!uiPrefsSnapshot().appear_offline) await api.presenceHeartbeat();
       const r = await api.recv();
       const fresh = (await api.contacts()) ?? [];
       const prevOnline = new Map(
@@ -1171,11 +1177,20 @@ export class App {
       if (conclaveArrived || this.rail === "conclaves") {
         conclavesChanged = await this.reloadConclaves();
       }
-      // Never repaint over a half-written message.
-      const composing = this.mailComposeOpen || this.conclaveCreateOpen || this.conclaveInviteOpen;
+      // Never repaint over a half-written message, or over a modal that owns
+      // text the user is part-way through: a repaint rebuilds the modal from
+      // stored state and resets the fields being typed into.
+      const editing =
+        this.mailComposeOpen ||
+        this.conclaveCreateOpen ||
+        this.conclaveInviteOpen ||
+        this.addFriendOpen ||
+        this.readsAddOpen ||
+        this.profileNick !== null ||
+        this.trustDeleteNick !== null;
       if (
         (r.messages.length || presenceChanged || mailboxChanged || conclavesChanged) &&
-        !composing
+        !editing
       ) {
         this.render();
       }
@@ -1193,6 +1208,7 @@ export class App {
     clearNotesStore();
     clearTorrentsStore();
     clearWalletStore();
+    this.walletOpen = false;
     this.walletPhrase = null;
     this.walletLastTx = null;
     this.walletError = null;
@@ -1296,8 +1312,6 @@ export class App {
       shell.appendChild(this.renderTorrents());
     } else if (this.rail === "irc") {
       shell.appendChild(this.renderIrc());
-    } else if (this.rail === "wallet") {
-      shell.appendChild(this.renderWallet());
     } else if (this.rail === "mail") {
       shell.appendChild(this.renderMailFolders());
       shell.appendChild(this.renderMailMain());
@@ -1306,14 +1320,20 @@ export class App {
     } else if (this.rail === "files") {
       shell.appendChild(this.renderFiles());
     } else if (this.rail === "vault") {
-      shell.appendChild(this.notesOpen ? this.renderNotes() : this.renderVault());
+      shell.appendChild(
+        this.walletOpen
+          ? this.renderWallet()
+          : this.notesOpen
+            ? this.renderNotes()
+            : this.renderVault(),
+      );
     } else {
       shell.appendChild(this.renderSettings());
     }
     this.root.appendChild(shell);
     this.startTorPoll();
     setTorrentsPaneOpen(this.rail === "torrents");
-    setWalletPaneOpen(this.rail === "wallet");
+    setWalletPaneOpen(this.rail === "vault" && this.walletOpen);
     this.renderedNick = this.rail === "chats" ? this.selectedNick : null;
     // Now that the thread pane is in the document and has layout, put the
     // reader where the conversation should open: the newest message, or their
@@ -1555,8 +1575,13 @@ export class App {
         });
       }
       if (id === "vault") {
-        // Keep the Notes tile's count fresh without a request per render.
+        // Keep the tiles' counts fresh without a request per render.
         void this.notesEnsureLoaded();
+        void refreshWallet()
+          .then(() => {
+            if (this.rail === "vault" && !this.walletOpen) this.render();
+          })
+          .catch(() => {});
       }
       if (id === "drops") {
         // Tor state lives in the shell, so poll it while the rail is up.
@@ -1601,7 +1626,6 @@ export class App {
       ),
     );
     rail.appendChild(this.railBtn("irc", "IRC", "irc", ircUnreadTotal()));
-    rail.appendChild(this.railBtn("wallet", "Wallet", "wallet"));
     rail.appendChild(this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())));
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
@@ -1633,6 +1657,24 @@ export class App {
       this.render();
     };
     head.append(h, plus);
+
+    // Appear-offline: the one control on this rail that is about you rather
+    // than a conversation. It persists to ui-prefs, which is what tells the
+    // daemon to stop heartbeating.
+    const offline = uiPrefsSnapshot().appear_offline;
+    const offlineRow = document.createElement("div");
+    offlineRow.className = `conv-offline${offline ? " on" : ""}`;
+    const offlineSwitch = this.makeSwitch(offline);
+    offlineSwitch.input.setAttribute("aria-label", "Appear offline");
+    offlineSwitch.input.onchange = () =>
+      void this.setAppearOffline(offlineSwitch.input.checked);
+    const offlineLabel = document.createElement("span");
+    offlineLabel.className = "text-13";
+    offlineLabel.textContent = offline
+      ? "Appearing offline to everyone"
+      : "Appear offline";
+    offlineRow.append(offlineSwitch.el, offlineLabel);
+
     const search = document.createElement("div");
     search.className = "search-pill";
     search.appendChild(icon("search"));
@@ -1665,6 +1707,7 @@ export class App {
         c.online,
         "sm",
         hasUnread(c.nickname),
+        displayNick(c.nickname),
       );
       const meta = document.createElement("div");
       meta.style.flex = "1";
@@ -1692,8 +1735,30 @@ export class App {
       };
       rows.appendChild(row);
     }
-    col.append(head, search, rows);
+    col.append(head, offlineRow, search, rows);
     return col;
+  }
+
+  /**
+   * Persist appear-offline. The pref is the whole mechanism: the daemon reads
+   * it before each heartbeat, so writing it is what makes contacts see this
+   * vault offline. Repaint so the capsule reflects the stored value.
+   */
+  private async setAppearOffline(on: boolean): Promise<void> {
+    try {
+      await patchUiPrefs({ appear_offline: on });
+      // Make the change visible at once rather than waiting out the relay's
+      // 90 s freshness window: clear the heartbeat on the way in, restore it on
+      // the way out. Both are best-effort — a relay without the clear route
+      // still goes offline when the heartbeat stops.
+      if (on) await api.presenceOffline().catch(() => {});
+      else await api.presenceHeartbeat().catch(() => {});
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Presence could not be changed.",
+      );
+    }
+    this.render();
   }
 
   private renderMainChat(): HTMLElement {
@@ -1730,7 +1795,9 @@ export class App {
     left.style.display = "flex";
     left.style.gap = "var(--space-3)";
     left.style.alignItems = "center";
-    left.appendChild(avatarWithPresence(contact.protocol_name, contact.online, "lg"));
+    left.appendChild(
+      avatarWithPresence(contact.protocol_name, contact.online, "lg", false, displayNick(nick)),
+    );
     const titles = document.createElement("div");
     const n = document.createElement("div");
     n.className = "text-17";
@@ -1754,14 +1821,44 @@ export class App {
     sub.append(lockLine);
     titles.append(n, sub);
     left.append(titles);
-    const more = document.createElement("button");
-    more.className = "pressable";
-    more.appendChild(icon("more"));
-    more.onclick = () => {
-      this.profileNick = nick;
-      this.render();
-    };
-    header.append(left, more);
+    // The conversation's actions, in one place: who this is, whether it is
+    // muted, and the one destructive action. The profile dialog is now only
+    // about the name, so the two do not repeat each other.
+    const menu = new OverflowMenu({
+      label: `Conversation options for ${displayNick(nick)}`,
+      items: [
+        {
+          id: "profile",
+          label: "View profile",
+          icon: "eye",
+          chevron: true,
+          onSelect: () => {
+            this.profileNick = nick;
+            this.render();
+          },
+        },
+        {
+          id: "mute",
+          label: "Mute notifications",
+          icon: isChatSoundMuted(nick) ? "bellOff" : "bell",
+          checked: isChatSoundMuted(nick),
+          onSelect: () => {
+            void setChatSoundMuted(nick, !isChatSoundMuted(nick)).then(() =>
+              this.render(),
+            );
+          },
+        },
+        {
+          id: "delete",
+          label: "Delete contact",
+          icon: "trash",
+          danger: true,
+          separatorBefore: true,
+          onSelect: () => this.openTrustDelete(nick),
+        },
+      ],
+    });
+    header.append(left, menu.element);
 
     const scroll = document.createElement("div");
     scroll.className = "chat-messages";
@@ -2425,13 +2522,7 @@ export class App {
     el.style.background = `linear-gradient(135deg, hsl(${hue},52%,60%), hsl(${
       (hue + 40) % 360
     },46%,50%))`;
-    const initials = d.name
-      .split(/\s+/)
-      .filter(Boolean)
-      .slice(0, 2)
-      .map((w) => w[0]?.toUpperCase() ?? "")
-      .join("");
-    el.textContent = initials || "?";
+    el.textContent = initialsFor(d.name) || "?";
     return el;
   }
 
@@ -2612,7 +2703,9 @@ export class App {
 
     const top = document.createElement("div");
     top.className = "trust-card-top";
-    top.appendChild(avatarWithPresence(c.protocol_name, c.online, "lg"));
+    top.appendChild(
+      avatarWithPresence(c.protocol_name, c.online, "lg", false, displayNick(c.nickname)),
+    );
 
     const meta = document.createElement("div");
     meta.className = "trust-card-meta";
@@ -3935,7 +4028,7 @@ export class App {
       left.style.display = "flex";
       left.style.gap = "var(--space-3)";
       left.style.alignItems = "center";
-      left.appendChild(createAvatarEl(c.protocol_name, "sm"));
+      left.appendChild(createAvatarEl(c.protocol_name, "sm", false, displayNick(nick)));
       const meta = document.createElement("div");
       const title = document.createElement("div");
       title.className = "text-15";
@@ -5245,7 +5338,12 @@ export class App {
       // Classic mail layout: a fixed avatar column, then everything else. The
       // message is not a card — messages are separated by a rule, and the avatar
       // is what tells you who wrote it without reading the header.
-      card.appendChild(createAvatarEl(this.avatarKeyFor(m), "sm"));
+      // The avatar is the author: the contact for mail that arrived, you for
+      // mail you sent (the same key `avatarKeyFor` already picks).
+      const author = m.outgoing
+        ? (this.mailHandle ?? this.vaultName)
+        : displayNick(m.contactNick);
+      card.appendChild(createAvatarEl(this.avatarKeyFor(m), "sm", false, author));
 
       const content = document.createElement("div");
       content.className = "mail-message-content";
@@ -5437,7 +5535,10 @@ export class App {
   private openDrop(id: string): void {
     this.dropInboxOpenId = id;
     this.render();
-    const drop = dropById(id);
+    // Look the drop up in the mail drop store, not the Tor Drops directory:
+    // same id shape, different records, and the registry lookup would always
+    // miss and skip the read flag.
+    const drop = getDropById(id);
     if (!drop) return;
     const flags = this.mailPrefs();
     if (flags.read.has(id)) return;
@@ -5521,30 +5622,34 @@ export class App {
     for (const d of rows) {
       const row = document.createElement("button");
       row.type = "button";
-      row.className = `mail-row${this.dropInboxOpenId === d.id ? " active" : ""}`;
+      row.className = `mail-row pressable${this.dropInboxOpenId === d.id ? " active" : ""}`;
       if (isDropUnread(d, flags)) row.classList.add("unread");
 
       const dot = document.createElement("span");
-      dot.className = "mail-row-unread";
+      dot.className = "mail-row-dot";
+
+      // Drops have no sender, so the who column is always "Anonymous".
+      const who = document.createElement("span");
+      who.className = "mail-row-who";
+      who.textContent = "Anonymous";
+
+      // The list shows the subject only; the body belongs in the reader.
       const main = document.createElement("div");
       main.className = "mail-row-main";
-      const top = document.createElement("div");
-      top.className = "mail-row-top";
-      const from = document.createElement("span");
-      from.className = "mail-row-from";
-      from.textContent = "Anonymous";
-      const date = document.createElement("span");
-      date.className = "mail-row-date";
-      date.textContent = formatRelative(d.receivedAt);
-      const subject = document.createElement("span");
+      const subject = document.createElement("div");
       subject.className = "mail-row-subject";
-      subject.textContent = d.subject || "(no subject)";
-      const snippet = document.createElement("span");
-      snippet.className = "mail-row-preview";
-      snippet.textContent = previewText(d.body, d.attachments.length);
-      top.append(from, date);
-      main.append(top, subject, snippet);
-      row.append(dot, main);
+      subject.textContent = `Subject: ${d.subject || "(no subject)"}`;
+      main.appendChild(subject);
+
+      const right = document.createElement("div");
+      right.className = "mail-row-right";
+      const time = document.createElement("span");
+      time.className = "text-12 faint";
+      time.textContent = formatRelative(d.receivedAt);
+      right.appendChild(time);
+      if (d.attachments.length) right.appendChild(this.iconSmall("attach"));
+
+      row.append(dot, who, main, right);
       row.onclick = () => this.openDrop(d.id);
       list.appendChild(row);
     }
@@ -6181,8 +6286,22 @@ export class App {
   // daemon owns the pipeline (TorBox → vault); nothing here talks to TorBox.
   // ------------------------------------------------------------------
 
+  /** Open the wallet from the Vault tile: full-bleed, with a way back. */
+  private walletOpenWallet(): void {
+    this.walletOpen = true;
+    this.notesOpen = false;
+    this.render();
+  }
+
+  /** Leave the wallet for the Vault bento. The phrase card survives a trip out. */
+  private walletBackToVault(): void {
+    this.walletOpen = false;
+    this.render();
+  }
+
   /**
-   * The Wallet pane: one self-custody wallet per vault, on two chains.
+   * The Wallet pane, reached from the Vault bento: one self-custody wallet per
+   * vault, on two chains.
    *
    * The phrase is generated and sealed by the daemon; this pane sees it exactly
    * once, at creation, and is responsible for making the user write it down.
@@ -6200,7 +6319,15 @@ export class App {
     const view = chainState(state, this.walletChain);
 
     const head = document.createElement("div");
-    head.className = "wallet-head";
+    head.className = `wallet-head${this.walletOpen ? " with-back" : ""}`;
+    if (this.walletOpen) {
+      const back = document.createElement("button");
+      back.type = "button";
+      back.className = "btn-secondary pressable wallet-back";
+      back.textContent = "← Vault";
+      back.addEventListener("click", () => this.walletBackToVault());
+      head.appendChild(back);
+    }
     const title = document.createElement("h1");
     title.className = "text-22";
     title.textContent = "Wallet";
@@ -8161,7 +8288,20 @@ export class App {
     notesTile.querySelector(".notes-tile-btn")!.addEventListener("click", () => {
       this.notesOpenNotes();
     });
-    grid.append(storage, lock, backup, filesTile, torrentsTile, notesTile);
+    const walletState = getWalletState();
+    const walletTile = document.createElement("div");
+    walletTile.className = "tile";
+    const btc = chainState(walletState, "bitcoin");
+    const walletHint = isWalletLoaded()
+      ? walletState.exists
+        ? `${formatBtc(btc.confirmed)} BTC · keys sealed in this vault`
+        : "No wallet yet — create one, keys stay in this vault"
+      : "Self-custody Bitcoin and Ethereum, sealed in this vault";
+    walletTile.innerHTML = `<div class="text-15">Wallet</div><div class="muted text-13">${walletHint}</div><button type="button" class="btn-secondary pressable wallet-tile-btn" style="margin-top:12px">Open Wallet</button>`;
+    walletTile.querySelector(".wallet-tile-btn")!.addEventListener("click", () => {
+      this.walletOpenWallet();
+    });
+    grid.append(storage, lock, backup, filesTile, torrentsTile, notesTile, walletTile);
     pane.append(h, grid);
     return pane;
   }
@@ -8198,6 +8338,7 @@ export class App {
   /** Open the board from the Vault tile: full-bleed, list first. */
   private notesOpenNotes(): void {
     this.notesOpen = true;
+    this.walletOpen = false;
     this.notesEditorOpen = false;
     this.notesEditingId = null;
     this.notesError = null;
@@ -9300,72 +9441,150 @@ export class App {
   private renderAddFriend(): HTMLElement {
     const back = document.createElement("div");
     back.className = "modal-backdrop";
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.addFriendOpen = false;
+        this.render();
+      }
+    };
     const modal = document.createElement("div");
-    modal.className = "modal";
+    modal.className = "modal add-trust-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Add a trust");
     const title = document.createElement("h2");
     title.className = "text-22";
     title.textContent = "Add a trust";
     title.style.marginBottom = "var(--space-3)";
-    let tab = "show" as "show" | "add";
+    let tab: "show" | "add" = "show";
+    // The two tabs are the two halves of one job, so they are a real tablist
+    // rather than two buttons that happen to swap a panel.
     const tabs = document.createElement("div");
     tabs.className = "tabs";
+    tabs.setAttribute("role", "tablist");
+    tabs.setAttribute("aria-label", "How to add a trust");
     const showTab = document.createElement("button");
+    showTab.type = "button";
     showTab.className = "tab active";
+    showTab.id = "add-trust-tab-show";
     showTab.textContent = "Show my invite";
+    showTab.setAttribute("role", "tab");
+    showTab.setAttribute("aria-selected", "true");
+    showTab.setAttribute("aria-controls", "add-trust-panel");
     const addTab = document.createElement("button");
+    addTab.type = "button";
     addTab.className = "tab";
+    addTab.id = "add-trust-tab-add";
     addTab.textContent = "Add with invite";
+    addTab.setAttribute("role", "tab");
+    addTab.setAttribute("aria-selected", "false");
+    addTab.setAttribute("aria-controls", "add-trust-panel");
     const body = document.createElement("div");
+    body.id = "add-trust-panel";
+    body.setAttribute("role", "tabpanel");
     const renderTab = async () => {
-      body.innerHTML = "";
+      body.replaceChildren();
+      body.setAttribute("aria-labelledby", tab === "show" ? showTab.id : addTab.id);
       showTab.classList.toggle("active", tab === "show");
       addTab.classList.toggle("active", tab === "add");
+      showTab.setAttribute("aria-selected", String(tab === "show"));
+      addTab.setAttribute("aria-selected", String(tab === "add"));
       if (tab === "show") {
         const card = document.createElement("div");
         card.className = "key-card";
         const inner = document.createElement("div");
         inner.className = "key-card-inner";
-        const qr = document.createElement("div");
-        qr.className = "qr-tile";
         try {
           const inv = await api.invite();
-          if (inv) {
-            const canvas = document.createElement("canvas");
-            await QRCode.toCanvas(canvas, inv.invite, { width: 160, margin: 1 });
-            qr.appendChild(canvas);
-            const copy = document.createElement("button");
-            copy.className = "btn-secondary pressable";
-            copy.textContent = "Copy invite link";
-            copy.style.marginTop = "12px";
-            copy.onclick = () => navigator.clipboard.writeText(inv.invite);
-            inner.append(qr, copy);
-            const note = document.createElement("p");
-            note.className = "text-13 muted";
-            note.textContent =
-              "Anyone with this card can start a chat with you. Single use.";
-            inner.appendChild(note);
-          }
+          if (!inv?.invite) throw new Error("empty invite");
+          // The invite carries a Kyber1024 prekey, so it encodes to ~9 kB of
+          // base64 — well past the ~3 kB a QR code holds at its lowest error
+          // correction. A QR is therefore never drawn for it: the code itself is
+          // the artefact, shown in full so it can be read or copied by hand.
+          const label = document.createElement("p");
+          label.className = "text-13 muted";
+          label.style.marginBottom = "var(--space-2)";
+          label.textContent = "Your invitation code";
+          const code = document.createElement("textarea");
+          code.className = "input-field invite-code";
+          code.readOnly = true;
+          code.rows = 4;
+          code.value = inv.invite;
+          code.setAttribute("aria-label", "Your invitation code");
+          // Selecting on focus is the only practical way to grab a string this
+          // long; the copy button is the fast path.
+          code.onfocus = () => code.select();
+          const copy = document.createElement("button");
+          copy.className = "btn-secondary pressable";
+          copy.textContent = "Copy invitation code";
+          copy.style.marginTop = "12px";
+          copy.onclick = () => {
+            navigator.clipboard.writeText(inv.invite).then(
+              () => this.announce("Invitation code copied."),
+              () =>
+                this.announce("Copy failed. Select the code and copy it by hand."),
+            );
+          };
+          const note = document.createElement("p");
+          note.className = "text-13 muted";
+          note.textContent =
+            "Anyone with this code can start a chat with you. Single use.";
+          inner.append(label, code, copy, note);
         } catch {
           inner.textContent = "Couldn't load invite";
         }
         card.appendChild(inner);
         body.appendChild(card);
       } else {
+        // Both fields carry a label: the placeholder is an example, not a name.
+        const nickField = document.createElement("label");
+        nickField.className = "conclave-field";
+        const nickText = document.createElement("span");
+        nickText.className = "text-13";
+        nickText.textContent = "Their name";
         const nick = document.createElement("input");
+        nick.type = "text";
         nick.className = "input-field";
-        nick.placeholder = "Nickname";
+        nick.placeholder = "e.g. Ada";
+        nick.autocomplete = "off";
+        nick.spellcheck = false;
+        nickField.append(nickText, nick);
+
+        const invField = document.createElement("label");
+        invField.className = "conclave-field";
+        const invText = document.createElement("span");
+        invText.className = "text-13";
+        invText.textContent = "Their invitation code";
         const inv = document.createElement("textarea");
-        inv.className = "input-field";
-        inv.placeholder = "Paste invite";
+        inv.className = "input-field invite-code";
         inv.rows = 3;
-        inv.style.marginTop = "8px";
+        inv.placeholder = "Paste the code they sent you";
+        inv.spellcheck = false;
+        invField.append(invText, inv);
+
         const err = document.createElement("p");
-        err.style.color = "var(--danger)";
+        err.className = "field-error text-13";
         err.hidden = true;
+
         const btn = document.createElement("button");
+        btn.type = "button";
         btn.className = "btn-primary pressable";
         btn.textContent = "Add contact";
-        btn.style.marginTop = "12px";
+        btn.style.marginTop = "var(--space-4)";
+        // Both halves are required, so the button says so rather than letting a
+        // round trip fail on a field that was never filled in.
+        const syncBtn = () => {
+          btn.disabled = !nick.value.trim() || !inv.value.trim();
+        };
+        nick.oninput = syncBtn;
+        inv.oninput = () => {
+          syncBtn();
+          // The reason belonged to the last attempt; a new code gets a fresh one.
+          if (!err.hidden) {
+            err.hidden = true;
+            err.textContent = "";
+          }
+        };
         btn.onclick = async () => {
           err.hidden = true;
           try {
@@ -9373,7 +9592,7 @@ export class App {
             this.contacts = (await api.contacts()) ?? [];
             setKnownContacts(this.contacts.map((c) => c.nickname));
             this.addFriendOpen = false;
-            this.announce("Names live only on your device.");
+            this.announce(`Added ${nick.value.trim()}.`);
             this.render();
           } catch (e) {
             err.hidden = false;
@@ -9381,11 +9600,20 @@ export class App {
               e instanceof AppError ? e.message : "Couldn't add contact";
           }
         };
+        syncBtn();
         const hint = document.createElement("p");
         hint.className = "text-13 muted";
         hint.textContent = "Names live only on your device.";
-        body.append(nick, inv, err, btn, hint);
+        body.append(nickField, invField, err, btn, hint);
       }
+    };
+    // A tablist is expected to answer the arrow keys.
+    tabs.onkeydown = (e) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      e.preventDefault();
+      tab = tab === "show" ? "add" : "show";
+      void renderTab();
+      (tab === "show" ? showTab : addTab).focus();
     };
     showTab.onclick = () => {
       tab = "show";
@@ -9398,8 +9626,9 @@ export class App {
     void renderTab();
     tabs.append(showTab, addTab);
     const close = document.createElement("button");
+    close.type = "button";
     close.className = "btn-secondary pressable";
-    close.textContent = "Close";
+    close.textContent = "Done";
     close.style.marginTop = "16px";
     close.onclick = () => {
       this.addFriendOpen = false;
@@ -9407,9 +9636,18 @@ export class App {
     };
     modal.append(title, tabs, body, close);
     back.appendChild(modal);
+    // Focus once the node is in the document, so the dialog is keyboard
+    // reachable without tabbing down from the top of the app.
+    queueMicrotask(() => showTab.focus());
     return back;
   }
 
+  /**
+   * The contact card reached from a conversation's overflow menu. It is only
+   * about identity: the name this vault shows for the person. Actions on the
+   * contact (mute, delete) live in the menu that opened it, so each is decided
+   * in one place.
+   */
   private renderProfile(): HTMLElement {
     const nick = this.profileNick!;
     const c = this.contacts.find((x) => x.nickname === nick);
@@ -9417,11 +9655,20 @@ export class App {
     back.className = "modal-backdrop";
     const modal = document.createElement("div");
     modal.className = "modal";
-    if (c) modal.appendChild(createAvatarEl(c.protocol_name, "lg"));
+    const title = document.createElement("h2");
+    title.className = "text-22";
+    title.style.marginBottom = "var(--space-3)";
+    title.textContent = "Contact";
+    modal.appendChild(title);
+    if (c) modal.appendChild(createAvatarEl(c.protocol_name, "lg", false, displayNick(nick)));
     const name = document.createElement("input");
     name.className = "input-field";
     name.value = displayNick(nick);
+    name.setAttribute("aria-label", "Display name");
     name.style.marginTop = "12px";
+    const hint = document.createElement("p");
+    hint.className = "text-13 muted";
+    hint.textContent = "The name this vault shows. Their own name is unchanged.";
     const save = document.createElement("button");
     save.className = "btn-secondary pressable";
     save.textContent = "Save nickname";
@@ -9431,27 +9678,6 @@ export class App {
         this.render();
       });
     };
-    const mute = document.createElement("button");
-    mute.className = "btn-secondary pressable";
-    mute.textContent = isChatSoundMuted(nick)
-      ? "Unmute sounds"
-      : "Mute sounds";
-    mute.onclick = () => {
-      void setChatSoundMuted(nick, !isChatSoundMuted(nick)).then(() =>
-        this.render(),
-      );
-    };
-    // Deletion lives in Trusts only. This button is a pointer to it, not a
-    // second implementation, so there is one place that decides what removing
-    // a person does.
-    const manage = document.createElement("button");
-    manage.className = "btn-secondary pressable";
-    manage.textContent = "Manage in Trusts";
-    manage.onclick = () => {
-      this.profileNick = null;
-      this.rail = "trusts";
-      this.render();
-    };
     const close = document.createElement("button");
     close.className = "btn-primary pressable";
     close.textContent = "Done";
@@ -9459,7 +9685,7 @@ export class App {
       this.profileNick = null;
       this.render();
     };
-    modal.append(name, save, mute, manage, close);
+    modal.append(name, hint, save, close);
     back.appendChild(modal);
     return back;
   }

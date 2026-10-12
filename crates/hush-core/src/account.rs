@@ -2202,6 +2202,18 @@ impl Account {
             .await
     }
 
+    /// Mark this vault offline at the relay, at once.
+    ///
+    /// The "appear offline" switch uses this on the way in so peers stop
+    /// seeing the vault online immediately, instead of waiting out the
+    /// heartbeat's 90 s freshness window.
+    pub async fn go_offline(&self) -> Result<(), Error> {
+        let relay = self.relay_client()?;
+        relay
+            .clear_presence(self.device.queue_id(), self.device.read_token())
+            .await
+    }
+
     pub async fn contact_is_online(&self, nickname: &str) -> Result<bool, Error> {
         let contact = self.find_contact(nickname).ok_or(Error::ContactNotFound)?;
         let relay = self.relay_client()?;
