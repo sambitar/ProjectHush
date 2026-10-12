@@ -137,10 +137,12 @@ import {
   isDropUnread,
   isUnread,
   listDrafts,
-  listDrops,
+  listDropInbox,
+  listDropsInFolder,
   listFolder,
   loadMailbox,
   preview,
+  previewText,
   searchMessages,
   setKnownContacts,
   threadSubject,
@@ -303,6 +305,10 @@ const MAIL_EMPTY: Record<MailFolder, string> = {
 /** `Re:` a subject, without stacking prefixes on an existing reply. */
 function reSubject(subject: string): string {
   return /^re:/i.test(subject.trim()) ? subject : `Re: ${subject}`;
+}
+
+function fwdSubject(subject: string): string {
+  return /^fwd:/i.test(subject.trim()) ? subject : `Fwd: ${subject}`;
 }
 
 /** How many torrents still need the pipeline's attention (for the rail badge). */
@@ -1848,10 +1854,9 @@ export class App {
       label: `Conversation options for ${displayNick(nick)}`,
       items: [
         {
-          id: "profile",
-          label: "View profile",
-          icon: "eye",
-          chevron: true,
+          id: "rename",
+          label: "Change nickname",
+          icon: "pencil",
           onSelect: () => {
             this.profileNick = nick;
             this.render();
@@ -2765,6 +2770,15 @@ export class App {
           label: "Email",
           icon: "mail",
           onSelect: () => this.emailContact(c.nickname),
+        },
+        {
+          id: "rename",
+          label: "Change nickname",
+          icon: "pencil",
+          onSelect: () => {
+            this.profileNick = c.nickname;
+            this.render();
+          },
         },
         {
           id: "delete",
@@ -5167,13 +5181,13 @@ export class App {
       label.textContent = MAIL_FOLDER_LABEL[f.id];
       btn.appendChild(label);
 
-      // Inbox shows how much is unread; Drops likewise (unopened); the rest
-      // show how much is in them.
+      // Inbox shows how much is unread; Drops likewise (unopened, and only
+      // what the folder shows); the rest show how much is in them.
       const unread =
         f.id === "inbox"
           ? unreadCount(flags)
           : f.id === "drops"
-            ? listDrops().filter((d) => isDropUnread(d, flags)).length
+            ? listDropInbox(flags).filter((d) => isDropUnread(d, flags)).length
             : 0;
       const count = unread > 0 ? unread : folderCount(f.id, flags);
       if (count > 0) {
@@ -5253,7 +5267,16 @@ export class App {
       listFolder(this.mailFolder, flags),
       this.mailSearch,
     );
-    if (!rows.length) {
+    // The shared folders file drops too — Trash, Archive, and Starred list
+    // them beside mail, newest first across both kinds.
+    const needle = this.mailSearch.trim().toLowerCase();
+    const dropRows = listDropsInFolder(this.mailFolder, flags).filter(
+      (d) =>
+        !needle ||
+        (d.subject ?? "").toLowerCase().includes(needle) ||
+        d.body.toLowerCase().includes(needle),
+    );
+    if (!rows.length && !dropRows.length) {
       pane.appendChild(
         this.mailEmpty(
           this.mailSearch
@@ -5264,9 +5287,16 @@ export class App {
       return pane;
     }
 
+    // One list, one chronology: mail and drops interleaved by when each
+    // arrived, so a folder reads as a single history.
+    const items: { ts: number; el: HTMLElement }[] = [
+      ...rows.map((m) => ({ ts: m.createdAt, el: this.mailRow(m, flags) })),
+      ...dropRows.map((d) => ({ ts: d.receivedAt, el: this.dropRow(d, flags) })),
+    ].sort((a, b) => b.ts - a.ts);
+
     const list = document.createElement("div");
     list.className = "mail-list";
-    for (const m of rows) list.appendChild(this.mailRow(m, flags));
+    for (const it of items) list.appendChild(it.el);
     pane.appendChild(list);
     return pane;
   }
@@ -5450,6 +5480,13 @@ export class App {
         }),
       ),
     );
+    // Forward quotes the one message the actions target, not the whole thread.
+    const target = msgs.find((m) => m.id === targetId) ?? msgs[0];
+    if (target) {
+      actions.appendChild(
+        this.mailAction("Forward", "send", () => this.forwardMail(target)),
+      );
+    }
     head.append(back, titles, actions);
     pane.appendChild(head);
 
@@ -5611,10 +5648,11 @@ export class App {
   ): Promise<void> {
     if (!id) return;
     await setMailFlag(flag, id, on);
-    // Filing the open message away drops you back to the list it left.
+    // Filing the open message or drop away drops you back to the list it left.
     if (on && (flag === "mail_trashed" || flag === "mail_archived")) {
       this.mailThreadId = null;
       this.mailOpenId = null;
+      this.dropInboxOpenId = null;
     }
     this.render();
   }
@@ -5646,6 +5684,7 @@ export class App {
     });
     this.mailThreadId = null;
     this.mailOpenId = null;
+    this.dropInboxOpenId = null;
     await this.reloadMailbox();
     this.announce("Message deleted");
     this.render();
@@ -5699,7 +5738,7 @@ export class App {
 
     const flags = this.mailPrefs();
     const needle = this.dropInboxSearch.trim().toLowerCase();
-    const rows = listDrops().filter(
+    const rows = listDropInbox(flags).filter(
       (d) =>
         !needle ||
         (d.subject ?? "").toLowerCase().includes(needle) ||
@@ -5744,41 +5783,54 @@ export class App {
     const list = document.createElement("div");
     list.className = "mail-list";
     for (const d of rows) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = `mail-row pressable${this.dropInboxOpenId === d.id ? " active" : ""}`;
-      if (isDropUnread(d, flags)) row.classList.add("unread");
-
-      const dot = document.createElement("span");
-      dot.className = "mail-row-dot";
-
-      // Drops have no sender, so the who column is always "Anonymous".
-      const who = document.createElement("span");
-      who.className = "mail-row-who";
-      who.textContent = "Anonymous";
-
-      // The list shows the subject only; the body belongs in the reader.
-      const main = document.createElement("div");
-      main.className = "mail-row-main";
-      const subject = document.createElement("div");
-      subject.className = "mail-row-subject";
-      subject.textContent = `Subject: ${d.subject || "(no subject)"}`;
-      main.appendChild(subject);
-
-      const right = document.createElement("div");
-      right.className = "mail-row-right";
-      const time = document.createElement("span");
-      time.className = "text-12 faint";
-      time.textContent = formatRelative(d.receivedAt);
-      right.appendChild(time);
-      if (d.attachments.length) right.appendChild(this.iconSmall("attach"));
-
-      row.append(dot, who, main, right);
-      row.onclick = () => this.openDrop(d.id);
-      list.appendChild(row);
+      list.appendChild(this.dropRow(d, flags, this.dropInboxOpenId === d.id));
     }
     pane.appendChild(list);
     return pane;
+  }
+
+  /**
+   * One drop in a message list — the same shape as `mailRow`, with "Anonymous"
+   * in the who column and the snippet showing, because a subject alone says
+   * almost nothing for a drop. `active` marks the drop open in the Drops
+   * folder; a drop listed under Trash or Archive is never the open one.
+   */
+  private dropRow(d: DropMessage, flags: MailFlags, active = false): HTMLElement {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `mail-row pressable${active ? " active" : ""}`;
+    if (isDropUnread(d, flags)) row.classList.add("unread");
+
+    const dot = document.createElement("span");
+    dot.className = "mail-row-dot";
+
+    // Drops have no sender, so the who column is always "Anonymous".
+    const who = document.createElement("span");
+    who.className = "mail-row-who";
+    who.textContent = "Anonymous";
+
+    const main = document.createElement("div");
+    main.className = "mail-row-main";
+    const subject = document.createElement("div");
+    subject.className = "mail-row-subject";
+    subject.textContent = d.subject || "(no subject)";
+    const snip = document.createElement("div");
+    snip.className = "mail-row-snippet";
+    snip.textContent = previewText(d.body, d.attachments.length);
+    main.append(subject, snip);
+
+    const right = document.createElement("div");
+    right.className = "mail-row-right";
+    const time = document.createElement("span");
+    time.className = "text-12 faint";
+    time.textContent = formatRelative(d.receivedAt);
+    right.appendChild(time);
+    if (flags.starred.has(d.id)) right.appendChild(this.iconSmall("star"));
+    if (d.attachments.length) right.appendChild(this.iconSmall("attach"));
+
+    row.append(dot, who, main, right);
+    row.onclick = () => this.openDrop(d.id);
+    return row;
   }
 
   /**
@@ -5816,7 +5868,40 @@ export class App {
     h.className = "text-17";
     h.textContent = drop.subject || "(no subject)";
     titles.appendChild(h);
-    head.append(back, titles);
+
+    // The same actions a mail thread has, minus Reply — there is no sender to
+    // reply to. Filing (star, archive, trash) rides the same per-record flag
+    // sets mail uses, and trash wins over everything, exactly as `inFolder`
+    // decides it for mail.
+    const flags = this.mailPrefs();
+    const actions = document.createElement("div");
+    actions.className = "mail-read-actions";
+    if (flags.trashed.has(drop.id)) {
+      actions.append(
+        this.mailAction("Restore to Drops", "inbox", () =>
+          void this.flagMail("mail_trashed", drop.id, false),
+        ),
+        this.mailAction("Delete forever", "trash", () =>
+          void this.deleteMailForever(drop.id),
+        ),
+      );
+    } else {
+      const starred = flags.starred.has(drop.id);
+      actions.append(
+        this.mailAction(starred ? "Unstar" : "Star", "star", () =>
+          void this.flagMail("mail_starred", drop.id, !starred), starred),
+        this.mailAction("Archive", "archive", () =>
+          void this.flagMail("mail_archived", drop.id, true),
+        ),
+        this.mailAction("Move to Trash", "trash", () =>
+          void this.flagMail("mail_trashed", drop.id, true),
+        ),
+      );
+    }
+    actions.appendChild(
+      this.mailAction("Forward", "send", () => this.forwardDrop(drop.id)),
+    );
+    head.append(back, titles, actions);
     pane.appendChild(head);
 
     // Provenance, in the reader's face: this came from outside Hush, with no
@@ -5879,7 +5964,41 @@ export class App {
   }
 
   /**
-   * A drop's attachment: save-only, with the SHA-256 shown before you save.
+  * Forward a filed drop to a contact. The quoted text is built with DOM text
+  * nodes — a drop body is untrusted, so it is escaped by construction and
+  * never passes through `innerHTML` — and the attachments ride along, since
+  * their bytes are already in the vault.
+  */
+  private forwardDrop(id: string): void {
+    const drop = getDropById(id);
+    if (!drop) return;
+    const quote = document.createElement("div");
+    const rule = document.createElement("p");
+    rule.textContent = "---------- Forwarded drop ----------";
+    const meta = document.createElement("p");
+    meta.append(
+      document.createTextNode("From: Anonymous (via drop)"),
+      document.createElement("br"),
+      document.createTextNode(
+        `Received: ${formatAbsolute(drop.receivedAt)}`,
+      ),
+    );
+    const bodyP = document.createElement("p");
+    const lines = drop.body.split("\n");
+    lines.forEach((line, i) => {
+      bodyP.append(document.createTextNode(line));
+      if (i < lines.length - 1) bodyP.appendChild(document.createElement("br"));
+    });
+    quote.append(rule, meta, bodyP);
+    this.openCompose({
+      subject: fwdSubject(drop.subject || ""),
+      body: quote.innerHTML,
+      attachments: drop.attachments.length ? drop.attachments : undefined,
+    });
+  }
+
+  /**
+  * A drop's attachment: save-only, with the SHA-256 shown before you save.
    *
    * The blob id *is* the SHA-256 of the bytes — the vault keys blobs by it —
    * so displaying it costs nothing and is exactly the hash a careful recipient
@@ -5945,12 +6064,47 @@ export class App {
 
   // ------------------------------------------------------------- compose
 
-  /** Open the full-pane composer for a new message, a reply, or a draft. */
+  /**
+   * Forward one mail message to a contact. The quote reuses the stored body —
+   * the composer sanitized it on send, and `bodyToDisplayHtml` re-sanitizes it
+   * here — and the attachments ride along, their bytes loaded back from the
+   * vault the same way a draft's are.
+   */
+  private forwardMail(m: MailMessage): void {
+    const quote = document.createElement("div");
+    const rule = document.createElement("p");
+    rule.textContent = "---------- Forwarded message ----------";
+    const meta = document.createElement("p");
+    meta.append(
+      document.createTextNode(
+        `From: ${m.outgoing ? (this.mailAddress() ?? "you") : displayNick(m.contactNick)}`,
+      ),
+      document.createElement("br"),
+      document.createTextNode(`Date: ${formatAbsolute(m.createdAt)}`),
+      document.createElement("br"),
+      document.createTextNode(`Subject: ${m.subject || "(no subject)"}`),
+    );
+    const bodyDiv = document.createElement("div");
+    bodyDiv.innerHTML = bodyToDisplayHtml(m.body);
+    quote.append(rule, meta, bodyDiv);
+    this.openCompose({
+      subject: fwdSubject(m.subject || threadSubject(m.threadId)),
+      body: quote.innerHTML,
+      attachments: m.attachments.length ? m.attachments : undefined,
+    });
+  }
+
+  /** Open the full-pane composer for a new message, a reply, a forward, or a
+   *  draft. */
   private openCompose(opts: {
     draftId?: string;
     to?: string;
     threadId?: string;
     subject?: string;
+    /** Pre-seeded body, already safe HTML — a forward's quoted text. */
+    body?: string;
+    /** Attachment refs to carry over, with bytes loaded back from the vault. */
+    attachments?: MailAttachmentRef[];
   }): void {
     this.mailComposeOpen = true;
     this.mailDraftId = opts.draftId ?? null;
@@ -5972,13 +6126,16 @@ export class App {
     const draft = opts.draftId ? draftById(opts.draftId) : undefined;
     this.mailComposeTo = opts.to ?? draft?.to ?? "";
     this.mailComposeSubject = draft?.subject ?? opts.subject ?? "";
-    this.mailComposeBody = draft?.body ?? "";
+    this.mailComposeBody = opts.body ?? draft?.body ?? "";
     this.render();
 
-    // Editing a draft has to carry its attachments forward, and the log only
-    // kept blob ids — so the bytes come back out of the vault.
-    if (draft?.attachments.length) {
-      void this.loadDraftAttachments(draft.attachments);
+    // Editing a draft — or forwarding — carries attachments over, and the log
+    // only kept blob ids, so the bytes come back out of the vault.
+    const refs = draft?.attachments.length
+      ? draft.attachments
+      : opts.attachments;
+    if (refs?.length) {
+      void this.loadDraftAttachments(refs);
     }
   }
 
@@ -9768,24 +9925,35 @@ export class App {
     const hint = document.createElement("p");
     hint.className = "text-13 muted";
     hint.textContent = "The name this vault shows. Their own name is unchanged.";
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "btn-secondary pressable";
+    close.textContent = "Cancel";
+    close.onclick = () => {
+      this.profileNick = null;
+      this.render();
+    };
     const save = document.createElement("button");
-    save.className = "btn-secondary pressable";
-    save.textContent = "Save nickname";
+    save.type = "button";
+    save.className = "btn-primary pressable";
+    save.textContent = "Save";
     save.onclick = () => {
       void setNickOverride(nick, name.value).then(() => {
         this.profileNick = null;
         this.render();
       });
     };
-    const close = document.createElement("button");
-    close.className = "btn-primary pressable";
-    close.textContent = "Done";
-    close.onclick = () => {
-      this.profileNick = null;
-      this.render();
-    };
-    modal.append(name, hint, save, close);
+    actions.append(close, save);
+    modal.append(name, hint, actions);
     back.appendChild(modal);
+    // Reached to rename, so the field starts focused and selected; the select
+    // makes the suggestion the user types over the old name in one keystroke.
+    queueMicrotask(() => {
+      name.focus();
+      name.select();
+    });
     return back;
   }
 }

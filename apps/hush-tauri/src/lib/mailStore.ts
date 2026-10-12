@@ -313,6 +313,36 @@ export function listDrops(): DropMessage[] {
   return [...drops].sort((a, b) => b.receivedAt - a.receivedAt);
 }
 
+/**
+ * The Drops folder's own view: what arrived and has not been filed away.
+ * Archived and trashed drops leave this list the way archived mail leaves the
+ * Inbox — they surface in the shared Archive and Trash folders instead.
+ */
+export function listDropInbox(flags: MailFlags): DropMessage[] {
+  return listDrops().filter(
+    (d) => !flags.trashed.has(d.id) && !flags.archived.has(d.id),
+  );
+}
+
+/**
+ * Drops filed into one of the shared folders. Trash wins over archive, the
+ * same rule `inFolder` applies to mail, and Starred is an overlay: a starred
+ * drop still lives in the Drops list and appears here too.
+ */
+export function listDropsInFolder(
+  folder: MailFolder,
+  flags: MailFlags,
+): DropMessage[] {
+  if (folder !== "trash" && folder !== "archive" && folder !== "starred") {
+    return [];
+  }
+  return listDrops().filter((d) => {
+    if (flags.trashed.has(d.id)) return folder === "trash";
+    if (folder === "starred") return flags.starred.has(d.id);
+    return folder === "archive" && flags.archived.has(d.id);
+  });
+}
+
 export function getDropById(id: string): DropMessage | undefined {
   return drops.find((d) => d.id === id);
 }
@@ -324,8 +354,10 @@ export function isDropUnread(d: DropMessage, flags: MailFlags): boolean {
 
 export function folderCount(folder: MailFolder, flags: MailFlags): number {
   if (folder === "drafts") return listDrafts().length;
-  if (folder === "drops") return listDrops().length;
-  return listFolder(folder, flags).length;
+  // The Drops badge tracks what the folder shows, so filed-away drops do not
+  // count toward it; the shared folders count their drops alongside mail.
+  if (folder === "drops") return listDropInbox(flags).length;
+  return listFolder(folder, flags).length + listDropsInFolder(folder, flags).length;
 }
 
 export function unreadCount(flags: MailFlags): number {
