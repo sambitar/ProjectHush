@@ -7,6 +7,8 @@ import type {
   MailboxDto,
   NotesNoteResponse,
   NotesStateDto,
+  PaperPresenceDto,
+  PaperViewDto,
   ConclaveDto,
   PendingInviteDto,
   RecvResponse,
@@ -382,6 +384,32 @@ export const api = {
   notesDeleteNote: (id: string) =>
     request<NotesStateDto>(`/api/notes/note/${encodeURIComponent(id)}`, {
       method: "DELETE",
+    }),
+  // --- Paper (the conclave's shared collaborative document). The daemon owns
+  // the merged CRDT state; the editor sends opaque updates and reads back
+  // merged ones. 401 until unlocked, 404 when the conclave has no paper. ---
+  paperGet: (conclaveId: string) =>
+    request<PaperViewDto>(`/api/paper/${encodeURIComponent(conclaveId)}`),
+  paperCreate: (conclaveId: string, title: string) =>
+    request<PaperViewDto>(`/api/paper/${encodeURIComponent(conclaveId)}/create`, {
+      method: "POST",
+      body: JSON.stringify({ title }),
+    }),
+  paperUpdate: (conclaveId: string, update: string) =>
+    request<PaperViewDto>(`/api/paper/${encodeURIComponent(conclaveId)}/update`, {
+      method: "POST",
+      body: JSON.stringify({ update }),
+    }),
+  // Presence rides the DataChannel only: it has no relay fallback, so an empty
+  // peer list means "nobody is on a channel", not "nobody is here".
+  paperPresence: (conclaveId: string) =>
+    request<PaperPresenceDto>(
+      `/api/paper/${encodeURIComponent(conclaveId)}/presence`,
+    ),
+  paperPublishPresence: (conclaveId: string, frame: string) =>
+    request<null>(`/api/paper/${encodeURIComponent(conclaveId)}/presence`, {
+      method: "POST",
+      body: JSON.stringify({ frame }),
     }),
   // --- Torrents (TorBox-powered client). The API key lives in the vault
   // sidecar and is never sent back; the daemon does all TorBox traffic. ---

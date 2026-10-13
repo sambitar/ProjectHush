@@ -1,5 +1,8 @@
 mod account_worker;
 mod notes_store;
+mod paper_data;
+mod paper_doc;
+mod paper_store;
 mod paths;
 mod reads;
 mod reads_store;
@@ -11,6 +14,7 @@ mod torrents_store;
 mod ui_prefs;
 mod wallet;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -27,7 +31,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
-use hush_core::{ChatRecord, ConclaveRecord, MessagePayload, PendingInvite, ReceivedMessage};
+use hush_core::{ChatRecord, ConclaveRecord, MessagePayload, PaperDescriptor, PendingInvite, ReceivedMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -84,6 +88,13 @@ struct App {
     /// so overlapping probes would queue behind each other and starve real
     /// work (heartbeats, mail).
     relay_probe_inflight: AtomicBool,
+    /// Conclave Paper's live DataChannel planes, keyed by conclave id, created
+    /// on demand when a paper is opened.
+    ///
+    /// Runtime-only and safe to lose: a plane is a socket, not state. The relay
+    /// fan-out underneath is what guarantees convergence, so dropping this map
+    /// (a restart, a lock) costs latency, never data.
+    paper_planes: Mutex<HashMap<String, Arc<paper_data::DataPlane>>>,
 }
 
 #[derive(Serialize)]
@@ -256,6 +267,14 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/notes/state", get(notes_state))
         .route("/api/notes/note", post(notes_save_note))
         .route("/api/notes/note/{id}", delete(notes_delete_note))
+        .route("/api/paper/{conclave_id}", get(paper_get))
+        .route("/api/paper/{conclave_id}/create", post(paper_create))
+        .route("/api/paper/{conclave_id}/update", post(paper_update))
+        .route(
+            "/api/paper/{conclave_id}/presence",
+            get(paper_presence).post(paper_publish_presence),
+        )
+        .route("/api/paper/{conclave_id}/hub/rehome", post(paper_rehome))
         .route("/api/torrents/state", get(torrents_state))
         .route("/api/torrents/key", post(torrents_set_key))
         .route("/api/torrents/test", post(torrents_test_key))
@@ -354,6 +373,12 @@ pub(crate) async fn force_lock(state: &Arc<App>) {
     state.worker.lock().await;
     *state.unlocked.lock().await = false;
     *state.unlocked_at.lock().await = None;
+    // The paper planes go with the vault: a DataChannel is a live socket whose
+    // state came out of the vault, and a locked vault must not keep one open.
+    // Peers see the channel close and fall back to the relay with no user
+    // action, which is the degradation the plan asks for — and nothing is lost,
+    // because the relay already has every byte that went over it.
+    paper_planes_shutdown(state).await;
 }
 
 /// libsignal protocol futures are not `Send`; account ops run on a dedicated worker thread.
@@ -395,6 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wallet_socks: Mutex::new(None),
         relay_health: Mutex::new(None),
         relay_probe_inflight: AtomicBool::new(false),
+        paper_planes: Mutex::new(HashMap::new()),
     };
     let state = Arc::new(app);
 
@@ -404,6 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(heartbeat_loop(state.clone()));
     tokio::spawn(torrents.run());
     suspend_lock::spawn_suspend_lock_watch(state.clone());
+    spawn_paper_plane_loop(state.clone());
 
     let router = api_router(state.clone());
 
@@ -838,9 +865,7 @@ async fn apply_relay_prefs(state: &Arc<App>) {
 }
 
 async fn lock(State(state): State<Arc<App>>) -> StatusCode {
-    state.worker.lock().await;
-    *state.unlocked.lock().await = false;
-    *state.unlocked_at.lock().await = None;
+    force_lock(&state).await;
     StatusCode::NO_CONTENT
 }
 
@@ -1228,6 +1253,12 @@ async fn kick_conclave_trustee(
             .kick_conclave_trustee(&body.conclave_id, &body.nickname)
             .await,
     )?;
+    // A kick can remove the paper's rendezvous, and this is the one roster
+    // change `recv` cannot report (see `paper_inherit_hub`): the roster is
+    // already updated by the time the next poll looks at it.
+    if paper_inherit_hub(&state, &body.conclave_id).await {
+        paper_plane_reset(&state, &body.conclave_id).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1263,6 +1294,10 @@ async fn leave_conclave(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(state.worker.leave_conclave(&body.conclave_id).await)?;
+    // The vault is out of the conclave, so its paper channels point at peers it
+    // can no longer address. Dropping them is the honest state; the relay
+    // refuses the fan-out either way.
+    paper_plane_reset(&state, &body.conclave_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1557,12 +1592,208 @@ async fn recv(
             ))
         }
     };
+    // Paper payloads are not chat messages: they belong in the papers sidecar,
+    // not the inbox. A payload this vault cannot use is logged rather than
+    // failing the poll — the messages in the same batch have already landed,
+    // and one peer's bad payload must not block the mailbox.
+    if !inbox.papers.is_empty() || !inbox.joined.is_empty() || !inbox.departed.is_empty() {
+        match paper_sidecar(&state).await {
+            Ok(mut parsed) => {
+                let now = paper_now_ms();
+                let mut changed = false;
+                // Conclave ids whose paper had its hub move during this poll, so
+                // the plane can be dropped and the next open can dial the new
+                // rendezvous instead of holding a dead channel to the old one.
+                let mut moved: Vec<String> = Vec::new();
+                // Deltas this vault holds the hub for, to re-fan after the
+                // roster write below. A mesh can only reach the trustees the
+                // sender's roster knew about, so an edit sent while that roster
+                // had not caught up with a join is otherwise stranded forever.
+                let mut relay: Vec<(String, String, String, Vec<u8>)> = Vec::new();
+                // Papers whose whole document has to go out: a trustee that just
+                // joined missed every delta before it, and — after an `adopt`
+                // that re-identified this vault's own paper — the winner of a
+                // create collision dropped the deltas this vault sent under the
+                // id it used at the time. Both are "here is the document", so
+                // they share the one send below.
+                let mut catch_up: Vec<(String, PaperDescriptor, Vec<u8>)> = Vec::new();
+                let me = paper_account_id(&state).await.ok();
+                for received in &inbox.papers {
+                    // Signalling moves the transport, not the text, so it is
+                    // consumed before the document path can see it.
+                    if paper_handle_signal(&state, &received.from_account, &received.payload).await {
+                        continue;
+                    }
+                    let hub_claim = match &received.payload {
+                        MessagePayload::PaperHub { paper } => Some(paper.conclave_id.clone()),
+                        _ => None,
+                    };
+                    // The id this vault's paper for the payload's conclave has
+                    // *before* the payload lands, so an `adopt` that moves it can
+                    // be told apart from an ordinary create.
+                    let identity_before = match &received.payload {
+                        MessagePayload::PaperState { paper } => {
+                            Some(parsed.get(&paper.conclave_id).map(|f| f.descriptor.paper_id.clone()))
+                        }
+                        _ => None,
+                    };
+                    match paper_apply_inbound(
+                        &mut parsed,
+                        &received.from_account,
+                        &received.payload,
+                        now,
+                    ) {
+                        Ok(did) => {
+                            changed |= did;
+                            if did {
+                                if let Some(conclave_id) = hub_claim {
+                                    moved.push(conclave_id);
+                                }
+                                if let MessagePayload::PaperState { paper } = &received.payload {
+                                    // A `PaperState` that moved this vault's
+                                    // paper to a different id means two trustees
+                                    // started one at the same moment and the
+                                    // earlier create won (see `adopt`). The
+                                    // deltas already sent under the old id were
+                                    // dropped by the winner as unknown, so the
+                                    // folded document is handed over under the
+                                    // winning descriptor — the one send that
+                                    // means "here is the whole document".
+                                    let moved_id = identity_before
+                                        .flatten()
+                                        .filter(|old_id| {
+                                            parsed
+                                                .get(&paper.conclave_id)
+                                                .is_some_and(|f| &f.descriptor.paper_id != old_id)
+                                        })
+                                        .is_some();
+                                    if moved_id {
+                                        if let Some(file) = parsed.get(&paper.conclave_id) {
+                                            let updates: Vec<Vec<u8>> =
+                                                file.log.iter().map(|u| u.update.clone()).collect();
+                                            match paper_doc::fold(&file.snapshot, &updates) {
+                                                Ok(full) => catch_up.push((
+                                                    paper.conclave_id.clone(),
+                                                    file.descriptor.clone(),
+                                                    full,
+                                                )),
+                                                Err(e) => eprintln!(
+                                                    "hush-daemon: paper {} re-announce failed: {e}",
+                                                    paper.conclave_id
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                                if let MessagePayload::PaperDelta { paper_id, update } =
+                                    &received.payload
+                                {
+                                    if let Some(me) = &me {
+                                        let held = parsed
+                                            .conclave_of(paper_id)
+                                            .and_then(|c| parsed.get(&c))
+                                            .map(|f| &f.descriptor.hub == me)
+                                            .unwrap_or(false);
+                                        if held {
+                                            relay.push((
+                                                parsed.conclave_of(paper_id).unwrap_or_default(),
+                                                paper_id.clone(),
+                                                received.from_account.clone(),
+                                                update.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "hush-daemon: paper payload from {} ignored: {e}",
+                            received.from_nick
+                        ),
+                    }
+                }
+                // Default hub succession: a paper whose hub left or was kicked
+                // has no rendezvous, so the conclave's convener inherits it.
+                // Every daemon that saw the departure tries this; the send is
+                // what decides, because that is where the convener is known —
+                // so no second copy of the roster is needed here.
+                for (conclave_id, _gone) in &inbox.departed {
+                    if paper_inherit_hub(&state, conclave_id).await {
+                        changed = true;
+                        moved.push(conclave_id.clone());
+                    }
+                }
+                // A trustee that just joined missed every delta that came
+                // before it, and deltas are never replayed — so the hub hands
+                // it the whole document. Only the hub does this: the paper's
+                // descriptor names it, so N trustees cannot each send one.
+                // Addressed to the joined set, which is idempotent to merge for
+                // a trustee that already had the document.
+                if !inbox.joined.is_empty() {
+                    if let Ok(me) = paper_account_id(&state).await {
+                        for conclave_id in &inbox.joined {
+                            let Some(file) = parsed.get(conclave_id) else {
+                                continue;
+                            };
+                            if file.descriptor.hub != me {
+                                continue;
+                            }
+                            let updates: Vec<Vec<u8>> =
+                                file.log.iter().map(|u| u.update.clone()).collect();
+                            match paper_doc::fold(&file.snapshot, &updates) {
+                                Ok(full) => catch_up.push((
+                                    conclave_id.clone(),
+                                    file.descriptor.clone(),
+                                    full,
+                                )),
+                                Err(e) => eprintln!(
+                                    "hush-daemon: paper {conclave_id} snapshot failed: {e}"
+                                ),
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    paper_persist(&state, &parsed).await?;
+                }
+                // Re-fan deltas this vault holds the hub for. Done after the
+                // persist so a failure to fan out never costs the local merge.
+                for (conclave_id, paper_id, from_account, update) in relay {
+                    if let WorkResult::Err(e) = state
+                        .worker
+                        .relay_paper_delta(&conclave_id, &paper_id, &from_account, &update)
+                        .await
+                    {
+                        eprintln!("hush-daemon: paper relay fan-out failed: {e}");
+                    }
+                }
+                // A moved hub is a moved rendezvous: drop the plane so the next
+                // open dials the new hub rather than holding a dead channel to
+                // the one that just left.
+                for conclave_id in moved {
+                    paper_plane_reset(&state, &conclave_id).await;
+                }
+                for (conclave_id, paper, full) in catch_up {
+                    if let WorkResult::Err(e) = state
+                        .worker
+                        .send_paper_snapshot(&conclave_id, paper, &full)
+                        .await
+                    {
+                        eprintln!("hush-daemon: paper snapshot fan-out failed: {e}");
+                    }
+                }
+            }
+            Err(_) => eprintln!(
+                "hush-daemon: papers sidecar unreadable; {} paper payload(s) lost",
+                inbox.papers.len()
+            ),
+        }
+    }
     Ok(Json(RecvResponse {
         messages: inbox.messages.into_iter().filter_map(to_dto).collect(),
         warnings: inbox.warnings,
     }))
 }
-
 /// `None` for an own-copy envelope: `recv` files those into the chat log itself
 /// and never surfaces them, so one reaching here would be a bug rather than a
 /// message to show.
@@ -1653,6 +1884,16 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         | MessagePayload::ConclaveLeave { .. }
         | MessagePayload::ConclaveUpdate { .. }
         | MessagePayload::ConclaveEnd { .. } => None,
+        // A paper payload is not a chat message either: it is routed into the
+        // paper store, never the inbox. An unknown tag has no rendering at all.
+        MessagePayload::PaperState { .. }
+        | MessagePayload::PaperDelta { .. }
+        | MessagePayload::PaperSnapshot { .. }
+        | MessagePayload::PaperPresence { .. }
+        | MessagePayload::PaperHub { .. }
+        | MessagePayload::PaperOffer { .. }
+        | MessagePayload::PaperAnswer { .. }
+        | MessagePayload::Unknown => None,
     }
 }
 
@@ -2643,6 +2884,1055 @@ async fn notes_delete_note(
 }
 
 // ---------------------------------------------------------------------------
+// Paper — the conclave's shared collaborative document behind `/api/paper/*`.
+//
+// The document is a Yjs doc owned by the webview's editor (ProseMirror); the
+// daemon owns the merged CRDT state as opaque `yrs` updates (see
+// [`paper_doc`]) and the encrypted `papers.enc` sidecar (see [`paper_store`]).
+// One paper per conclave, created by the first trustee who starts it; the
+// creator is the hub. Phase 1 is offline — no wire fan-out yet, so an update's
+// `origin` is always this vault's account. Conclave-lifecycle coupling (create
+// validating membership, `ConclaveEnd` read-only, deletion cleanup) lands with
+// the fan-out in Phase 2, where the two-daemon script can exercise it. Like
+// Notes, every route round-trips through the account worker and a locked vault
+// answers 401.
+// ---------------------------------------------------------------------------
+
+/// Pending updates tolerated before the log folds into the snapshot. Small on
+/// purpose: every fetch and every update re-folds the pending log, so this
+/// bounds that work; the snapshot itself is capped in [`paper_store`].
+const PAPER_COMPACT_AFTER: usize = 64;
+
+fn paper_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Deserialize)]
+struct PaperCreateRequest {
+    #[serde(default)]
+    title: String,
+}
+
+#[derive(Deserialize)]
+struct PaperUpdateRequest {
+    /// Base64 of a v1 Yjs update produced by the editor.
+    update: String,
+}
+
+#[derive(Serialize)]
+struct PaperUpdateView {
+    rev: u64,
+    origin: String,
+    /// Base64 of the opaque v1 update.
+    update: String,
+    at_ms: u64,
+}
+
+#[derive(Serialize)]
+struct PaperView {
+    paper: paper_store::PaperDescriptor,
+    /// Last applied revision; 0 on a fresh paper. Revisions are gapless and
+    /// never restart, even across compaction.
+    revision: u64,
+    updated_ms: u64,
+    /// Base64 of the full merged v1 state — what a second editor loads.
+    state: String,
+    /// Pending log updates (post-snapshot), oldest first.
+    updates: Vec<PaperUpdateView>,
+    /// Whether the write that produced this view folded the log into the
+    /// snapshot.
+    compacted: bool,
+    /// Where this daemon's edits are going right now, for the UI's badge.
+    fast_path: PaperPathView,
+}
+
+/// The fast path as the badge reads it.
+#[derive(Serialize)]
+struct PaperPathView {
+    /// `live` when at least one trustee is on a DataChannel, `relay` when none
+    /// are — i.e. whether the next edit goes out fast or at relay speed.
+    ///
+    /// One flag rather than a per-peer breakdown because that is the question
+    /// the badge answers. A hub with some trustees live and some not reads
+    /// `live`, which is true of its own edits and of the paper's latency; the
+    /// count is here for a UI that wants to be more specific.
+    path: &'static str,
+    /// How many trustees are on the fast path right now.
+    live_peers: usize,
+}
+
+/// Where the fast path stands for a paper, as the badge reads it.
+async fn paper_path_view(state: &Arc<App>, conclave_id: &str) -> PaperPathView {
+    let live_peers = match paper_open_plane(state, conclave_id).await {
+        Some(plane) => plane.peers().len(),
+        None => 0,
+    };
+    PaperPathView {
+        path: if live_peers > 0 { "live" } else { "relay" },
+        live_peers,
+    }
+}
+
+fn paper_view_of(
+    file: &paper_store::PaperFile,
+    state: String,
+    compacted: bool,
+    fast_path: PaperPathView,
+) -> PaperView {
+    PaperView {
+        paper: file.descriptor.clone(),
+        revision: file.next_rev - 1,
+        updated_ms: file.updated_ms,
+        state,
+        updates: file
+            .log
+            .iter()
+            .map(|u| PaperUpdateView {
+                rev: u.rev,
+                origin: u.origin.clone(),
+                update: STANDARD.encode(&u.update),
+                at_ms: u.at_ms,
+            })
+            .collect(),
+        compacted,
+        fast_path,
+    }
+}
+
+const PAPER_NOT_FOUND: (&str, StatusCode) = ("no paper in this conclave", StatusCode::NOT_FOUND);
+
+/// Fetch the raw papers sidecar bytes through the worker and decode them.
+async fn paper_sidecar(
+    state: &App,
+) -> Result<paper_store::PapersState, (StatusCode, Json<ApiError>)> {
+    match state.worker.secret_read(paper_store::STATE_FILE).await {
+        WorkResult::Secret(raw) => paper_store::decode(raw.as_deref()).map_err(|m| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError { error: m }),
+            )
+        }),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Persist the papers sidecar wholesale.
+async fn paper_persist(
+    state: &App,
+    parsed: &paper_store::PapersState,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let bytes = parsed.encode().map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    match state.worker.secret_write(paper_store::STATE_FILE, bytes).await {
+        WorkResult::Ok => Ok(()),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn paper_account_id(state: &App) -> Result<String, (StatusCode, Json<ApiError>)> {
+    match state.worker.account_id().await {
+        WorkResult::AccountId(id) => Ok(id),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Apply one paper payload received from a peer to the local sidecar.
+///
+/// Authority mirrors the conclave's, and every check is on the **sender**:
+/// - `PaperDelta` carries no authority at all. A CRDT merges an update
+///   anywhere, in any order, so it is applied whoever sent it.
+/// - `PaperState` is creator-authoritative at creation: a paper this vault has
+///   never seen is materialised only when the sender is the creator the
+///   descriptor names, so a trustee cannot invent a paper in someone else's
+///   name.
+/// - `PaperSnapshot` is merged exactly like a delta rather than replacing the
+///   snapshot: a full state is a valid v1 update, and merging keeps local edits
+///   the hub had not seen, where replacing would drop them.
+/// - `PaperHub` (convener-authoritative succession) and `PaperPresence` (v1
+///   sends presence on the DataChannel only) are accepted and ignored rather
+///   than treated as errors.
+///
+/// Returns whether the local document changed. An unusable payload is an error
+/// for the caller to log, never a reason to fail the whole poll.
+fn paper_apply_inbound(
+    parsed: &mut paper_store::PapersState,
+    from_account: &str,
+    payload: &MessagePayload,
+    now_ms: u64,
+) -> Result<bool, String> {
+    match payload {
+        MessagePayload::PaperState { paper } => {
+            if paper.creator != from_account {
+                return Err(format!(
+                    "paper {} names {} as its creator but came from {}",
+                    paper.paper_id, paper.creator, from_account
+                ));
+            }
+            parsed.adopt(paper.clone(), now_ms)
+        }
+        MessagePayload::PaperDelta { paper_id, update } => {
+            let conclave_id = parsed
+                .conclave_of(paper_id)
+                .ok_or_else(|| format!("no paper {paper_id} in this vault"))?;
+            parsed.apply_update(&conclave_id, from_account, update, now_ms)?;
+            Ok(true)
+        }
+        MessagePayload::PaperSnapshot { paper, state } => {
+            // A snapshot is self-contained: the peer that needs one joined after
+            // the paper existed, so it never saw the `PaperState` fan-out and
+            // has no local record to apply against. Adopt the descriptor first,
+            // under the same creator authority `PaperState` enforces, so a
+            // snapshot cannot introduce a paper on a peer's behalf. An already
+            // known paper keeps its local descriptor — only the state merges,
+            // which is why a peer cannot retitle or re-home via a snapshot.
+            let conclave_id = match parsed.conclave_of(&paper.paper_id) {
+                Some(id) => id,
+                None => {
+                    if paper.creator != from_account {
+                        return Err(format!(
+                            "paper {} names {} as its creator but came from {}",
+                            paper.paper_id, paper.creator, from_account
+                        ));
+                    }
+                    parsed.adopt(paper.clone(), now_ms)?;
+                    // `adopt` settles a create collision by conclave, so the id
+                    // it resolved may not be the one the snapshot named: a
+                    // snapshot for the paper that lost belongs to the conclave's
+                    // paper all the same, because the two are one document at
+                    // two ids and merging is what the loser needs anyway.
+                    parsed
+                        .conclave_of(&paper.paper_id)
+                        .or_else(|| {
+                            (!paper.conclave_id.is_empty()
+                                && parsed.get(&paper.conclave_id).is_some())
+                            .then(|| paper.conclave_id.clone())
+                        })
+                        .ok_or_else(|| format!("no paper {} in this vault", paper.paper_id))?
+                }
+            };
+            parsed.apply_update(&conclave_id, from_account, state, now_ms)?;
+            Ok(true)
+        }
+        // Convener-authoritative hub succession. The authority check already
+        // happened in `recv`, where the conclave record is in hand — what is
+        // left here is storage, and only the rendezvous moves.
+        MessagePayload::PaperHub { paper } => parsed.rehome(&paper.paper_id, &paper.hub, now_ms),
+        // Recognised paper payloads that change no document state. Signalling
+        // belongs here rather than in the state path because it moves the
+        // *transport*, not the text: the data plane consumes it before it
+        // reaches this function (Task 6 Step 2). Until that wiring lands it is
+        // accepted and ignored, not reported as a foreign payload.
+        MessagePayload::PaperPresence { .. }
+        | MessagePayload::PaperOffer { .. }
+        | MessagePayload::PaperAnswer { .. } => Ok(false),
+        other => Err(format!("not a paper payload: {other:?}")),
+    }
+}
+
+/// Move a paper's hub to this vault when the one that held it is gone.
+///
+/// Two places see the joined set change, and only one of them is a `recv`:
+///
+/// - a peer's leave or kick arrives as a payload, and `recv` reports the
+///   departure in `inbox.departed`;
+/// - the convener's *own* kick changes the roster with no payload at all — the
+///   roster is already updated by the time the next poll takes its "before"
+///   snapshot, so the diff is empty and nothing is reported.
+///
+/// Both call this. The core decides: it is the convener's claim to make, and
+/// only when the paper's rendezvous is really no longer a joined trustee — so a
+/// kick of somebody who is not the hub moves nothing, and the caller does not
+/// have to go and find the account id of whoever left.
+///
+/// Returns whether the rendezvous moved here, which is what the caller needs to
+/// know to drop the plane that points at the old hub.
+async fn paper_inherit_hub(state: &Arc<App>, conclave_id: &str) -> bool {
+    let Ok(mut parsed) = paper_sidecar(state).await else {
+        return false;
+    };
+    let Some(paper) = parsed
+        .get(conclave_id)
+        .map(|file| file.descriptor.clone())
+    else {
+        return false;
+    };
+    let hub = paper.hub.clone();
+    let moved = match state
+        .worker
+        .inherit_paper_hub(conclave_id, &hub, paper)
+        .await
+    {
+        WorkResult::Rehomed(Some(moved)) => moved,
+        // `None` is the common case: a trustee that is not the convener, or a
+        // hub that is still here. Not an error, and not worth logging.
+        _ => return false,
+    };
+    match paper_apply_inbound(
+        &mut parsed,
+        "",
+        &MessagePayload::PaperHub { paper: moved },
+        paper_now_ms(),
+    ) {
+        Ok(true) => {
+            if let Err(e) = paper_persist(state, &parsed).await {
+                eprintln!(
+                    "hush-daemon: paper {conclave_id} could not be saved: {}",
+                    e.1.error
+                );
+            }
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            eprintln!("hush-daemon: inherited hub for {conclave_id} ignored: {e}");
+            false
+        }
+    }
+}
+
+/// Whether the conclave a paper belongs to has ended.
+///
+/// Read from the chat log through the worker, because the roster is the vault's
+/// and the daemon keeps no second copy of it. A worker that cannot answer is
+/// reported as "not ended": a locked vault fails the paper route that follows
+/// anyway, and a transient read error must not turn into a vault that silently
+/// refuses to save an edit.
+async fn paper_conclave_ended(state: &Arc<App>, conclave_id: &str) -> bool {
+    match state.worker.conclaves().await {
+        WorkResult::Conclaves(list) => list.iter().any(|c| c.id == conclave_id && c.ended),
+        _ => false,
+    }
+}
+
+/// The refusal a paper write gets when the conclave no longer allows one.
+///
+/// Two cases, and they are not the same sentence:
+///
+/// - the conclave has **ended** (`ConclaveEnd`): read-only on every peer, and
+///   the relay would refuse the fan-out, so accepting an edit here would only
+///   diverge this vault's copy from everyone else's;
+/// - this vault is **not a joined trustee** — kicked, or an invitation that was
+///   never accepted: the same fan-out refusal, and a local-only edit nobody
+///   else will ever see is worse than a refusal.
+///
+/// Reads are untouched by both: the document is this vault's own copy, and
+/// refusing to show it would not un-share it.
+async fn paper_write_refusal(
+    state: &Arc<App>,
+    conclave_id: &str,
+) -> Option<(StatusCode, Json<ApiError>)> {
+    let list = match state.worker.conclaves().await {
+        WorkResult::Conclaves(list) => list,
+        // A worker that cannot answer is not a reason to refuse: a locked vault
+        // fails the paper route that follows anyway, and a transient read error
+        // must not turn into a vault that silently refuses to save an edit.
+        _ => return None,
+    };
+    let Some(conclave) = list.iter().find(|c| c.id == conclave_id) else {
+        // Not a conclave this vault knows: the paper route 404s on its own.
+        return None;
+    };
+    if conclave.ended {
+        return Some(paper_ended_error());
+    }
+    let me = paper_account_id(state).await.ok()?;
+    if conclave.joined().any(|t| t.account_id == me) {
+        return None;
+    }
+    Some((
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            error: "you are not a trustee of this conclave, so the paper is read-only".into(),
+        }),
+    ))
+}
+
+/// The refusal an ended conclave's paper writes get.
+///
+/// `ConclaveEnd` makes a conclave read-only on every peer, and the paper is part
+/// of that: the relay would refuse the fan-out anyway, so accepting the edit
+/// here would only diverge this vault's copy from everyone else's.
+fn paper_ended_error() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            error: "the conclave has ended, so the paper is read-only".into(),
+        }),
+    )
+}
+
+/// Re-home a paper: the convener's word settles where the rendezvous is.
+#[derive(Deserialize)]
+struct PaperRehomeRequest {
+    /// The trustee that should become the hub.
+    hub: String,
+}
+
+/// Move a paper's DataChannel rendezvous to another trustee.
+///
+/// The authority check is the core's, not the daemon's:
+/// `send_conclave_paper_hub` refuses anyone but the conclave's convener, so
+/// there is no second copy of the roster here to drift. A refusal is a 403
+/// rather than a 400 — the caller may ask, they are simply not the convener —
+/// which is the same distinction `change_passphrase` draws for a wrong
+/// passphrase.
+///
+/// This is the *explicit* half of succession. The default is automatic: when a
+/// paper's hub leaves or is kicked, the convener inherits it in `recv` with no
+/// user action. This route exists for the case that has no roster event — the
+/// hub is still a member but is gone for good (a dead machine, a lost device).
+async fn paper_rehome(
+    State(state): State<Arc<App>>,
+    Path(conclave_id): Path<String>,
+    Json(body): Json<PaperRehomeRequest>,
+) -> Result<Json<PaperView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    if body.hub.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "a re-home needs the account id of the new hub".into(),
+            }),
+        ));
+    }
+    let mut parsed = paper_sidecar(&state).await?;
+    let mut descriptor = parsed
+        .get(&conclave_id)
+        .map(|file| file.descriptor.clone())
+        .ok_or_else(|| {
+            (
+                PAPER_NOT_FOUND.1,
+                Json(ApiError {
+                    error: PAPER_NOT_FOUND.0.into(),
+                }),
+            )
+        })?;
+    descriptor.hub = body.hub.trim().to_string();
+    match state.worker.send_paper_hub(&conclave_id, descriptor).await {
+        WorkResult::Ok => {}
+        WorkResult::Err(msg) if msg.contains("convener") => {
+            return Err((StatusCode::FORBIDDEN, Json(ApiError { error: msg })));
+        }
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    }
+    let paper_id = parsed
+        .get(&conclave_id)
+        .map(|file| file.descriptor.paper_id.clone())
+        .expect("the paper existed a moment ago");
+    parsed
+        .rehome(&paper_id, &body.hub.trim().to_string(), paper_now_ms())
+        .map_err(|m| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError { error: m }),
+            )
+        })?;
+    paper_persist(&state, &parsed).await?;
+    // The open channel points at the rendezvous that just moved.
+    paper_plane_reset(&state, &conclave_id).await;
+    let path = paper_path_view(&state, &conclave_id).await;
+    let file = parsed
+        .get(&conclave_id)
+        .expect("the paper existed a moment ago");
+    let updates: Vec<Vec<u8>> = file.log.iter().map(|u| u.update.clone()).collect();
+    let full = paper_doc::fold(&file.snapshot, &updates).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    Ok(Json(paper_view_of(
+        file,
+        STANDARD.encode(full),
+        false,
+        path,
+    )))
+}
+
+/// One peer's presence frame.
+#[derive(Serialize)]
+struct PresenceView {
+    /// The account the frame came from.
+    account: String,
+    /// The opaque awareness bytes, base64. The daemon never reads them.
+    frame: String,
+}
+
+/// Who is in the document, as far as the fast path knows.
+#[derive(Serialize)]
+struct PaperPresenceView {
+    peers: Vec<PresenceView>,
+}
+
+/// A presence frame the editor just produced.
+#[derive(Deserialize)]
+struct PaperPresenceRequest {
+    /// Opaque awareness bytes, base64.
+    frame: String,
+}
+
+/// Who else is in the paper right now.
+///
+/// Presence lives only on the fast path: there is no relay fallback and no
+/// persistence, because a cursor that arrives a second and a half late is worse
+/// than no cursor, and a stale one is a lie about who is reading. An empty list
+/// is therefore a real answer — it means nobody else is reachable quickly —
+/// rather than a failure, and the editor draws no cursors for it.
+async fn paper_presence(
+    State(state): State<Arc<App>>,
+    Path(conclave_id): Path<String>,
+) -> Result<Json<PaperPresenceView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    paper_sidecar(&state).await?.get(&conclave_id).ok_or_else(|| {
+        (
+            PAPER_NOT_FOUND.1,
+            Json(ApiError {
+                error: PAPER_NOT_FOUND.0.into(),
+            }),
+        )
+    })?;
+    let peers = match paper_open_plane(&state, &conclave_id).await {
+        Some(plane) => plane
+            .presence()
+            .into_iter()
+            .map(|(account, bytes)| PresenceView {
+                account,
+                frame: STANDARD.encode(bytes),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(Json(PaperPresenceView { peers }))
+}
+
+/// Publish the editor's own presence frame along the star.
+///
+/// A trustee's frame goes to the hub, the hub's goes to every trustee, and the
+/// hub forwards what it receives — which is what makes a cursor on one screen
+/// visible on the others. Best-effort by construction, like every other use of
+/// the fast path: no channel means the frame is dropped, and the editor keeps
+/// typing at relay latency with no cursors, exactly as it did before Task 7.
+async fn paper_publish_presence(
+    State(state): State<Arc<App>>,
+    Path(conclave_id): Path<String>,
+    Json(body): Json<PaperPresenceRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let bytes = STANDARD.decode(body.frame.as_bytes()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "frame is not valid base64".into(),
+            }),
+        )
+    })?;
+    paper_sidecar(&state).await?.get(&conclave_id).ok_or_else(|| {
+        (
+            PAPER_NOT_FOUND.1,
+            Json(ApiError {
+                error: PAPER_NOT_FOUND.0.into(),
+            }),
+        )
+    })?;
+    let Some(plane) = paper_open_plane(&state, &conclave_id).await else {
+        // No plane yet: the editor's next poll dials and presence resumes on its
+        // own. Spawned sends below for the same reason an update's are — a
+        // channel that has gone quiet must not hold the request open.
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    for peer in plane.peers() {
+        let plane = Arc::clone(&plane);
+        let bytes = bytes.clone();
+        tokio::spawn(async move {
+            let _ = plane.send_presence(&peer, &bytes).await;
+        });
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn paper_get(    State(state): State<Arc<App>>,
+    Path(conclave_id): Path<String>,
+) -> Result<Json<PaperView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let parsed = paper_sidecar(&state).await?;
+    let file = parsed
+        .get(&conclave_id)
+        .ok_or_else(|| (PAPER_NOT_FOUND.1, Json(ApiError { error: PAPER_NOT_FOUND.0.into() })))?;
+    let updates: Vec<Vec<u8>> = file.log.iter().map(|u| u.update.clone()).collect();
+    let full = paper_doc::fold(&file.snapshot, &updates).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    // Opening the paper is also where the fast path comes up: a trustee dials
+    // its hub, a hub does nothing and waits to be dialled. Best-effort and
+    // rate-limited, so a poll that finds no change costs a mutex.
+    let descriptor = file.descriptor.clone();
+    paper_dial(&state, &conclave_id, &descriptor).await;
+    let fast_path = paper_path_view(&state, &conclave_id).await;
+    Ok(Json(paper_view_of(
+        file,
+        STANDARD.encode(full),
+        false,
+        fast_path,
+    )))
+}
+
+async fn paper_create(
+    State(state): State<Arc<App>>,
+    Path(conclave_id): Path<String>,
+    Json(body): Json<PaperCreateRequest>,
+) -> Result<Json<PaperView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    // A paper in a conclave this vault cannot write to would be local-only: the
+    // `PaperState` fan-out is refused, so no peer would ever learn it exists.
+    if let Some(refusal) = paper_write_refusal(&state, &conclave_id).await {
+        return Err(refusal);
+    }
+    let creator = paper_account_id(&state).await?;
+    let mut parsed = paper_sidecar(&state).await?;
+    parsed
+        .create(&conclave_id, &creator, &body.title, paper_now_ms())
+        .map_err(|m| {
+            if m.contains("already") {
+                (StatusCode::CONFLICT, Json(ApiError { error: m }))
+            } else {
+                (StatusCode::BAD_REQUEST, Json(ApiError { error: m }))
+            }
+        })?;
+    paper_persist(&state, &parsed).await?;
+    // A brand-new paper has no plane yet — this daemon is its creator, so it is
+    // the hub and waits to be dialled. The badge starts at `relay` and turns
+    // `live` the first time a trustee connects.
+    let path = paper_path_view(&state, &conclave_id).await;
+    let file = parsed.get(&conclave_id).expect("just created");
+    let descriptor = file.descriptor.clone();
+    let view = paper_view_of(file, STANDARD.encode(yrs::Update::EMPTY_V1), false, path);
+    // Tell the conclave's trustees the paper exists. Best-effort: the paper is
+    // already local, and a send queues in the outbox, so a trustee that is
+    // offline or locked still receives it on its next drain.
+    if let WorkResult::Err(e) = state
+        .worker
+        .send_paper_state(&conclave_id, descriptor)
+        .await
+    {
+        eprintln!("hush-daemon: paper state fan-out failed: {e}");
+    }
+    Ok(Json(view))
+}
+
+async fn paper_update(
+    State(state): State<Arc<App>>,
+    Path(conclave_id): Path<String>,
+    Json(body): Json<PaperUpdateRequest>,
+) -> Result<Json<PaperView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    if let Some(refusal) = paper_write_refusal(&state, &conclave_id).await {
+        return Err(refusal);
+    }
+    let raw = STANDARD
+        .decode(body.update.as_bytes())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "update is not valid base64".into(),
+                }),
+            )
+        })?;
+    let origin = paper_account_id(&state).await?;
+    let mut parsed = paper_sidecar(&state).await?;
+    // Merge onto the document as it stands: fold the pending log, apply the
+    // incoming update, then record it — the CRDT makes re-applying our own or
+    // a peer's update a no-op, so the same path serves every sender.
+    let (snapshot, pending): (Vec<u8>, Vec<Vec<u8>>) = {
+        let file = parsed.get(&conclave_id).ok_or_else(|| {
+            (
+                PAPER_NOT_FOUND.1,
+                Json(ApiError {
+                    error: PAPER_NOT_FOUND.0.into(),
+                }),
+            )
+        })?;
+        (
+            file.snapshot.clone(),
+            file.log.iter().map(|u| u.update.clone()).collect(),
+        )
+    };
+    let base = paper_doc::fold(&snapshot, &pending).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    let full = paper_doc::apply(&base, &raw)
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+
+    parsed
+        .apply_update(&conclave_id, &origin, &raw, paper_now_ms())
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    let mut compacted = false;
+    if parsed
+        .get(&conclave_id)
+        .map(|p| p.log.len())
+        .unwrap_or(0)
+        >= PAPER_COMPACT_AFTER
+    {
+        parsed
+            .snapshot_replace(&conclave_id, &full, paper_now_ms())
+            .map_err(|m| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError { error: m }),
+                )
+            })?;
+        compacted = true;
+    }
+    paper_persist(&state, &parsed).await?;
+    let path = paper_path_view(&state, &conclave_id).await;
+    let file = parsed
+        .get(&conclave_id)
+        .expect("the paper existed a moment ago");
+    let paper_id = file.descriptor.paper_id.clone();
+    let view = paper_view_of(file, STANDARD.encode(full), compacted, path);
+    // The fast path first, then the relay, with identical bytes: the only
+    // question the channel answers is which copy arrives first, and the relay is
+    // what makes that question unimportant. Spawned rather than awaited so a
+    // channel that has gone quiet cannot hold the editor's request open — the
+    // relay copy is going out below regardless.
+    if let Some(plane) = paper_open_plane(&state, &conclave_id).await {
+        for peer in plane.peers() {
+            let plane = Arc::clone(&plane);
+            let bytes = raw.clone();
+            tokio::spawn(async move {
+                let _ = plane.send(&peer, &bytes).await;
+            });
+        }
+    }
+    // Fan the update out to the trustees. This is the *local* edit path, so it
+    // sends exactly the bytes the editor produced and nothing else; an update
+    // that arrived from a peer is applied by `recv` and never re-fanned, which
+    // is what keeps the fan-out from looping.
+    if let WorkResult::Err(e) = state
+        .worker
+        .send_paper_delta(&conclave_id, &paper_id, &raw)
+        .await
+    {
+        eprintln!("hush-daemon: paper delta fan-out failed: {e}");
+    }
+    Ok(Json(view))
+}
+
+// ---------------------------------------------------------------------------
+// Conclave Paper — the DataChannel fast path (Task 6 Step 2).
+//
+// The relay fan-out above is the guarantee; this is the latency. One plane per
+// paper, created the first time the paper is opened on this daemon and drained
+// by a single background loop. Every path here is best-effort by construction:
+// a failure ends in "the update rides the relay", never in a lost edit, which
+// is why none of it returns an error to a caller.
+// ---------------------------------------------------------------------------
+
+/// How often the drain loop looks at the planes.
+///
+/// Two orders of magnitude below the relay's ~1–3 s cadence, and one wake-up
+/// per plane per tick, so an idle daemon costs nothing.
+const PAPER_PLANE_TICK_MS: u64 = 50;
+
+/// The plane for `conclave_id`, created on first use.
+///
+/// `stun` is resolved from config here rather than stored on the plane, so an
+/// operator who adds a STUN server gets it on the next paper without a restart
+/// and there is still exactly one config system (DR-14).
+async fn paper_plane(state: &Arc<App>, conclave_id: &str) -> Arc<paper_data::DataPlane> {
+    let mut planes = state.paper_planes.lock().await;
+    planes
+        .entry(conclave_id.to_string())
+        .or_insert_with(|| {
+            Arc::new(paper_data::DataPlane::new(
+                hush_core::config::resolve_stun_url(&state.dir),
+            ))
+        })
+        .clone()
+}
+
+/// The plane for a paper, when one has already been opened here.
+async fn paper_open_plane(
+    state: &Arc<App>,
+    conclave_id: &str,
+) -> Option<Arc<paper_data::DataPlane>> {
+    state
+        .paper_planes
+        .lock()
+        .await
+        .get(conclave_id)
+        .map(Arc::clone)
+}
+
+/// Find a paper this vault holds, by the id the wire carries.
+///
+/// Signalling names the paper and not the conclave, because that is all a peer
+/// knows; the sidecar is the mapping. `None` is a signal about a paper this
+/// vault does not have, which is dropped rather than treated as an error.
+async fn paper_lookup(state: &Arc<App>, paper_id: &str) -> Option<(String, PaperDescriptor)> {
+    let parsed = paper_sidecar(state).await.ok()?;
+    let conclave_id = parsed.conclave_of(paper_id)?;
+    let descriptor = parsed.get(&conclave_id)?.descriptor.clone();
+    Some((conclave_id, descriptor))
+}
+
+/// Bring the fast path up for a paper this daemon has open.
+///
+/// The trustee dials and the hub waits, because the star's shape follows from
+/// who created the paper and the descriptor already names them. Called on every
+/// open rather than once: a restart, a lock, or a hub that went away all leave
+/// the plane empty, and the open is the natural moment to notice. The dial is
+/// rate-limited by [`paper_data::DataPlane::should_dial`], so the UI's
+/// one-second poll cannot turn into one offer per second.
+///
+/// Best-effort throughout — a paper with no channel is a paper at relay
+/// latency, not a failure.
+async fn paper_dial(state: &Arc<App>, conclave_id: &str, paper: &PaperDescriptor) {
+    let Ok(me) = paper_account_id(state).await else {
+        return;
+    };
+    // We are the hub: peers dial us. An offer that never comes is not ours to
+    // chase, and there is nobody to offer to.
+    if paper.hub == me {
+        return;
+    }
+    let plane = paper_plane(state, conclave_id).await;
+    if !plane.should_dial(&paper.hub) {
+        return;
+    }
+    let sdp = match plane.offer(&paper.hub).await {
+        Ok(sdp) => sdp,
+        Err(e) => {
+            eprintln!("hush-daemon: paper {conclave_id} dial failed: {e}");
+            return;
+        }
+    };
+    let payload = MessagePayload::PaperOffer {
+        paper_id: paper.paper_id.clone(),
+        sdp,
+    };
+    if let WorkResult::Err(e) = state
+        .worker
+        .send_paper_signal(conclave_id, &paper.hub, payload)
+        .await
+    {
+        eprintln!("hush-daemon: paper {conclave_id} offer could not be sent: {e}");
+    }
+}
+
+/// Move the transport for one signalling payload, if it is ours.
+///
+/// Returns whether the payload was a paper signal. Signals are consumed here
+/// and never reach `paper_apply_inbound`: they move the *transport*, not the
+/// text, so they are the one paper payload class that changes no document.
+async fn paper_handle_signal(state: &Arc<App>, from: &str, payload: &MessagePayload) -> bool {
+    match payload {
+        // Hub half. Authority is the descriptor's, exactly as it is for
+        // `PaperState`: only the daemon the paper names as its hub answers, so
+        // a trustee cannot be talked into holding a channel for a paper whose
+        // descriptor says someone else owns the rendezvous.
+        MessagePayload::PaperOffer { paper_id, sdp } => {
+            let Some((conclave_id, descriptor)) = paper_lookup(state, paper_id).await else {
+                return true;
+            };
+            let Ok(me) = paper_account_id(state).await else {
+                return true;
+            };
+            if descriptor.hub != me {
+                return true;
+            }
+            let plane = paper_plane(state, &conclave_id).await;
+            let answer = match plane.answer(from, sdp).await {
+                Ok(answer) => answer,
+                Err(e) => {
+                    eprintln!("hush-daemon: paper {conclave_id} could not answer {from}: {e}");
+                    return true;
+                }
+            };
+            let payload = MessagePayload::PaperAnswer {
+                paper_id: paper_id.clone(),
+                sdp: answer,
+            };
+            if let WorkResult::Err(e) = state
+                .worker
+                .send_paper_signal(&conclave_id, from, payload)
+                .await
+            {
+                // The answer could not be addressed, which in practice means
+                // the sender is not a joined trustee of this conclave: the
+                // addressed send refuses exactly that. Drop the connection with
+                // it, because a half-open channel to a peer that cannot be
+                // answered is only cost.
+                eprintln!("hush-daemon: paper {conclave_id} answer to {from} failed: {e}");
+                plane.forget(from);
+            }
+            true
+        }
+        // Trustee half: only an answer to a dial this daemon made has an
+        // outstanding connection to match, and `accept_answer` is what says so.
+        MessagePayload::PaperAnswer { paper_id, sdp } => {
+            let Some((conclave_id, _)) = paper_lookup(state, paper_id).await else {
+                return true;
+            };
+            let Some(plane) = paper_open_plane(state, &conclave_id).await else {
+                return true;
+            };
+            if let Err(e) = plane.accept_answer(from, sdp).await {
+                eprintln!("hush-daemon: paper {conclave_id} answer from {from} refused: {e}");
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Apply everything the channels have received, then pass it along the star.
+///
+/// The re-broadcast is the reason this loop exists. The relay fan-out is a full
+/// mesh, but the channels are a star: without forwarding, an update that
+/// reached the hub over one channel would reach the other trustees only at
+/// relay speed, which is the whole thing the fast path is for.
+///
+/// "Every live peer except the sender" is the right fan-out for both roles
+/// without asking which one this daemon is — a trustee's only peer *is* the hub,
+/// so it forwards nothing.
+///
+/// A locked vault simply drops the batch: the relay copy is still queued and
+/// applying it is what happens on unlock, so that is a delay, not a loss.
+async fn paper_drain_once(state: &Arc<App>) {
+    let planes: Vec<(String, Arc<paper_data::DataPlane>)> = {
+        let planes = state.paper_planes.lock().await;
+        planes
+            .iter()
+            .map(|(id, plane)| (id.clone(), Arc::clone(plane)))
+            .collect()
+    };
+    for (conclave_id, plane) in planes {
+        let inbound = plane.drain();
+        if inbound.is_empty() {
+            continue;
+        }
+        let Ok(mut parsed) = paper_sidecar(state).await else {
+            continue;
+        };
+        let Some(paper_id) = parsed
+            .get(&conclave_id)
+            .map(|file| file.descriptor.paper_id.clone())
+        else {
+            continue;
+        };
+        let now = paper_now_ms();
+        let mut changed = false;
+        let mut forwards: Vec<(String, paper_data::InboundFrame)> = Vec::new();
+        for paper_data::Inbound { from, frame } in inbound {
+            match frame {
+                paper_data::InboundFrame::Update(update) => {
+                    let payload = MessagePayload::PaperDelta {
+                        paper_id: paper_id.clone(),
+                        update: update.clone(),
+                    };
+                    if let Err(e) = paper_apply_inbound(&mut parsed, &from, &payload, now) {
+                        // Unappliable is also unforwardable: passing on an update
+                        // this vault rejected would spread a bad payload along
+                        // the star.
+                        eprintln!("hush-daemon: paper update from {from} ignored: {e}");
+                        continue;
+                    }
+                    changed = true;
+                    forwards.push((from, paper_data::InboundFrame::Update(update)));
+                }
+                // Presence changes no document, so it is neither applied nor
+                // persisted — it is forwarded, which is what makes a cursor on
+                // one trustee visible to the others instead of only to the hub.
+                presence @ paper_data::InboundFrame::Presence(_) => {
+                    forwards.push((from, presence));
+                }
+            }
+        }
+        if changed {
+            if let Err(e) = paper_persist(state, &parsed).await {
+                eprintln!("hush-daemon: paper {conclave_id} could not be saved: {}", e.1.error);
+            }
+        }
+        for (from, frame) in forwards {
+            for peer in plane.peers() {
+                if peer == from {
+                    continue;
+                }
+                // `UseRelay` needs no handling: the relay fan-out is already
+                // carrying these exact bytes to that peer for an update, and
+                // presence has no relay copy at all — a cursor is not worth a
+                // store-and-forward round trip.
+                match &frame {
+                    paper_data::InboundFrame::Update(bytes) => {
+                        let _ = plane.send(&peer, bytes).await;
+                    }
+                    paper_data::InboundFrame::Presence(bytes) => {
+                        let _ = plane.send_presence(&peer, bytes).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Spawn the paper drain loop. One per daemon, for the process's lifetime.
+fn spawn_paper_plane_loop(app: Arc<App>) {
+    tokio::spawn(async move {
+        let tick = Duration::from_millis(PAPER_PLANE_TICK_MS);
+        loop {
+            tokio::time::sleep(tick).await;
+            paper_drain_once(&app).await;
+        }
+    });
+}
+
+/// Close every paper plane and forget them.
+///
+/// The registry is emptied rather than just closed, so the next paper open
+/// dials afresh instead of finding a plane full of dead links. Best-effort:
+/// `shutdown` closes what it can and a connection that refuses to close is not
+/// worth holding a lock over.
+async fn paper_planes_shutdown(state: &Arc<App>) {
+    let planes: Vec<Arc<paper_data::DataPlane>> = {
+        let mut planes = state.paper_planes.lock().await;
+        planes.drain().map(|(_, plane)| plane).collect()
+    };
+    for plane in planes {
+        plane.shutdown();
+    }
+}
+
+/// Drop one paper's plane, if it has one.
+///
+/// Used when the paper's hub moves: the channel that exists points at the old
+/// rendezvous, so keeping it would leave the trustee talking to a daemon that
+/// is no longer the hub.
+async fn paper_plane_reset(state: &Arc<App>, conclave_id: &str) {
+    let plane = state.paper_planes.lock().await.remove(conclave_id);
+    if let Some(plane) = plane {
+        plane.shutdown();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Torrents — the TorBox-powered pipeline behind `/api/torrents/*`.
 //
 // Every call goes through [`torrents::TorrentsManager`]; the API key lives in
@@ -3066,6 +4356,7 @@ mod drops_api_tests {
             wallet_socks: Mutex::new(None),
             relay_health: Mutex::new(None),
             relay_probe_inflight: AtomicBool::new(false),
+            paper_planes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3343,6 +4634,7 @@ mod wallet_api_tests {
             wallet_socks: Mutex::new(Some(TEST_SOCKS.to_string())),
             relay_health: Mutex::new(None),
             relay_probe_inflight: AtomicBool::new(false),
+            paper_planes: Mutex::new(HashMap::new()),
         });
         app.wallet
             .apply_relay(false, Some(TEST_SOCKS.to_string()))
@@ -3847,7 +5139,7 @@ mod notes_api_tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    fn build_app(dir: &std::path::Path, worker: AccountWorker, unlocked: bool) -> Arc<App> {
+    pub(crate) fn build_app(dir: &std::path::Path, worker: AccountWorker, unlocked: bool) -> Arc<App> {
         Arc::new(App {
             dir: dir.to_path_buf(),
             socket: None,
@@ -3862,11 +5154,12 @@ mod notes_api_tests {
             wallet_socks: Mutex::new(None),
             relay_health: Mutex::new(None),
             relay_probe_inflight: AtomicBool::new(false),
+            paper_planes: Mutex::new(HashMap::new()),
         })
     }
 
     /// A created vault plus the worker that holds it, unlocked.
-    async fn unlocked_app(dir: &std::path::Path) -> Arc<App> {
+    pub(crate) async fn unlocked_app(dir: &std::path::Path) -> Arc<App> {
         hush_core::Account::create(dir, "pw", "http://127.0.0.1:9")
             .await
             .unwrap();
@@ -3878,7 +5171,7 @@ mod notes_api_tests {
         build_app(dir, worker, true)
     }
 
-    async fn request(
+    pub(crate) async fn request(
         app: &axum::Router,
         method: &str,
         uri: &str,
@@ -3963,5 +5256,1023 @@ mod notes_api_tests {
         let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
         let (status, _) = request(&router, "GET", "/api/notes/state", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+/// The Paper routes driven end to end over a real unlocked vault, through
+/// `api_router` so no socket is bound. Phase 1 is offline: the paper belongs
+/// to a conclave id the UI already has; conclave-lifecycle coupling (create
+/// validating membership, `ConclaveEnd` read-only, deletion cleanup) lands
+/// with the wire fan-out in Phase 2, where the two-daemon script can test it.
+#[cfg(test)]
+mod paper_api_tests {
+    use super::*;
+    use crate::notes_api_tests::{build_app, request, unlocked_app};
+    use tempfile::TempDir;
+
+    /// A real v1 Yjs update, encoded the way any peer (the webview editor
+    /// included) produces them: one transaction on a fresh doc.
+    fn yjs_update(text: &str) -> String {
+        use yrs::{Doc, ReadTxn, StateVector, Text, Transact};
+        let doc = Doc::new();
+        let content = doc.get_or_insert_text("content");
+        let mut txn = doc.transact_mut();
+        content.insert(&mut txn, 0, text);
+        STANDARD.encode(txn.encode_state_as_update_v1(&StateVector::default()))
+    }
+
+    #[tokio::test]
+    async fn paper_routes_round_trip_a_document() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        // No paper yet.
+        let (status, _) = request(&router, "GET", "/api/paper/c-1", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Create: creator and hub are this vault's own account id.
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/create",
+            Some(r#"{"title":"Minutes"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let creator = created["paper"]["creator"].as_str().unwrap().to_string();
+        assert!(!creator.is_empty(), "creator is the local account id");
+        assert_eq!(created["paper"]["hub"], created["paper"]["creator"]);
+        assert_eq!(created["paper"]["title"], "Minutes");
+        assert_eq!(created["revision"], 0);
+        // A brand-new paper's state must be a decodable update, never zero
+        // bytes: the webview feeds it straight to Y.applyUpdate, which throws
+        // "Unexpected end of array" on an empty buffer.
+        let fresh = created["state"].as_str().unwrap();
+        assert!(!fresh.is_empty(), "a fresh paper's state is not zero bytes");
+        let fresh_bytes = STANDARD.decode(fresh).unwrap();
+        use yrs::updates::decoder::Decode;
+        assert!(
+            yrs::Update::decode_v1(&fresh_bytes).is_ok(),
+            "a fresh paper's state decodes as a v1 update"
+        );
+
+        // A second create is a conflict, not a silent reset.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/create",
+            Some(r#"{"title":"x"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // One edit.
+        let body = format!(r#"{{"update":"{}"}}"#, yjs_update("hello"));
+        let (status, upd) = request(&router, "POST", "/api/paper/c-1/update", Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{upd}");
+        assert_eq!(upd["revision"], 1);
+        assert_eq!(upd["compacted"], false);
+
+        // The fetch reflects it: revision, one log entry authored locally,
+        // and a non-empty merged state for a second editor to start from.
+        let (status, got) = request(&router, "GET", "/api/paper/c-1", None).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["revision"], 1);
+        assert_eq!(got["updates"].as_array().unwrap().len(), 1);
+        assert_eq!(got["updates"][0]["origin"], creator);
+        assert!(!got["state"].as_str().unwrap().is_empty());
+
+        // Compaction: at the threshold the pending log folds into the
+        // snapshot; revisions keep counting up. First update + 63 = 64
+        // pending, and the 64th triggers the fold.
+        for i in 0..63 {
+            let b = format!(r#"{{"update":"{}"}}"#, yjs_update(&format!("line {i}")));
+            let (status, _) = request(&router, "POST", "/api/paper/c-1/update", Some(&b)).await;
+            assert_eq!(status, StatusCode::OK, "update {i}");
+        }
+        let (status, got) = request(&router, "GET", "/api/paper/c-1", None).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["revision"], 64);
+        assert_eq!(
+            got["updates"].as_array().unwrap().len(),
+            0,
+            "the log folded into the snapshot"
+        );
+        assert!(!got["state"].as_str().unwrap().is_empty());
+
+        // A fresh editor folds the same sidecar into the same document bytes
+        // (convergence itself is paper_doc's test); here we only prove the
+        // state survives a re-decode of the persisted sidecar.
+        let (status, again) = request(&router, "GET", "/api/paper/c-1", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["state"], got["state"], "stable across re-decodes");
+    }
+
+    #[tokio::test]
+    async fn paper_update_refuses_garbage_bytes() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        request(&router, "POST", "/api/paper/c-1/create", Some("{}"))
+            .await
+            .0;
+        // Not base64 at all.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/update",
+            Some(r#"{"update":"!!!"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Base64, but not a Yjs update.
+        let b64 = STANDARD.encode(b"garbage bytes");
+        let body = format!(r#"{{"update":"{b64}"}}"#);
+        let (status, _) = request(&router, "POST", "/api/paper/c-1/update", Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn paper_routes_are_401_while_locked() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+        for (method, uri, body) in [
+            ("GET", "/api/paper/c-1", None),
+            ("POST", "/api/paper/c-1/create", Some("{}")),
+            // A well-formed body: the 401 must come from the lock, not from
+            // JSON extraction failing first.
+            ("POST", "/api/paper/c-1/update", Some(r#"{"update":"AAA="}"#)),
+        ] {
+            let (status, _) = request(&router, method, uri, body).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+
+    /// The sidecar lives in the vault dir for the whole life of the machine,
+    /// so its bytes must never be the document. Distinctive markers in the
+    /// title and in the body must not appear in the file at rest.
+    #[tokio::test]
+    async fn paper_sidecar_is_ciphertext_at_rest() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        const TITLE_MARKER: &str = "atrest-title-marker";
+        const BODY_MARKER: &str = "atrest-body-marker";
+
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/create",
+            Some(&format!(r#"{{"title":"{TITLE_MARKER}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let body = format!(r#"{{"update":"{}"}}"#, yjs_update(BODY_MARKER));
+        let (status, upd) = request(&router, "POST", "/api/paper/c-1/update", Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{upd}");
+
+        // The sidecar is a vault file named exactly `papers.enc`, written
+        // atomically; find it under the account dir whatever the layout.
+        fn find_sidecar(root: &std::path::Path) -> Option<std::path::PathBuf> {
+            let mut out = None;
+            for entry in walkdir(root) {
+                if entry.file_name()?.to_string_lossy() == paper_store::STATE_FILE {
+                    out = Some(entry);
+                }
+            }
+            out
+        }
+        fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut all = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                let entries = match std::fs::read_dir(&d) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else {
+                        all.push(p);
+                    }
+                }
+            }
+            all
+        }
+
+        let sidecar = find_sidecar(dir.path()).expect("papers.enc exists after a create");
+        let raw = std::fs::read(&sidecar).expect("sidecar readable");
+        assert!(!raw.is_empty(), "sidecar is not empty");
+        assert!(
+            !windows_are_subslice(&raw, TITLE_MARKER.as_bytes()),
+            "title appears in plaintext on disk"
+        );
+        assert!(
+            !windows_are_subslice(&raw, BODY_MARKER.as_bytes()),
+            "body text appears in plaintext on disk"
+        );
+        // Sanity: the plaintext IS in the API's view, so the markers were real.
+        let (status, got) = request(&router, "GET", "/api/paper/c-1", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(got.to_string().contains(TITLE_MARKER));
+    }
+
+    /// A marker could straddle a buffer edge; sliding windows make the
+    /// substring check honest for any needle shorter than the file.
+    fn windows_are_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return false;
+        }
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // -----------------------------------------------------------------------
+    // The receiving half of the fan-out: what `recv` hands the daemon, and what
+    // `paper_apply_inbound` makes of it.
+    // -----------------------------------------------------------------------
+
+    /// A yrs update as bytes, which is how it travels the wire (the helper
+    /// above returns the base64 the HTTP API takes).
+    fn yjs_update_bytes(text: &str) -> Vec<u8> {
+        STANDARD.decode(yjs_update(text)).unwrap()
+    }
+
+    fn inbound_descriptor(paper_id: &str, conclave_id: &str, creator: &str) -> PaperDescriptor {
+        PaperDescriptor {
+            paper_id: paper_id.into(),
+            conclave_id: conclave_id.into(),
+            creator: creator.into(),
+            hub: creator.into(),
+            title: "Minutes".into(),
+            created_ms: 1_760_000_000_000,
+        }
+    }
+
+    /// Two trustees can each start the paper before either hears from the
+    /// other, and `create` cannot refuse a second paper it has never seen. The
+    /// collision is settled by the earlier `created_ms`, and the loser takes the
+    /// winner's identity while keeping its own document — one paper per
+    /// conclave, one hub, so the fast path has a rendezvous to dial.
+    ///
+    /// Without this the vault ends up with two entries for one conclave, each
+    /// naming its own hub, and neither side dials — while the deltas still
+    /// converge, because the fan-out is by conclave, so nothing looks wrong.
+    #[test]
+    fn a_create_collision_settles_on_the_earlier_paper() {
+        // Bob started his own paper second, and has an edit in it already.
+        let mut bob = paper_store::PapersState::default();
+        bob.create("c-1", "bb", "Minutes", 2_000).unwrap();
+        bob.apply_update("c-1", "bb", &yjs_update_bytes("bob's line"), 2_001)
+            .unwrap();
+        let bob_before = folded(&bob, "c-1");
+        let loser_id = bob.get("c-1").unwrap().descriptor.paper_id.clone();
+
+        // Alice's descriptor arrives: she started first, so hers wins.
+        let mut winner = inbound_descriptor("p-alice", "c-1", "aa");
+        winner.created_ms = 1_000;
+        assert!(
+            paper_apply_inbound(
+                &mut bob,
+                "aa",
+                &MessagePayload::PaperState { paper: winner.clone() },
+                2_002,
+            )
+            .unwrap(),
+            "adopting the winner's identity is a change"
+        );
+
+        assert_eq!(bob.papers.len(), 1, "one paper per conclave, not two");
+        let held = bob.get("c-1").unwrap();
+        assert_eq!(held.descriptor.paper_id, "p-alice", "the winner's id");
+        assert_eq!(held.descriptor.creator, "aa", "and the winner's creator");
+        assert_eq!(held.descriptor.hub, "aa", "and a hub this vault can dial");
+        assert_eq!(
+            folded(&bob, "c-1"),
+            bob_before,
+            "the loser keeps the document it already had"
+        );
+
+        // The same descriptor again is idempotent, and the old id resolves to
+        // nothing now — which is why the daemon re-announces the document.
+        assert!(!paper_apply_inbound(
+            &mut bob,
+            "aa",
+            &MessagePayload::PaperState { paper: winner },
+            2_003,
+        )
+        .unwrap());
+        assert_eq!(bob.conclave_of(&loser_id), None);
+    }
+
+    /// The other half of the rule: the vault that started first ignores the
+    /// later claim, so both sides converge on the same winner from the same two
+    /// descriptors without another round trip.
+    #[test]
+    fn the_later_create_loses_on_the_side_that_started_first() {
+        let mut alice = paper_store::PapersState::default();
+        alice.create("c-1", "aa", "Minutes", 1_000).unwrap();
+        let winner_id = alice.get("c-1").unwrap().descriptor.paper_id.clone();
+
+        let mut later = inbound_descriptor("p-bob", "c-1", "bb");
+        later.created_ms = 2_000;
+        assert!(
+            !paper_apply_inbound(
+                &mut alice,
+                "bb",
+                &MessagePayload::PaperState { paper: later },
+                2_001,
+            )
+            .unwrap(),
+            "the later create changes nothing here"
+        );
+
+        assert_eq!(alice.papers.len(), 1);
+        assert_eq!(alice.get("c-1").unwrap().descriptor.paper_id, winner_id);
+        assert_eq!(alice.get("c-1").unwrap().descriptor.hub, "aa");
+    }
+
+    /// Equal timestamps still have to pick one winner, and both sides have to
+    /// pick the same one, so the tie falls back to the id.
+    #[test]
+    fn a_create_collision_on_the_same_millisecond_still_picks_one_winner() {
+        let mut held = paper_store::PapersState::default();
+        held.create("c-1", "bb", "Minutes", 1_000).unwrap();
+        let mut mine = inbound_descriptor("p-zzz", "c-1", "aa");
+        mine.created_ms = 1_000;
+        // The vault's own id is a uuid, so make the comparison explicit: the
+        // smaller id wins, whichever side it is on.
+        let my_id = held.get("c-1").unwrap().descriptor.paper_id.clone();
+        let expect_move = "p-zzz" < my_id.as_str();
+
+        assert_eq!(
+            paper_apply_inbound(
+                &mut held,
+                "aa",
+                &MessagePayload::PaperState { paper: mine },
+                1_001,
+            )
+            .unwrap(),
+            expect_move
+        );
+        assert_eq!(held.papers.len(), 1);
+        assert_eq!(
+            held.get("c-1").unwrap().descriptor.paper_id,
+            if expect_move { "p-zzz" } else { my_id.as_str() }
+        );
+    }
+
+    /// The document as it stands in a sidecar.
+    fn folded(state: &paper_store::PapersState, conclave_id: &str) -> Vec<u8> {
+        let file = state.get(conclave_id).expect("paper exists");
+        let updates: Vec<Vec<u8>> = file.log.iter().map(|u| u.update.clone()).collect();
+        paper_doc::fold(&file.snapshot, &updates).unwrap()
+    }
+
+    /// The whole point of the fan-out: the creator's descriptor materialises the
+    /// paper on a peer, the deltas that follow merge into it, and both vaults
+    /// hold the same document.
+    #[test]
+    fn inbound_paper_payloads_converge_on_the_creators_document() {
+        let mut alice = paper_store::PapersState::default();
+        let paper_id = alice.create("c-1", "aa", "Minutes", 1).unwrap();
+        let descriptor = alice.get("c-1").unwrap().descriptor.clone();
+        let u1 = yjs_update_bytes("Phase 2 ");
+        let u2 = yjs_update_bytes("fan-out.");
+        alice.apply_update("c-1", "aa", &u1, 2).unwrap();
+        alice.apply_update("c-1", "aa", &u2, 3).unwrap();
+        let alice_state = folded(&alice, "c-1");
+
+        // Bob has never seen the paper at all.
+        let mut bob = paper_store::PapersState::default();
+        assert!(
+            paper_apply_inbound(
+                &mut bob,
+                "aa",
+                &MessagePayload::PaperState {
+                    paper: descriptor.clone()
+                },
+                4,
+            )
+            .unwrap(),
+            "the descriptor materialised the paper"
+        );
+        assert_eq!(
+            bob.get("c-1").unwrap().descriptor.creator,
+            "aa",
+            "the adopted paper keeps its creator"
+        );
+        for (n, update) in [u1, u2].into_iter().enumerate() {
+            assert!(
+                paper_apply_inbound(
+                    &mut bob,
+                    "aa",
+                    &MessagePayload::PaperDelta {
+                        paper_id: paper_id.clone(),
+                        update
+                    },
+                    5 + n as u64,
+                )
+                .unwrap()
+            );
+        }
+
+        assert_eq!(
+            folded(&bob, "c-1"),
+            alice_state,
+            "the peer converges on the creator's document"
+        );
+    }
+
+    /// Deltas arrive from the peer that made them, so the log records the
+    /// sender — the sender's own account id, never the local one.
+    #[test]
+    fn an_inbound_delta_is_recorded_against_its_sender() {
+        let mut bob = paper_store::PapersState::default();
+        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1).unwrap();
+        paper_apply_inbound(
+            &mut bob,
+            "aa",
+            &MessagePayload::PaperDelta {
+                paper_id: "p-1".into(),
+                update: yjs_update_bytes("from alice"),
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(bob.get("c-1").unwrap().log[0].origin, "aa");
+    }
+
+    /// A paper state naming someone else as its creator is refused: otherwise
+    /// any joined trustee could invent a paper in another trustee's name.
+    #[test]
+    fn a_paper_state_from_anyone_but_its_creator_is_refused() {
+        let mut bob = paper_store::PapersState::default();
+        let err = paper_apply_inbound(
+            &mut bob,
+            "cc",
+            &MessagePayload::PaperState {
+                paper: inbound_descriptor("p-1", "c-1", "aa"),
+            },
+            1,
+        );
+        assert!(err.is_err(), "cc may not create a paper credited to aa");
+        assert!(bob.papers.is_empty(), "nothing was materialised");
+    }
+
+    /// A delta for a paper this vault does not hold is refused rather than
+    /// materialising a paper with no descriptor.
+    #[test]
+    fn a_delta_for_an_unknown_paper_is_refused() {
+        let mut bob = paper_store::PapersState::default();
+        assert!(paper_apply_inbound(
+            &mut bob,
+            "aa",
+            &MessagePayload::PaperDelta {
+                paper_id: "p-nobody".into(),
+                update: vec![1, 2, 3],
+            },
+            1,
+        )
+        .is_err());
+        assert!(bob.papers.is_empty());
+    }
+
+    /// A snapshot **merges**, so a trustee's own unshared edits survive the
+    /// hub's catch-up. Replacing the snapshot instead would silently drop them.
+    #[test]
+    fn an_inbound_snapshot_merges_and_keeps_local_edits() {
+        let mut bob = paper_store::PapersState::default();
+        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1).unwrap();
+        let bob_local = yjs_update_bytes("bob's line");
+        bob.apply_update("c-1", "bb", &bob_local, 2).unwrap();
+
+        // The hub's full state, built without bob's edit.
+        let mut hub = paper_store::PapersState::default();
+        hub.create("c-1", "aa", "", 1).unwrap();
+        hub.apply_update("c-1", "aa", &yjs_update_bytes("alice's line"), 2)
+            .unwrap();
+        let hub_state = folded(&hub, "c-1");
+
+        assert!(paper_apply_inbound(
+            &mut bob,
+            "aa",
+            &MessagePayload::PaperSnapshot {
+                paper: inbound_descriptor("p-1", "c-1", "aa"),
+                state: hub_state.clone(),
+            },
+            3,
+        )
+        .unwrap());
+
+        let merged = folded(&bob, "c-1");
+        assert_ne!(
+            merged, hub_state,
+            "a snapshot that replaced would have dropped bob's line"
+        );
+        assert_eq!(
+            merged,
+            paper_doc::apply(&hub_state, &bob_local).unwrap(),
+            "the hub's state merged with the local edit, both changes kept"
+        );
+
+        // Idempotent: a re-sent snapshot is a no-op, like any CRDT update.
+        paper_apply_inbound(
+            &mut bob,
+            "aa",
+            &MessagePayload::PaperSnapshot {
+                paper: inbound_descriptor("p-1", "c-1", "aa"),
+                state: hub_state,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            folded(&bob, "c-1"),
+            merged,
+            "a re-sent snapshot changes nothing"
+        );
+    }
+
+    /// The peer that needs a snapshot is the one that joined after the paper
+    /// existed, so it never saw the `PaperState` fan-out and holds no record to
+    /// apply against. The snapshot has to materialise the paper itself, or the
+    /// hub's catch-up lands as "no paper in this vault" and is dropped.
+    #[test]
+    fn a_snapshot_from_the_creator_materialises_an_unknown_paper() {
+        let mut carol = paper_store::PapersState::default();
+        assert!(carol.papers.is_empty(), "carol starts with no paper at all");
+
+        let mut hub = paper_store::PapersState::default();
+        hub.create("c-1", "aa", "Minutes", 1).unwrap();
+        hub.apply_update("c-1", "aa", &yjs_update_bytes("alice's line"), 2)
+            .unwrap();
+        let hub_state = folded(&hub, "c-1");
+
+        assert!(paper_apply_inbound(
+            &mut carol,
+            "aa",
+            &MessagePayload::PaperSnapshot {
+                paper: inbound_descriptor("p-1", "c-1", "aa"),
+                state: hub_state.clone(),
+            },
+            3,
+        )
+        .unwrap());
+
+        assert_eq!(
+            folded(&carol, "c-1"),
+            hub_state,
+            "carol has the document the hub caught her up with"
+        );
+    }
+
+    /// The same authority rule `PaperState` enforces: a third party may not
+    /// introduce a paper credited to someone else, whether by state or by
+    /// snapshot.
+    #[test]
+    fn a_snapshot_credited_to_another_peer_is_refused() {
+        let mut bob = paper_store::PapersState::default();
+        let err = paper_apply_inbound(
+            &mut bob,
+            "cc",
+            &MessagePayload::PaperSnapshot {
+                paper: inbound_descriptor("p-1", "c-1", "aa"),
+                state: yjs_update_bytes("forged"),
+            },
+            1,
+        );
+        assert!(err.is_err(), "cc may not introduce a paper credited to aa");
+        assert!(bob.papers.is_empty(), "nothing was materialised");
+    }
+
+    /// A hub claim that moves the rendezvous is applied; presence is still
+    /// reserved and changes nothing. Neither is an error.
+    #[test]
+    fn a_hub_claim_moves_the_rendezvous_and_presence_changes_nothing() {
+        let mut bob = paper_store::PapersState::default();
+        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1).unwrap();
+        assert_eq!(bob.get("c-1").unwrap().descriptor.hub, "aa");
+
+        // Convener-authoritative succession, already checked in `recv`: the
+        // storage half just moves the hub.
+        assert!(
+            paper_apply_inbound(
+                &mut bob,
+                "cc",
+                &MessagePayload::PaperHub {
+                    paper: inbound_descriptor("p-1", "c-1", "cc"),
+                },
+                2,
+            )
+            .unwrap(),
+            "the rendezvous moved"
+        );
+        assert_eq!(bob.get("c-1").unwrap().descriptor.hub, "cc");
+        // The title is not the claim's to change.
+        assert_eq!(bob.get("c-1").unwrap().descriptor.title, "Minutes");
+
+        // The same claim twice is a no-op, and a claim about a paper this vault
+        // does not hold changes nothing — a hub is a rendezvous, not a way to
+        // conjure a paper.
+        assert!(
+            !paper_apply_inbound(
+                &mut bob,
+                "cc",
+                &MessagePayload::PaperHub {
+                    paper: inbound_descriptor("p-1", "c-1", "cc"),
+                },
+                3,
+            )
+            .unwrap()
+        );
+        assert!(
+            !paper_apply_inbound(
+                &mut bob,
+                "cc",
+                &MessagePayload::PaperHub {
+                    paper: inbound_descriptor("p-absent", "c-absent", "cc"),
+                },
+                4,
+            )
+            .unwrap()
+        );
+
+        // Presence is v1 DataChannel-only, so a relay copy is reserved, not
+        // unknown: accepted and ignored.
+        assert!(
+            !paper_apply_inbound(
+                &mut bob,
+                "aa",
+                &MessagePayload::PaperPresence {
+                    paper_id: "p-1".into(),
+                    peer: "aa".into(),
+                    state: vec![1],
+                },
+                5,
+            )
+            .unwrap()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The fast path as the daemon drives it (Task 6 Step 2): who is allowed to
+    // answer an offer, and what the drain loop does with what arrives on a
+    // channel. `paper_data`'s own tests cover the transport; these cover the
+    // wiring that puts it on a production path.
+    // -----------------------------------------------------------------------
+
+    async fn settle(ms: u64) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
+    /// The sidecar routes return `ApiError`, which has no `Debug` — it is never
+    /// logged by value in production — so `unwrap` cannot be used on them.
+    async fn sidecar(app: &Arc<App>) -> paper_store::PapersState {
+        match paper_sidecar(app).await {
+            Ok(parsed) => parsed,
+            Err((code, _)) => panic!("the sidecar was unreadable: {code}"),
+        }
+    }
+
+    async fn persist(app: &Arc<App>, parsed: &paper_store::PapersState) {
+        if let Err((code, _)) = paper_persist(app, parsed).await {
+            panic!("the sidecar could not be written: {code}");
+        }
+    }
+
+    /// This vault's own account id.
+    async fn me(app: &Arc<App>) -> String {
+        match paper_account_id(app).await {
+            Ok(id) => id,
+            Err((code, _)) => panic!("no account id: {code}"),
+        }
+    }
+
+    /// Join a dialer to a hub the way the star joins them: the dialer offers,
+    /// the hub answers, the dialer takes the answer. Polls rather than sleeping
+    /// a fixed amount, so the test is not timing-fragile.
+    async fn connected_pair(
+        hub: &Arc<paper_data::DataPlane>,
+        hub_peer: &str,
+        dialer_peer: &str,
+    ) -> Arc<paper_data::DataPlane> {
+        let dialer = Arc::new(paper_data::DataPlane::new(None));
+        let offer = dialer.offer(hub_peer).await.unwrap();
+        let answer = hub.answer(dialer_peer, &offer).await.unwrap();
+        dialer.accept_answer(hub_peer, &answer).await.unwrap();
+        for _ in 0..200 {
+            if hub.peers().iter().any(|p| p == dialer_peer)
+                && dialer.peers().iter().any(|p| p == hub_peer)
+            {
+                return dialer;
+            }
+            settle(5).await;
+        }
+        panic!("the pair never came up");
+    }
+
+    /// A daemon that is not the paper's hub must not hold a channel for it.
+    ///
+    /// This is the descriptor's authority applied to the transport rather than
+    /// the text, and it is the same rule `PaperState` is checked against: only
+    /// the daemon the paper names as its hub answers.
+    #[tokio::test]
+    async fn only_the_papers_hub_answers_an_offer() {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+
+        let mut parsed = paper_store::PapersState::default();
+        let paper_id = parsed.create("c-1", "someone-else", "Minutes", 1).unwrap();
+        persist(&app, &parsed).await;
+
+        let offerer = paper_data::DataPlane::new(None);
+        let sdp = offerer.offer("hub").await.unwrap();
+        let offer = MessagePayload::PaperOffer {
+            paper_id: paper_id.clone(),
+            sdp,
+        };
+        assert!(
+            paper_handle_signal(&app, "bb", &offer).await,
+            "signalling is consumed here and never reaches the document path"
+        );
+        assert!(
+            paper_open_plane(&app, "c-1").await.is_none(),
+            "a daemon that is not the hub holds no channel for the paper"
+        );
+    }
+
+    /// The hub takes the connection — and drops it when the answer cannot be
+    /// addressed, which is how a non-trustee's offer leaves nothing behind.
+    #[tokio::test]
+    async fn the_hub_drops_a_channel_it_cannot_answer() {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+
+        // Created here, so this vault *is* the hub. The descriptor's hub is the
+        // creator, and it has to be this vault's real account id for the
+        // authority check to pass.
+        let mut parsed = paper_store::PapersState::default();
+        let paper_id = parsed.create("c-1", &me(&app).await, "Minutes", 1).unwrap();
+        persist(&app, &parsed).await;
+
+        let offerer = paper_data::DataPlane::new(None);
+        let sdp = offerer.offer("hub").await.unwrap();
+        let offer = MessagePayload::PaperOffer {
+            paper_id: paper_id.clone(),
+            sdp,
+        };
+        assert!(paper_handle_signal(&app, "bb", &offer).await);
+
+        let plane = paper_open_plane(&app, "c-1")
+            .await
+            .expect("the hub takes the connection");
+        // "bb" is no trustee of any conclave in this vault, so the addressed
+        // answer is refused. Without the `forget`, the channel would still come
+        // up a moment later and the peer would be on the star for good.
+        settle(300).await;
+        assert!(
+            plane.peers().is_empty(),
+            "a peer the answer could not be addressed to never becomes live"
+        );
+    }
+
+    /// The re-broadcast, which is the whole reason the drain loop exists.
+    ///
+    /// The relay fan-out is a full mesh, but the channels are a star: an update
+    /// that reached the hub over one channel would reach the other trustees at
+    /// relay speed without this, which is exactly the thing the fast path is
+    /// for. The relay is not part of this test, so the second trustee can only
+    /// learn about the edit by the hub forwarding it.
+    #[tokio::test]
+    async fn the_drain_loop_applies_a_channel_update_and_re_broadcasts_it() {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        let router = api_router(app.clone());
+
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/create",
+            Some(r#"{"title":"Minutes"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["revision"], 0);
+
+        // The hub's plane, with two trustees on it: the star this test is
+        // about. `paper_handle_signal` would have made the same plane.
+        let hub = paper_plane(&app, "c-1").await;
+        let t1 = connected_pair(&hub, "hub", "t1").await;
+        let t2 = connected_pair(&hub, "hub", "t2").await;
+        assert_eq!(hub.peers().len(), 2, "both trustees are on the star");
+
+        // A trustee edits. It reaches the hub over one channel and nobody else.
+        let edit = yjs_update_bytes("star.");
+        assert_eq!(t1.send("hub", &edit).await, paper_data::Sent::Live);
+
+        // The loop is what closes the gap, so poll it the way the daemon does.
+        let mut applied = false;
+        for _ in 0..200 {
+            paper_drain_once(&app).await;
+            let parsed = sidecar(&app).await;
+            if parsed.get("c-1").map(|f| f.next_rev).unwrap_or(0) > 1 {
+                applied = true;
+                break;
+            }
+            settle(5).await;
+        }
+        assert!(applied, "the hub applied the update it received on a channel");
+
+        let mut forwarded = false;
+        for _ in 0..200 {
+            if t2.drain().iter().any(|i| {
+                matches!(&i.frame, paper_data::InboundFrame::Update(bytes) if bytes == &edit)
+            }) {
+                forwarded = true;
+                break;
+            }
+            settle(5).await;
+        }
+        assert!(
+            forwarded,
+            "the hub re-broadcast the update to the other trustee"
+        );
+
+        // And the hub's own copy is the merged document, not the raw bytes.
+        let parsed = sidecar(&app).await;
+        assert_eq!(parsed.get("c-1").unwrap().log.len(), 1);
+        assert!(!folded(&parsed, "c-1").is_empty());
+    }
+
+    /// An ended conclave's paper is read-only, locally as well as on the wire.
+    ///
+    /// The core already refuses the fan-out, so accepting the edit here would
+    /// only diverge this vault's copy from every other peer's.
+    #[tokio::test]
+    async fn an_ended_conclave_paper_refuses_writes() {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        let router = api_router(app.clone());
+
+        // A conclave needs at least one other trustee, so the vault needs a
+        // contact first — the roster is what "ended" is read from.
+        let peer_dir = TempDir::new().unwrap();
+        let mut peer = hush_core::Account::create(peer_dir.path(), "pw", "http://127.0.0.1:9")
+            .await
+            .unwrap();
+        let invite = peer.invite().await.unwrap();
+        assert!(matches!(
+            app.worker.add_contact("peer", &invite).await,
+            WorkResult::Ok
+        ));
+
+        // Creating a conclave also sends the invite, and this vault's relay is a
+        // dead address on purpose — no test here reaches the network. The send
+        // fails *after* the record is made, which is all this test needs:
+        // "ended" is read from the roster, not from an invite.
+        let _ = app
+            .worker
+            .create_conclave("Trip", vec!["peer".into()])
+            .await;
+        let conclave_id = match app.worker.conclaves().await {
+            WorkResult::Conclaves(list) if !list.is_empty() => list[0].id.clone(),
+            _ => panic!("the conclave record was not created"),
+        };
+        let (status, created) = request(
+            &router,
+            "POST",
+            &format!("/api/paper/{conclave_id}/create"),
+            Some(r#"{"title":"Minutes"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+
+        // Editable while the conclave is live...
+        let body = format!(r#"{{"update":"{}"}}"#, yjs_update("live"));
+        let (status, _) = request(
+            &router,
+            "POST",
+            &format!("/api/paper/{conclave_id}/update"),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // ...and not once it has ended.
+        assert!(matches!(
+            app.worker.end_conclave(&conclave_id).await,
+            WorkResult::Ok
+        ));
+        let (status, refused) = request(
+            &router,
+            "POST",
+            &format!("/api/paper/{conclave_id}/update"),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("ended"),
+            "the refusal says why: {refused}"
+        );
+
+        // The document is still readable — read-only, not gone.
+        let (status, got) = request(&router, "GET", &format!("/api/paper/{conclave_id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+        assert_eq!(got["revision"], 1);
+
+        // A second paper cannot be started in an ended conclave either.
+        let (status, _) = request(
+            &router,
+            "POST",
+            &format!("/api/paper/{conclave_id}/create"),
+            Some(r#"{"title":"Another"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// The re-home route is mounted and refuses what it should.
+    ///
+    /// The authority itself is the core's, and is tested there
+    /// (`conclaves.rs`); what is pinned here is the route's shape — the 404 and
+    /// 400 boundaries, that a refusal leaves the hub where it was, and that the
+    /// badge field is always present rather than omitted when there is no plane.
+    #[tokio::test]
+    async fn the_rehome_route_refuses_before_it_moves_anything() {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        let router = api_router(app.clone());
+
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/hub/rehome",
+            Some(r#"{"hub":"zz"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no paper here yet");
+
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/create",
+            Some(r#"{"title":"Minutes"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["fast_path"]["path"], "relay");
+        assert_eq!(created["fast_path"]["live_peers"], 0);
+
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/hub/rehome",
+            Some(r#"{"hub":"   "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "nobody to move to");
+
+        // This vault is in no conclave, so the core refuses the send.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/paper/c-1/hub/rehome",
+            Some(r#"{"hub":"zz"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (_, got) = request(&router, "GET", "/api/paper/c-1", None).await;
+        assert_eq!(
+            got["paper"]["hub"], created["paper"]["hub"],
+            "a refused re-home leaves the hub where it was"
+        );
+    }
+
+    /// Locking the vault takes the fast path with it.
+    ///
+    /// A plane is a live socket whose state came out of the vault, so a locked
+    /// vault must not keep one. Both sides fall back to the relay with no user
+    /// action, which is why nothing here has to be recovered on unlock.
+    #[tokio::test]
+    async fn locking_the_vault_closes_the_paper_planes() {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        let router = api_router(app.clone());
+
+        let hub = paper_plane(&app, "c-1").await;
+        let _t1 = connected_pair(&hub, "hub", "t1").await;
+        assert_eq!(hub.peers().len(), 1, "the channel is up before the lock");
+
+        let (status, _) = request(&router, "POST", "/api/lock", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert!(
+            app.paper_planes.lock().await.is_empty(),
+            "the registry is emptied so the next open dials afresh"
+        );
+        assert!(hub.peers().is_empty(), "the channel is closed");
     }
 }

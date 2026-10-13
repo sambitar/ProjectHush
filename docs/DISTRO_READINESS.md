@@ -55,6 +55,7 @@ When implementing any milestone task, follow these rules. If a task conflicts, *
 - Outbound traffic through **one relay client** with a configurable endpoint list (OS can force firewall or Tor later).
 - **HTTPS required** for non-loopback relay URLs in release builds (Task 5c.4).
 - No telemetry, analytics, or update pings except the **signed updater** path.
+- **The Paper DataChannel is a second, direct egress path** (added 2026-10-12). A conclave's shared document opens a pure-Rust WebRTC `DataChannel` (SCTP over UDP) straight to the paper's hub, so a hardened sandbox must allow UDP/SCTP egress for it and must not assume the relay is the only socket the daemon holds. STUN is configured in exactly one place (`ClientConfig::stun_url`, the `client-config.json` surface — no second config system) and has **no default**, because a public STUN server would learn the address of every peer that opens a paper. There is **no TURN**: a peer behind symmetric NAT falls back to relay cadence rather than opening a relay-side data path. **No new devices:** the channel is a userspace UDP socket, not a capture or render device, so `PrivateDevices` stays.
 
 ### Updates and signing
 
@@ -65,7 +66,7 @@ When implementing any milestone task, follow these rules. If a task conflicts, *
 ### Packaging
 
 - Clean `cargo build --release --locked` per binary; no runtime downloads.
-- Minimal audited deps (`cargo-deny`, `cargo-audit` in CI).
+- Minimal audited deps (`cargo-deny`, `cargo-audit` in CI). The Paper feature (2026-10-12) added two: **`yrs`** (CRDT, pure computation, no network or I/O) and **`webrtc-rs`** (pure-Rust WebRTC — userspace UDP sockets only, no native `libwebrtc` and no new device access). Both belong in the `cargo-deny` / `cargo-audit` scope, and `webrtc-rs`'s UDP use is the SCTP egress the sandbox must permit above.
 - Flatpak/deb later: no hard-coded absolute paths; config via env + config file under data root.
 
 ### Keys, TPM, and Confidential (Task 10)

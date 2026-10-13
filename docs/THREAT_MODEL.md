@@ -60,10 +60,54 @@ publisher's signature against the account id, not a device-list lookup.
 - **Payment processor:** name/email/money. The messenger identity is not the Stripe customer ID.
 - **Update server:** can offer bytes; the app installs only if they verify the baked-in public key.
 
+## Paper (a conclave's shared document)
+
+One encrypted collaborative document per conclave, added 2026-10-12. The surface it adds:
+
+| New surface | What it may see | Rule |
+|---|---|---|
+| Relay | Same as today: ciphertext, size, time, queue id, IP. Paper adds **more, smaller, more frequent blobs** while a paper is open | **No change** to what is visible; the *timing* signal is richer — accepted, same as any live feature; padding is out of scope |
+| STUN server | Querying IP + port | Self-hosted, configured only via `ClientConfig::stun_url` and with **no default**. **No TURN** — a peer behind symmetric NAT simply falls back to relay cadence |
+| Hub daemon | Each peer's IP (ICE), and doc updates (it merges and re-fans-out) | **Accepted** — trustees are mutually trusted; the hub sees no more plaintext than any trustee already holds in their own vault |
+| DataChannel peers | Each other's IP | Same accepted limit as calls, stated in copy |
+| Doc bytes at rest | Nothing in plaintext | `papers.enc` is sealed under the vault master key; locked vault = unreadable; the editor runs from local assets only |
+| Persistence | The document **persists in every vault by design**, like conclave messages. Deleting is local, per vault | Copy states this plainly — Paper is not "leaves nothing behind" like a call; it is "stays in the trustees' vaults" |
+
+**Honest limits for user-facing copy:** collaboration reveals IPs to trustees; the relay learns *that*
+(and roughly when) a conclave is editing, though never what; a kicked trustee keeps the last copy of
+the paper their vault already held, exactly as they keep conclave messages.
+
+## Zines (members-only long-form, added 2026-10-12)
+
+Every member's blog of articles with a comments section, readable by **all members** (not only
+contacts), added 2026-10-12. It is the **first new relay ability since the founding constraint**, so
+it is stated in full. Full design: [`docs/tasks/zines.md`](tasks/zines.md) (Task **21**).
+
+| New surface | What it may see | Rule |
+|---|---|---|
+| Relay bulletin | Opaque blob sizes, count, times; **not** which member published which blob in storage | Accepted — the lane is a flat log with **no author column** |
+| Publish linkability | At publish the relay **must** authorize, so it transiently learns **which member published a zine blob** | **Accepted and documented** — narrower than what the operator already knows (payment identity). Drains reveal no readership (every member drains the whole lane). An optional Tor-path publish is the later fix |
+| Re-post linkability | A re-post tells the relay a member **holds** that zine | **Accepted** — in a converging commons (everyone holds everything) this is near-zero signal; it is the price of author-independent availability |
+| Read keys | Held in `zines.enc` at rest; a grant gives **permanent** read of that zine | **No revocation**, like a kicked trustee keeping conclave messages; rotation is later |
+| Comments | An opaque blob; only the pen name can open it | Accepted; a commenter's slot is linkable to the publish, same as an article |
+| Corpus size | Every member downloads every blob | Bandwidth, not privacy; text-only keeps totals in low MBs; the per-member rate limit is the throttle |
+| At rest | Nothing in plaintext | `zines.enc` sealed under the vault master key; locked vault = unreadable; the editor runs from local assets only |
+
+**Rejected surfaces, recorded so they are not re-proposed:** a **public IPFS/DHT** layer (announces
+your IP *and* your interest in that exact content to the swarm — a direct break of "the relay cannot
+learn who reads what"); a **private swarm in v1** (a second network stack for a text-only feature);
+a **relay-side category registry** (a relay directory, which the founding constraint forbids —
+sections live inside the encrypted article instead).
+
+**Honest limits for user-facing copy:** publishing reveals your member slot to the relay operator
+(not to other members); a zine you hold can be seen to be held if someone re-posts it; read access,
+once granted, is not revocable; and every member holds a copy of what they have received — zines are
+not "leaves nothing behind."
+
 ## Implications already decided
 
 - No phone/email directory, no global username search.
-- No DHT or other public discovery layer. A Tox-style DHT publishes each identity so peers can find it, which makes the social graph queryable by anyone; discovery stays invite-only.
+- No DHT or other public discovery layer. A Tox-style DHT publishes each identity so peers can find it, which makes the social graph queryable by anyone; discovery stays invite-only. (This is also why **zines** use a relay bulletin and not a public IPFS/DHT — see above.)
 - Add-by QR/invite.
 - Report-a-slot, not content scanning.
 - Unpaid users keep the local vault.

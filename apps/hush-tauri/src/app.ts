@@ -188,6 +188,15 @@ import {
   type Conclave,
 } from "./lib/conclaveStore";
 import {
+  attachEditor,
+  closePaper,
+  createPaper,
+  flushPaperEdits,
+  openPaper,
+  paperHasFocus,
+  paperSession,
+} from "./lib/paperStore";
+import {
   dropById,
   verifiedCount,
   visibleDrops,
@@ -623,6 +632,20 @@ export class App {
    * background re-render cannot lose it.
    */
   private conclaveId: string | null = null;
+  /**
+   * Which surface of the conclave detail is showing: the chat or the shared
+   * Paper. Reset to chat whenever the selection changes.
+   */
+  private conclaveTab: "chat" | "paper" = "chat";
+  /**
+   * The stable host element for the Paper editor.
+   *
+   * render() rebuilds the pane from scratch on every pass, but the
+   * ProseMirror view is built once per paper session and re-parented into the
+   * fresh pane, so the caret, focus and undo history survive re-renders (the
+   * same doctrine as the reader pane's stable DOM).
+   */
+  private paperHost: HTMLElement | null = null;
   private conclaveCreateOpen = false;
   /**
    * The in-progress create-conclave form.
@@ -1205,7 +1228,9 @@ export class App {
       }
       // Never repaint over a half-written message, or over a modal that owns
       // text the user is part-way through: a repaint rebuilds the modal from
-      // stored state and resets the fields being typed into.
+      // stored state and resets the fields being typed into. The Paper editor
+      // counts too: while its surface holds the caret, background traffic
+      // (presence flips, other chats) must not detach it and steal focus.
       const editing =
         this.mailComposeOpen ||
         this.conclaveCreateOpen ||
@@ -1213,7 +1238,8 @@ export class App {
         this.addFriendOpen ||
         this.readsAddOpen ||
         this.profileNick !== null ||
-        this.trustDeleteNick !== null;
+        this.trustDeleteNick !== null ||
+        (this.conclaveTab === "paper" && paperHasFocus());
       if (
         (r.messages.length || presenceChanged || mailboxChanged || conclavesChanged) &&
         !editing
@@ -1226,10 +1252,19 @@ export class App {
   }
 
   private async lock(): Promise<void> {
+    // Flush the paper while the vault is still open. Every paper route answers
+    // 401 once it is locked, and the editor's doc dies with the session below,
+    // so an edit still inside its flush window would otherwise be lost.
+    flushPaperEdits();
     await api.lock();
     clearChatStore();
     clearMailStore();
     clearConclaveStore();
+    // The paper's editor doc and its sync loop die with the session; the
+    // merged state survives only inside the vault's encrypted sidecar.
+    closePaper();
+    this.paperHost = null;
+    this.conclaveTab = "chat";
     clearReadsStore();
     clearNotesStore();
     clearTorrentsStore();
@@ -1572,7 +1607,13 @@ export class App {
       b.appendChild(dot);
     }
     b.onclick = () => {
+      const wasConclaves = this.rail === "conclaves";
       this.rail = id;
+      if (wasConclaves && id !== "conclaves") {
+        // Leaving the rail closes the paper: one session at a time, and the
+        // pending edits flush before the timers stop.
+        this.leavePaperTab();
+      }
       this.render();
       // The Mail rail reads the encrypted log, so pick up anything that landed
       // while another rail was showing.
@@ -2978,6 +3019,10 @@ export class App {
     card.appendChild(preview);
 
     card.onclick = () => {
+      if (this.conclaveId !== m.id) {
+        // A different conclave's paper must never bleed into this one's tab.
+        this.leavePaperTab();
+      }
       this.conclaveId = m.id;
       this.render();
     };
@@ -3256,8 +3301,145 @@ export class App {
     composer.appendChild(inner);
     syncSend();
 
-    pane.append(header, members, scroll, composer);
+    // Chat and Paper are the two surfaces of the same meeting; the pill swaps
+    // between them without touching the header or the members row.
+    const tabs = this.renderConclaveTabs();
+    if (this.conclaveTab === "paper") {
+      pane.append(header, members, tabs, this.renderPaperSurface(conclave.id, me));
+      return pane;
+    }
+    pane.append(header, members, tabs, scroll, composer);
     return pane;
+  }
+
+  /** Leave the Paper surface: drop the editor, its sync loop and the host.
+   *  Called on conclave switch, rail switch, and vault lock. */
+  private leavePaperTab(): void {
+    closePaper();
+    this.paperHost = null;
+    this.conclaveTab = "chat";
+  }
+
+  /** The Chat | Paper pill for the conclave detail. */
+  private renderConclaveTabs(): HTMLElement {
+    const tabs = document.createElement("div");
+    tabs.className = "segmented conclave-tabs";
+    tabs.setAttribute("role", "tablist");
+    tabs.setAttribute("aria-label", "Conclave surfaces");
+    for (const t of ["chat", "paper"] as const) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      b.textContent = t === "chat" ? "Chat" : "Paper";
+      const active = this.conclaveTab === t;
+      b.classList.toggle("active", active);
+      b.setAttribute("aria-selected", String(active));
+      b.onclick = () => {
+        if (this.conclaveTab === t) return;
+        if (t === "chat") {
+          // Leaving the paper flushes its pending edits and stops the timers.
+          closePaper();
+          this.paperHost = null;
+          this.conclaveTab = "chat";
+        } else {
+          this.conclaveTab = "paper";
+        }
+        this.render();
+      };
+      tabs.appendChild(b);
+    }
+    return tabs;
+  }
+
+  /**
+   * The Paper surface: the editor host, or the affordances around it.
+   *
+   * The host element is built once per paper session and re-parented on
+   * re-renders; only the loading and start states are rebuilt.
+   */
+  private renderPaperSurface(conclaveId: string, me: string): HTMLElement {
+    const s = paperSession();
+    if (!s || s.conclaveId !== conclaveId) {
+      // (Re)entering the tab: open the paper. Until it resolves the surface
+      // shows a quiet placeholder, then one re-render swaps in the editor.
+      const loading = document.createElement("div");
+      loading.className = "paper-pane paper-pane-loading muted text-13";
+      loading.textContent = "Opening paper…";
+      void openPaper(conclaveId)
+        .then(() => {
+          if (this.conclaveTab === "paper" && this.conclaveId === conclaveId) {
+            this.render();
+          }
+        })
+        .catch((e) => {
+          if (this.conclaveTab !== "paper" || this.conclaveId !== conclaveId) return;
+          loading.textContent =
+            e instanceof AppError ? e.message : "Couldn't open the paper.";
+        });
+      return loading;
+    }
+    if (this.paperHost) return this.paperHost;
+    const host = document.createElement("div");
+    host.className = "paper-pane";
+    if (!s.exists) {
+      // One paper per conclave; the first trustee to start it wins, and the
+      // title is just a label everyone sees.
+      const start = document.createElement("div");
+      start.className = "paper-start";
+      const h = document.createElement("h2");
+      h.className = "text-17";
+      h.textContent = "No paper yet";
+      const p = document.createElement("p");
+      p.className = "muted text-13";
+      p.textContent =
+        "Start a shared page of notes for this conclave. Every trustee can edit it, and it is stored encrypted in each vault.";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn-secondary pressable";
+      btn.textContent = "Start paper";
+      btn.onclick = () => {
+        btn.disabled = true;
+        void createPaper(conclaveId, `${conclaveById(conclaveId)?.name ?? "Conclave"} paper`)
+          .then(() => {
+            this.paperHost = null;
+            if (this.conclaveTab === "paper") this.render();
+          })
+          .catch((e) => {
+            btn.disabled = false;
+            this.announce(
+              e instanceof AppError ? e.message : "Couldn't start the paper.",
+            );
+          });
+      };
+      start.append(h, p, btn);
+      host.appendChild(start);
+      this.paperHost = host;
+      return host;
+    }
+    try {
+      const conclave = conclaveById(conclaveId);
+      const mine = conclave?.trustees.find((t) => t.accountId === me);
+      // An ended conclave is read-only on every peer, and so is one this vault
+      // is no longer a joined trustee of (kicked, or an invitation never
+      // accepted): the daemon refuses the write and the relay refuses the
+      // fan-out behind it, so the surface must not invite an edit.
+      const readOnly = !!conclave && (conclave.ended || mine?.state !== "joined");
+      attachEditor(s, host, me, readOnly);
+    } catch (e) {
+      // render() clears the root before it rebuilds, so a throw here would
+      // abort the whole paint and leave a blank window. The editor is the one
+      // part of the shell that mounts a third-party view, so it fails into a
+      // visible pane the user can leave, not into nothing.
+      console.error("paper editor failed to mount", e);
+      this.paperHost = null;
+      const failed = document.createElement("div");
+      failed.className = "paper-pane paper-pane-error muted text-13";
+      failed.textContent =
+        "The paper editor couldn't open. Switch tabs and try again.";
+      return failed;
+    }
+    this.paperHost = host;
+    return host;
   }
 
   private openConclaveCreate(): void {
@@ -3507,7 +3689,10 @@ export class App {
   private async leaveConclave(conclaveId: string): Promise<void> {
     try {
       await api.leaveConclave(conclaveId);
-      if (this.conclaveId === conclaveId) this.conclaveId = null;
+      if (this.conclaveId === conclaveId) {
+        this.leavePaperTab();
+        this.conclaveId = null;
+      }
       await this.reloadConclaves();
       this.render();
     } catch (e) {
@@ -3521,7 +3706,10 @@ export class App {
     try {
       const joined = await api.acceptConclaveInvite(conclaveId);
       await this.reloadConclaves();
-      if (joined) this.conclaveId = joined.id;
+      if (joined) {
+        this.leavePaperTab();
+        this.conclaveId = joined.id;
+      }
       this.announce("Invite accepted.");
       this.render();
     } catch (e) {
@@ -3837,7 +4025,10 @@ export class App {
     try {
       await api.deleteConclave(id);
       this.closeConclaveDelete();
-      if (this.conclaveId === id) this.conclaveId = null;
+      if (this.conclaveId === id) {
+        this.leavePaperTab();
+        this.conclaveId = null;
+      }
       await this.reloadConclaves();
       this.announce("Conclave deleted. Files it shared stay in your vault.");
       this.render();

@@ -594,3 +594,384 @@ async fn a_conclave_needs_a_name_and_known_contacts() {
     );
     assert!(alice.conclaves().is_empty(), "nothing was written");
 }
+
+// ---------------------------------------------------------------------------
+// Paper — the conclave's shared collaborative document (Task 19).
+//
+// The document itself is a CRDT owned by each trustee's daemon; hush-core's
+// job is transport: fan the descriptor and the opaque updates out to the
+// joined trustees, and surface what arrives. A paper payload is not a chat
+// message, so it must never enter the conclave's message log — the local
+// document lives in the daemon's paper sidecar instead.
+// ---------------------------------------------------------------------------
+
+fn paper_for(conclave_id: &str, creator: &str) -> hush_core::PaperDescriptor {
+    hush_core::PaperDescriptor {
+        paper_id: "p-1".into(),
+        conclave_id: conclave_id.into(),
+        creator: creator.into(),
+        hub: creator.into(),
+        title: "Minutes".into(),
+        created_ms: 1_760_000_000_000,
+    }
+}
+
+/// The descriptor and every later update reach each joined trustee, bytes
+/// intact. A yrs update is binary, so it is carried as bytes and not as text.
+#[tokio::test]
+async fn a_paper_descriptor_and_its_deltas_reach_every_joined_trustee() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let carol_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+    let mut carol = Account::create(carol_dir.path(), "carol-pass", &relay)
+        .await
+        .unwrap();
+    let carol_invite = carol.invite().await.unwrap();
+    alice.add_contact("carol", &carol_invite).await.unwrap();
+    carol.add_contact("alice", &alice.invite().await.unwrap()).await.unwrap();
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string(), "carol".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    carol.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    carol.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+    assert_eq!(alice.conclaves()[0].joined().count(), 3, "all three joined");
+
+    let alice_id = alice.protocol_name().to_string();
+    let descriptor = paper_for(&conclave.id, &alice_id);
+    let update = vec![0u8, 1, 2, 255, 0];
+
+    alice
+        .send_conclave_paper_state(&conclave.id, descriptor.clone())
+        .await
+        .unwrap();
+    alice
+        .send_conclave_paper_delta(&conclave.id, &descriptor.paper_id, &update)
+        .await
+        .unwrap();
+
+    for (who, inbox) in [("bob", bob.recv().await.unwrap()), ("carol", carol.recv().await.unwrap())]
+    {
+        assert_eq!(inbox.papers.len(), 2, "{who} gets the descriptor then the delta");
+        assert_eq!(inbox.papers[0].from_nick, "alice");
+        assert_eq!(inbox.papers[0].from_account, alice_id, "{who} sees the author");
+        match &inbox.papers[0].payload {
+            MessagePayload::PaperState { paper } => assert_eq!(paper, &descriptor),
+            other => panic!("{who} expected a paper state, got {other:?}"),
+        }
+        match &inbox.papers[1].payload {
+            MessagePayload::PaperDelta { paper_id, update: got } => {
+                assert_eq!(paper_id, &descriptor.paper_id);
+                assert_eq!(got, &update, "{who} gets the update bytes intact");
+            }
+            other => panic!("{who} expected a paper delta, got {other:?}"),
+        }
+        assert!(
+            inbox.messages.is_empty(),
+            "{who}: a paper payload is not a chat message"
+        );
+    }
+    assert!(
+        bob.conclaves()[0].messages.is_empty(),
+        "the document does not enter the message log"
+    );
+}
+
+/// A paper payload in an ended conclave is refused, exactly like a message:
+/// `ConclaveEnd` makes the paper read-only on every peer.
+#[tokio::test]
+async fn paper_payloads_are_refused_once_the_conclave_has_ended() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    let descriptor = paper_for(&conclave.id, alice.protocol_name());
+    alice
+        .send_conclave_paper_state(&conclave.id, descriptor.clone())
+        .await
+        .unwrap();
+
+    alice.leave_conclave(&conclave.id).await.unwrap();
+    assert!(alice.conclaves()[0].ended);
+
+    assert!(matches!(
+        alice
+            .send_conclave_paper_delta(&conclave.id, &descriptor.paper_id, &[1, 2, 3])
+            .await,
+        Err(Error::ConclaveEnded)
+    ));
+    assert!(matches!(
+        alice
+            .send_conclave_paper_snapshot(&conclave.id, descriptor.clone(), &[1, 2, 3])
+            .await,
+        Err(Error::ConclaveEnded)
+    ));
+    // The end reaches the trustee, which refuses to send too.
+    bob.recv().await.unwrap();
+    assert!(bob.conclaves()[0].ended);
+    assert!(matches!(
+        bob.send_conclave_paper_delta(&conclave.id, &descriptor.paper_id, &[1, 2, 3])
+            .await,
+        Err(Error::ConclaveEnded)
+    ));
+}
+
+/// A vault that has no such conclave cannot send into it — the same boundary
+/// `send_conclave_message` enforces.
+#[tokio::test]
+async fn a_paper_payload_cannot_be_sent_into_an_unknown_conclave() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let (mut alice, _bob) = two_contacts(
+        &relay,
+        &alice_dir,
+        &TempDir::new().unwrap(),
+    )
+    .await;
+
+    let descriptor = paper_for("c-nobody", alice.protocol_name());
+    assert!(matches!(
+        alice
+            .send_conclave_paper_state("c-nobody", descriptor.clone())
+            .await,
+        Err(Error::ConclaveNotFound)
+    ));
+    assert!(matches!(
+        alice
+            .send_conclave_paper_delta("c-nobody", &descriptor.paper_id, &[1])
+            .await,
+        Err(Error::ConclaveNotFound)
+    ));
+}
+
+/// Hub succession is the convener's word and nobody else's.
+///
+/// The rule is enforced in `recv`, where the conclave record is in hand, so a
+/// claim that is not authoritative is dropped before the daemon ever sees it —
+/// there is no second copy of the roster for it to be judged against.
+#[tokio::test]
+async fn only_the_convener_may_re_home_a_paper() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    let alice_id = alice.protocol_name().to_string();
+    let bob_id = bob.protocol_name().to_string();
+
+    // Bob is a joined trustee, so he can put a payload on the wire — which is
+    // exactly what a peer running a modified client would do. He is not the
+    // convener, so Alice must ignore the claim entirely.
+    let mut claim = paper_for(&conclave.id, &alice_id);
+    claim.hub = bob_id.clone();
+    bob.send_paper_signal(
+        &conclave.id,
+        &alice_id,
+        MessagePayload::PaperHub { paper: claim },
+    )
+    .await
+    .unwrap();
+    let inbox = alice.recv().await.unwrap();
+    assert!(
+        inbox.papers.is_empty(),
+        "a re-home from a trustee who is not the convener is dropped"
+    );
+
+    // The convener's claim is the one that settles it.
+    let mut claim = paper_for(&conclave.id, &alice_id);
+    claim.hub = bob_id.clone();
+    alice
+        .send_conclave_paper_hub(&conclave.id, claim.clone())
+        .await
+        .unwrap();
+    let inbox = bob.recv().await.unwrap();
+    assert_eq!(inbox.papers.len(), 1, "the convener's re-home is delivered");
+    match &inbox.papers[0].payload {
+        MessagePayload::PaperHub { paper } => assert_eq!(paper, &claim),
+        other => panic!("expected a hub claim, got {other:?}"),
+    }
+}
+
+/// The default succession rule: a paper whose hub leaves is inherited by the
+/// conclave's convener, and by nobody else.
+///
+/// This is what runs on a kick or a leave with no user action: `recv` reports
+/// the departure, the daemon asks the core to inherit, and only the convener
+/// comes back with a descriptor to apply.
+#[tokio::test]
+async fn the_convener_inherits_a_paper_whose_hub_left() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    let alice_id = alice.protocol_name().to_string();
+    let bob_id = bob.protocol_name().to_string();
+    let mut paper = paper_for(&conclave.id, &alice_id);
+    paper.hub = bob_id.clone();
+
+    // Bob is a joined trustee but not the convener, so the departure is not his
+    // to act on: he inherits nothing and says so by returning `None` rather
+    // than failing, because every daemon tries this.
+    let mut claim = paper.clone();
+    claim.hub = alice_id.clone();
+    assert!(
+        bob.inherit_conclave_paper_hub(&conclave.id, &alice_id, claim.clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "a trustee who is not the convener inherits nothing"
+    );
+
+    // The claim only applies to the hub that actually left.
+    assert!(
+        alice
+            .inherit_conclave_paper_hub(&conclave.id, "c-nobody", paper.clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "a paper whose hub is still here is not re-homed"
+    );
+
+    // Bob leaves. Alice is the convener, so she takes the rendezvous.
+    bob.leave_conclave(&conclave.id).await.unwrap();
+    let inbox = alice.recv().await.unwrap();
+    assert!(
+        inbox.departed.contains(&(conclave.id.clone(), bob_id.clone())),
+        "the departure is reported, which is what triggers succession: {:?}",
+        inbox.departed
+    );
+
+    let moved = alice
+        .inherit_conclave_paper_hub(&conclave.id, &bob_id, paper)
+        .await
+        .unwrap()
+        .expect("the convener inherits the hub");
+    assert_eq!(moved.hub, alice_id);
+    assert_eq!(moved.paper_id, "p-1", "nothing else about the paper moves");
+}
+
+/// The convener's own kick moves the roster without a `recv` to notice it, so
+/// the check is "is the hub still joined?" rather than "did I just see them
+/// leave" — and the same rule refuses to move a paper whose hub is still here.
+#[tokio::test]
+async fn kicking_the_hub_moves_the_rendezvous_to_the_convener() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    let alice_id = alice.protocol_name().to_string();
+    let bob_id = bob.protocol_name().to_string();
+    let mut paper = paper_for(&conclave.id, &bob_id);
+    paper.hub = bob_id.clone();
+
+    // Bob is the hub and still joined, so naming him must not move the paper.
+    assert!(
+        alice
+            .inherit_conclave_paper_hub(&conclave.id, &bob_id, paper.clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "a hub that is still a joined trustee keeps the rendezvous"
+    );
+
+    // The convener kicks the hub. There is no departure to observe — the roster
+    // is already updated — which is exactly why the rule is checked against the
+    // roster and not against an event.
+    alice.kick_conclave_trustee(&conclave.id, "bob").await.unwrap();
+    let roster = alice.conclaves();
+    let joined = roster
+        .iter()
+        .find(|c| c.id == conclave.id)
+        .expect("the conclave is still there");
+    assert!(
+        joined.joined().all(|t| t.account_id != bob_id),
+        "the kick removed bob from the joined set"
+    );
+
+    let moved = alice
+        .inherit_conclave_paper_hub(&conclave.id, &bob_id, paper)
+        .await
+        .unwrap()
+        .expect("the convener inherits a hub it just kicked");
+    assert_eq!(moved.hub, alice_id);
+
+    // And the kick is not a silent one: the vault that was removed is told, so
+    // it stops believing it is still a member. `broadcast_update` goes to the
+    // joined set, which no longer contains it — this is the one address that is
+    // not on that list, and the one that matters most.
+    bob.recv().await.unwrap();
+    let roster = bob.conclaves();
+    let seen = roster
+        .iter()
+        .find(|c| c.id == conclave.id)
+        .and_then(|c| c.trustee(&bob_id).map(|t| t.state.clone()));
+    assert_eq!(
+        seen,
+        Some(hush_core::TrusteeState::Kicked),
+        "the kicked vault learns it was kicked"
+    );
+}
+
+/// A trustee who is not the convener cannot make the claim at all.
+#[tokio::test]
+async fn a_trustee_cannot_re_home_a_paper() {    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    let mut claim = paper_for(&conclave.id, alice.protocol_name());
+    claim.hub = bob.protocol_name().to_string();
+    assert!(matches!(
+        bob.send_conclave_paper_hub(&conclave.id, claim).await,
+        Err(Error::NotConclaveConvener)
+    ));
+}

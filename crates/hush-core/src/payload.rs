@@ -122,6 +122,40 @@ pub struct ConclaveDescriptor {
     pub ended: bool,
 }
 
+/// The descriptor carried by every paper payload.
+///
+/// One paper per conclave. This is both the wire shape and the at-rest record
+/// (the daemon's paper sidecar stores it), so a paper is defined once — the
+/// same arrangement as [`ConclaveDescriptor`], and the reason there is not a
+/// second, drifting copy in the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperDescriptor {
+    /// Random id. Never a name: the relay sees opaque ciphertext only.
+    pub paper_id: String,
+    /// The conclave this paper belongs to.
+    pub conclave_id: String,
+    /// Account id of the trustee who created the paper.
+    pub creator: String,
+    /// Account id of the current hub — the DataChannel rendezvous, not
+    /// authority over content (a CRDT merges anywhere). It is the convener
+    /// whose word settles a `PaperHub` claim.
+    pub hub: String,
+    /// Display title. Absent from the first wire shape, so it defaults rather
+    /// than failing to decode.
+    #[serde(default = "default_paper_title")]
+    pub title: String,
+    pub created_ms: u64,
+}
+
+/// The title a paper falls back to when its creator did not give one. Single
+/// source: the wire default and the daemon's create path both read it, so the
+/// two cannot drift.
+pub const DEFAULT_PAPER_TITLE: &str = "Paper";
+
+fn default_paper_title() -> String {
+    DEFAULT_PAPER_TITLE.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum MessagePayload {
@@ -234,6 +268,77 @@ pub enum MessagePayload {
         /// identity key.
         signature: Vec<u8>,
     },
+    /// A paper's descriptor, sent when a paper is created or adopted.
+    ///
+    /// Creator-authoritative at creation: the creator names themselves as hub.
+    /// Later hub changes are convener-authoritative and ride `PaperHub`.
+    PaperState { paper: PaperDescriptor },
+    /// One opaque yrs update.
+    ///
+    /// Authority-free by design: a CRDT merges an update anywhere, in any
+    /// order, so a receiver applies this without checking who sent it.
+    PaperDelta {
+        paper_id: String,
+        #[serde(with = "b64_bytes")]
+        update: Vec<u8>,
+    },
+    /// The whole document, for a trustee that has just joined or a peer too far
+    /// behind for replaying deltas to be worth it. Sent by the hub.
+    ///
+    /// The descriptor travels with the state because the peer that needs this
+    /// is exactly the one that never saw `PaperState`: without the descriptor
+    /// the payload names a paper this vault has no record of, so it could not
+    /// be placed in a conclave even though its state merges perfectly well.
+    PaperSnapshot {
+        paper: PaperDescriptor,
+        #[serde(with = "b64_bytes")]
+        state: Vec<u8>,
+    },
+    /// Coarse presence over the slow path.
+    ///
+    /// v1 sends presence on the DataChannel only; the variant is reserved so the
+    /// relay path can carry a coarse version later without a format change.
+    PaperPresence {
+        paper_id: String,
+        peer: String,
+        #[serde(with = "b64_bytes")]
+        state: Vec<u8>,
+    },
+    /// Hub succession, or the convener explicitly re-homing a paper.
+    ///
+    /// Accepted only when the sender is the convener of `paper.conclave_id`,
+    /// which is why the descriptor has to carry that id: the check is
+    /// `sender == conclave(paper.conclave_id).convener`.
+    PaperHub { paper: PaperDescriptor },
+    /// One half of a paper's DataChannel handshake, sent by the peer that
+    /// offers.
+    ///
+    /// Signalling rides the existing 1:1 session rather than a channel of its
+    /// own: the relay already delivers it reliably and in order, and it is the
+    /// only path that exists before the DataChannel does. Only meaningful for a
+    /// paper both ends already hold — a hub ignores an offer naming a paper it
+    /// does not have — so no descriptor travels with it.
+    ///
+    /// `sdp` is the connection description as the JSON both WebRTC stacks
+    /// already agree on, which keeps this module free of any WebRTC dependency.
+    /// It carries the gathered ICE candidates, so there is deliberately no
+    /// separate candidate variant: the handshake is one round trip, and the
+    /// relay path is already live while it happens, so waiting for gathering to
+    /// finish costs the user nothing.
+    PaperOffer { paper_id: String, sdp: String },
+    /// The hub's reply to `PaperOffer`.
+    ///
+    /// Sent only by the paper's hub, and only to the peer that offered: the
+    /// topology is a star, so a peer never answers another peer.
+    PaperAnswer { paper_id: String, sdp: String },
+    /// A payload whose tag this build does not know.
+    ///
+    /// Decoded rather than rejected so a peer running a newer build can send
+    /// something this build cannot read without the whole message being thrown
+    /// away as corrupt. Never constructed locally and never sent: it exists so
+    /// that `decode` has somewhere honest to land.
+    #[serde(other)]
+    Unknown,
 }
 
 mod b64_bytes {
@@ -474,5 +579,151 @@ mod tests {
         assert_eq!(d.trustees.len(), 1);
         assert_eq!(d.trustees[0].nick, "bob");
         assert_eq!(d.trustees[0].state, TrusteeState::Joined);
+    }
+
+    fn paper_descriptor() -> PaperDescriptor {
+        PaperDescriptor {
+            paper_id: "p-1".into(),
+            conclave_id: "c-1".into(),
+            creator: "aa".into(),
+            hub: "aa".into(),
+            title: "Trip notes".into(),
+            created_ms: 1_791_837_993_291,
+        }
+    }
+
+    #[test]
+    fn a_paper_state_round_trips_with_its_descriptor() {
+        let p = MessagePayload::PaperState {
+            paper: paper_descriptor(),
+        };
+        assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    /// A yrs update is binary. Bytes that a JSON number array would still carry
+    /// but a reader could mangle (0x00, 0xff) must survive the wire.
+    #[test]
+    fn a_paper_delta_round_trips_binary_bytes() {
+        let update = vec![0u8, 255, 1, 128, 0];
+        let p = MessagePayload::PaperDelta {
+            paper_id: "p-1".into(),
+            update,
+        };
+        let decoded = MessagePayload::decode(&p.encode().unwrap()).unwrap();
+        assert_eq!(decoded, p);
+        match decoded {
+            MessagePayload::PaperDelta { update, .. } => {
+                assert_eq!(update, vec![0u8, 255, 1, 128, 0])
+            }
+            other => panic!("expected a paper delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_paper_snapshot_round_trips_binary_bytes() {
+        let p = MessagePayload::PaperSnapshot {
+            paper: paper_descriptor(),
+            state: vec![0, 0],
+        };
+        assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn a_paper_presence_round_trips() {
+        let p = MessagePayload::PaperPresence {
+            paper_id: "p-1".into(),
+            peer: "bb".into(),
+            state: vec![7],
+        };
+        assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    /// Signalling is one round trip and the offer carries the gathered
+    /// candidates, so there is no separate candidate payload that could be
+    /// dropped while the handshake is in flight.
+    #[test]
+    fn paper_signalling_round_trips() {
+        let sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\na=candidate:1 1 udp 1 127.0.0.1 9 typ host\r\n";
+        for p in [
+            MessagePayload::PaperOffer {
+                paper_id: "p-1".into(),
+                sdp: sdp.into(),
+            },
+            MessagePayload::PaperAnswer {
+                paper_id: "p-1".into(),
+                sdp: sdp.into(),
+            },
+        ] {
+            let decoded = MessagePayload::decode(&p.encode().unwrap()).unwrap();
+            assert_eq!(decoded, p);
+            match decoded {
+                MessagePayload::PaperOffer { sdp, .. } | MessagePayload::PaperAnswer { sdp, .. } => {
+                    assert!(sdp.contains("a=candidate:"), "candidates must survive the wire")
+                }
+                other => panic!("expected paper signalling, got {other:?}"),
+            }
+        }
+    }
+
+    /// `PaperHub` is accepted only when the convener sent it, so the descriptor
+    /// must carry the conclave id the receiver resolves that convener through:
+    /// the check is `sender == conclave(paper.conclave_id).convener`.
+    #[test]
+    fn a_paper_hub_round_trips_and_names_the_conclave_to_check_against() {
+        let p = MessagePayload::PaperHub {
+            paper: paper_descriptor(),
+        };
+        let decoded = MessagePayload::decode(&p.encode().unwrap()).unwrap();
+        assert_eq!(decoded, p);
+        match decoded {
+            MessagePayload::PaperHub { paper } => {
+                assert_eq!(paper.conclave_id, "c-1");
+                assert_eq!(paper.hub, "aa");
+            }
+            other => panic!("expected a paper hub, got {other:?}"),
+        }
+    }
+
+    /// The wire descriptor omits `title`; a payload written that way still has
+    /// to name the paper, so it defaults rather than failing to decode.
+    #[test]
+    fn a_paper_descriptor_without_a_title_decodes_as_paper() {
+        let json =
+            r#"{"paper_id":"p-1","conclave_id":"c-1","creator":"aa","hub":"aa","created_ms":5}"#;
+        let d: PaperDescriptor = serde_json::from_str(json).unwrap();
+        assert_eq!(d.title, "Paper");
+    }
+
+    /// A payload from a newer build must be ignored, not treated as corrupt.
+    #[test]
+    fn an_unknown_payload_tag_decodes_to_unknown() {
+        let json = br#"{"t":"something_this_build_has_never_heard_of","x":1}"#;
+        assert_eq!(
+            MessagePayload::decode(json).unwrap(),
+            MessagePayload::Unknown
+        );
+    }
+
+    /// The legacy fallback turns undecodable bytes into a chat message, which
+    /// would surface a future payload as a bogus text message in someone's
+    /// chat. An unknown tag must not ride that path.
+    #[test]
+    fn an_unknown_payload_tag_is_not_decoded_as_text() {
+        let json = br#"{"t":"something_this_build_has_never_heard_of","x":1}"#;
+        assert!(
+            !matches!(
+                MessagePayload::decode(json).unwrap(),
+                MessagePayload::Text { .. }
+            ),
+            "an unknown tag must not become a text message"
+        );
+    }
+
+    /// Tolerating an unknown *tag* must not tolerate a malformed *body*: a
+    /// `text` payload missing its body is real corruption, not a newer format,
+    /// and reading it as `Unknown` would hide a broken peer.
+    #[test]
+    fn a_known_tag_with_a_malformed_body_is_still_an_error() {
+        assert!(MessagePayload::decode(br#"{"t":"text"}"#).is_err());
     }
 }

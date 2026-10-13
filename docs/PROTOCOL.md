@@ -6,7 +6,8 @@ Not a crypto paper. We use **Signal protocol (`libsignal`)** for 1:1 sessions. T
 
 - **Vault:** one person’s encrypted data on their device. Source of truth.
 - **Daemon:** owns keys and vault; UI is a local client.
-- **Relay:** dumb store-and-forward of ciphertext blobs, keyed by **queue IDs**, not people.
+- **Relay:** dumb store-and-forward of ciphertext blobs, keyed by **queue IDs**, not people — plus one
+  generic broadcast lane, the **bulletin** (Zines, Task **21**), which is keyed by nobody.
 - **Cloud replica (optional):** WebDAV or S3-compatible; ciphertext only.
 
 ## Identity
@@ -176,6 +177,101 @@ two-party chat, just repeated. Nothing on the relay changes.
 Relay view of a conclave message is unchanged from any other message: an opaque ciphertext blob. The
 conclave name, trustee list, and body are inside the Signal envelope and never appear in relay storage.
 
+### Paper
+
+One shared, live, encrypted collaborative document per conclave — the "Paper" — owned by the daemon
+and edited through the UI's ProseMirror/Yjs bridge. It is **not** a relay-side object and adds no
+relay ability: the document is a `yrs` CRDT whose updates ride the same per-trustee fan-out as
+conclave messages, and nothing on the relay learns the paper exists.
+
+- **State.** The merged CRDT is the daemon's (`papers.enc` in the vault, the `notes_store` pattern:
+  a snapshot plus a log of opaque `yrs` updates, compacted when the log grows). The webview holds a
+  working copy and exchanges binary updates over `/api/paper/{conclave_id}/*`; the daemon is the
+  source of truth, so a restart rebuilds the editor from the daemon's state.
+- **Wire payloads.** `MessagePayload::PaperState { descriptor }` (creator-authoritative creation),
+  `PaperDelta { paper_id, update }`, `PaperSnapshot { descriptor, state }` (late-joiner catch-up),
+  `PaperHub { descriptor }` (convener-authoritative succession), `PaperPresence { .. }`, and the
+  DataChannel signalling pair `PaperOffer` / `PaperAnswer`. Binary fields use the house `b64_bytes`
+  codec. An unknown payload tag decodes to a tolerated `Unknown`, never `Error::Corrupt`.
+- **Authority mirrors the conclave's.** A `PaperDelta` carries no authority — a CRDT merges an update
+  from anyone, in any order. A paper this vault has never seen is materialised only from a
+  `PaperState` whose sender is the creator the descriptor names. `PaperHub` is accepted only from the
+  conclave's **convener**, so a trustee cannot claim the rendezvous. Writing is refused (`403`) when
+  the conclave has **ended** or the writer is not a joined trustee.
+- **Delivery.** The default path is the relay fan-out: one encrypted copy per joined trustee over
+  that trustee's existing 1:1 session, store-and-forward, exactly like a conclave message. Deltas are
+  never replayed, so a trustee that joins after edits is caught up by a `PaperSnapshot` the **hub**
+  sends; only the hub sends one, so N trustees cannot each send their own.
+- **Fast path (DataChannel).** The paper's **hub** (its creator, until succession moves it) is a
+  rendezvous for a pure-Rust WebRTC `DataChannel` carrying `yrs` updates and ephemeral presence.
+  Signalling rides the relay as `PaperOffer`/`PaperAnswer` (the gathered ICE candidates are inside
+  them — one round trip, no third variant). The channel is a **star** through the hub, so the hub
+  re-broadcasts an update it receives over one channel to its other channels; the relay is still
+  fanning out underneath, so the channel is a latency optimization, never the guarantee. When it is
+  unusable the daemon sends over the relay and the UI badge reads `relay` instead of `live`.
+- **STUN, no TURN.** `ClientConfig::stun_url` is the one place a STUN server is configured and it has
+  **no default** — a public one would learn the address of every peer that opens a paper. There is no
+  TURN, so symmetric NAT degrades to the relay rather than being traversed.
+- **Presence.** Cursors, colour, and display name are `y-protocols` awareness frames carried over the
+  DataChannel **only** — there is no relay copy and a 30-second TTL in daemon memory, so presence is
+  ephemeral and a peer that drops off simply disappears.
+- **Succession.** The descriptor names the hub. The convener can move it explicitly
+  (`POST /api/paper/{conclave_id}/hub/rehome`); when a hub **leaves or is kicked**, the convener
+  inherits it automatically, with no user action, and the surviving trustees re-dial the new
+  rendezvous. A kicked trustee keeps its readable copy and its history but is refused writes once it
+  is told it was kicked.
+- **No plaintext.** The document, its title, and the presence frames never appear in relay storage,
+  and `papers.enc` is ciphertext at rest; the dogfood scans every file the run leaves behind for the
+  edit strings and finds none.
+
+Relay view of a paper delta is unchanged from any other message: an opaque ciphertext blob, stored on
+a queue and dropped after its TTL. The relay cannot tell a paper update from a chat message, and
+there is no paper object, membership, or history on it.
+
+### Zines (2026-10-12, design not built)
+
+Members-only long-form publishing. Every member has a **zine** — their own blog of articles with a
+comments section — readable by **all members**, not only contacts. It is the **one place the relay
+gains a new ability**: a **bulletin**, a generic opaque append-only broadcast lane. Everything else
+reuses existing primitives. Full design: [`docs/tasks/zines.md`](tasks/zines.md) (Task **21**).
+
+- **Bulletin.** `PUT /b` appends an opaque blob to a flat log; `GET /b?since={seq}` drains it. A
+  member authorizes with the credential for a queue they own — the **delivery** credential to
+  publish, the **read** credential to drain, reusing the existing split. The stored row carries **no
+  queue id**, so the log is not an author index, and every member drains the same lane, so a drain
+  reveals no readership. Its own cap (256 KiB) and TTL (30 days), and a per-member rate limit. It is
+  **per relay**: relays never talk to each other (see *Many relays* below), so cross-relay reach is
+  holders re-posting to their own relay's bulletin — no federation, no relay-to-relay path.
+- **Delivery is broadcast; readability is epidemic.** There is no all-members key and no member list
+  to encrypt to, so the bulletin carries **ciphertext**. An article is sealed under the zine's
+  symmetric **read key**; the author hands that key to a contact as `MessagePayload::ZineGrant` over
+  their existing 1:1 session, and **any holder** may re-share the same key to *their* contacts. A
+  member may therefore hold an unreadable blob until a key reaches them. This is the price of
+  members-only E2EE on a broadcast lane.
+- **Wire payload.** One new variant, `ZineGrant { zine_id, key, latest_hash }` — read keys are the
+  only zine thing that rides the sessions; articles and comments ride the bulletin. `zine_id` is the
+  pen name's public key. Receiving it is authority-free (any holder may re-share); it grants read,
+  never write. `Unknown` (shared with Paper) keeps a zine-unaware build interoperable.
+- **Article blob.** Opaque to the relay, content-addressed by hash. Plaintext descriptor: pen name,
+  title, **sections (tags)**, author-declared `created_ms` (clamped on ingest), `revision`,
+  `prev_hash` (an edit chain), body, and the merged comment thread. Authorship is the pen name's
+  **signature** (verifiable without the read key); integrity is **AEAD**. Sections live inside the
+  descriptor, so the relay never sees a tag and there is **no relay-side category registry**.
+- **Comments.** Sealed to the pen name's **public** key and published to the bulletin, so no session
+  to the author is needed to write one. The author drains, trial-decrypts, keeps what opens, merges
+  the accepted ones, and republishes. Moderation is entirely author-side; an unmerged comment simply
+  ages out with the window.
+- **Identity.** A zine belongs to a **pen name** — a vault keypair isolated from messaging keys, so a
+  messaging pubkey never appears in a zine and a pen name never appears on the relay. One zine per
+  pen name in v1.
+- **At rest.** `zines.enc` in the vault holds my zines, held zines, the **read keys I hold**, and the
+  local section index; it is ciphertext when locked. Browsing is a local facet — no follows, no
+  ranking, no relay knowledge.
+
+Relay view of a bulletin blob is an opaque ciphertext blob with a size and a time. The relay learns
+that **some** member published at a time (it must authorize the publish) and nothing else; it cannot
+tell a zine from a comment, and the pen name, title, sections, and body never appear in its storage.
+
 ## What the relay HTTP API looks like (shape)
 
 - `PUT /q/{id}` — store blob (authz for that queue)
@@ -185,6 +281,7 @@ conclave name, trustee list, and body are inside the Signal envelope and never a
 - `PUT /k/{account_id}` — publish this account's prekey record (authz: the record's own signature)
 - `GET /k/{account_id}` — take the record, consuming one one-time prekey
 - `PUT /drop/{id}`, `GET /drop/{id}` — outsider delivery containers, keyed by a random capability id
+- `PUT /b`, `GET /b?since={seq}` — the **bulletin** broadcast lane (opaque blobs; publish authorized by a member credential; the stored row carries no author)
 - No search, no profiles, no public keys directory, and no device directory (`/d/…` is gone)
 
 A drop container is `HSHD`-magic and one of two versions (2026-10-08): **v1** is sealed under a PIN
@@ -299,6 +396,6 @@ applies to every base, since each queue reference carries both.
 
 ## Out of scope for this sketch
 
-- Groups, follow-feeds, MLS
+- Groups, MLS (zines — Task **21** — is a members-only **broadcast commons**, not a follow-feed: no follows, no ranking, no relay-visible graph)
 - Sealed-sender copy of Signal’s exact scheme (we use queues instead; review whether we still need sealed certificates)
 - P2P bypass of the relay (nice later; not required for v1)

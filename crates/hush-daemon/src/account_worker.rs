@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use hush_core::{Account, ChatRecord, ConclaveRecord, InboxResult, PendingInvite};
+use hush_core::{
+    Account, ChatRecord, ConclaveRecord, InboxResult, MessagePayload, PaperDescriptor,
+    PendingInvite,
+};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct AccountWorker {
@@ -211,6 +214,64 @@ enum Work {
     },
     /// Reads pane: load the encrypted sidecar state (None when never saved).
     ReadsStateGet {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// This vault's own account id (the hex identity key), for features that
+    /// stamp local authorship — Conclave Paper's creator/hub fields.
+    AccountId {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Tell a conclave's trustees that a paper exists, or that its hub moved.
+    SendPaperState {
+        conclave_id: String,
+        paper: PaperDescriptor,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Fan one opaque `yrs` update out to a conclave's trustees.
+    SendPaperDelta {
+        conclave_id: String,
+        paper_id: String,
+        update: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Pass one opaque `yrs` update on to the conclave's other trustees.
+    ///
+    /// The hub's half of the relay fan-out: a mesh can only reach the trustees
+    /// the sender's roster knew about, and a roster that has not caught up with
+    /// a join strands that edit forever.
+    RelayPaperDelta {
+        conclave_id: String,
+        paper_id: String,
+        from_account: String,
+        update: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Hand a trustee that joined late the whole document.
+    SendPaperSnapshot {
+        conclave_id: String,
+        paper: PaperDescriptor,
+        state: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Announce a paper's new hub to the conclave. Convener-only.
+    SendPaperHub {
+        conclave_id: String,
+        paper: PaperDescriptor,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Deliver one DataChannel signalling payload to a single trustee.
+    SendPaperSignal {
+        conclave_id: String,
+        peer_account: String,
+        payload: MessagePayload,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Take the hub of a paper whose hub left, when this vault is the conclave's
+    /// convener.
+    InheritPaperHub {
+        conclave_id: String,
+        gone_hub: String,
+        paper: PaperDescriptor,
         reply: oneshot::Sender<WorkResult>,
     },
     /// Reads pane: replace the encrypted sidecar state wholesale.
@@ -456,6 +517,8 @@ pub enum WorkResult {
     Drops(Vec<ChatRecord>),
     /// The Reads pane's encrypted sidecar state; `None` until first saved.
     ReadsState(Option<Vec<u8>>),
+    /// This vault's own account id (the hex identity key).
+    AccountId(String),
     /// A named vault sidecar's bytes; `None` when nothing is stored under that
     /// name yet.
     Secret(Option<Vec<u8>>),
@@ -476,6 +539,10 @@ pub enum WorkResult {
     ConclaveAccepted(ConclaveRecord),
     /// Conclave invitations received but not yet accepted or declined.
     PendingInvites(Vec<PendingInvite>),
+    /// The descriptor a hub succession sent, when this vault was the convener
+    /// that inherited it. `None` is the ordinary answer for every other trustee
+    /// that saw the same departure.
+    Rehomed(Option<PaperDescriptor>),
     /// The supplied current passphrase did not match the vault.
     WrongPassphrase,
     /// The account's drop key and the URL outsiders post to.
@@ -851,6 +918,143 @@ impl AccountWorker {
                                         Err(e) => WorkResult::Err(e.to_string()),
                                     }
                                 }
+                            };
+                            (reply, result)
+                        }
+                        Work::AccountId { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::AccountId(a.protocol_name().to_string()),
+                            };
+                            (reply, result)
+                        }
+                        Work::SendPaperState {
+                            conclave_id,
+                            paper,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .send_conclave_paper_state(&conclave_id, paper)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendPaperDelta {
+                            conclave_id,
+                            paper_id,
+                            update,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .send_conclave_paper_delta(&conclave_id, &paper_id, &update)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RelayPaperDelta {
+                            conclave_id,
+                            paper_id,
+                            from_account,
+                            update,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .relay_conclave_paper_delta(
+                                        &conclave_id,
+                                        &paper_id,
+                                        &from_account,
+                                        &update,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendPaperSnapshot {
+                            conclave_id,
+                            paper,
+                            state,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .send_conclave_paper_snapshot(&conclave_id, paper, &state)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendPaperSignal {
+                            conclave_id,
+                            peer_account,
+                            payload,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .send_paper_signal(&conclave_id, &peer_account, payload)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::InheritPaperHub {
+                            conclave_id,
+                            gone_hub,
+                            paper,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .inherit_conclave_paper_hub(&conclave_id, &gone_hub, paper)
+                                    .await
+                                {
+                                    Ok(moved) => WorkResult::Rehomed(moved),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendPaperHub {
+                            conclave_id,
+                            paper,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .send_conclave_paper_hub(&conclave_id, paper)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
                             };
                             (reply, result)
                         }
@@ -1484,6 +1688,129 @@ impl AccountWorker {
     /// saved). The JSON schema lives in [`crate::reads_store`].
     pub async fn reads_state_get(&self) -> WorkResult {
         self.call(|reply| Work::ReadsStateGet { reply }).await
+    }
+
+    /// This vault's own account id (the hex identity key); `Err("locked")`
+    /// while the vault is locked, like every other secret-touching call.
+    pub async fn account_id(&self) -> WorkResult {
+        self.call(|reply| Work::AccountId { reply }).await
+    }
+
+    /// Fan a paper descriptor out to a conclave's joined trustees.
+    pub async fn send_paper_state(
+        &self,
+        conclave_id: &str,
+        paper: PaperDescriptor,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendPaperState {
+            conclave_id: conclave_id.to_string(),
+            paper,
+            reply,
+        })
+        .await
+    }
+
+    /// Fan one opaque CRDT update out to a conclave's joined trustees.
+    pub async fn send_paper_delta(
+        &self,
+        conclave_id: &str,
+        paper_id: &str,
+        update: &[u8],
+    ) -> WorkResult {
+        self.call(|reply| Work::SendPaperDelta {
+            conclave_id: conclave_id.to_string(),
+            paper_id: paper_id.to_string(),
+            update: update.to_vec(),
+            reply,
+        })
+        .await
+    }
+
+    /// Pass one opaque CRDT update on to the conclave's other trustees.
+    ///
+    /// Called by the paper's hub when a delta arrives from a peer, so an edit
+    /// cannot be stranded by a sender whose roster had not caught up with a
+    /// join.
+    pub async fn relay_paper_delta(
+        &self,
+        conclave_id: &str,
+        paper_id: &str,
+        from_account: &str,
+        update: &[u8],
+    ) -> WorkResult {
+        self.call(|reply| Work::RelayPaperDelta {
+            conclave_id: conclave_id.to_string(),
+            paper_id: paper_id.to_string(),
+            from_account: from_account.to_string(),
+            update: update.to_vec(),
+            reply,
+        })
+        .await
+    }
+
+    /// Hand a trustee that joined late the whole document.
+    pub async fn send_paper_snapshot(
+        &self,
+        conclave_id: &str,
+        paper: PaperDescriptor,
+        state: &[u8],
+    ) -> WorkResult {
+        self.call(|reply| Work::SendPaperSnapshot {
+            conclave_id: conclave_id.to_string(),
+            paper,
+            state: state.to_vec(),
+            reply,
+        })
+        .await
+    }
+
+    /// Deliver one DataChannel signalling payload to a single trustee.
+    ///
+    /// Addressed rather than fanned out: the channel is 1:1 between a trustee
+    /// and the paper's hub.
+    pub async fn send_paper_signal(
+        &self,
+        conclave_id: &str,
+        peer_account: &str,
+        payload: MessagePayload,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendPaperSignal {
+            conclave_id: conclave_id.to_string(),
+            peer_account: peer_account.to_string(),
+            payload,
+            reply,
+        })
+        .await
+    }
+
+    /// Take the hub of a paper whose hub left, when this vault is the convener.
+    ///
+    /// The answer is the descriptor that was sent, or `None` when this vault
+    /// has no authority to inherit — which is the ordinary answer for every
+    /// trustee that is not the convener, not an error.
+    pub async fn inherit_paper_hub(
+        &self,
+        conclave_id: &str,
+        gone_hub: &str,
+        paper: PaperDescriptor,
+    ) -> WorkResult {
+        self.call(|reply| Work::InheritPaperHub {
+            conclave_id: conclave_id.to_string(),
+            gone_hub: gone_hub.to_string(),
+            paper,
+            reply,
+        })
+        .await
+    }
+
+    /// Announce a paper's new hub. Refused unless this vault is the convener.
+    pub async fn send_paper_hub(&self, conclave_id: &str, paper: PaperDescriptor) -> WorkResult {
+        self.call(|reply| Work::SendPaperHub {
+            conclave_id: conclave_id.to_string(),
+            paper,
+            reply,
+        })
+        .await
     }
 
     /// Replace the Reads pane's encrypted sidecar state wholesale.

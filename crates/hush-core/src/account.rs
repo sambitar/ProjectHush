@@ -18,8 +18,8 @@ use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_fi
 use crate::crypto::{decrypt, encrypt};
 use crate::error::Error;
 use crate::invite::InvitePayload;
-use crate::message::{InboxResult, ReceivedAttachment, ReceivedMessage};
-use crate::payload::{MailAttachment, MessagePayload, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS};
+use crate::message::{InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper};
+use crate::payload::{MailAttachment, MessagePayload, PaperDescriptor, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS};
 use crate::relay_client::{normalize_relay_base, validate_onion_relay, RelayClient};
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
@@ -1573,6 +1573,259 @@ impl Account {
         Ok(())
     }
 
+    /// Fan one paper payload out to the conclave's joined trustees.
+    ///
+    /// Papers ride the same 1:1 sessions as conclave messages: there is no
+    /// relay-side room and no group object, so this is one encrypted copy per
+    /// joined trustee. Unlike a message it is **not** written to the local chat
+    /// log — the document lives in the daemon's paper sidecar, and the sender's
+    /// own copy of an update is recorded there, not here.
+    ///
+    /// A paper follows the conclave's lifecycle: once the conclave has ended
+    /// the document is read-only on every peer, so sending is refused exactly
+    /// as `send_conclave_message` refuses.
+    async fn fan_out_paper(
+        &mut self,
+        conclave_id: &str,
+        payload: MessagePayload,
+    ) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended {
+            return Err(Error::ConclaveEnded);
+        }
+        if !conclave.is_joined(&me) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        let targets: Vec<String> = conclave
+            .joined()
+            .filter(|m| m.account_id != me)
+            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
+            .collect();
+        for nick in targets {
+            self.send_payload_inner(&nick, payload.clone(), false).await?;
+        }
+        Ok(())
+    }
+
+    /// Tell the conclave's trustees that a paper exists, or that its hub moved.
+    ///
+    /// Creator-authoritative at creation: the receiver accepts a new paper only
+    /// from the trustee the descriptor names as its creator.
+    pub async fn send_conclave_paper_state(
+        &mut self,
+        conclave_id: &str,
+        paper: PaperDescriptor,
+    ) -> Result<(), Error> {
+        self.fan_out_paper(conclave_id, MessagePayload::PaperState { paper })
+            .await
+    }
+
+    /// Re-home a paper: the convener's word settles where the DataChannel
+    /// rendezvous is.
+    ///
+    /// Convener-only at both ends, exactly like a roster change — the sender
+    /// must be the convener to make the claim, and `recv` drops one from anyone
+    /// else before it reaches the inbox. The paper's *creator* is deliberately
+    /// not consulted: the creator is the first hub, and the whole point of
+    /// succession is that it may have left or been kicked, which is precisely
+    /// when a new hub is needed.
+    pub async fn send_conclave_paper_hub(
+        &mut self,
+        conclave_id: &str,
+        paper: PaperDescriptor,
+    ) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let convener = self
+            .chat_log
+            .conclave(conclave_id)
+            .map(|c| c.convener.clone())
+            .ok_or(Error::ConclaveNotFound)?;
+        if convener != me {
+            return Err(Error::NotConclaveConvener);
+        }
+        self.fan_out_paper(conclave_id, MessagePayload::PaperHub { paper })
+            .await
+    }
+
+    /// Inherit a paper's hub when the one that held it is gone.
+    ///
+    /// The default succession rule: the creator — or whoever last held the
+    /// rendezvous — left or was kicked, so the conclave's **convener** takes it.
+    /// Returns the descriptor that was sent when this vault is the convener and
+    /// the claim went out, and `None` otherwise.
+    ///
+    /// `None` is not a failure: a trustee that is not the convener has no
+    /// authority to re-home anything, and every daemon that sees the departure
+    /// tries this, so most of them are supposed to come back empty-handed.
+    ///
+    /// Three things must hold, and the roster is checked here rather than by the
+    /// caller because a caller does not always know who left: this vault is the
+    /// convener, the paper names `gone_hub` as its rendezvous, and that account
+    /// is **no longer a joined trustee**. The last check is what lets a daemon
+    /// call this after any roster change — a kick of somebody who is not the hub
+    /// must not move the paper — and it is why the argument is the hub to
+    /// replace rather than an account id the caller has to go and find.
+    pub async fn inherit_conclave_paper_hub(
+        &mut self,
+        conclave_id: &str,
+        gone_hub: &str,
+        paper: PaperDescriptor,
+    ) -> Result<Option<PaperDescriptor>, Error> {
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.convener != me || paper.hub != gone_hub {
+            return Ok(None);
+        }
+        if conclave.joined().any(|t| t.account_id == gone_hub) {
+            return Ok(None);
+        }
+        let mut moved = paper;
+        moved.hub = me;
+        self.send_conclave_paper_hub(conclave_id, moved.clone())
+            .await?;
+        Ok(Some(moved))
+    }
+
+    /// Pass one opaque `yrs` update on to the conclave's other trustees.
+    ///
+    /// The relay fan-out is a mesh, and a mesh is only as good as the roster
+    /// the sender had when it fanned out. A trustee that has not yet drained a
+    /// third trustee's join does not send to them, and deltas are never
+    /// replayed — so that edit would never reach them at all. The hub is the
+    /// one party placed to close that gap: it is the paper's rendezvous, so it
+    /// is the party every trustee addresses, and it is the party the
+    /// DataChannel star already makes responsible for re-broadcast.
+    ///
+    /// The caller decides who is the hub (`PaperDescriptor::hub`); this is pure
+    /// transport and carries no authority, exactly like
+    /// [`send_conclave_paper_delta`](Self::send_conclave_paper_delta). Sending
+    /// to a trustee that already had the update costs one duplicate blob and no
+    /// correctness — merging an update twice is a no-op — which is the right
+    /// trade against an edit that never arrives.
+    ///
+    /// The sender is skipped: it is the one peer that certainly has these bytes.
+    pub async fn relay_conclave_paper_delta(
+        &mut self,
+        conclave_id: &str,
+        paper_id: &str,
+        from_account: &str,
+        update: &[u8],
+    ) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended || !conclave.is_joined(&me) {
+            return Ok(());
+        }
+        let targets: Vec<String> = conclave
+            .joined()
+            .filter(|m| m.account_id != me && m.account_id != from_account)
+            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
+            .collect();
+        for nick in targets {
+            self.send_payload_inner(
+                &nick,
+                MessagePayload::PaperDelta {
+                    paper_id: paper_id.to_string(),
+                    update: update.to_vec(),
+                },
+                false,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Fan one opaque `yrs` update out to the conclave's trustees.
+    ///
+    /// The bytes are never parsed here: merging is the CRDT's job and belongs
+    /// to whoever owns the document, so this is pure transport and carries no
+    /// authority.
+    pub async fn send_conclave_paper_delta(
+        &mut self,
+        conclave_id: &str,
+        paper_id: &str,
+        update: &[u8],
+    ) -> Result<(), Error> {
+        self.fan_out_paper(
+            conclave_id,
+            MessagePayload::PaperDelta {
+                paper_id: paper_id.to_string(),
+                update: update.to_vec(),
+            },
+        )
+        .await
+    }
+
+    /// Send the whole document to the conclave's trustees.
+    ///
+    /// This is the catch-up a trustee who joined after the paper existed needs:
+    /// the deltas it missed are not replayed, so the hub hands it the current
+    /// state instead. The descriptor rides along because that trustee never saw
+    /// `PaperState` — without it the state would name a paper it cannot place.
+    pub async fn send_conclave_paper_snapshot(
+        &mut self,
+        conclave_id: &str,
+        paper: PaperDescriptor,
+        state: &[u8],
+    ) -> Result<(), Error> {
+        self.fan_out_paper(
+            conclave_id,
+            MessagePayload::PaperSnapshot {
+                paper,
+                state: state.to_vec(),
+            },
+        )
+        .await
+    }
+
+    /// Send one DataChannel signalling payload to a single trustee, by account id.
+    ///
+    /// Signalling is addressed, never fanned out: the DataChannel is a 1:1 affair
+    /// between a trustee and the paper's hub, so an offer or an answer has
+    /// exactly one recipient. It rides the same session and the same relay queue
+    /// as every other payload, which is the only path that exists before the
+    /// channel does — so a signal can be delivered late, or to a peer that is
+    /// offline, without anything having to be retried by hand.
+    ///
+    /// Gated the same way the fan-out is: the conclave must exist and both ends
+    /// must be joined trustees, so a signal cannot be aimed at a stranger or at
+    /// a conclave this vault is not in.
+    pub async fn send_paper_signal(
+        &mut self,
+        conclave_id: &str,
+        peer_account: &str,
+        payload: MessagePayload,
+    ) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended {
+            return Err(Error::ConclaveEnded);
+        }
+        if !conclave.is_joined(&me) || !conclave.is_joined(peer_account) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        let nick = self
+            .contact_nick_for_protocol(peer_account)
+            .ok_or(Error::ContactNotFound)?;
+        self.send_payload_inner(&nick, payload, false).await
+    }
+
     /// Share a file into a conclave, one encrypted copy per joined trustee.
     ///
     /// There is no shared blob to point everyone at: files are per-recipient
@@ -1882,6 +2135,21 @@ impl Account {
             .cloned()
             .ok_or(Error::ConclaveNotFound)?;
         self.broadcast_update(&record).await?;
+        // Tell the trustee itself. `broadcast_update` targets the *joined* set,
+        // and a kick removes them from it first — so without this the one vault
+        // that most needs to know is the only one never told. It would keep a
+        // joined roster: still fan out into a conclave that has removed it, and
+        // still edit the conclave's paper, which nobody else would ever see.
+        // Addressed by nickname because that is the handle the caller had, and
+        // the roster entry for them is `Kicked` from here on.
+        self.send_payload_inner(
+            nickname,
+            MessagePayload::ConclaveUpdate {
+                descriptor: descriptor_of(&record),
+            },
+            false,
+        )
+        .await?;
         self.save().await?;
         Ok(())
     }
@@ -2474,8 +2742,25 @@ impl Account {
         }
 
         let mut out = Vec::new();
+        let mut papers = Vec::new();
         let mut warnings = Vec::new();
         let mut dirty = false;
+        // Who was joined before this poll, so a trustee that joins during it can
+        // be reported to the caller (the paper hub hands it a snapshot) and one
+        // that leaves can be too (the convener inherits a paper whose hub just
+        // left). The account ids rather than a count: a swap that keeps the size
+        // the same still has to report both halves.
+        let joined_before: Vec<(String, Vec<String>)> = self
+            .chat_log
+            .conclaves()
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    c.joined().map(|t| t.account_id.clone()).collect(),
+                )
+            })
+            .collect();
         for (expected_contact, queue_id, read_token) in queues {
             let ids = relay.list_optional(&queue_id, &read_token).await?;
             for blob_id in ids {
@@ -2684,6 +2969,52 @@ impl Account {
                     | MessagePayload::ConclaveEnd { .. } => {
                         unreachable!("control payload handled above")
                     }
+                    // A paper payload is not a chat message, so it must not
+                    // reach `out` as one: it leaves through `papers` for the
+                    // caller's paper store. The blob is consumed here because
+                    // it has been delivered — leaving it would re-deliver it on
+                    // every poll forever.
+                    MessagePayload::PaperState { .. }
+                    | MessagePayload::PaperDelta { .. }
+                    | MessagePayload::PaperSnapshot { .. }
+                    | MessagePayload::PaperPresence { .. }
+                    | MessagePayload::PaperHub { .. }
+                    | MessagePayload::PaperOffer { .. }
+                    | MessagePayload::PaperAnswer { .. } => {
+                        // Hub succession is convener-authoritative, and the
+                        // check belongs here rather than in the daemon: this is
+                        // where the conclave record is in hand, so there is no
+                        // second copy of the roster to drift. A claim from
+                        // anyone else is consumed and dropped — the same
+                        // treatment `Unknown` gets, for the same reason.
+                        if let MessagePayload::PaperHub { paper } = &payload {
+                            let convener = self
+                                .chat_log
+                                .conclave(&paper.conclave_id)
+                                .map(|c| c.convener.as_str())
+                                .unwrap_or_default();
+                            if convener.is_empty() || convener != from_account {
+                                relay.delete(&queue_id, &read_token, &blob_id).await?;
+                                dirty = true;
+                                continue;
+                            }
+                        }
+                        papers.push(ReceivedPaper {
+                            from_account: from_account.clone(),
+                            from_nick: nick.clone(),
+                            payload: payload.clone(),
+                        });
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        dirty = true;
+                        continue;
+                    }
+                    // A tag this build does not know, from one that does.
+                    // Consumed and dropped: it can never be interpreted here,
+                    // and leaving it would re-deliver it on every poll forever.
+                    MessagePayload::Unknown => {
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        continue;
+                    }
                 };
                 if let Some(c) = self
                     .state
@@ -2706,8 +3037,46 @@ impl Account {
         if dirty {
             self.save().await?;
         }
+        // A conclave whose joined set grew this poll. A trustee that was
+        // already joined counts as before, so a kick-and-rejoin or a roster
+        // re-broadcast that changes nothing reports nothing.
+        let joined: Vec<String> = self
+            .chat_log
+            .conclaves()
+            .iter()
+            .filter(|c| {
+                let before = joined_before
+                    .iter()
+                    .find(|(id, _)| id == &c.id)
+                    .map(|(_, ids)| ids.len())
+                    .unwrap_or(0);
+                c.joined().count() > before
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        // ...and the mirror: every trustee that stopped being joined, named, so
+        // the caller can tell whether the one that left was the paper's hub.
+        let departed: Vec<(String, String)> = self
+            .chat_log
+            .conclaves()
+            .iter()
+            .flat_map(|c| {
+                let Some((_, before)) = joined_before.iter().find(|(id, _)| id == &c.id) else {
+                    return Vec::new();
+                };
+                let now: Vec<&str> = c.joined().map(|t| t.account_id.as_str()).collect();
+                before
+                    .iter()
+                    .filter(|account| !now.contains(&account.as_str()))
+                    .map(|account| (c.id.clone(), account.clone()))
+                    .collect()
+            })
+            .collect();
         Ok(InboxResult {
             messages: out,
+            papers,
+            joined,
+            departed,
             warnings,
         })
     }

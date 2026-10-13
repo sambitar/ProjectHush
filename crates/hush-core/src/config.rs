@@ -28,6 +28,9 @@ pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:9876";
 pub const ENV_RELAY_URL: &str = "HUSH_RELAY_URL";
 /// Environment override for the relay's onion address.
 pub const ENV_RELAY_ONION_URL: &str = "HUSH_RELAY_ONION_URL";
+/// Environment override for the STUN server used by the Conclave Paper data
+/// channel.
+pub const ENV_STUN_URL: &str = "HUSH_STUN_URL";
 /// Environment override for the daemon bind address (enables the TCP listener).
 pub const ENV_DAEMON_ADDR: &str = "HUSH_DAEMON_ADDR";
 /// Environment override for the daemon Unix socket path.
@@ -68,6 +71,10 @@ pub struct ClientConfig {
     /// it up automatically in Tor relay mode and the user never types one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onion_relay: Option<String>,
+    /// STUN server for the Conclave Paper data channel. Operator config, and
+    /// deliberately without a default — see [`resolve_stun_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_url: Option<String>,
     /// TCP bind address for the daemon. Setting this opts the TCP listener back in;
     /// the default is Unix socket only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +94,7 @@ impl Default for ClientConfig {
                 v: 1,
                 relay_url: None,
                 onion_relay: None,
+                stun_url: None,
                 daemon_addr: None,
                 daemon_socket: None,
             }
@@ -157,6 +165,24 @@ pub fn resolve_onion_relay_url(data_dir: &Path) -> Option<String> {
     non_empty(file.onion_relay.as_deref()).map(str::to_string)
 }
 
+/// Effective STUN server for the Conclave Paper data channel, when one is on
+/// file (env or config file).
+///
+/// There is deliberately no default. A public STUN server would learn the
+/// public address of every peer that opens a paper — the exact metadata this
+/// project refuses to hand a third party — so an operator either runs one (the
+/// same self-hosted one Task 17 needs) or peers gather host candidates only and
+/// connect where they can see each other directly. With no STUN and no TURN, a
+/// symmetric NAT falls back to the relay path rather than failing; see
+/// `hush_daemon::paper_data`.
+pub fn resolve_stun_url(data_dir: &Path) -> Option<String> {
+    if let Some(v) = non_empty(std::env::var(ENV_STUN_URL).ok().as_deref()) {
+        return Some(v.to_string());
+    }
+    let file = load(data_dir);
+    non_empty(file.stun_url.as_deref()).map(str::to_string)
+}
+
 /// Effective daemon bind address plus the source that supplied it.
 ///
 /// `None` means "no TCP listener": the Unix socket is the default API (DR-02),
@@ -224,8 +250,40 @@ mod tests {
     fn with_clean_env<T>(f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ENV_RELAY_URL);
+        std::env::remove_var(ENV_RELAY_ONION_URL);
         std::env::remove_var(ENV_DAEMON_ADDR);
+        std::env::remove_var(ENV_DAEMON_SOCKET);
+        std::env::remove_var(ENV_STUN_URL);
         f()
+    }
+
+    #[test]
+    fn stun_is_absent_by_default_and_follows_env_then_file() {
+        with_clean_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            // No default, by design: a public STUN server would learn the public
+            // address of every peer that opens a paper.
+            assert_eq!(resolve_stun_url(dir.path()), None);
+
+            save(
+                dir.path(),
+                &ClientConfig {
+                    stun_url: Some("stun:stun.internal:3478".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                resolve_stun_url(dir.path()),
+                Some("stun:stun.internal:3478".to_string())
+            );
+
+            std::env::set_var(ENV_STUN_URL, "stun:stun.from-env:3478");
+            assert_eq!(
+                resolve_stun_url(dir.path()),
+                Some("stun:stun.from-env:3478".to_string())
+            );
+        });
     }
 
     #[test]

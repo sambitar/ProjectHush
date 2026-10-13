@@ -22,16 +22,18 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **D — Async member mail** | When live chat feels solid | **5d** internal `@myserver.com` mail (replaces “message while offline”) | ✅ Done (threads, compose, multi-attachment, offline delivery; Cc/Bcc + out-of-band attachments deferred) |
 | **E — Outsider delivery** | After 5d | **5e** inbound drop, **5f** outbound to outsiders | Planned |
 | **F — Local notes** | Before public layer | **16** sticky-notes dashboard | Spec resolved 2026-10-11; not implemented |
-| **G — Articles** | After notes or parallel late | **11** Nostr pen names | Planned |
+| **G — Articles** | Reshaped 2026-10-12 | **11** Nostr pen names → **export only** | **Reshaped** — native long-form is **zines** (Task **21** / Phase **O**); Nostr is now an optional export bridge |
 | **H — Knowledge layer** | After 11 dogfood | **12–15** (see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)) | Backlog |
 | **I — Confidential** | Heavy; spec early, code late | **10** TPM + lease rail | Planning only |
 | **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | Partly started — **updater + release workflow landed 2026-10-11** (branch `feature/auto-update`); `hush-verify` extraction, `rust-toolchain.toml`, `cargo deny`/`audit` still open |
 | **K — Member calls** | After **C** stabilizes | **17** P2P audio/video between contacts | Planning only |
 | **L — Shared surface** | After **17** Phase 4 (video) | **18** live screen share / co-browse in a conclave | Planning only |
+| **M — Conclave Paper** | Before **17** (voice/video postponed; data-only WebRTC) | **19** collaborative paper ("Etherpad-like") in a conclave | Spec resolved 2026-10-12; **Phases 1–2 (offline core + editor, wire fan-out) landed and dogfooded 2026-10-12** — Tasks 3–8 open, DataChannel liveness next |
 | **N — Reading room** | After **19**'s spine (reused); independent of **17**/**18** media | **20** shared reading + discussion in a conclave | Idea captured 2026-10-12; planning only, not grilled |
+| **O — Zines** | After **19**'s spine (reused) + a relay bulletin lane; independent of **17**/**18** media | **21** members-only long-form blogs ("zines") with comments, broadcast on a relay bulletin | Spec resolved 2026-10-12 by grilling; planning only |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
 
-**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane.
+**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane. **Zines** (O) is the members-only long-form commons: also a data feature, reusing **19**'s spine, and it is the one task that adds a relay ability (a broadcast bulletin) — also independent of the media plane. It reshapes **Articles** (G) from a native Nostr build into an optional export.
 
 Detailed specs follow **by task ID** (1, 2, …). Dependency order is in the table above.
 
@@ -69,7 +71,7 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 | `crates/hush-daemon/` | Unlock, local API |
 | `crates/hush-cli/` | Send/recv without GUI |
 | `apps/hush-tauri/` | Contacts, conversation, send file, vault status |
-| `crates/hush-articles/` | (Task 11) Nostr pen names, feed, cache — **planned** |
+| `crates/hush-articles/` | (Task 11) Nostr **export** of a zine (NIP-23) — **planned**; native long-form is Task **21** (`hush-core`/`hush-daemon`, no new crate) |
 
 ---
 
@@ -383,7 +385,7 @@ Member maintains a **list of outsider contacts** (like address book entries). Ro
 - Buried recovery code at first unlock.
 - Export/import encrypted vault to a folder (stand-in for WebDAV/S3).
 - Device-link QR if time; else document as next slice.
-- **Articles (Task 11):** pen-name keypairs and articles DB/cache in backup manifest (pen name loss = identity loss).
+- **Zines (Task 21):** pen-name keypairs, held read keys, and `zines.enc` in the backup manifest (pen name loss = identity loss; a lost read key = a zine you can no longer read).
 
 **Verify:** destroy local vault copy, restore with passphrase + backup file; recover keys with recovery code in a test.
 
@@ -430,23 +432,32 @@ Reached from a **Vault bento tile** that opens the board full-bleed.
 
 ---
 
-### Task 11: Articles (Nostr pen names — planning only)
+### Task 11: Articles — Nostr **export** bridge (reshaped 2026-10-12)
 
-**Status:** Planned — **Phase G** (after **16** or in parallel once **Phase C** is stable).
+**Status:** **Reshaped** — **Phase G**, now optional and **after 21**. The native long-form surface is
+**zines** (Task **21** / Phase **O**); this task is now only the **export** path that pushes a zine
+beyond the membership.
 
-**Goal:** Pseudonymous long-form publishing: **pen names** (vault keypairs, isolated from messaging), **Nostr** articles/comments (NIP-23/22/09/50/56 — **verify before build**), **Tor** transport (`arti`), local follows/mutes/drafts, daemon-sanitized UI.
+**Why it changed:** zines deliver members-only E2EE long-form on rails the capsule already has
+(Task **19**'s spine plus one relay bulletin lane) with no second network stack and no public
+metadata. Nostr's value is **reach to a public audience** and interop with other clients — real, but
+not the native shape. Both reuse the same **pen-name keys**.
 
-Full design, build order, and acceptance criteria:
+**Goal (reshaped):** an optional action that **exports** a zine as a **NIP-23** event, signed with
+its pen-name key and published over **Tor** (`arti`) to a curated relay list — the "vault→publish"
+arc from the knowledge-layer roadmap, as a button rather than a parallel product.
 
-→ **[`docs/tasks/hush-articles.md`](../tasks/hush-articles.md)**
+Full design (pen names, relay pool, media, NIPs) is retained for the parts that still apply:
 
-**Crate:** `crates/hush-articles/` on **rust-nostr**; daemon **`/api/articles/*`**; UI never talks to relays directly.
+→ **[`docs/tasks/hush-articles.md`](../tasks/hush-articles.md)** — now scoped to **export**; its
+feed / follow / relay-pool sections are superseded by zines.
 
-**Build order (summary):** pen names + relay pool → publish/read → feed phase 1 → media pipeline → editor → comments/search/mute/report → feed phase 2 (opt-in global) → Tor per-pen-name hardening.
+**Crate:** `crates/hush-articles/` on **rust-nostr** (export only); UI never talks to relays directly.
 
-**Depends on:** Task **5** (daemon API), **5c** (encrypted local store), **6** (backup includes pen-name keys). **Independent** of `hush-relay` / libsignal messaging.
+**Depends on:** Task **21** (zine + pen-name keys), **6** (backup includes pen-name keys), **5c**
+(encrypted local store). **Independent** of `hush-relay` / libsignal messaging.
 
-**Distro-readiness:** Cache/drafts under data root; document **second egress** (Nostr over Tor); sanitized-only UI — see Task 11 doc.
+**Distro-readiness:** document the **second egress** (Nostr over Tor) — DR-18; sanitized-only UI.
 
 **Not at launch:** Operating a first-party Nostr relay.
 
@@ -523,6 +534,43 @@ Full design, build order, and acceptance criteria:
 
 ---
 
+### Task 19: Conclave Paper — collaborative note-taking
+
+**Status:** **Phase M** — spec resolved 2026-10-12 by grilling. **All eight tasks landed and
+dogfooded 2026-10-12**: the sidecar store, `yrs` doc + `/api/paper/*`, wire payloads, fan-out +
+inbound routing and late-joiner catch-up (Tasks 1–4); the ProseMirror/Yjs editor and Paper tab with
+bridge unit tests (Task 5); the DataChannel fast path with hub re-broadcast and relay fallback
+(Task 6); presence cursors, convener succession, lock/suspend, and read-only-after-end hardening
+(Task 7); and the distro/threat/protocol docs (Task 8) — see the records in
+[`2026-10-12-conclave-paper.md`](2026-10-12-conclave-paper.md).
+Three trustees converging over the relay, the DataChannel fast path with the relay left undrained,
+presence cursors, explicit and automatic succession, and read-only-after-end are all verified
+end-to-end by
+[`scripts/paper-dogfood.sh`](../../scripts/paper-dogfood.sh) — three daemons, a real relay, and no
+paper plaintext on disk.
+
+**Goal:** One shared, live, **E2EE collaborative document** ("Paper", Etherpad-like) per conclave.
+**Sub-second** editing over a **WebRTC DataChannel** (data-only, pure-Rust stack — no GStreamer;
+deliberately does **not** wait for the postponed Task 17 media plane), with automatic **relay
+fan-out fallback** (~1–3 s convergence) over the trustees' existing 1:1 Signal sessions. The
+document **persists in every trustee's vault** like the conclave message log. Basic rich text,
+author colours, named live cursors. No Etherpad code, no server, no relay change.
+
+→ **[`docs/tasks/conclave-paper.md`](../tasks/conclave-paper.md)** · plan: [`2026-10-12-conclave-paper.md`](2026-10-12-conclave-paper.md)
+
+**Key decisions:** Hush-native CRDT (`yrs`) owned by the daemon; one paper per conclave, creatable
+by any joined trustee; hub = paper creator (rendezvous only — a CRDT merges anywhere), degrades to
+relay cadence when absent; **convener inherits the hub** when the creator leaves/is kicked, and may
+re-home it explicitly; late joiners receive the current snapshot from the hub; `ConclaveEnd` makes
+papers read-only.
+
+**Depends on:** conclave fan-out (done), **5h** presence (done), **5c** encrypted store (done); the
+tolerant unknown-tag decode shared with Task 17 Phase 1 (Paper brings it if it lands first).
+**Independent of** **17** / **18** media work; the two-WebRTC-stack trade (data vs media) is
+consolidated at Task 18.
+
+---
+
 ### Task 20: Conclave Reading Room — shared reading + discussion (planning only)
 
 **Status:** **Phase N** — idea captured 2026-10-12 from discussion; **planning only**, and **not
@@ -561,12 +609,46 @@ renderer's asset footprint and the document-size cap.
 
 ---
 
+### Task 21: Zines — members-only long-form publishing
+
+**Status:** **Phase O** — spec resolved **2026-10-12 by grilling**; **planning only**. No code until
+a phase is approved.
+
+**Goal:** Every member has a **zine** — their own blog of long-form articles with a comments
+section, readable by **all members** (not just contacts), end-to-end encrypted. Articles and
+comments are **broadcast** to a relay **bulletin** (one new, generic, opaque append-only lane) and
+held in every member's vault; readability propagates **holder-to-holder** over existing 1:1 sessions
+(one read key per zine). Sections/tags ride **inside** the encrypted article and are browsed
+locally — a newspaper you read what you want from, with no follows and no algorithm. Text-only rich
+text. Reuses Task **19**'s spine (sidecar store, fan-out, payload codec, tolerant decode) but **not**
+its CRDT: one writer per document.
+
+→ **[`docs/tasks/zines.md`](../tasks/zines.md)**
+
+**Key decisions:** members-only E2EE; pen-name identity; **relay bulletin** for broadcast delivery;
+**key epidemic** for readability (no all-members key exists, so delivery is broadcast and readability
+is epidemic); one read key per zine, no revocation; tags in the descriptor, no relay registry;
+comments sealed to the pen-name public key and merged author-side; **no public IPFS/DHT** (metadata
+leak) and **no relay category registry** (a directory) — both rejected in the spec's Section 1;
+optional later **Nostr export** (reshaped Task **11**).
+
+**Depends on:** Task **19**'s landed spine, conclave fan-out (done), **5c** encrypted store (done),
+**6** backup. **New relay work:** the bulletin lane — the first new relay ability since the founding
+constraint, stated in full in the spec's threat-model delta. **Independent of** **17**/**18** media
+work.
+
+**Distro-readiness:** no new client egress (the bulletin is the existing relay); relay storage grows
+with the corpus (its own cap + TTL); the optional Nostr export adds the Tor egress already tracked
+as DR-18.
+
+---
+
 ### Task 8: Deliberately later (do not start)
 
 - Stripe
 - WebDAV/S3 live providers
 - Android
-- Groups; **messaging** follow-model (Articles Task **11** uses **local-only** follows, not published lists)
+- Groups; **messaging** follow-model (Zines Task **21** deliberately has **no** follows — it is a pull-only newspaper; Articles Task **11** is now only a Nostr **export**)
 - Flathub
 - Expert review pass on queue auth (covered in Task **5c.1** / **5c.4** before calling transport “done”)
 - Full SMTP/IMAP product for `@myserver.com` on the public Internet (partial inbound via **5e** only)

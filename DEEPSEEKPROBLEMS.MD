@@ -13,6 +13,665 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-12 — Zines spec (design, docs-only)
+
+Trigger: the user proposed member blogs with comments, broadcast to all members, and asked to grill
+the idea into a locked spec. Scope: docs only — `docs/tasks/zines.md` (new), the milestone index,
+`PROTOCOL.md`, `THREAT_MODEL.md`, `DESIGN.md`, `docs/tasks/hush-articles.md`, and the roadmap. No
+code.
+
+### "A blog is a single-author Paper" was too broad — the CRDT does not carry over — `FIXED`
+
+Attempted: framing the blog idea as a direct generalization of Task 19's Paper ("a blog is almost
+exactly a single-author Paper"), then writing the spec on that basis.
+
+Symptom: the framing implied zines would reuse Paper's `yrs` CRDT and the ProseMirror/Yjs bridge.
+Writing the spec made the mismatch explicit — a zine article has exactly **one** writer (its pen
+name), and each comment is a separate signed blob merged by the author, so there is no concurrent
+edit to merge. A CRDT would be dead weight and `y-prosemirror` a dependency with no purpose.
+
+Resolution: the spec states the correction up front — zines reuse Paper's **spine** (sidecar-store
+pattern, per-trustee fan-out, payload codec, tolerant `Unknown` decode) but **not** its CRDT; the
+editor reuses the ProseMirror rendering and toolbar without Yjs. Recorded in `zines.md` Section 2.
+
+Lesson: "reuses task X's spine" and "reuses task X's mechanism" are different claims. Name the
+spine's parts explicitly before leaning on the analogy — the CRDT was the one part that did not
+transfer, and it was the part most likely to be assumed.
+
+---
+
+## 2026-10-12 — Conclave Paper, verification and the create collision
+
+Trigger: driving the finished slice end-to-end in two real app windows instead of trusting the
+suite. That turned up one real correctness bug and two process problems.
+
+### Two trustees starting the paper at once produced two papers for one conclave — `FIXED`
+
+Attempted: open the Paper tab in two app windows and click "Start paper" in both, to check
+convergence in the real UI.
+
+Symptom: the text converged **both ways**, so nothing looked wrong — but
+`GET /api/paper/{conclave_id}` on the two daemons returned **different** `paper_id`s, each with
+`hub` set to its own vault. `fast_path` was `{"path":"relay","live_peers":0}` on both sides, for the
+life of the paper, and no cursors ever appeared.
+
+Root cause: `PapersState::adopt` looked a paper up by `paper_id` while `create` and `get` key on the
+conclave. A second descriptor for the same conclave therefore did not match the entry already
+there — it was pushed as a **second** paper. Each side kept its own as "first", so `get(conclave)`
+returned each side's own descriptor, `paper.hub == me` was true on both, and `paper_dial` returned
+early on both. Neither side ever dialled. The content still converged because the relay fan-out is
+by **conclave** and `conclave_of` resolved both ids once each side had adopted the other's
+descriptor, so the only visible symptom was a permanently dead fast path.
+
+Resolution: `adopt` keys on the conclave, and a collision is settled deterministically — the
+earlier `created_ms` wins, ties go to the smaller id, and the loser takes the winner's identity
+while keeping its own document. That is the rule the UI already promised ("the first create wins
+and everyone else adopts it") and it is total, so both sides pick the same winner from the same two
+descriptors with no extra round trip. Because the loser's earlier deltas went out under the old id
+and the winner dropped them as unknown, the daemon re-announces the folded document as a
+`PaperSnapshot` when it notices its paper has been re-identified. Verified end-to-end: after the
+fix both daemons report the same `paper_id`, `hub` = the earlier creator, and
+`fast_path: {"path":"live","live_peers":1}`; cursors then render in both editors. Three unit tests
+cover the rule (`a_create_collision_settles_on_the_earlier_paper`,
+`the_later_create_loses_on_the_side_that_started_first`,
+`a_create_collision_on_the_same_millisecond_still_picks_one_winner`).
+
+Lesson: `create` refusing a second paper it has never seen cannot prevent a distributed collision,
+and keying a sidecar on one identity while a sibling method keys on another is the kind of
+inconsistency that produces no error at all. The fan-out being keyed on the conclave is what hid
+it — a bug whose only symptom is a performance feature quietly not working is invisible to a test
+suite that only checks convergence.
+
+### The dev stack was running a daemon binary older than the source — `WORKED AROUND`
+
+Attempted: `./scripts/run-two-ui.sh --dev` after changing `paperStore.ts`, then driving the UI.
+
+Symptom: the UI behaved as if the feature did not exist. Probing the running daemon directly:
+`GET /api/paper/{id}/presence` → **404 with an empty body**, `POST /api/paper/{id}/hub/rehome` → 404
+empty, and `GET /api/paper/{id}` had no `fast_path` key. An empty 404 is axum's fallback, so those
+routes did not exist in the running binary; a real handler answers with JSON
+(`{"error":"no paper in this conclave"}`), which is what a bogus path did not do. The daemons had
+been left running from an earlier session.
+
+Resolution: killed the daemons and re-ran the script. This is a **process** problem, not a repo
+problem — the script says it reuses a daemon that is already up, which is right for editing the UI
+and wrong after touching `crates/`. Worth knowing the tell: **an empty-bodied 404 from the daemon
+means the route is not in the running binary**, so the binary is stale, not the request wrong.
+
+Lesson: "the code is right but the behaviour is old" is a stale binary until proven otherwise.
+Probe for a route the change added before debugging anything else.
+
+### The remote cursor's label was a 64-character account id — `FIXED`
+
+Attempted: read the rendered cursor markup in the live editor.
+
+Symptom: `<div style="background-color: #b7791f">05cde85f415c09d24220b5bda8dc1ce04364e9678c4509
+60d7272376de9f0cbd37</div>` — the caret was drawn with the right colour and the wrong label.
+
+Root cause: a peer publishes its account id as `user.name`, which is deliberate (it is the identity
+the relay authenticated, so a peer cannot label its caret with someone else's name), but nothing
+resolved it to a name for display.
+
+Resolution: the receiver relabels the frame before applying it (`relabelAwareness` in
+`paperWire.ts`), looking the id up in the conclave roster — the same source the member list and the
+chat use. An account the roster cannot place is passed through untouched, so an unknown peer keeps
+its id rather than losing its cursor. Verified in the live UI: Alice's editor renders
+`<div style="background-color: #b7791f">bob</div>` and Bob's renders `alice`. Five unit tests cover
+the codec, including two-peer frames and unreadable bytes.
+
+---
+
+## 2026-10-12 — Conclave Paper, Task 7 (relay re-fan, dogfood, docs)
+
+Trigger: closing out the plan (`docs/plans/2026-10-12-conclave-paper.md`). The functional work was
+already in place except the hub's relay re-fan; this slice added it, ran the dogfood, and wrote the
+Task 8 docs.
+
+### A delta could be stranded by a sender whose roster had not caught up — `FIXED`
+
+Attempted: the three-daemon dogfood with Carol joining late, then Bob editing over the relay.
+
+Symptom: Carol never received Bob's post-lock edit. Bob had posted it while his local roster still
+had Carol as not-yet-joined, so his relay fan-out skipped her, and deltas are never replayed — the
+edit was gone for her permanently.
+
+Root cause: the relay fan-out is a full mesh built from the **sender's** roster. A roster that has
+not yet applied a join silently drops that trustee from the fan-out, and nothing repairs it.
+
+Resolution: the hub now re-fans. `Account::relay_conclave_paper_delta` (core) plus
+`Work::RelayPaperDelta` (`account_worker.rs`) plus the call in `main.rs`'s paper `recv` loop: when a
+`PaperDelta` arrives and this vault is the paper's hub, it is re-sent to every other joined trustee.
+The hub is the one node guaranteed to have the merged view, so it is the right place to repair a
+sender's stale roster. Verified by the dogfood's Carol check (her document now contains EDIT_4).
+
+Lesson: a mesh built from the sender's view of membership needs a node with a wider view to repair
+it. "Never replayed" plus "fan-out from local roster" is a silent-loss combination.
+
+### A backgrounded shell command was killed when its session ended, and the log looked like success — `WORKED AROUND`
+
+Attempted: `cargo test --workspace > /tmp/hush-test-workspace.log 2>&1 &` from a Shell call, to run
+the suite while other work continued.
+
+Symptom: the task reported `status: succeeded` and `exit_code: 0`, and the log ended with
+`Finished \`test\` profile ... in 38.67s` — but it contained **zero** `test result` lines and no
+`EXIT=` marker. The outer shell had exited after backgrounding the subshell, taking the test process
+with it; the exit code reported was the outer shell's, not the test run's.
+
+Resolution: re-ran in the foreground (`cargo test --workspace`, ~234 s) and captured the real
+output. This is a **tooling** problem, not a repo problem: a `&` inside a Shell call is not detached
+from the session's process group, so it dies with the session while still reporting success.
+
+Lesson: never treat a backgrounded Shell task's exit code as the command's result. Either run in the
+foreground, or detach properly (`setsid nohup ... & disown`) and then read the artifact for a
+completion marker.
+
+---
+
+## 2026-10-12 — Reading Room docs commit (on master)
+
+Trigger: the user asked to add the Reading Room idea to the coming tasks, then to "commit on
+master". Scope: the two new/changed doc files only — no code.
+
+### The milestone plan mixed two workstreams, so the commit needed hunk surgery — `WORKED AROUND`
+
+Attempted: commit only the Reading Room docs on `master`.
+
+Symptom: `docs/plans/2026-10-04-v1-milestones.md` carried both the pre-existing Conclave Paper edits
+(the Phase **M** row and the whole Task 19 section, uncommitted) and the new Reading Room edits. A
+plain `git add <file>` would have swept the Paper hunks in, and there was no clean hunk split —
+the Phase **M** and Phase **N** rows are adjacent added lines in one hunk, so `git add -p` could not
+separate them either.
+
+Resolution: trimmed the working file to the Reading Room hunks (removed the Phase **M** row and the
+Task 19 section), staged and committed those (`c8bca83`), then restored the full file from a backup
+so the Paper edits stay in the working tree. `master` was fast-forwarded to the commit with
+`git branch -f master HEAD` instead of a `git checkout`, because switching branches with the large
+dirty tree would have refused or dropped files. Because `master` and `feature/conclave-paper` were at
+the same commit, the commit is now reachable from both.
+
+Lesson: a doc that accumulates every workstream (the milestone plan) cannot be partially committed
+cleanly. Commit it whole, or keep per-workstream docs separate.
+
+### The Paper cross-link could not be committed with the Reading Room docs — `WORKED AROUND`
+
+Attempted: include the one-line cross-link added to `docs/tasks/conclave-paper.md` (its non-goals now
+name Task 20).
+
+Symptom: that file is **untracked** — the entire Paper spec was never committed — so committing the
+cross-link means committing the whole Paper spec onto `master`, which is not "only the Reading Room
+docs".
+
+Resolution: left `docs/tasks/conclave-paper.md` uncommitted with the rest of the Paper work.
+Consequence, stated plainly: `docs/tasks/conclave-reading-room.md` (now on `master`) links to
+`conclave-paper.md`, which is not on `master` yet, so that link dangles until the Paper docs land.
+
+Lesson: a cross-link into an uncommitted file cannot be shipped on its own.
+
+---
+
+## 2026-10-12 — Conclave Paper, Task 6 Step 2 wiring (signalling sends)
+
+Trigger: continuing after the data plane. Scope of this slice: the addressed signalling send —
+`Account::send_paper_signal` and the `Work::SendPaperSignal` command that carries it. The daemon
+that would call them (dial on paper open, answer inbound offers, drain the channels) is not in this
+slice.
+
+### Replaced a function body instead of appending to it — `FIXED`
+
+Attempted: added `send_paper_signal` to `account.rs` by matching `send_conclave_paper_snapshot`'s
+`fan_out_paper` call and replacing it with "that call plus the new method".
+
+Symptom: `error: expected expression, found `.`` at the `await` of a function whose body had been
+deleted — the replacement text omitted the call it was supposed to preserve, so
+`send_conclave_paper_snapshot` was left as `{ .await }`. The compiler caught it immediately.
+
+Resolution: restored the body. The method is whole again and `cargo check -p hush-core -p
+hush-daemon --all-targets` is clean.
+
+Lesson: when the intent is "keep this, add after it", the replacement has to literally contain what
+was matched. Re-reading the pair before applying is cheaper than the round trip.
+
+## 2026-10-12 — Conclave Paper, Task 6 Step 2 (signalling types + data plane)
+
+Trigger: continuing Phase 3 after the spike. Scope of this slice: the `MessagePayload` signalling
+variants, the `ClientConfig::stun_url` knob, and `paper_data::DataPlane` (offer/answer/send/
+fallback). The daemon wiring that would consume them is not in this slice.
+
+### Measured the transport with the test's own poll interval baked into the number — `FIXED`
+
+Attempted: timed "one update end to end" as `sent_at.elapsed()` after the receiver's `drain()`
+returned, polling `drain()` every 20 ms.
+
+Symptom: 21.1 ms for a 55-byte update, reported alongside the spike's 957 µs for the same payload.
+The number was self-consistent and plausible, so nothing flagged it — but it was almost entirely the
+poll interval. The loop slept 20 ms before it first looked; the transport contributed ~1 ms.
+
+Resolution: dropped the poll to 1 ms and stated the bound in the code ("transport plus at most one
+poll interval"), which puts the figure at 2.2 ms and makes its meaning explicit. The honest number
+for the transport alone remains the spike's ~1 ms.
+
+Lesson: a latency measurement whose floor is the harness's own polling is measuring the harness. When
+the measurement and the mechanism share a loop, say which one the number describes.
+
+### Edited sources while `cargo check` was running, then trusted its exit code — `WORKED AROUND`
+
+Attempted: started `cargo check --workspace --all-targets` in the background, then fixed the
+non-exhaustive matches it was about to report (in `hush-cli` and `hush-daemon`) while it compiled.
+
+Symptom: the check exited 0 with no errors — but it had compiled `hush-core` before the edits and the
+dependent crates after them, so it verified a tree that never existed. Nothing was wrong this time;
+the result simply did not mean what it appeared to mean.
+
+Resolution: re-ran the suites against a quiescent tree before recording anything as verified. Same
+class as the `| tail` entry above: the signal was real, its meaning was not.
+
+Lesson: a verification run is evidence only for the tree it actually read. Edit, then verify — not
+the other way round, and not concurrently.
+
+### Added UI-facing API (`Path::as_str`, a `role` field) before anything consumed it — `FIXED`
+
+Attempted: gave `Path` a badge-ready string method and `DataPlane` a hub/trustee role, on the
+reasoning that the UI would want both.
+
+Symptom: three dead-code warnings in a module whose whole point is compiling clean. Nothing used
+either, because the UI wiring is a later step.
+
+Resolution: deleted both. The plane genuinely does not need to know its role — the hub calls
+`answer`, a trustee calls `offer`, and which one a daemon is follows from whether it created the
+paper. One `DataPlane::new(stun)` replaced the two constructors.
+
+Lesson: the compiler is the cheapest reviewer for speculative API, but it only complains after the
+round trip. Not writing the method is cheaper still.
+
+## 2026-10-12 — Conclave Paper, Task 6 spike (`webrtc` DataChannel)
+
+Trigger: "go" — start Phase 3 with the spike the plan gates the rest of Task 6 on. The spike lives
+in `crates/hush-daemon/src/paper_data.rs` and is test-only (`#[cfg(test)] mod paper_data;`) until
+Step 2 promotes it.
+
+### Assumed the closure-based webrtc-rs API; 0.21 is builder + handler + injected runtime — `FIXED`
+
+Attempted: planned the spike against the webrtc-rs API most docs and blog posts show — `APIBuilder`
+plus `MediaEngine` plus `InterceptorRegistry`, `peer_connection.on_data_channel(Box::new(|dc| ...))`,
+`data_channel.on_message(Box::new(|msg| ...))`.
+
+Symptom: none, because reading the vendored crate source first caught it. `webrtc` 0.21.1 is a
+rewrite:
+
+- `PeerConnectionBuilder::new().with_handler(..).with_runtime(..).with_udp_addrs(..).build()`, and
+  `.build()` returns `impl PeerConnection`, not `Arc<dyn PeerConnection>` — the `Arc::new` is the
+  caller's job.
+- Events arrive through an `#[async_trait] impl PeerConnectionEventHandler` trait, not closures.
+- A `DataChannel` is polled (`while let Some(event) = dc.poll().await`), not callback-driven.
+- Binary send is `send(BytesMut)`, not `send(&[u8])`.
+
+Resolution: wrote the spike against the real API after reading
+`~/.cargo/registry/src/*/webrtc-0.21.1/{examples,tests}/`. `bytes` and `async-trait` became direct
+dependencies (both already in the tree via axum and zbus, so no extra compile time).
+
+Lesson: webrtc-rs 0.21 is recent enough that the ecosystem's examples are stale — read the vendored
+crate, not the internet. This reaches past the spike: Task 17/18 plan a *second* WebRTC stack
+(GStreamer `webrtcbin`), and the two are now confirmed to share nothing but the SDP/ICE vocabulary.
+
+### `cargo test … | tail` reports `tail`'s exit code, so a compile failure read as success — `WORKED AROUND`
+
+Attempted: `cargo test -p hush-daemon <filter> -- --nocapture 2>&1 | tail -40`, then trusted the
+reported exit code.
+
+Symptom: the run reported `exit code: 0` while its output held four `error[E0308]` compile failures.
+A pipeline's status is the last command's, and `tail` succeeded.
+
+Resolution: stopped piping when the exit code is the signal, and read `${PIPESTATUS[0]}` explicitly;
+the rerun surfaced `CARGO_EXIT=101`. Tooling-related, not a repo problem. Cost one round trip.
+
+Lesson: a pipe swallows the exit code of everything upstream of it. When the exit code *is* the
+signal, do not pipe the command that produces it.
+
+### The spike proves loopback, not a LAN, and not the in-daemon driving model — `OPEN`
+
+Attempted: Step 1 asks for "two daemons on one machine", so the spike runs both peer connections in
+one process bound to `127.0.0.1:0`, handing SDP and ICE over directly. It passes: handshake 612 ms,
+one real `yrs` update end to end in 957 µs, received byte-for-byte.
+
+Symptom: three things Steps 2–3 depend on are therefore *unproven*, not disproven:
+
+- **No LAN.** Loopback gathers host candidates on `lo` only; two real machines add interface
+  candidates and possibly a STUN reflexive pair. No STUN server is configured at all.
+- **No signalling round trip.** SDP and candidates never touch `MessagePayload`, so the cost of
+  carrying them over the existing 1:1 sessions is unmeasured.
+- **Not driven from the daemon's tokio runtime.** The test uses a plain `#[test]` plus the crate's
+  `Runtime::block_on` (which is `()`-only, so the value is moved out through a slot). The daemon
+  already owns a tokio runtime, where `block_on` must not be nested. `runtime().spawn(...)` should
+  be fine from an ambient tokio context, but nothing here proves it.
+
+Resolution: none yet. Closed by Step 2 (signalling payloads, hub lifecycle inside the running
+daemon) and Step 3 (LAN run, NAT degradation).
+
+Lesson: a hermetic spike buys repeatability at the cost of scope, so its record has to name what it
+did *not* cover. The pass is real, but it is not the acceptance criterion.
+
+## 2026-10-12 — Conclave Paper, Task 4 dogfood (three daemons + a real relay)
+
+Trigger: "ok" — run the live two-peer (extended to three) Paper dogfood that Task 4's Step 5 asked
+for. Harness: `scripts/paper-dogfood.sh` + `scripts/paper-edit.mjs`.
+
+### The hub's late-joiner catch-up could never land on the peer it exists for — `FIXED`
+
+Attempted: verified the Phase 2 acceptance criteria (converge, no plaintext, late joiner) by
+driving three real daemons through a real relay.
+
+Symptom: the late joiner stayed empty forever while the hub reported the document fine.
+
+```
+hush-daemon: paper payload from alice ignored: no paper 5c65d6e4-98d2-4e88-bcd5-eb72b3a9cd25 in this vault
+```
+
+Cause: `PaperSnapshot` was `{ paper_id, state }`. `paper_apply_inbound` looks the paper up with
+`parsed.conclave_of(paper_id)` and errors when it is unknown — but the only peer that ever needs a
+snapshot is one that joined *after* the paper existed, so it never received the `PaperState`
+fan-out and has no record to look up. The payload named a paper the vault could not place, so the
+catch-up was dropped every time. The feature was unusable in its only use case, and no unit test
+covered it: `an_inbound_snapshot_merges_and_keeps_local_edits` seeds the receiver with a paper
+first, which is exactly the state a real late joiner is not in.
+
+Resolution: `PaperSnapshot` now carries the `PaperDescriptor` instead of a bare `paper_id`, so the
+payload is self-contained and order-independent. `paper_apply_inbound` adopts the descriptor when
+the paper is unknown — under the same creator-authority rule `PaperState` enforces — and merges
+only the state when it is already known, so a peer cannot retitle or re-home via a snapshot. Two
+tests added: a snapshot from the creator materialises an unknown paper; a snapshot credited to
+another peer is refused. Verified by re-running the dogfood (Carol converges) plus
+`cargo test -p hush-core -p hush-daemon`.
+
+Lesson: a payload whose only consumer is the peer with the least state has to carry everything that
+peer needs. The existing test's fixture (receiver already holds the paper) made a broken path look
+covered.
+
+### Assumed `/api/recv` exposes the joined-trustee set to clients — `FIXED` (wrong assumption)
+
+Attempted: gated the harness on the hub observing a join by matching `"joined":[...]` in the
+`POST /api/recv` body.
+
+Symptom: the body came back `{"messages":[],"warnings":[]}` — no `joined` key at all, so the gate
+could never pass.
+
+Cause: `InboxResult.joined` is internal to the daemon. `recv` consumes it (to decide about
+catch-up snapshots) and returns its own `RecvResponse { messages, warnings }`. Nothing about
+membership is published over HTTP.
+
+Resolution: the harness now reads the roster through `GET /api/conclaves` and matches the
+trustee's `state` for the invited nick. Lesson: read the route's return type, not the domain
+struct it is built from — they are not the same type here.
+
+### The Yjs helper read its own updates back as empty — `FIXED` (wrong assumption)
+
+Attempted: wrote `scripts/paper-edit.mjs` to build edits in the editor's shape and read them back
+to assert convergence.
+
+Symptom: `read` returned `""` for updates that were demonstrably non-empty (100 and 172 base64
+chars).
+
+Cause: two wrong assumptions about the yjs API. `Y.XmlElement.toArray()` yields plain **strings**
+for text runs, not `Y.XmlText` instances, so the recursive walk fell through to `""`; and the value
+handed to the walk is a `Y.XmlFragment` (the top-level `getXmlFragment` result), not an
+`XmlElement`, so an `instanceof Y.XmlElement` check matched nothing. A third: the editor binds an
+XmlFragment named `prosemirror` via `y-prosemirror` (a `<doc>` element of `<paragraph>` nodes), not
+a `Y.Text`, so the first draft was the wrong shape entirely.
+
+Resolution: walk `Y.XmlFragment` (which `XmlElement` extends) and handle the string case, and build
+`<doc><paragraph>text</paragraph></doc>`. Lesson: `toString()` on the fragment showed the content
+immediately and would have found this in one step — reach for the debug print before rewriting the
+walk.
+
+### The at-rest plaintext check could pass without looking at anything — `FIXED`
+
+Attempted: asserted no plaintext in `relay.db` and both `papers.enc` files with
+`grep -aq "$needle" <file>`.
+
+Symptom: none — it passed. That was the problem. If the path were wrong or the file missing, grep
+exits non-zero, the `if` reads that as "no match", and the check passes having scanned nothing.
+Only `relay.db` was scanned, so a WAL file or a new sidecar carrying payloads would have gone
+unnoticed.
+
+Resolution: assert `relay.db` and each `papers.enc` exist and are non-empty first, then scan
+*every* file the run left behind (`find`, excluding only the harness's own scratch response) and
+report which file matched. Confirmed the detector has teeth with a negative control: it fires on a
+planted file and does not fire on absent text. Lesson: an absence assertion needs proof it looked
+somewhere — a control, or a guard that fails when the corpus is empty.
+
+### The daemon-side delta debounce from Task 4 Step 3 is not implemented — `WORKED AROUND`
+
+Attempted: checked whether the "debounce (~300–500 ms) in the worker" Step 3 asks for exists.
+
+Symptom: `rg debounce crates/hush-daemon crates/hush-core` matches nothing. The daemon fans out one
+relay blob per `POST /api/paper/{id}/update`.
+
+Cause/context: the editor already coalesces before the daemon sees anything — `paperStore.ts`
+buffers keystrokes and sends `Y.mergeUpdates(batch)` every `PAPER_FLUSH_MS = 400`, which is the
+window the plan asked for. The daemon-side timer would be a second layer for no fewer blobs.
+
+Resolution: documented as a deliberate deviation in the plan and the task doc rather than built. A
+non-UI caller that posts per keystroke still gets one fan-out per call — nothing coalesces that.
+Lesson: state the deviation where the step lives, or "Step 3 done" is a claim the code does not
+support.
+
+---
+
+## 2026-10-12 — Build and test-loop latency (mostly environment, not repo code)
+
+Trigger: "is there a way we can avoid building everything like dependencies and stuff everytime
+.. because it takes time". Goal was to find where the minutes actually went.
+
+### The loop is test-execution bound, not build bound — `FIXED` (wrong assumption, corrected)
+
+Attempted: assumed Cargo recompiling the dependency tree was the cost, and started tuning build
+configuration.
+
+Symptom: that assumption was 93% wrong for warm iterations. Measured on `hush-core` + `hush-daemon`:
+
+- cold dev build, all deps, from an empty `target/`: 214 s
+- warm rebuild after touching `crates/hush-core/src/payload.rs`: 16 s (lib alone), 6 s (lib plus
+  all 23 test binaries)
+- no-change `cargo test -p hush-core --no-run`: 0.75 s
+- no-change `cargo test -p hush-core`: **110 s** — the suite run, not the build
+
+Per-target breakdown of that 110 s: `--lib` 46.0 s, `conclaves` 19.7 s, `internal_mail` 9.5 s,
+`revocation` 9.1 s, `two_party_relay` 7.5 s, `backup_recovery` 7.1 s, `file_transfer` 5.1 s,
+`relay_tor_mode` 3.5 s, `drops` 3.2 s, `vault_identity` 2.7 s, `presence_helper` 0.7 s.
+
+Resolution: the inner loop is test-selection bound. Use a module or file filter while iterating
+(`cargo test -p hush-core payload`, `cargo test -p hush-core --test conclaves`) and keep the full
+crate and `cargo test --workspace` for the completion gate only. `--workspace` additionally
+compiles the Tauri desktop app and `hush-wallet`, which the Rust-only loop does not need; that
+extra cost was not measured, so no number is claimed for it.
+
+Lesson: measure the loop before tuning it. The bottleneck was not where it was assumed to be.
+
+### 119 GB of dev artifacts on a spinning disk — `FIXED`
+
+Attempted: reduce build time by reviewing Cargo configuration.
+
+Symptom: `target/` was 121 GB, 119 GB of it `target/debug` (39 GB of that `incremental`), and
+`/home` is `/dev/sdb2` — a Seagate ST1000LM035 with `ROTA=1`, i.e. a spinning disk — while `/` is
+`/dev/sda2`, a Samsung SSD with 106 GB free. Every build read and wrote that tree on the HDD. The
+bulk came from the default `[profile.dev] debug = 2`.
+
+Resolution: `target/` is now a symlink to `/var/tmp/hush-target` on the SSD. The 2.2 GB of
+release binaries were moved across; the 119 GB dev tree was deleted rather than copied, because
+the profile change invalidated it anyway and copying 119 GB off an HDD would have cost ~20 min.
+Added `[profile.dev] debug = 0` at the workspace root plus a `dev-with-debug` profile as the gdb
+escape hatch. The same dev build now occupies 2.1 GB instead of 119 GB. Verified by a cold
+rebuild producing every binary and a green test run, not by inspection.
+
+`/var/tmp` was chosen over `/var/cache` because `/var/cache` needs root and this box has no
+passwordless sudo. A dangling symlink there self-heals, since `create_dir_all` recreates the
+destination; if the cache is wiped the next build is simply a cold one.
+
+Also added an opt-in `HUSH_PROFILE=debug` to `scripts/run-two-ui.sh`. The daemon stays release by
+default for the documented AEAD-throughput reason, but pure paper/UI work can now share the dev
+profile with `cargo test` instead of compiling the ~1550-crate tree in both profiles.
+
+### Swap exhausted and RAM starved — `OPEN` (environment, not repo)
+
+Symptom: before any build started, `free -m` showed 7993/8069 MB of swap in use and 1294 MB RAM
+free; `/dev/zram0` was 100% full. Top consumers were `cursor`, eight `chrome` processes and
+`ofelia`. `/swap.img` already lives on the SSD, so this is not a disk-placement problem.
+
+Resolution: unresolved. It is the user's desktop load rather than anything in the repo, and no
+build setting fixes it. Flagged to the user; it slows every build and test run regardless of the
+other two fixes. Recorded here so it is not mistaken for a repo regression later.
+
+---
+
+## 2026-10-12 — Conclave Paper, Phase 2 Task 3 (wire payloads + tolerant decode)
+
+Slice goal: add the five paper `MessagePayload` variants and the shared tolerant-decode change,
+then consolidate the daemon's duplicate descriptor onto the one definition.
+
+### [FIXED] Adding an enum variant broke a crate nobody had looked at (`hush-cli`)
+
+- **Attempted:** add the paper variants to `MessagePayload` and verify with
+  `cargo build -p hush-core` and `cargo test -p hush-core -p hush-daemon`.
+- **Symptom:** both of those passed, so the change looked done. `cargo test --workspace` then
+  failed to compile: `error[E0004]: non-exhaustive patterns: MessagePayload::PaperState { .. }, ...
+  --> crates/hush-cli/src/main.rs:266`. A third exhaustive match on `MessagePayload` lived in a
+  crate that neither of the earlier commands builds.
+- **Why it happened:** I enumerated match sites with `rg MessagePayload::` **after** the failure
+  rather than before, and I treated "the crates I edited compile" as evidence the workspace
+  compiles. `hush-core` had two match sites, the daemon had one, and `hush-cli` had a fourth that
+  no targeted build touched. Each cost a full multi-minute compile to discover.
+- **Resolution:** all four sites now name the paper variants explicitly, and none of them routes
+  them into the `unreachable!` control-payload arm (which would have panicked on a real paper
+  payload). `cargo test --workspace` is green: 329 tests across 20 binaries.
+- **Lesson:** for a change to a shared enum, grep the whole workspace for the type name *before*
+  editing, and treat the workspace build — not the per-crate build — as the compile check. A
+  per-crate build proves only that the crates you thought of still compile.
+
+### [WORKED AROUND] `pgrep -f` reports the daemon as still running, because it matches my own command line
+
+- **Attempted:** confirm the two-peer dev stack had stopped after `kill -TERM <supervisor>`, with
+  `pgrep -f "target/release/hush-daemon --dir"`.
+- **Symptom:** the check printed `STILL UP` after a 30 s wait, when the daemons were in fact gone.
+  `pgrep -f` matches against the *whole* command line, and the sandbox wrapper that runs my command
+  contains that literal string, so `pgrep` matched its own shell. The same false positive occurred
+  in the Phase 1 session and was read as a real state again here.
+- **Resolution:** verify processes with `ps -C hush-daemon` (matches on the executable name, not on
+  my command line), or filter `pgrep` output by excluding the current PID. Confirmed with `ps -C`:
+  no daemons running.
+- **Lesson:** in this environment, `pgrep -f <pattern>` is unreliable whenever the pattern appears
+  in the command being run — which is always the case for a check I write myself. Prefer
+  `ps -C <comm>`.
+
+### [FIXED] A `StrReplace` silently deleted a line because the `old_string` was only a prefix
+
+- **Attempted:** insert a new test above `empty_and_missing_sidecars_decode_to_default` in
+  `paper_store.rs` by replacing the first four lines of that test.
+- **Symptom:** the replacement dropped the `assert!(` line that opened a multi-line assertion,
+  leaving `decode(Some(b"garbage")).is_err(),` as a bare expression — a broken test that would not
+  have compiled. The edit tool reported success.
+- **Resolution:** read the region back, saw the mangled assertion, and restored it along with the
+  new test. The intended insert had no reason to touch that line at all.
+- **Lesson:** when inserting near existing code, make `old_string` cover a complete syntactic unit
+  (through a closing brace) and re-read the region afterwards; a successful edit is not evidence
+  that the file is still correct.
+
+---
+
+
+## 2026-10-12 — Conclave Paper, Phase 1 dogfood (two bugs the tests could not see)
+
+Slice goal: run Phase 1 in the real app before moving to Phase 2. Both bugs below were invisible to
+a green test suite and only appeared against the live daemon and a real editor.
+
+### [FIXED] A blank paper threw "Unexpected end of array" and the editor never opened
+
+- **Attempted:** open the Paper tab on a conclave whose paper existed but had never been edited
+  (revision 0, no content).
+- **Symptom:** the pane showed "Couldn't open the paper." Reproduced in the page: `openPaper()`
+  rejected with `Error: Unexpected end of array` — a Yjs decoder error. The daemon was returning
+  `"state": ""` for a paper with no content, and `Y.applyUpdate(doc, new Uint8Array(0))` cannot
+  decode zero bytes. The Rust side had the same hole: `paper_doc::apply` normalised an empty
+  result to the canonical empty update, but `fold` (which is what the GET route uses) did not, so
+  a fresh paper's state was zero bytes while an edited one was valid.
+- **Why the tests missed it:** `paper_routes_round_trip_a_document` asserted `!state.is_empty()`
+  only *after* pushing an update, and `paper_doc`'s tests never folded an empty snapshot with an
+  empty log. Every existing test exercised a paper that already had content. The webview had no
+  test at all.
+- **Resolution:** `paper_doc::fold` now normalises a zero-byte result to the canonical empty v1
+  update, so the state a paper reports is always decodable; the webview's `applyRemote` skips an
+  empty update instead of throwing at it (a transport must not be able to break the editor by
+  sending nothing); and both sides got regression tests — `a_paper_with_no_content_folds_to_a_
+  decodable_empty_update` (unit) and a fresh-paper state assertion in the API round-trip test.
+  Verified live: the fresh paper's state went from `""` to `[0, 0]`.
+- **Lesson:** "is the state non-empty" is not the property that matters — "is the state
+  *decodable*" is. The empty document is a distinct case from the non-empty one and needs its own
+  test on both sides of the wire.
+
+### [FIXED] `attachEditor` threw in the editor's constructor and blanked the whole app
+
+- **Attempted:** mount the ProseMirror view with a `dispatchTransaction` override that closed over
+  `view` so the toolbar's pressed state could refresh.
+- **Symptom:** `Cannot access 'view' before initialization`. `y-prosemirror` dispatches a
+  transaction *while the `EditorView` is still constructing* (adopting the Yjs fragment into the
+  ProseMirror doc), so the override read `view` in its temporal dead zone. Worse, because
+  `render()` clears `root.innerHTML` before rebuilding, the throw aborted the paint and left the
+  **entire window blank** — not just the Paper pane.
+- **Resolution:** replaced the dispatch override with a small plugin whose `view.update(view)` hook
+  receives the view as an argument, so nothing reads it early; and wrapped the editor mount in a
+  try/catch that renders a visible "couldn't open" pane, because a failure inside one pane must not
+  be able to blank the shell. The earlier fix in this slice (binding toolbar click handlers after
+  the view was created) had addressed the same hazard in the *click* path and was assumed to have
+  covered it — it had not.
+- **Lesson:** a partially-applied fix is a wrong fix. When moving a reference later to escape a
+  temporal dead zone, grep every reference to that binding, not just the one that failed. And any
+  mount that can throw inside a shell that clears its root first needs a guard at the boundary.
+
+---
+
+## 2026-10-12 — Conclave Paper, Phase 1 (offline paper core + editor)
+
+Slice goal: `paper_store.rs` sidecar, `paper_doc.rs` yrs plumbing, `/api/paper/*` routes, and
+the ProseMirror/Yjs editor wired into the conclave detail as a Chat | Paper pill.
+
+### [FIXED] The ydoc update handler's origin guard was written before checking what origin is
+
+- **Attempted:** the first draft of the `ydoc.on("update")` handler in `paperStore.ts` guarded
+  on a guessed origin value so locally typed edits would be queued for the daemon but remote
+  applications would not be re-sent.
+- **Symptom:** the guess (`origin === ydoc.clientID`) was type-nonsense — a ydoc update's
+  origin is whatever the mutating `transact()` call passed, and `clientID` is a number that is
+  never an origin. Nothing would have failed at compile time; the bug class is "sent nothing"
+  or "sent everything including our own poll applications".
+- **Resolution:** read `y-prosemirror`'s bundled source: `_prosemirrorChanged` calls
+  `doc.transact(..., ySyncPluginKey)`, so editor-originated (and undo-originated) changes carry
+  the plugin key, and only our own poll applications carry the `"remote"` string we pass to
+  `Y.applyUpdate`. The guard is one line: `origin === "remote"` returns. Undo/redo changes flow
+  to peers like typing does, which is what peers need.
+- **Lesson:** before guarding on a callback parameter, read the emitter's source. y-prosemirror
+  passes the sync plugin key as the transaction origin — anything else is either our transport
+  or an undo manager, and both must fan out.
+
+### [FIXED] First-draft type errors in paperStore cost two fix cycles, and one edit used sed
+
+- **Attempted:** wrote the whole editor binding in one pass, then typechecked.
+- **Symptom:** `Schema<{...}>` does not satisfy `extends string` — prosemirror-model's `Schema`
+  is generic over node/mark *name* types, not spec maps, so the widened-record trick does not
+  type; the toolbar closures referenced `view` before its declaration and a `paperSchema` /
+  `schema` name mismatch; the daemon-side at-rest test hit `Path::file_name()` returning
+  `Option<&OsStr>` twice. Separately, one bulk rename was done with `sed -i` instead of the
+  edit tools, against the workspace's own tool discipline (verified with `rg` immediately
+  after; no damage).
+- **Resolution:** alias `MarkType`/`NodeType` from prosemirror-model, build toolbar buttons
+  before the view and bind click handlers after it exists, use `file_name()?` inside the
+  `Option`-returning finder, and no further shell edits. (A later checkbox tick in the plan doc
+  still reached for a `python3` heredoc before this entry was finished — same violation, also
+  verified after the fact. The lesson stands: shell-based file edits are a habit to break, not
+  a shortcut to keep.)
+- **Lesson:** prosemirror's `Schema` generics are name unions — reach for `MarkType`/`NodeType`
+  directly rather than trying to parameterise the schema type; and when a module grows past a
+  screen, typecheck the halves instead of stacking assumptions.
+
+---
+
 ## 2026-10-11 — Vault absorbs the Files rail pane
 
 Slice goal: remove the Files entry from the rail; the Vault bento already tells the

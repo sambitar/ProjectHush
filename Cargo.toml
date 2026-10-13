@@ -8,3 +8,18 @@ members = [
   "apps/hush-tauri/src-tauri",
 ]
 resolver = "2"
+
+# Dev/test builds skip DWARF debug info. It cost ~119 GB of target/ and a large
+# slice of codegen and link time on a ~1550-crate dependency tree, which does not
+# fit on this machine's SSD. Panic locations and assert messages still point at the
+# right source line (that is compile-time metadata); only backtraces *inside*
+# dependency frames lose file:line. Use `debug = "line-tables-only"` if those are
+# needed, or `cargo build --profile dev-with-debug` for a one-off gdb session.
+[profile.dev]
+debug = 0
+
+# Escape hatch for the rare gdb/backtrace session:
+#   cargo build --profile dev-with-debug
+[profile.dev-with-debug]
+inherits = "dev"
+debug = 2

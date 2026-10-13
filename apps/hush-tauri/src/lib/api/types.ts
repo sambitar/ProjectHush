@@ -363,6 +363,62 @@ export interface NotesNoteResponse {
   id: string;
 }
 
+/** A conclave paper's descriptor: who made it and where live editing anchors. */
+export interface PaperDescriptorDto {
+  paper_id: string;
+  conclave_id: string;
+  /** Account id of the trustee who created the paper. */
+  creator: string;
+  /** Account id of the DataChannel rendezvous (Phase 1: always the creator). */
+  hub: string;
+  title: string;
+  created_ms: number;
+}
+
+/** One merged CRDT update in the paper's pending log. */
+export interface PaperUpdateDto {
+  rev: number;
+  /** Account id of the authoring trustee. */
+  origin: string;
+  /** Base64 of the opaque v1 Yjs update. */
+  update: string;
+  at_ms: number;
+}
+
+/**
+ * `GET`/`POST /api/paper/*` — one conclave's shared paper.
+ *
+ * `state` is the full merged document (base64 v1 Yjs update); `updates` are
+ * the pending log entries after the last compaction, oldest first. `revision`
+ * is gapless and never restarts, even across compaction.
+ */
+export interface PaperViewDto {
+  paper: PaperDescriptorDto;
+  revision: number;
+  updated_ms: number;
+  state: string;
+  updates: PaperUpdateDto[];
+  compacted: boolean;
+}
+
+/** One peer's live presence frame, opaque to the daemon. */
+export interface PaperPresencePeerDto {
+  /** Account id the frame came from. */
+  account: string;
+  /** Base64 of the editor's awareness update. */
+  frame: string;
+}
+
+/**
+ * `GET /api/paper/{id}/presence` — who else is reachable on the fast path.
+ *
+ * An empty list is a real answer, not an error: presence has no relay fallback
+ * and no persistence, so "nobody" means nobody is on a channel right now.
+ */
+export interface PaperPresenceDto {
+  peers: PaperPresencePeerDto[];
+}
+
 // --- Torrents (TorBox-powered client) ------------------------------------------
 
 /** Where a queued item's data came from. */

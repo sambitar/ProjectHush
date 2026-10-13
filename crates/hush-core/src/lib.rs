@@ -45,10 +45,10 @@ pub use invite::InvitePayload;
 pub use mail::{
     format_address, normalize_handle, normalize_vault_name, DEFAULT_VAULT_NAME, MAX_HANDLE_LEN,
 };
-pub use message::{InboxResult, ReceivedAttachment, ReceivedMessage};
+pub use message::{InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper};
 pub use payload::{
-    ConclaveDescriptor, ConclaveTrustee, MessagePayload, TrusteeState, MailAttachment,
-    MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS,
+    ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeState,
+    MailAttachment, DEFAULT_PAPER_TITLE, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS,
 };
 pub use prekey::{OneTimePreKey, PreKeyRecord};
 pub use relay_client::{

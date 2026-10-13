@@ -3805,3 +3805,149 @@ button.library-item-main {
   margin-top: auto;
 }
 
+/* --- Conclave Paper (shared notes) ---------------------------------------
+   The Paper tab is the conclave's shared page of notes: a toolbar, one long
+   writing surface, and (later) remote carets. The pane reuses the segmented
+   pill for its Chat | Paper switch and the rich-editor toolbar styles. */
+
+.conclave-tabs {
+  align-self: center;
+  width: 220px;
+  flex-shrink: 0;
+  margin: var(--space-2) 0;
+}
+
+.paper-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+.paper-pane-loading,
+.paper-pane-error {
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.paper-start {
+  margin: auto;
+  max-width: 440px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.paper-start .btn-secondary {
+  width: auto;
+}
+
+.paper-editor {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+/* The writing surface: ProseMirror mounts a .ProseMirror element into it. */
+.paper-surface {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-4) var(--space-6);
+}
+
+.paper-surface .ProseMirror {
+  min-height: 240px;
+  outline: none;
+  line-height: 1.55;
+  caret-color: var(--paper-caret, var(--accent-strong));
+}
+
+.paper-surface .ProseMirror > * + * {
+  margin-top: var(--space-2);
+}
+
+.paper-surface .ProseMirror h1,
+.paper-surface .ProseMirror h2,
+.paper-surface .ProseMirror h3 {
+  margin-top: var(--space-3);
+  line-height: 1.25;
+}
+
+.paper-surface .ProseMirror h1 {
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.paper-surface .ProseMirror h2 {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.paper-surface .ProseMirror h3 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.paper-surface .ProseMirror ul,
+.paper-surface .ProseMirror ol {
+  padding-left: 1.4em;
+}
+
+.paper-surface .ProseMirror li p {
+  margin: 0;
+}
+
+/* Placeholder for the first keystroke on a fresh paper. */
+.paper-surface .ProseMirror p:first-child:only-child:empty::before {
+  content: "Start typing — everyone in the conclave sees this page.";
+  color: var(--text-faint);
+}
+
+/* Live cursors, drawn by y-prosemirror's cursor plugin. The colour and the name
+   come from the peer's awareness state, so one style serves every trustee. */
+.paper-surface .ProseMirror-yjs-cursor {
+  position: relative;
+  margin-left: -1px;
+  margin-right: -1px;
+  border-left: 2px solid;
+  border-right: 2px solid;
+  border-color: orange;
+  word-break: normal;
+  pointer-events: none;
+}
+
+.paper-surface .ProseMirror-yjs-cursor > div {
+  position: absolute;
+  top: -1.35em;
+  left: -2px;
+  padding: 1px 5px;
+  border-radius: 4px 4px 4px 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #fff;
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* A peer's selection: the same colour, translucent. */
+.paper-surface .ProseMirror-yjs-selection {
+  border-radius: 2px;
+}
+
+/* An ended conclave: the document is still shared, it is just frozen. */
+.paper-readonly-note {
+  margin: 0;
+  padding: var(--space-2) var(--space-6) 0;
+}
+

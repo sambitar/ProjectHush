@@ -92,7 +92,21 @@ RELAY_BIN="${BIN}/hush-relay"
 # The daemon runs in release: its vault store encrypts multi-GB torrent files
 # chunk by chunk, and AEAD is ~40x slower in a debug build (see run-one-ui.sh),
 # which made large downloads look stalled at 100%.
-DAEMON_BIN="${ROOT}/target/release/hush-daemon"
+#
+# HUSH_PROFILE=debug opts out for work that never touches the vault (paper/UI
+# iteration). It keeps the daemon's ~1550-crate dependency tree in the same
+# profile as `cargo test`, so the tree is compiled once instead of twice.
+PROFILE="${HUSH_PROFILE:-release}"
+if [[ "$PROFILE" == "debug" ]]; then
+  DAEMON_BIN="${ROOT}/target/debug/hush-daemon"
+  DAEMON_CARGO_FLAGS=()
+elif [[ "$PROFILE" == "release" ]]; then
+  DAEMON_BIN="${ROOT}/target/release/hush-daemon"
+  DAEMON_CARGO_FLAGS=(--release)
+else
+  echo "Unknown HUSH_PROFILE '$PROFILE' (expected debug or release)." >&2
+  exit 2
+fi
 TAURI_BIN="${BIN}/hush-tauri"
 
 LOG_DIR="${RUN_DIR}/logs"
@@ -125,7 +139,7 @@ if [[ "$DEV" == 1 ]]; then
   else
     echo "Dev mode: building the daemon only (remote relay; no UI or desktop build)."
   fi
-  cargo build --release -p hush-daemon
+  cargo build "${DAEMON_CARGO_FLAGS[@]}" -p hush-daemon
 else
   echo "Building UI (Vite)…"
   (cd "${ROOT}/apps/hush-tauri" && npm run build)
@@ -135,7 +149,7 @@ else
   else
     cargo build -p hush-tauri
   fi
-  cargo build --release -p hush-daemon
+  cargo build "${DAEMON_CARGO_FLAGS[@]}" -p hush-daemon
 fi
 
 REQUIRED_BINS=("$DAEMON_BIN")
@@ -317,7 +331,7 @@ start_vite() {
   echo "  Both sides must add each other's invite (Copy my invite)."
   echo ""
   echo "After a change under crates/, rebuild the daemon and re-run with --dev:"
-  echo "  cargo build --release -p hush-daemon   # then Ctrl+C here and run $0 --dev"
+  echo "  cargo build ${DAEMON_CARGO_FLAGS[*]} -p hush-daemon   # then Ctrl+C here and run $0 --dev"
   echo "The desktop binary is neither built nor started in dev mode."
 }
 

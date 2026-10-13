@@ -182,7 +182,7 @@ pub enum CallMedia { Audio, AudioVideo }
 {"t":"call_hangup","call_id":"…","reason":"user"}
 ```
 
-- **Backward compatibility:** older clients that receive an unknown `t` must ignore it cleanly rather than error. `MessagePayload::decode` currently falls back to `Error::Corrupt` for unknown tags; add an `Unknown` arm that is skipped, so a v1 peer and a call-capable peer interoperate for text/file. (Same discipline as the legacy-file path already in `payload.rs`.)
+- **Backward compatibility:** older clients that receive an unknown `t` must ignore it cleanly rather than error. `MessagePayload::decode` currently falls back to `Error::Corrupt` for unknown tags; add an `Unknown` arm that is skipped, so a v1 peer and a call-capable peer interoperate for text/file. (Same discipline as the legacy-file path already in `payload.rs`.) — **Already landed**: Conclave Paper (Task 19) added the `Unknown` arm on 2026-10-12, so this task adds only its own call variants and must not duplicate it.
 - **No relay or wire-format change.** `encode_relay_blob`/`decode_relay_blob` are untouched.
 
 ---
@@ -264,7 +264,7 @@ Follows the existing socket-first, thin-UI pattern in [`main.rs`](../../crates/h
 - [ ] Verify the WebKitGTK finding on the target machine (WebKitGTK version, `RTCPeerConnection` present or not).
 
 ### Phase 1 — Signaling plumbing (no media)
-- [ ] New `MessagePayload` call variants + tolerant `decode` for unknown tags.
+- [ ] New `MessagePayload` call variants (the tolerant `decode` for unknown tags already landed with Paper, Task 19 — do not duplicate it).
 - [ ] Call state machine in `hush-core` with timeouts (ring timeout, no-answer, busy).
 - [ ] `/api/call/*` endpoints; UI call bar with ringing/answer/reject/hangup.
 - [ ] Two daemons exchange invite/answer/ICE and reach a terminal state with a **fake** peer connection (no audio yet).
@@ -329,7 +329,7 @@ Per [`DISTRO_READINESS.md`](../DISTRO_READINESS.md):
 ### 13.1 Control / signaling plane
 
 - No new server. Signaling is new `MessagePayload` variants inside the existing Signal session (Section 5); the relay stays a dumb store-and-forward.
-- `MessagePayload::decode` must skip unknown tags cleanly (the legacy fallback at [`payload.rs`](../../crates/hush-core/src/payload.rs) is the pattern), so a v1 peer and a call-capable peer interoperate.
+- `MessagePayload::decode` skips unknown tags cleanly as of Conclave Paper (Task 19, 2026-10-12) — the `Unknown` arm is in place, so a v1 peer and a call-capable peer interoperate.
 - **Ringing latency** is the one real control-plane question. The UI drains on `RECV_POLL_MS = 4000` ([`constants.ts`](../../apps/hush-tauri/src/lib/constants.ts)), so a ring can take ~4 s. Options, cheapest first:
   1. Accept it for dogfood (Section 9 #7) — **the v1 default**.
   2. Daemon→UI push (`GET /api/call/events`, SSE) so the UI updates the instant the daemon has the invite. Local only; does not change relay timing.
