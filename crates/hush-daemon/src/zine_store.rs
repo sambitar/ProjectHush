@@ -6,10 +6,11 @@
 //! is nonetheless the wire schema, because Phase 2 publishes exactly these
 //! bytes and a migration later would have to re-sign every revision:
 //!
-//! - A **zine** is one long-form article, named by its author's **pen name**
-//!   ([`ZineDescriptor::zine_id`]). One zine per pen name; more than one pen
-//!   name per vault is a later feature, which is why the pen name is a field
-//!   rather than a constant.
+//! - A **zine** is one long-form article: a **post**. Its author is a **pen
+//!   name** ([`ZineDescriptor::pen_id`]), and one pen name holds **many** posts
+//!   ([`ZineDescriptor::zine_id`]), each with its own read key and its own
+//!   revision chain. More than one pen name per vault is a later feature, which
+//!   is why the pen name is a field rather than a constant.
 //! - Its body is **sanitized HTML** ([`crate::reads::sanitize_rich_text`]),
 //!   pinned here rather than left open (the task doc's open question 5). HTML
 //!   is what the editor already produces and what a later Nostr export needs,
@@ -75,10 +76,17 @@ const MAX_CLOCK_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
 /// arrive by constructing one directly.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ZineDescriptor {
-    /// The author's pen name: their seal public key, hex. This is the address a
-    /// comment is sealed to, which is why it is the id rather than the signing
-    /// key — see `PenName` in `hush_core::vault`.
+    /// This post's id: a fresh random id per post, never an identity. One pen
+    /// name publishes many zines, and each one carries its own read key and its
+    /// own revision chain, so the id addresses a post rather than an author.
     pub zine_id: String,
+    /// The author's pen name: their seal public key, hex, stable across every
+    /// post they write. This is the address a comment is sealed to, which is why
+    /// it is the seal key rather than the signing key — see `PenName` in
+    /// `hush_core::vault`. Empty only on a record written before the reshape,
+    /// which [`ZinesState::migrate`] repairs on first read.
+    #[serde(default)]
+    pub pen_id: String,
     /// The byline shown to readers. Chosen by the author, so it can change
     /// without changing the id.
     #[serde(default)]
@@ -189,8 +197,13 @@ pub fn decode(bytes: Option<&[u8]>) -> Result<ZinesState, String> {
     }
 }
 
-/// What the UI posts to create or edit a zine. Absent `zine_id` means "the
-/// caller's own pen name", which is the only case Phase 1 can author.
+/// What the UI posts to create a post or revise one.
+///
+/// Absent `zine_id` means "a new post": the daemon mints the id and takes the
+/// byline from the vault, which is the only thing Phase 1 can author. A present
+/// id names the post to revise, and is refused rather than treated as a create
+/// when this vault does not hold it — a stale UI must not resurrect a post that
+/// was forgotten locally.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ZineDraft {
     #[serde(default)]
@@ -341,6 +354,38 @@ impl ZinesState {
         changed
     }
 
+    /// One-time upgrade of records written before a pen name could hold many
+    /// posts. Reports whether anything changed, so the caller persists once.
+    ///
+    /// Before the reshape the record's `zine_id` **was** the pen name's seal
+    /// public key, which is what limited a pen name to one post. An empty
+    /// `pen_id` is the marker: the field did not exist, so it decodes as empty,
+    /// and the id it carries is the identity. Both are repaired together — the
+    /// identity moves to `pen_id` and the record gets a fresh post id — so the
+    /// invariant "a `zine_id` is an address, never an identity" holds for every
+    /// record afterwards.
+    ///
+    /// Nothing on the wire references a post id yet (Phase 2 has not landed), so
+    /// re-addressing is free here and would not be later.
+    pub fn migrate(&mut self) -> bool {
+        let mut changed = self.backfill_read_keys();
+        for z in self.zines.iter_mut() {
+            if z.descriptor.pen_id.is_empty() {
+                // A held zine predates the reshape too, and its blob did carry
+                // the author's identity in the id — the same field, the same
+                // repair. Only an authored record is re-addressed: a held one is
+                // addressed by the blob that carries it, and a fresh id here
+                // would make this vault's copy unrecognisable to its author.
+                z.descriptor.pen_id = z.descriptor.zine_id.clone();
+                if z.authored {
+                    z.descriptor.zine_id = uuid::Uuid::new_v4().to_string();
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The index the UI renders: newest first, optionally filtered by section
     /// and by pen name. Muted zines are included but flagged — muting is a
     /// display decision, and a caller that wants them gone filters on the flag.
@@ -358,7 +403,7 @@ impl ZinesState {
             .filter(|z| {
                 pen.as_ref().is_none_or(|p| {
                     z.descriptor.pen_name.to_lowercase().contains(p)
-                        || z.descriptor.zine_id.to_lowercase().starts_with(p)
+                        || z.descriptor.pen_id.to_lowercase().starts_with(p)
                 })
             })
             .map(|z| ZineSummary {
@@ -403,38 +448,55 @@ impl ZinesState {
         counts
     }
 
-    /// Create the pen name's zine, or write a new revision of it.
+    /// Publish a new post, or write a new revision of one this vault wrote.
     ///
     /// `body` arrives from the UI as HTML and is sanitized here, at the
     /// boundary, rather than trusted: the editor is not the only thing that can
-    /// post to the route. Returns the new revision number.
+    /// post to the route. Returns the post's id and the revision it now holds.
     ///
-    /// A create is refused past [`ZINES_CAP`]; an edit of a zine this vault does
-    /// not hold is refused rather than silently created, so a stale UI cannot
-    /// resurrect something that was forgotten locally. A zine this vault only
-    /// *holds* is refused too: only the pen name that signed it can publish a new
-    /// revision, and a local edit would be unsigned and unshareable.
+    /// The draft's `zine_id` is `None` to publish a new post under `pen_id`, and
+    /// `Some` to revise one — read from the draft rather than passed alongside
+    /// it, so the two can never disagree about what is being written. The two
+    /// are genuinely different operations now that a pen name holds many posts:
+    /// a revise of an id this vault does not hold is refused rather than
+    /// silently created, so a stale UI cannot resurrect something that was
+    /// forgotten locally, and a post this vault only *holds* is refused too —
+    /// only the pen name that signed it can publish a new revision, and a local
+    /// edit would be unsigned and unshareable. A create is refused past
+    /// [`ZINES_CAP`].
     pub fn write(
         &mut self,
-        zine_id: &str,
+        pen_id: &str,
         pen_name: &str,
         draft: ZineDraft,
         now_ms: u64,
-    ) -> Result<u64, String> {
-        if zine_id.is_empty() {
+    ) -> Result<(String, u64), String> {
+        let ZineDraft {
+            zine_id,
+            title,
+            sections,
+            body,
+        } = draft;
+        if pen_id.is_empty() {
             return Err("a zine needs a pen name to publish under".to_string());
         }
-        let body = crate::reads::sanitize_rich_text(&draft.body);
+        let body = crate::reads::sanitize_rich_text(&body);
         if body.len() > BODY_SOFT_CAP {
             return Err(format!(
                 "the article is over the {} KiB cap",
                 BODY_SOFT_CAP / 1024
             ));
         }
-        let title = draft.title.trim().to_string();
-        let sections = normalize_sections(&draft.sections);
+        let title = title.trim().to_string();
+        let sections = normalize_sections(&sections);
 
-        if let Some(file) = self.get_mut(zine_id) {
+        if let Some(id) = zine_id.as_deref() {
+            if id.is_empty() {
+                return Err("a revision needs the id of the post it revises".to_string());
+            }
+            let Some(file) = self.get_mut(id) else {
+                return Err("no post with that id is held".to_string());
+            };
             if !file.authored {
                 return Err("only the pen name that wrote a zine can edit it".to_string());
             }
@@ -455,18 +517,24 @@ impl ZinesState {
             file.descriptor.title = title;
             file.descriptor.sections = sections;
             file.descriptor.body = body;
+            file.descriptor.pen_id = pen_id.to_string();
             file.descriptor.pen_name = pen_name.trim().to_string();
             file.descriptor.created_ms = clamp_ms(file.descriptor.created_ms, now_ms);
             file.updated_ms = now_ms;
-            return Ok(file.descriptor.revision);
+            return Ok((file.descriptor.zine_id.clone(), file.descriptor.revision));
         }
 
         if self.zines.len() >= ZINES_CAP {
             return Err(format!("at most {ZINES_CAP} zines are held"));
         }
+        // A post id is minted here rather than derived: it is an address, not an
+        // identity, and deriving it from the pen name is what limited a pen name
+        // to one post.
+        let id = uuid::Uuid::new_v4().to_string();
         self.zines.push(ZineFile {
             descriptor: ZineDescriptor {
-                zine_id: zine_id.to_string(),
+                zine_id: id.clone(),
+                pen_id: pen_id.to_string(),
                 pen_name: pen_name.trim().to_string(),
                 title,
                 sections,
@@ -483,19 +551,21 @@ impl ZinesState {
             muted: false,
             updated_ms: now_ms,
         });
-        Ok(1)
+        Ok((id, 1))
     }
 
-    /// Rename the byline on every zine this pen name wrote.
+    /// Rename the byline on every post this pen name wrote.
     ///
-    /// A display name is not an identity: `zine_id` does not move, so nothing
-    /// already published is invalidated and no reader's index has to be
-    /// rebuilt. Local only until the next revision publishes.
-    pub fn rename_byline(&mut self, zine_id: &str, pen_name: &str, now_ms: u64) -> bool {
+    /// A display name is not an identity: `pen_id` and every `zine_id` stay
+    /// put, so nothing already published is invalidated and no reader's index
+    /// has to be rebuilt. All of them, because the byline belongs to the author
+    /// rather than to one post — one pen name holds many. Local only until the
+    /// next revision publishes.
+    pub fn rename_byline(&mut self, pen_id: &str, pen_name: &str, now_ms: u64) -> bool {
         let name = pen_name.trim().to_string();
         let mut changed = false;
         for z in self.zines.iter_mut() {
-            if z.descriptor.zine_id == zine_id && z.authored && z.descriptor.pen_name != name {
+            if z.descriptor.pen_id == pen_id && z.authored && z.descriptor.pen_name != name {
                 z.descriptor.pen_name = name.clone();
                 z.updated_ms = now_ms;
                 changed = true;
@@ -529,7 +599,7 @@ impl ZinesState {
         }
         let file = self
             .get_mut(zine_id)
-            .ok_or_else(|| "no zine with that pen name is held".to_string())?;
+            .ok_or_else(|| "no post with that id is held".to_string())?;
         if !file.authored {
             return Err("only the pen name that wrote a zine can merge comments".to_string());
         }
@@ -607,7 +677,9 @@ mod zine_store_tests {
     use base64::Engine;
 
     const NOW: u64 = 1_760_000_000_000;
-    const ZINE: &str = "aa11";
+    /// The vault's pen name: the seal public key in production, a fixed string
+    /// here. A post id is minted by the store, so no test chooses one.
+    const PEN: &str = "pen-ada";
 
     fn draft(title: &str, body: &str) -> ZineDraft {
         ZineDraft {
@@ -618,11 +690,34 @@ mod zine_store_tests {
         }
     }
 
+    /// Publish a new post and hand back the id the store minted.
+    fn create(s: &mut ZinesState, pen: &str, name: &str, d: ZineDraft, now: u64) -> String {
+        s.write(pen, name, d, now).unwrap().0
+    }
+
+    /// Revise a post, returning the revision it now holds.
+    fn revise(s: &mut ZinesState, id: &str, pen: &str, name: &str, d: ZineDraft, now: u64) -> u64 {
+        s.write(pen, name, revising(id, d), now).unwrap().1
+    }
+
+    /// The same draft, aimed at an existing post.
+    fn revising(id: &str, d: ZineDraft) -> ZineDraft {
+        ZineDraft {
+            zine_id: Some(id.to_string()),
+            ..d
+        }
+    }
+
     fn with_zine() -> ZinesState {
         let mut s = ZinesState::default();
-        s.write(ZINE, "ada", draft("First", "<p>hello</p>"), NOW)
-            .unwrap();
+        create(&mut s, PEN, "ada", draft("First", "<p>hello</p>"), NOW);
         s
+    }
+
+    /// The id of the only post in `s`.
+    fn the_id(s: &ZinesState) -> String {
+        assert_eq!(s.zines.len(), 1, "this helper expects exactly one post");
+        s.zines[0].descriptor.zine_id.clone()
     }
 
     #[test]
@@ -630,7 +725,7 @@ mod zine_store_tests {
         // The key exists before anything is published, so a later publish is a
         // seal-and-send rather than a migration of every zine already written.
         let s = with_zine();
-        let file = s.get(ZINE).unwrap();
+        let file = s.zines.first().unwrap();
         let key = file.read_key.clone().expect("an authored zine has a read key");
         assert_eq!(
             base64::engine::general_purpose::STANDARD
@@ -644,7 +739,7 @@ mod zine_store_tests {
         // A fresh mint per vault: the key is random, not derived from the id.
         let other = with_zine();
         assert_ne!(
-            other.get(ZINE).unwrap().read_key,
+            other.zines.first().unwrap().read_key,
             file.read_key,
             "two vaults do not share a read key"
         );
@@ -656,27 +751,27 @@ mod zine_store_tests {
         // and the read path mints one. The second call is a no-op, so the key
         // does not move under a zine that has already been shared.
         let mut s = with_zine();
+        let id = the_id(&s);
         s.zines[0].read_key = None;
 
         assert!(s.backfill_read_keys(), "the missing key is filled in");
-        let minted = s.get(ZINE).unwrap().read_key.clone().unwrap();
+        let minted = s.get(&id).unwrap().read_key.clone().unwrap();
         assert!(!s.backfill_read_keys(), "the second pass has nothing to do");
-        assert_eq!(s.get(ZINE).unwrap().read_key.as_deref(), Some(minted.as_str()));
+        assert_eq!(s.get(&id).unwrap().read_key.as_deref(), Some(minted.as_str()));
 
         // And it survives a round trip, which is what makes it the key Phase 2
         // publishes rather than a value that changes on every load.
         let back = decode(Some(&s.encode().unwrap())).unwrap();
-        assert_eq!(back.get(ZINE).unwrap().read_key.as_deref(), Some(minted.as_str()));
+        assert_eq!(back.get(&id).unwrap().read_key.as_deref(), Some(minted.as_str()));
     }
 
-    #[test]
-    fn a_held_zine_is_not_given_a_read_key() {
-        // Only the author holds the plaintext, so only the author can mint the
-        // key. A held zine with no key is `unreadable`, not silently readable.
-        let mut s = ZinesState::default();
-        s.zines.push(ZineFile {
+    /// A held post: written by someone else, so this vault can read it and not
+    /// edit it. Built by hand because the create path always authors.
+    fn held_post(id: &str, pen_id: &str) -> ZineFile {
+        ZineFile {
             descriptor: ZineDescriptor {
-                zine_id: "bb22".to_string(),
+                zine_id: id.to_string(),
+                pen_id: pen_id.to_string(),
                 pen_name: "someone else".to_string(),
                 title: "Theirs".to_string(),
                 sections: Vec::new(),
@@ -692,7 +787,15 @@ mod zine_store_tests {
             unreadable: true,
             muted: false,
             updated_ms: NOW,
-        });
+        }
+    }
+
+    #[test]
+    fn a_held_zine_is_not_given_a_read_key() {
+        // Only the author holds the plaintext, so only the author can mint the
+        // key. A held zine with no key is `unreadable`, not silently readable.
+        let mut s = ZinesState::default();
+        s.zines.push(held_post("bb22", "pen-bob"));
         assert!(!s.backfill_read_keys(), "a held zine is left as it was");
         assert!(s.get("bb22").unwrap().read_key.is_none());
     }
@@ -708,11 +811,17 @@ mod zine_store_tests {
     }
 
     #[test]
-    fn a_create_lands_at_revision_one_with_the_pen_name_as_the_id() {
+    fn a_create_lands_at_revision_one_under_a_minted_id() {
         let s = with_zine();
-        let z = s.get(ZINE).unwrap();
+        let z = s.zines.first().unwrap();
         assert_eq!(z.descriptor.revision, 1);
-        assert_eq!(z.descriptor.zine_id, ZINE);
+        assert_eq!(z.descriptor.pen_id, PEN, "the identity is the pen name");
+        assert_ne!(
+            z.descriptor.zine_id, PEN,
+            "the id addresses the post, not the author: deriving it from the pen \
+             name is what limited a pen name to one post"
+        );
+        assert!(!z.descriptor.zine_id.is_empty(), "every post has an address");
         assert_eq!(z.descriptor.pen_name, "ada");
         assert!(z.descriptor.prev_hash.is_empty(), "nothing precedes revision 1");
         assert!(z.authored, "this vault wrote it");
@@ -720,14 +829,64 @@ mod zine_store_tests {
     }
 
     #[test]
+    fn a_pen_name_can_hold_many_posts() {
+        let mut s = ZinesState::default();
+        let first = create(&mut s, PEN, "ada", draft("First", "<p>one</p>"), NOW);
+        let second = create(&mut s, PEN, "ada", draft("Second", "<p>two</p>"), NOW + 10);
+
+        assert_ne!(first, second, "each post gets its own address");
+        assert_eq!(s.zines.len(), 2, "the first is not replaced by the second");
+        assert!(
+            s.zines.iter().all(|z| z.descriptor.pen_id == PEN && z.authored),
+            "both are this pen name's"
+        );
+        assert!(
+            s.zines.iter().all(|z| z.descriptor.revision == 1),
+            "a new post is not a revision of the one before it"
+        );
+        assert_eq!(s.index(None, None).len(), 2, "both are in the index");
+    }
+
+    #[test]
+    fn each_post_carries_its_own_read_key() {
+        // One key per zine, and a zine is one post: granting a reader one post
+        // must not open the rest of the corpus.
+        let mut s = ZinesState::default();
+        create(&mut s, PEN, "ada", draft("First", "<p>one</p>"), NOW);
+        create(&mut s, PEN, "ada", draft("Second", "<p>two</p>"), NOW + 10);
+        let a = s.zines[0].read_key.clone().unwrap();
+        let b = s.zines[1].read_key.clone().unwrap();
+        assert_ne!(a, b, "two posts do not share a read key");
+    }
+
+    #[test]
+    fn revising_one_post_leaves_the_other_alone() {
+        let mut s = ZinesState::default();
+        let first = create(&mut s, PEN, "ada", draft("First", "<p>one</p>"), NOW);
+        let second = create(&mut s, PEN, "ada", draft("Second", "<p>two</p>"), NOW + 10);
+        let head = content_hash(&s.get(&first).unwrap().descriptor);
+
+        assert_eq!(
+            revise(&mut s, &first, PEN, "ada", draft("First, revised", "<p>one v2</p>"), NOW + 20),
+            2
+        );
+        let a = s.get(&first).unwrap();
+        assert_eq!(a.descriptor.prev_hash, head, "the chain points at its own head");
+        assert_eq!(a.history.len(), 1, "only the revised post has history");
+        let b = s.get(&second).unwrap();
+        assert_eq!(b.descriptor.revision, 1, "the other post did not move");
+        assert_eq!(b.descriptor.title, "Second");
+        assert!(b.history.is_empty(), "and gained no history");
+    }
+
+    #[test]
     fn an_edit_bumps_the_revision_and_chains_to_the_one_before() {
         let mut s = with_zine();
-        let first = content_hash(&s.get(ZINE).unwrap().descriptor);
-        let rev = s
-            .write(ZINE, "ada", draft("Second", "<p>bye</p>"), NOW + 5)
-            .unwrap();
+        let id = the_id(&s);
+        let first = content_hash(&s.get(&id).unwrap().descriptor);
+        let rev = revise(&mut s, &id, PEN, "ada", draft("Second", "<p>bye</p>"), NOW + 5);
         assert_eq!(rev, 2);
-        let z = s.get(ZINE).unwrap();
+        let z = s.get(&id).unwrap();
         assert_eq!(z.descriptor.prev_hash, first, "the chain points at the head it replaced");
         assert_eq!(z.descriptor.title, "Second");
         assert_eq!(z.history.len(), 1);
@@ -739,11 +898,18 @@ mod zine_store_tests {
     #[test]
     fn history_is_capped_newest_first() {
         let mut s = with_zine();
+        let id = the_id(&s);
         for i in 0..HISTORY_CAP + 5 {
-            s.write(ZINE, "ada", draft(&format!("t{i}"), "<p>x</p>"), NOW + i as u64)
-                .unwrap();
+            revise(
+                &mut s,
+                &id,
+                PEN,
+                "ada",
+                draft(&format!("t{i}"), "<p>x</p>"),
+                NOW + i as u64,
+            );
         }
-        let z = s.get(ZINE).unwrap();
+        let z = s.get(&id).unwrap();
         assert_eq!(z.history.len(), HISTORY_CAP);
         assert_eq!(
             z.history[0].revision,
@@ -757,30 +923,48 @@ mod zine_store_tests {
     }
 
     #[test]
-    fn an_edit_to_an_unknown_zine_is_refused_not_created() {
+    fn a_revision_of_a_post_this_vault_only_holds_is_refused() {
         let mut s = ZinesState::default();
-        // `write` creates when the id is new, so the guard that matters is the
-        // one on a zine this vault only *holds*.
-        s.write("bb22", "bob", draft("Theirs", "<p>x</p>"), NOW).unwrap();
-        s.get_mut("bb22").unwrap().authored = false;
+        s.zines.push(held_post("bb22", "pen-bob"));
         let err = s
-            .write("bb22", "bob", draft("Mine now", "<p>y</p>"), NOW)
+            .write(PEN, "ada", revising("bb22", draft("Mine now", "<p>y</p>")), NOW)
             .unwrap_err();
         assert!(err.contains("only the pen name"), "{err}");
         assert_eq!(s.get("bb22").unwrap().descriptor.title, "Theirs");
     }
 
     #[test]
+    fn a_revision_of_an_unknown_post_is_refused_not_created() {
+        // The guard that matters now that a create mints its own id: an edit
+        // naming an id this vault does not hold is a stale UI, and treating it
+        // as a create would silently resurrect a forgotten post under that id.
+        let mut s = ZinesState::default();
+        let err = s
+            .write(PEN, "ada", revising("nope", draft("x", "<p>b</p>")), NOW)
+            .unwrap_err();
+        assert!(err.contains("no post with that id"), "{err}");
+        assert!(s.zines.is_empty(), "a refused revision stores nothing");
+
+        // An empty id is a caller bug rather than "no id given", which is what
+        // an absent field means: it must not fall through to a create either.
+        let err = s
+            .write(PEN, "ada", revising("", draft("x", "<p>b</p>")), NOW)
+            .unwrap_err();
+        assert!(err.contains("id of the post"), "{err}");
+        assert!(s.zines.is_empty(), "a refused revision stores nothing");
+    }
+
+    #[test]
     fn a_body_is_sanitized_at_the_boundary() {
         let mut s = ZinesState::default();
-        s.write(
-            ZINE,
+        let id = create(
+            &mut s,
+            PEN,
             "ada",
             draft("x", "<p>hi</p><script>alert(1)</script><img src=x onerror=1>"),
             NOW,
-        )
-        .unwrap();
-        let body = &s.get(ZINE).unwrap().descriptor.body;
+        );
+        let body = &s.get(&id).unwrap().descriptor.body;
         assert!(body.contains("<p>hi</p>"), "{body}");
         assert!(!body.contains("script"), "{body}");
         assert!(!body.contains("onerror"), "{body}");
@@ -790,17 +974,17 @@ mod zine_store_tests {
     #[test]
     fn the_marks_the_toolbar_offers_survive_sanitizing() {
         let mut s = ZinesState::default();
-        s.write(
-            ZINE,
+        let id = create(
+            &mut s,
+            PEN,
             "ada",
             draft(
                 "x",
                 "<p><strong>b</strong><em>i</em><u>u</u><s>s</s></p><ul><li>l</li></ul><h2>h</h2><blockquote>q</blockquote>",
             ),
             NOW,
-        )
-        .unwrap();
-        let body = &s.get(ZINE).unwrap().descriptor.body;
+        );
+        let body = &s.get(&id).unwrap().descriptor.body;
         for tag in ["<strong>", "<em>", "<u>", "<s>", "<ul>", "<li>", "<h2>", "<blockquote>"] {
             assert!(body.contains(tag), "{tag} was stripped from {body}");
         }
@@ -810,7 +994,7 @@ mod zine_store_tests {
     fn an_over_cap_body_is_refused_with_a_reason() {
         let mut s = ZinesState::default();
         let huge = "x".repeat(BODY_SOFT_CAP + 1);
-        let err = s.write(ZINE, "ada", draft("x", &huge), NOW).unwrap_err();
+        let err = s.write(PEN, "ada", draft("x", &huge), NOW).unwrap_err();
         assert!(err.contains("cap"), "{err}");
         assert!(s.zines.is_empty(), "a refused write stores nothing");
     }
@@ -818,8 +1002,9 @@ mod zine_store_tests {
     #[test]
     fn sections_are_normalised_deduped_and_capped() {
         let mut s = ZinesState::default();
-        s.write(
-            ZINE,
+        let id = create(
+            &mut s,
+            PEN,
             "ada",
             ZineDraft {
                 zine_id: None,
@@ -834,9 +1019,8 @@ mod zine_store_tests {
                 body: "<p>b</p>".into(),
             },
             NOW,
-        )
-        .unwrap();
-        let sections = &s.get(ZINE).unwrap().descriptor.sections;
+        );
+        let sections = &s.get(&id).unwrap().descriptor.sections;
         assert_eq!(sections, &vec!["rust".to_string(), "distributed systems".to_string()]);
     }
 
@@ -844,8 +1028,9 @@ mod zine_store_tests {
     fn a_section_label_is_length_capped() {
         let mut s = ZinesState::default();
         let long = "a".repeat(SECTION_MAX_CHARS + 50);
-        s.write(
-            ZINE,
+        let id = create(
+            &mut s,
+            PEN,
             "ada",
             ZineDraft {
                 zine_id: None,
@@ -854,10 +1039,9 @@ mod zine_store_tests {
                 body: "<p>b</p>".into(),
             },
             NOW,
-        )
-        .unwrap();
+        );
         assert_eq!(
-            s.get(ZINE).unwrap().descriptor.sections[0].chars().count(),
+            s.get(&id).unwrap().descriptor.sections[0].chars().count(),
             SECTION_MAX_CHARS
         );
     }
@@ -865,20 +1049,20 @@ mod zine_store_tests {
     #[test]
     fn the_section_index_counts_and_sorts() {
         let mut s = ZinesState::default();
-        s.write(
-            "z1",
+        create(
+            &mut s,
+            PEN,
             "ada",
             ZineDraft { zine_id: None, title: "a".into(), sections: vec!["rust".into(), "systems".into()], body: "<p>x</p>".into() },
             NOW,
-        )
-        .unwrap();
-        s.write(
-            "z2",
+        );
+        create(
+            &mut s,
+            "pen-bob",
             "bob",
             ZineDraft { zine_id: None, title: "b".into(), sections: vec!["rust".into()], body: "<p>x</p>".into() },
             NOW + 1,
-        )
-        .unwrap();
+        );
         assert_eq!(
             s.sections(),
             vec![("rust".to_string(), 2), ("systems".to_string(), 1)]
@@ -888,8 +1072,8 @@ mod zine_store_tests {
     #[test]
     fn the_index_is_newest_first_and_filters_by_section_and_pen() {
         let mut s = ZinesState::default();
-        s.write("z1", "ada", ZineDraft { zine_id: None, title: "old".into(), sections: vec!["rust".into()], body: "<p>a</p>".into() }, NOW).unwrap();
-        s.write("z2", "bob", ZineDraft { zine_id: None, title: "new".into(), sections: vec!["go".into()], body: "<p>b</p>".into() }, NOW + 10).unwrap();
+        create(&mut s, PEN, "ada", ZineDraft { zine_id: None, title: "old".into(), sections: vec!["rust".into()], body: "<p>a</p>".into() }, NOW);
+        create(&mut s, "pen-bob", "bob", ZineDraft { zine_id: None, title: "new".into(), sections: vec!["go".into()], body: "<p>b</p>".into() }, NOW + 10);
 
         let all = s.index(None, None);
         assert_eq!(all[0].title, "new", "newest first");
@@ -902,28 +1086,35 @@ mod zine_store_tests {
         let by_pen = s.index(None, Some("AD"));
         assert_eq!(by_pen.len(), 1);
         assert_eq!(by_pen[0].pen_name, "ada");
+
+        // The identity, not the address: a post id is random, so filtering on it
+        // would make "everything by this pen name" unanswerable.
+        let by_id = s.index(None, Some("pen-bob"));
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].pen_name, "bob");
     }
 
     #[test]
     fn a_forged_future_timestamp_is_clamped_on_write() {
         let mut s = ZinesState::default();
-        s.write(ZINE, "ada", draft("x", "<p>b</p>"), NOW).unwrap();
+        let id = create(&mut s, PEN, "ada", draft("x", "<p>b</p>"), NOW);
         // A descriptor arriving from a peer with a timestamp far in the future
         // must not be able to pin itself to the top of the index forever.
         let mut z = s.zines.remove(0);
         z.descriptor.created_ms = u64::MAX;
         s.zines.push(z);
-        let clamped = clamp_ms(s.get(ZINE).unwrap().descriptor.created_ms, NOW);
+        let clamped = clamp_ms(s.get(&id).unwrap().descriptor.created_ms, NOW);
         assert_eq!(clamped, NOW);
         // And the write path applies the same clamp to a create.
         let mut s2 = ZinesState::default();
-        s2.write("z9", "ada", draft("x", "<p>b</p>"), NOW).unwrap();
-        assert!(s2.get("z9").unwrap().descriptor.created_ms <= NOW + MAX_CLOCK_SKEW_MS);
+        let id2 = create(&mut s2, PEN, "ada", draft("x", "<p>b</p>"), NOW);
+        assert!(s2.get(&id2).unwrap().descriptor.created_ms <= NOW + MAX_CLOCK_SKEW_MS);
     }
 
     #[test]
     fn comments_merge_once_and_read_oldest_first() {
         let mut s = with_zine();
+        let id = the_id(&s);
         let comment = |hash: &str, body: &str, at: u64| ZineComment {
             hash: hash.into(),
             author: "bob".into(),
@@ -931,14 +1122,14 @@ mod zine_store_tests {
             created_ms: at,
             merged_ms: 0,
         };
-        s.merge_comment(ZINE, comment("h2", "<p>second</p>", NOW + 20), NOW)
+        s.merge_comment(&id, comment("h2", "<p>second</p>", NOW + 20), NOW)
             .unwrap();
-        s.merge_comment(ZINE, comment("h1", "<p>first</p>", NOW + 10), NOW)
+        s.merge_comment(&id, comment("h1", "<p>first</p>", NOW + 10), NOW)
             .unwrap();
         // The same blob arriving on every drain must not grow the thread.
-        s.merge_comment(ZINE, comment("h1", "<p>first</p>", NOW + 10), NOW)
+        s.merge_comment(&id, comment("h1", "<p>first</p>", NOW + 10), NOW)
             .unwrap();
-        let comments = &s.get(ZINE).unwrap().descriptor.comments;
+        let comments = &s.get(&id).unwrap().descriptor.comments;
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].hash, "h1", "a thread reads in the order written");
         assert_eq!(comments[1].hash, "h2");
@@ -948,9 +1139,10 @@ mod zine_store_tests {
     #[test]
     fn an_empty_comment_is_refused_and_a_hostile_one_is_sanitized() {
         let mut s = with_zine();
+        let id = the_id(&s);
         let err = s
             .merge_comment(
-                ZINE,
+                &id,
                 ZineComment { hash: "h".into(), author: "b".into(), body: "   ".into(), created_ms: NOW, merged_ms: 0 },
                 NOW,
             )
@@ -958,7 +1150,7 @@ mod zine_store_tests {
         assert!(err.contains("empty"), "{err}");
 
         s.merge_comment(
-            ZINE,
+            &id,
             ZineComment {
                 hash: "h".into(),
                 author: "b".into(),
@@ -969,7 +1161,7 @@ mod zine_store_tests {
             NOW,
         )
         .unwrap();
-        let body = &s.get(ZINE).unwrap().descriptor.comments[0].body;
+        let body = &s.get(&id).unwrap().descriptor.comments[0].body;
         assert!(body.contains("ok"));
         assert!(!body.contains("script"), "{body}");
     }
@@ -977,9 +1169,10 @@ mod zine_store_tests {
     #[test]
     fn a_comment_without_a_hash_is_refused() {
         let mut s = with_zine();
+        let id = the_id(&s);
         let err = s
             .merge_comment(
-                ZINE,
+                &id,
                 ZineComment { hash: String::new(), author: "b".into(), body: "<p>x</p>".into(), created_ms: NOW, merged_ms: 0 },
                 NOW,
             )
@@ -990,9 +1183,10 @@ mod zine_store_tests {
     #[test]
     fn comments_are_capped_with_a_reason() {
         let mut s = with_zine();
+        let id = the_id(&s);
         for i in 0..COMMENTS_CAP {
             s.merge_comment(
-                ZINE,
+                &id,
                 ZineComment { hash: format!("h{i}"), author: "b".into(), body: "<p>x</p>".into(), created_ms: NOW + i as u64, merged_ms: 0 },
                 NOW,
             )
@@ -1000,7 +1194,7 @@ mod zine_store_tests {
         }
         let err = s
             .merge_comment(
-                ZINE,
+                &id,
                 ZineComment { hash: "one-more".into(), author: "b".into(), body: "<p>x</p>".into(), created_ms: NOW, merged_ms: 0 },
                 NOW,
             )
@@ -1011,9 +1205,10 @@ mod zine_store_tests {
     #[test]
     fn muting_is_local_and_idempotent() {
         let mut s = with_zine();
-        assert!(s.set_muted(ZINE, true, NOW));
-        assert!(s.get(ZINE).unwrap().muted);
-        assert!(!s.set_muted(ZINE, true, NOW), "setting it again changes nothing");
+        let id = the_id(&s);
+        assert!(s.set_muted(&id, true, NOW));
+        assert!(s.get(&id).unwrap().muted);
+        assert!(!s.set_muted(&id, true, NOW), "setting it again changes nothing");
         assert!(s.index(None, None)[0].muted, "the index reports it");
         assert!(!s.set_muted("nope", true, NOW));
     }
@@ -1021,20 +1216,20 @@ mod zine_store_tests {
     #[test]
     fn forgetting_removes_the_zine_and_is_idempotent() {
         let mut s = with_zine();
-        assert!(s.forget(ZINE));
-        assert!(s.get(ZINE).is_none());
-        assert!(!s.forget(ZINE));
+        let id = the_id(&s);
+        assert!(s.forget(&id));
+        assert!(s.get(&id).is_none());
+        assert!(!s.forget(&id));
     }
 
     #[test]
     fn create_over_the_cap_is_refused() {
         let mut s = ZinesState::default();
-        for i in 0..ZINES_CAP {
-            s.write(&format!("z{i}"), "ada", draft("t", "<p>b</p>"), NOW)
-                .unwrap();
+        for _ in 0..ZINES_CAP {
+            create(&mut s, PEN, "ada", draft("t", "<p>b</p>"), NOW);
         }
         let err = s
-            .write("one-more", "ada", draft("t", "<p>b</p>"), NOW)
+            .write(PEN, "ada", draft("t", "<p>b</p>"), NOW)
             .unwrap_err();
         assert!(err.contains("at most"), "{err}");
     }
@@ -1047,13 +1242,24 @@ mod zine_store_tests {
     }
 
     #[test]
-    fn renaming_the_byline_moves_no_identity() {
-        let mut s = with_zine();
-        assert!(s.rename_byline(ZINE, "Ada Lovelace", NOW + 1));
-        let z = s.get(ZINE).unwrap();
-        assert_eq!(z.descriptor.pen_name, "Ada Lovelace");
-        assert_eq!(z.descriptor.zine_id, ZINE, "the address did not move");
-        assert!(!s.rename_byline(ZINE, "Ada Lovelace", NOW + 2), "no-op reports false");
+    fn renaming_the_byline_moves_no_identity_and_hits_every_post() {
+        let mut s = ZinesState::default();
+        let first = create(&mut s, PEN, "ada", draft("First", "<p>one</p>"), NOW);
+        let second = create(&mut s, PEN, "ada", draft("Second", "<p>two</p>"), NOW + 1);
+
+        assert!(s.rename_byline(PEN, "Ada Lovelace", NOW + 2));
+        for id in [&first, &second] {
+            let z = s.get(id).unwrap();
+            assert_eq!(z.descriptor.pen_name, "Ada Lovelace");
+            assert_eq!(z.descriptor.zine_id, *id, "the address did not move");
+            assert_eq!(z.descriptor.pen_id, PEN, "nor did the identity");
+        }
+        assert!(
+            !s.rename_byline(PEN, "Ada Lovelace", NOW + 3),
+            "no-op reports false"
+        );
+        // Another pen name's byline is not this vault's to move.
+        assert!(!s.rename_byline("pen-bob", "Bob", NOW + 4));
     }
 
     #[test]
@@ -1068,33 +1274,81 @@ mod zine_store_tests {
     #[test]
     fn the_content_hash_ignores_the_chain_field_it_cannot_cover() {
         let mut s = with_zine();
-        let a = content_hash(&s.get(ZINE).unwrap().descriptor);
-        s.get_mut(ZINE).unwrap().descriptor.prev_hash = "deadbeef".into();
-        let b = content_hash(&s.get(ZINE).unwrap().descriptor);
+        let id = the_id(&s);
+        let a = content_hash(&s.get(&id).unwrap().descriptor);
+        s.get_mut(&id).unwrap().descriptor.prev_hash = "deadbeef".into();
+        let b = content_hash(&s.get(&id).unwrap().descriptor);
         assert_eq!(a, b, "prev_hash is not part of what it hashes");
 
-        s.get_mut(ZINE).unwrap().descriptor.body = "<p>different</p>".into();
-        let c = content_hash(&s.get(ZINE).unwrap().descriptor);
+        s.get_mut(&id).unwrap().descriptor.body = "<p>different</p>".into();
+        let c = content_hash(&s.get(&id).unwrap().descriptor);
         assert_ne!(a, c, "a changed body changes the hash");
     }
 
     #[test]
     fn state_roundtrips_through_bytes() {
         let mut s = with_zine();
-        s.write(ZINE, "ada", draft("Second", "<p>bye</p>"), NOW + 5)
-            .unwrap();
+        let id = the_id(&s);
+        revise(&mut s, &id, PEN, "ada", draft("Second", "<p>bye</p>"), NOW + 5);
         s.merge_comment(
-            ZINE,
+            &id,
             ZineComment { hash: "h1".into(), author: "bob".into(), body: "<p>hi</p>".into(), created_ms: NOW, merged_ms: 0 },
             NOW,
         )
         .unwrap();
         let back = decode(Some(&s.encode().unwrap())).unwrap();
-        let z = back.get(ZINE).unwrap();
+        let z = back.get(&id).unwrap();
         assert_eq!(z.descriptor.title, "Second");
         assert_eq!(z.descriptor.revision, 2);
         assert_eq!(z.history.len(), 1);
         assert_eq!(z.descriptor.comments.len(), 1);
         assert!(z.authored);
+    }
+
+    #[test]
+    fn a_post_written_before_the_reshape_is_re_addressed_once() {
+        // The legacy shape: the record's id *was* the pen name, which is exactly
+        // what limited a pen name to one post. `pen_id` did not exist, so it
+        // decodes as empty — that is the marker the migration keys on.
+        let mut s = ZinesState::default();
+        let mut legacy = held_post(PEN, "");
+        legacy.authored = true;
+        legacy.unreadable = false;
+        legacy.read_key = None;
+        s.zines.push(legacy);
+
+        assert!(s.migrate(), "the legacy record is upgraded");
+        let z = s.get(PEN);
+        assert!(z.is_none(), "the identity is no longer an address");
+        let z = s.zines.first().unwrap();
+        assert_eq!(z.descriptor.pen_id, PEN, "the identity moved to pen_id");
+        assert_ne!(z.descriptor.zine_id, PEN);
+        assert_eq!(z.descriptor.pen_name, "someone else", "nothing else moved");
+        assert!(z.read_key.is_some(), "the same pass mints the read key");
+
+        let id = the_id(&s);
+        assert!(!s.migrate(), "the second pass has nothing to do");
+        assert_eq!(s.get(&id).unwrap().descriptor.pen_id, PEN);
+
+        // It survives a round trip, which is what makes it a migration rather
+        // than a value that changes on every load.
+        let back = decode(Some(&s.encode().unwrap())).unwrap();
+        assert_eq!(back.get(&id).unwrap().descriptor.pen_id, PEN);
+        assert!(back.get(PEN).is_none());
+    }
+
+    #[test]
+    fn a_held_post_before_the_reshape_keeps_the_address_its_blob_carries() {
+        // A held post is addressed by the blob that carries it: re-addressing it
+        // here would make this vault's copy unrecognisable to its author. The
+        // identity is still recovered from the legacy id.
+        let mut s = ZinesState::default();
+        s.zines.push(held_post("bb22", ""));
+        assert!(s.migrate());
+        let z = s.get("bb22").unwrap();
+        assert_eq!(z.descriptor.pen_id, "bb22", "the identity came from the id");
+        assert_eq!(z.descriptor.zine_id, "bb22", "the address did not move");
+        assert!(z.read_key.is_none(), "a held post still has no key");
+        assert!(!s.migrate(), "nothing left to do");
     }
 }

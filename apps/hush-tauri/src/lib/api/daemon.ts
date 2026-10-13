@@ -30,6 +30,7 @@ import type {
   WalletStateDto,
   ZineDraftDto,
   ZinesViewDto,
+  ZinesWriteDto,
   ZineViewDto,
   PenNameDto,
 } from "./types";
@@ -584,7 +585,7 @@ export const api = {
   zinesGet: (zineId: string) =>
     request<ZineViewDto>(`/api/zines/${encodeURIComponent(zineId)}`),
   zinesWrite: (draft: ZineDraftDto) =>
-    request<ZinesViewDto>("/api/zines", {
+    request<ZinesWriteDto>("/api/zines", {
       method: "POST",
       body: JSON.stringify(draft),
     }),

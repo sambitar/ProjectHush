@@ -4941,10 +4941,9 @@ export class App {
     return section ? all.filter((z) => z.sections.includes(section)) : all;
   }
 
-  /** This vault's own zine, if the pen name has published one. */
-  private zinesOwn(): ZineSummaryDto | undefined {
-    const id = this.zinesView?.pen_name?.id;
-    return id ? this.zinesView?.zines.find((z) => z.zine_id === id) : undefined;
+  /** Every post this vault's pen name wrote, newest first. */
+  private zinesMine(): ZineSummaryDto[] {
+    return (this.zinesView?.zines ?? []).filter((z) => z.authored);
   }
 
   /** Open a zine in the reading pane. */
@@ -4982,11 +4981,11 @@ export class App {
   }
 
   /**
-   * Open the draft editor for a new revision.
+   * Open the draft editor for a new post, or a new revision of one.
    *
-   * `zineId` is the zine being revised, or null for the pen name's first zine:
-   * the daemon takes the byline from the vault and treats an absent id as "my
-   * own", which is the only thing Phase 1 can author.
+   * `zineId` is the post being revised, or null to publish a new one: the daemon
+   * takes the byline from the vault and mints the post's id, because a pen name
+   * holds many posts and an id is an address rather than an identity.
    */
   private zinesStartDraft(
     zineId: string | null,
@@ -5030,49 +5029,21 @@ export class App {
   }
 
   /**
-   * Start a revision from the rail's write button.
+   * Start a new post from the rail's write button.
    *
-   * The rail holds the index, and a summary carries a preview rather than the
-   * article, so the body has to come from somewhere else: the open detail when
-   * it is the caller's own zine, and a fetch when it is not. Seeding an empty
-   * body here is not a neutral default — the title and sections are pre-filled
-   * from the existing zine, so an empty editor reads as "the body is gone",
-   * and publishing it would blank an article that was already written.
-   *
-   * A failed fetch therefore does not open a draft at all: a refusal the author
-   * can act on beats an editor that looks ready and would destroy the article.
+   * Always a new post, never a revision: the button publishes something new, and
+   * revising is what the open article's own "Write a new revision" does, seeded
+   * with that article. There is no body to carry over and nothing to overwrite,
+   * so an empty editor is the honest state — the earlier shape, where this
+   * button had to fetch the pen name's one zine back to avoid blanking it, went
+   * away with the one-post-per-pen-name model.
    */
-  private async zinesStartOwnDraft(): Promise<void> {
-    const own = this.zinesOwn();
-    if (!own) {
-      this.zinesStartDraft(null, "", "", "");
-      return;
-    }
-    let body: string | null = null;
-    const open = this.zinesDetail?.zine.descriptor;
-    if (open && open.zine_id === own.zine_id) {
-      body = open.body;
-    } else {
-      try {
-        const detail = await api.zinesGet(own.zine_id);
-        if (detail) body = detail.zine.descriptor.body;
-      } catch (e) {
-        if (this.rail === "zines") {
-          this.announce(
-            e instanceof AppError
-              ? e.message
-              : "Couldn't read that zine back to revise it.",
-          );
-        }
-        return;
-      }
-    }
-    if (body === null || this.rail !== "zines") return;
-    this.zinesStartDraft(own.zine_id, own.title, own.sections.join(", "), body);
+  private zinesStartNewPost(): void {
+    this.zinesStartDraft(null, "", "", "");
   }
 
   /**
-   * Publish the draft as a new revision.
+   * Publish the draft as a new post, or as a new revision of one.
    *
    * The editor's document is read *before* the button is disabled, because
    * publishing tears the editor down on success and the doc goes with it.
@@ -5097,9 +5068,9 @@ export class App {
         body,
       });
       if (view) this.zinesView = view;
-      // The id to read back is the pen name's own: a first publish has no
-      // draft id yet, and the daemon answers with the pen name it used.
-      const publishedId = revising ?? view?.pen_name?.id ?? null;
+      // A create mints the post's id, so the answer is where the id to read back
+      // comes from; a revision already knew its own.
+      const publishedId = view?.zine_id ?? revising ?? null;
       this.zinesDiscardDraft();
       if (publishedId) {
         void this.zinesOpen(publishedId);
@@ -5244,12 +5215,11 @@ export class App {
     col.appendChild(card);
 
     if (penName) {
-      const own = this.zinesOwn();
       const write = document.createElement("button");
       write.type = "button";
       write.className = "btn-primary pressable zines-write";
-      write.textContent = own ? "Write a new revision" : "Write a zine";
-      write.onclick = () => void this.zinesStartOwnDraft();
+      write.textContent = "Write a post";
+      write.onclick = () => this.zinesStartNewPost();
       col.appendChild(write);
     }
 
@@ -5591,16 +5561,13 @@ export class App {
     head.className = "zine-draft-head";
     const h = document.createElement("h2");
     h.className = "text-17";
-    h.textContent = this.zinesDraftZineId
-      ? "New revision"
-      : this.zinesOwn()
-        ? "New revision"
-        : "Write a zine";
+    h.textContent = this.zinesDraftZineId ? "New revision" : "New post";
     head.appendChild(h);
     const hint = document.createElement("p");
     hint.className = "muted text-12";
-    hint.textContent =
-      "Published under your pen name and stored encrypted in your vault. Publishing adds a revision to the chain; earlier ones are kept.";
+    hint.textContent = this.zinesDraftZineId
+      ? "Published under your pen name and stored encrypted in your vault. Publishing adds a revision to this post's chain; earlier ones are kept."
+      : "Published under your pen name and stored encrypted in your vault. Each post is its own zine, with its own read key and its own revision chain.";
     head.appendChild(hint);
     form.appendChild(head);
 

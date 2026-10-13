@@ -614,20 +614,22 @@ renderer's asset footprint and the document-size cap.
 **Status:** **Phase O** — spec resolved **2026-10-12 by grilling**; **planning only**. No code until
 a phase is approved.
 
-**Goal:** Every member has a **zine** — their own blog of long-form articles with a comments
-section, readable by **all members** (not just contacts), end-to-end encrypted. Articles and
-comments are **broadcast** to a relay **bulletin** (one new, generic, opaque append-only lane) and
-held in every member's vault; readability propagates **holder-to-holder** over existing 1:1 sessions
-(one read key per zine). Sections/tags ride **inside** the encrypted article and are browsed
-locally — a newspaper you read what you want from, with no follows and no algorithm. Text-only rich
-text. Reuses Task **19**'s spine (sidecar store, fan-out, payload codec, tolerant decode) but **not**
-its CRDT: one writer per document.
+**Goal:** Every member has a **zine** — a long-form post with a comments section, published under
+their **pen name**, readable by **all members** (not just contacts), end-to-end encrypted. A pen name
+holds **many** zines: each post is its own zine, with its own read key and its own revision chain.
+Posts and comments are **broadcast** to a relay **bulletin** (one new, generic, opaque append-only
+lane) and held in every member's vault; readability propagates **holder-to-holder** over existing 1:1
+sessions (one read key per zine, and a zine is one post). Sections/tags ride **inside** the encrypted
+post and are browsed locally — a newspaper you read what you want from, with no follows and no
+algorithm. Text-only rich text. Reuses Task **19**'s spine (sidecar store, fan-out, payload codec,
+tolerant decode) but **not** its CRDT: one writer per document.
 
 → **[`docs/tasks/zines.md`](../tasks/zines.md)**
 
-**Key decisions:** members-only E2EE; pen-name identity; **relay bulletin** for broadcast delivery;
-**key epidemic** for readability (no all-members key exists, so delivery is broadcast and readability
-is epidemic); one read key per zine, no revocation; tags in the descriptor, no relay registry;
+**Key decisions:** members-only E2EE; pen-name identity with many posts per pen name; **relay
+bulletin** for broadcast delivery; **key epidemic** for readability (no all-members key exists, so
+delivery is broadcast and readability is epidemic); one read key per zine, so a grant covers one post
+and a reader collects a grant per post, no revocation; tags in the descriptor, no relay registry;
 comments sealed to the pen-name public key and merged author-side; **no public IPFS/DHT** (metadata
 leak) and **no relay category registry** (a directory) — both rejected in the spec's Section 1;
 optional later **Nostr export** (reshaped Task **11**).

@@ -3036,6 +3036,20 @@ struct ZinesView {
     pen_name: Option<PenNameDto>,
 }
 
+/// The answer to a write: the index the UI renders, plus which post was written.
+///
+/// A create mints the post's id, so the caller cannot know it in advance — and
+/// without it the UI would publish a second post and then open nothing, or
+/// guess. Flattened rather than nested so the response is still a `ZinesView`
+/// to every reader that only wants the index.
+#[derive(serde::Serialize)]
+struct ZineWriteView {
+    zine_id: String,
+    revision: u64,
+    #[serde(flatten)]
+    view: ZinesView,
+}
+
 #[derive(serde::Serialize)]
 struct ZineSectionView {
     name: String,
@@ -3073,9 +3087,10 @@ fn yes() -> bool {
 
 /// Fetch the raw zines sidecar bytes through the worker and decode them.
 ///
-/// Authored zines that predate the read key being minted at create time are
-/// backfilled here and the result persisted, so the migration runs once, on the
-/// first read after the upgrade, rather than waiting for the next edit.
+/// Records written by an older build are upgraded here and the result persisted,
+/// so the migration runs once, on the first read after the upgrade, rather than
+/// waiting for the next edit: a missing read key is minted, and a record whose id
+/// still doubles as the author's identity is re-addressed as a post.
 async fn zines_sidecar(
     state: &App,
 ) -> Result<zine_store::ZinesState, (StatusCode, Json<ApiError>)> {
@@ -3089,7 +3104,7 @@ async fn zines_sidecar(
         WorkResult::Err(msg) => return Err(worker_err(msg)),
         _ => return Err(unexpected_worker_response()),
     };
-    if parsed.backfill_read_keys() {
+    if parsed.migrate() {
         zines_persist(state, &parsed).await?;
     }
     Ok(parsed)
@@ -3184,7 +3199,8 @@ async fn zines_get(
     Ok(Json(ZineView { zine }))
 }
 
-/// Create the pen name's zine, or write a new revision of it.
+/// Publish a new post under the vault's pen name, or write a new revision of one
+/// this vault already wrote.
 ///
 /// The pen name is taken from the vault, never from the request: a caller does
 /// not get to choose which byline it publishes under, because that would let a
@@ -3195,7 +3211,7 @@ async fn zines_get(
 async fn zines_write(
     State(state): State<Arc<App>>,
     Json(draft): Json<zine_store::ZineDraft>,
-) -> Result<Json<ZinesView>, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<ZineWriteView>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let Some(pen_name) = zines_pen_name_dto(&state).await? else {
         return Err((
@@ -3206,20 +3222,20 @@ async fn zines_write(
         ));
     };
     let mut parsed = zines_sidecar(&state).await?;
-    // The draft may name a zine, but only the caller's own: a held zine is
-    // refused inside the store, and a draft naming someone else's id would
-    // otherwise create a *new* zine under that id.
-    let zine_id = draft
-        .zine_id
-        .as_deref()
-        .filter(|id| *id == pen_name.id)
-        .unwrap_or(&pen_name.id)
-        .to_string();
-    parsed
-        .write(&zine_id, &pen_name.name, draft, paper_now_ms())
+    // A draft with no id publishes a new post; one with an id revises that post.
+    // The store refuses an id this vault does not hold rather than treating it as
+    // a create, so a stale UI cannot resurrect a post that was forgotten locally,
+    // and it refuses a post this vault only holds, so a draft cannot be written
+    // under someone else's pen name.
+    let (zine_id, revision) = parsed
+        .write(&pen_name.id, &pen_name.name, draft, paper_now_ms())
         .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
     zines_persist(&state, &parsed).await?;
-    Ok(Json(zines_view(&parsed, None, None, Some(pen_name))))
+    Ok(Json(ZineWriteView {
+        zine_id,
+        revision,
+        view: zines_view(&parsed, None, None, Some(pen_name)),
+    }))
 }
 
 /// Set the local mute flag. Local only: no wire effect, and the zine is still
@@ -6668,7 +6684,7 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
         Some(r#"{"name":"ada"}"#),
     )
     .await;
-    let id = pen["pen_name"]["id"].as_str().unwrap().to_string();
+    let pen_id = pen["pen_name"]["id"].as_str().unwrap().to_string();
 
     // Create.
     let (status, created) = request(
@@ -6682,9 +6698,18 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
     let row = &created["zines"][0];
     assert_eq!(row["title"], "On relays");
     assert_eq!(row["revision"], 1);
-    assert_eq!(row["zine_id"], id, "the id is the pen name");
     assert_eq!(row["authored"], true);
     assert_eq!(row["preview"], "hello world");
+    // A create mints the post's id, and the answer carries it so the caller can
+    // open what it just published.
+    let id = created["zine_id"].as_str().unwrap().to_string();
+    assert_eq!(row["zine_id"], id, "the answer names the post it wrote");
+    assert_eq!(created["revision"], 1);
+    assert_ne!(
+        id, pen_id,
+        "the id addresses the post, not the pen name: that is what lets one \
+         pen name hold many posts"
+    );
     assert_eq!(
         row["sections"].as_array().unwrap().len(),
         2,
@@ -6699,7 +6724,28 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
             .collect();
         assert!(names.contains(&"rust") && names.contains(&"networking"), "{names:?}");
 
-    // Edit: a new revision, chained to the one before it.
+    // A second post under the same pen name: the first is not replaced.
+    let (status, second) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(r#"{"title":"On gossip","body":"<p>another one</p>"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let second_id = second["zine_id"].as_str().unwrap().to_string();
+    assert_ne!(second_id, id, "a second post gets its own id");
+    assert_eq!(
+        second["zines"].as_array().unwrap().len(),
+        2,
+        "the pen name now holds two posts"
+    );
+    assert_eq!(
+        second["zines"][0]["zine_id"], second_id,
+        "the newest is first, and both are this vault's"
+    );
+
+    // Edit: a new revision of the first post, chained to the one before it.
     let (status, edited) = request(
         &router,
         "POST",
@@ -6710,13 +6756,32 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{edited}");
-    assert_eq!(edited["zines"][0]["revision"], 2);
-    assert_eq!(edited["zines"][0]["title"], "On relays, again");
+    assert_eq!(edited["zine_id"], id, "the same post was revised");
+    assert_eq!(edited["revision"], 2);
+    let edited_first = edited["zines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|z| z["zine_id"] == id.as_str())
+        .unwrap();
+    assert_eq!(edited_first["title"], "On relays, again");
+    let untouched = edited["zines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|z| z["zine_id"] == second_id.as_str())
+        .unwrap();
+    assert_eq!(untouched["revision"], 1, "the other post did not move");
+    assert_eq!(untouched["title"], "On gossip");
 
     // The chain and the history are visible on the article.
     let (status, one) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
     assert_eq!(status, StatusCode::OK, "{one}");
     assert_eq!(one["zine"]["descriptor"]["revision"], 2);
+    assert_eq!(
+        one["zine"]["descriptor"]["pen_id"], pen_id,
+        "the article carries the identity the post was written under"
+    );
     assert_eq!(
         one["zine"]["descriptor"]["prev_hash"].as_str().unwrap().len(),
         64,
@@ -6725,6 +6790,24 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
     assert_eq!(one["zine"]["history"][0]["revision"], 1);
     assert_eq!(one["zine"]["history"][0]["title"], "On relays");
     assert_eq!(one["zine"]["authored"], true);
+
+    // A revision naming a post this vault does not hold is refused rather than
+    // treated as a create, so a stale UI cannot resurrect a forgotten post.
+    let (status, err) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(r#"{"zine_id":"nope","title":"Ghost","body":"<p>x</p>"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
+    let (_, after) = request(&router, "GET", "/api/zines", None).await;
+    assert_eq!(
+        after["zines"].as_array().unwrap().len(),
+        2,
+        "the refused revision stored nothing"
+    );
 
     // Filters.
     let (_, by_section) = request(&router, "GET", "/api/zines?section=rust", None).await;
@@ -6736,12 +6819,19 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
         "an unknown section is an empty list, not an error"
     );
     let (_, by_pen) = request(&router, "GET", "/api/zines?pen=AD", None).await;
-    assert_eq!(by_pen["zines"].as_array().unwrap().len(), 1);
+    assert_eq!(by_pen["zines"].as_array().unwrap().len(), 2);
 
-    // Mute, then unmute.
+    // Mute, then unmute. The row is found by id: the index is newest first, and
+    // which post that is depends on the corpus rather than on this test.
     let (status, muted) = request(&router, "POST", &format!("/api/zines/{id}/mute"), Some("{}")).await;
     assert_eq!(status, StatusCode::OK, "{muted}");
-    assert_eq!(muted["zines"][0]["muted"], true);
+    let muted_row = muted["zines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|z| z["zine_id"] == id.as_str())
+        .unwrap();
+    assert_eq!(muted_row["muted"], true);
     let (_, unmuted) = request(
         &router,
         "POST",
@@ -6749,21 +6839,31 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
         Some(r#"{"muted":false}"#),
     )
     .await;
-    assert_eq!(unmuted["zines"][0]["muted"], false);
+    let unmuted_row = unmuted["zines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|z| z["zine_id"] == id.as_str())
+        .unwrap();
+    assert_eq!(unmuted_row["muted"], false);
 
-    // Forget.
+    // Forget. The other post is untouched: forgetting is per post.
     let (status, gone) = request(&router, "DELETE", &format!("/api/zines/{id}"), None).await;
     assert_eq!(status, StatusCode::OK, "{gone}");
-    assert_eq!(gone["zines"].as_array().unwrap().len(), 0);
+    assert_eq!(gone["zines"].as_array().unwrap().len(), 1);
+    assert_eq!(gone["zines"][0]["zine_id"], second_id);
     let (status, _) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = request(&router, "GET", &format!("/api/zines/{second_id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "the other post is still held");
 }
 
 #[tokio::test]
-async fn a_draft_naming_someone_elses_zine_writes_under_our_own_byline() {
-    // The pen name comes from the vault, never from the request: a caller
-    // does not choose which byline it publishes under, so a stale id must
-    // not create a second zine under an identity we do not hold.
+async fn a_draft_naming_a_post_this_vault_does_not_hold_is_refused() {
+    // The pen name comes from the vault, never from the request, so a caller
+    // does not choose which byline it publishes under. A draft naming an id
+    // this vault does not hold is a stale UI — and treating it as a create
+    // would let that stale UI write a second post under an id it made up.
     let dir = TempDir::new().unwrap();
     let router = api_router(unlocked_app(dir.path()).await);
     let (_, pen) = request(
@@ -6776,7 +6876,7 @@ async fn a_draft_naming_someone_elses_zine_writes_under_our_own_byline() {
     let mine = pen["pen_name"]["id"].as_str().unwrap().to_string();
     let theirs = "b".repeat(64);
 
-    let (status, view) = request(
+    let (status, err) = request(
         &router,
         "POST",
         "/api/zines",
@@ -6785,11 +6885,30 @@ async fn a_draft_naming_someone_elses_zine_writes_under_our_own_byline() {
         )),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["zines"].as_array().unwrap().len(), 1);
-    assert_eq!(view["zines"][0]["zine_id"], mine, "it landed under our byline");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
+    let (_, view) = request(&router, "GET", "/api/zines", None).await;
+    assert_eq!(
+        view["zines"].as_array().unwrap().len(),
+        0,
+        "nothing was written under any id"
+    );
     let (status, _) = request(&router, "GET", &format!("/api/zines/{theirs}"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // And the pen name's own id is not a post id either, so it is refused the
+    // same way: the identity is not an address.
+    let (status, err) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(&format!(
+            r#"{{"zine_id":"{mine}","title":"Not mine either","body":"<p>x</p>"}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
 }
 
 #[tokio::test]
@@ -6932,14 +7051,15 @@ async fn a_zine_survives_a_restart() {
         Some(r#"{"name":"ada"}"#),
     )
     .await;
-    let id = pen["pen_name"]["id"].as_str().unwrap().to_string();
-    request(
+    assert_eq!(pen["pen_name"]["name"], "ada");
+    let (_, created) = request(
         &router,
         "POST",
         "/api/zines",
         Some(r#"{"title":"Persisted","sections":["rust"],"body":"<p>still here</p>"}"#),
     )
     .await;
+    let id = created["zine_id"].as_str().unwrap().to_string();
 
     // A brand-new worker over the same vault dir: the daemon restarting.
     let worker = AccountWorker::spawn();
@@ -6951,7 +7071,11 @@ async fn a_zine_survives_a_restart() {
     let (status, view) = request(&restarted, "GET", "/api/zines", None).await;
     assert_eq!(status, StatusCode::OK, "{view}");
     assert_eq!(view["zines"][0]["title"], "Persisted");
-    assert_eq!(view["zines"][0]["zine_id"], id);
+    assert_eq!(
+        view["zines"][0]["zine_id"], id,
+        "the minted post id survives a restart, so it is the id Phase 2 can \
+         address a blob by"
+    );
     assert_eq!(view["pen_name"]["name"], "ada");
     assert_eq!(view["sections"][0]["name"], "rust");
     let (status, one) = request(&restarted, "GET", &format!("/api/zines/{id}"), None).await;

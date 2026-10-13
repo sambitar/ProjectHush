@@ -639,7 +639,11 @@ export interface ZineRevisionDto {
 
 /** The article itself, as it is stored. */
 export interface ZineDescriptorDto {
+  /** This post's id: a fresh id per post, never an identity. */
   zine_id: string;
+  /** The author's pen name: their seal public key, hex, stable across every post
+   *  they write, and the address a comment is sealed to. */
+  pen_id: string;
   pen_name: string;
   title: string;
   sections: string[];
@@ -697,12 +701,20 @@ export interface ZineViewDto {
   zine: ZineFileDto;
 }
 
-/** `POST /api/zines`. An absent `zine_id` means "the caller's own pen name",
- *  which is the only case Phase 1 can author. */
+/** `POST /api/zines`. An absent `zine_id` publishes a new post; a present one
+ *  revises that post, and is refused rather than treated as a create when this
+ *  vault does not hold it. */
 export interface ZineDraftDto {
   zine_id?: string;
   title: string;
   sections: string[];
   /** Sanitized HTML. */
   body: string;
+}
+
+/** `POST /api/zines`: the index, plus which post was written. A create mints the
+ *  id, so the answer is the only way the caller learns what it just published. */
+export interface ZinesWriteDto extends ZinesViewDto {
+  zine_id: string;
+  revision: number;
 }

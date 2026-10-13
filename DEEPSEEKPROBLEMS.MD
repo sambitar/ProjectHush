@@ -13,6 +13,92 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-13 — Zines: many posts per pen name
+
+Trigger: "Currently zine only allow one post?!" — a correct observation. Phase 1 had made the pen
+name's seal public key the post id, so the id could not address two things and a pen name could only
+ever hold one post. The reshape decouples them (`pen_id` is the identity, `zine_id` is a minted
+address), and this section is the problems hit doing it. Two are the stale-binary and `pkill` traps
+in a new guise; the third is the verification harness, not the app.
+
+### `cargo test` left `target/debug/hush-daemon` on the previous build — `FIXED`
+
+Attempted: verify the migration on the real `peer-a` vault, which held a genuine legacy record (a
+post whose `zine_id` equalled the pen name id, at revision 3, with two superseded revisions and a
+read key).
+
+Symptom: after restarting the daemon on the new source, `GET /api/zines` still answered with the
+**legacy id** (`73682e4a…`, identical to `pen_name.id`), so the migration looked like it had not
+run — the opposite of what the store tests, all green, asserted. The tell was in the binary's
+mtime: `target/debug/hush-daemon` was older than the source edits. `cargo test -p hush-daemon`
+builds the `--test` artifact and does **not** refresh the bin target, so the running process was the
+pre-reshape build; the same slot as before, a different mechanism from the entry above.
+
+Resolution: `cargo build -p hush-daemon` explicitly, restart, re-check. The migration then ran on
+real data and the result was verified twice: `zine_id` became a minted uuid
+(`48b92ed5-62e7-429e-b303-78beb7a84e68`), `pen_id` recovered the old id
+(`73682e4abccc262c0f5d4d786f24c70afaa59f941080f41b0eac144f040ca70f`), revision 3, both history
+entries, the 64-char `prev_hash`, the body and the read key all intact; and the id was unchanged
+after a restart, which a re-migration could not have produced because it mints a fresh uuid each
+pass.
+
+Lesson: "the tests pass" and "the process I am talking to contains the tests" are different claims.
+Before verifying against a running daemon, check the binary's mtime, not just that it answers.
+
+### `pkill -f` matched the shell that was running it — `FIXED`
+
+Attempted: restart the `peer-a` daemon with `pkill -f 'hush-daemon.*--dir /home/sam/ProjectHush/instances/peer-a'`
+followed by a `setsid nohup … &` in the same command.
+
+Symptom: the daemon was killed, no replacement started, and the redirect target
+(`/tmp/hush-daemon-zines.log`) did not exist — `tail` reported "No such file or directory". The
+shell tool wraps every command in a `/bin/bash -c` whose own command line contains the pattern, so
+`pkill -f` matched and killed that wrapper mid-command, before the `nohup` line ran. The earlier
+`pgrep -af` output in the same session shows the wrapper text, which is what made the cause
+identifiable.
+
+Resolution: anchor the pattern to the process's own argv (`pkill -f '^\./target/debug/hush-daemon .*peer-a'`),
+which the `/bin/bash -c …` wrapper cannot match, and `disown` the background start.
+
+Lesson: any `pkill -f` run through a shell wrapper is a candidate to match itself. Anchor to the
+start of the command line, or kill by pid.
+
+### The CDP verification script hung with no output, and one assertion read `null` — `FIXED`
+
+Attempted: drive the Zines pane in headless Chrome over CDP (publish a second post, then revise the
+migrated one) and capture the result.
+
+Symptom: the run was piped to `tail -70`, so nothing appeared until the process exited; the process
+never exited because the open CDP WebSocket kept node's event loop alive, even after the script's
+last `console.log`. A first pass had exited only because it threw a `TypeError` (an undefined row),
+which is exactly why the hang looked like a new failure rather than a missing `process.exit(0)`. The
+same pass also recorded `mainTitle: null` for a title that rendered fine: the sample was taken
+immediately after publish, before the detail fetch resolved, and `.zine-article-head h1` did not
+exist yet. Neither was an app defect; both cost a round trip to diagnose.
+
+Resolution: `process.exit(0)` at the end of the script, output redirected to a file rather than
+piped to `tail`, and the assertion re-read after the pane settled — which returned
+`Field notes on a local zine`, `revision 4`, and the per-post history. The pane was then verified
+end-to-end: "Write a post" → a "New post" draft → publish → two rows both marked "Yours", the
+migrated post untouched at rev 3 → open it → "Write a new revision" seeded with **that** post's
+title and body → publish → the original at rev 4 with three history entries and the second post
+still at rev 1.
+
+Lesson: a harness that never exits cannot report a failure, and a DOM assertion taken the same tick
+as a click reads a pane that has not painted. Both belong to the harness, and neither is evidence
+about the app.
+
+### The dev vault's relay answers `429 Too Many Requests` on drop drains — `OPEN`
+
+Not this slice, recorded because it is the last thing in the daemon log cited as evidence above:
+`hush-daemon: drop drain failed: relay error: drop get failed: 429 Too Many Requests`, repeatedly,
+against the cloudflared relay stored in `peer-a`'s config. It did not affect zines (nothing in this
+slice publishes to the wire — Phase 2 is unstarted) and it is an environment/rate-limit condition
+rather than a repo defect, but it means the daemon log is noisy and a drops claim made from this
+vault would need the relay sorted first.
+
+---
+
 ## 2026-10-12 — Conclave Paper, verification follow-up (ended-conclave read-only)
 
 Trigger: an independent browser-verification pass over the finished Paper slice, run against the

@@ -8,14 +8,21 @@ explicitly approved.
 native shape and becomes an optional **export bridge**. Builds on Task **19**'s sidecar-store +
 fan-out spine ([`conclave-paper.md`](conclave-paper.md)); adds one relay ability.
 
-    10|**Goal:** Every member has a **zine** — their own blog of long-form articles with a comments
-section, readable by **all members** (not just contacts), end-to-end encrypted, with no server
-holding plaintext. Articles and comments are **broadcast** to a relay **bulletin** and held in every
-member's vault; readability propagates **holder-to-holder** over existing 1:1 sessions. Sections
-(tags) ride inside the encrypted article. Browsing is local and pull-only — a newspaper you read
-what you want from, with no follows and no algorithm.
+    10|**Goal:** Every member has a **zine** — a long-form post with a comments section, published under
+their **pen name**, readable by **all members** (not just contacts), end-to-end encrypted, with no
+server holding plaintext. A pen name holds **many** zines: each post is its own zine, with its own
+read key and its own revision chain. Posts and comments are **broadcast** to a relay **bulletin**
+and held in every member's vault; readability propagates **holder-to-holder** over existing 1:1
+sessions. Sections (tags) ride inside the encrypted post. Browsing is local and pull-only — a
+newspaper you read what you want from, with no follows and no algorithm.
 
 **Name:** **zines** (product name, lowercase in prose). An article is a zine; a tag is a **section**.
+    20|
+**Amended 2026-10-13 (before Phase 2):** Phase 1 shipped a zine as one post with a revision chain and
+made the pen name's seal key the post id, which limited a pen name to a single post — the id could
+not address two things. The model below is the corrected one: the pen name's seal key is
+`pen_id`, a post's id is minted per post, and each post carries its own read key. The cost is stated
+where it belongs, in the read-key row of Section 2.
 
 **Non-goals (this task):** images/media (a later phase); public plaintext or the public IPFS DHT
     20|(Section 1); a relay-side category registry (Section 1); follows/subscriptions (newspaper model);
@@ -62,13 +69,13 @@ hold" live in the members' vaults, which is where the availability story actuall
 | Decision | Choice |
 |---|---|
 | Audience | **Members-only**, end-to-end encrypted. Not public, not contacts-only |
-| Author identity | **Pen name** — a vault keypair isolated from messaging keys (the Task 11 doctrine); one zine per pen name; multiple pen names later |
+| Author identity | **Pen name** — a vault keypair isolated from messaging keys (the Task 11 doctrine); one pen name per vault, **many zines (posts) per pen name**; multiple pen names later |
 | Delivery | **Relay bulletin** — one new, generic, opaque, append-only **broadcast lane**. Any member may publish; any member drains. Content-blind, name-blind |
 | Readability | **Key epidemic** — the bulletin carries ciphertext encrypted to the zine's read key; read keys propagate holder-to-holder over existing 1:1 Signal sessions |
-| Read key | **One per zine**, not per article. One grant reads that zine forever after. No revocation; rotation is later |
+| Read key | **One per zine, and a zine is one post.** One grant reads that post forever after. The honest cost: a reader needs a **grant per post**, so a prolific author's readers collect grants rather than one. Accepted 2026-10-13 over a per-pen-name key, which would have needed a post registry inside one blob and made "which posts exist" a rewrite of the whole zine. No revocation; rotation is later |
 | Sections (tags) | **Inside the encrypted descriptor**; a local facet index. No relay registry |
 | Comments | Blobs encrypted to the pen name's **public** key, published to the same lane; the author pulls, merges accepted ones, republishes |
-| Edits | New blobs; a revision pointer in the descriptor; old revisions age out with the window and are pruned locally |
+| Edits | New blobs; a revision pointer in the descriptor, **per post**; old revisions age out with the window and are pruned locally |
 | Browsing | **Newspaper model** — no follows, no subscriptions; the full local index (all / by section / by pen name), local mute per pen name |
 | Beyond Hush | Optional later **export** (Nostr NIP-23), reusing the pen-name keys — a button, not a second product |
 | Scope | **Text-only rich text** (Paper's toolbar: bold/italic/underline, lists, headings) |
@@ -114,12 +121,13 @@ flowchart LR
   exception to "the relay gains no new abilities" — Section 7 states exactly what it costs.
 - **Key epidemic (readability).** There is no "all members" key and no member list to encrypt to, so
   the bulletin cannot carry readable articles to a stranger. Instead: **delivery is broadcast,
-  readability is epidemic.** An article is sealed under the zine's symmetric **read key**; the author
+  readability is epidemic.** A post is sealed under its own symmetric **read key**; the author
   hands that key to a contact as a `ZineGrant` over their existing 1:1 session; **any holder** may
   re-share the same key to *their* contacts. A member may therefore hold an unreadable blob until a
   key reaches them, then a local "retry unreadable blobs against the new key" sweep classifies it.
-  This is the price of members-only E2EE on a broadcast lane; the alternative is public plaintext,
-  which is rejected.
+  One grant covers one post, so a reader of a prolific author collects a grant per post — the
+  consequence of a key per post rather than per pen name (Section 2, read key). This is the price of
+  members-only E2EE on a broadcast lane; the alternative is public plaintext, which is rejected.
 - **Comments.** A comment is sealed to the pen name's **public** key (no session to the author is
   required to write one) and published to the same lane. The author drains, tries to open each
   unclassified blob with the pen-name private key, keeps the ones that open, merges the accepted
@@ -159,10 +167,11 @@ pub enum MessagePayload {
 }
 ```
 
-- **`ZineGrant`** is the key epidemic in one payload: `zine_id` is the pen name's public key (hex),
+- **`ZineGrant`** is the key epidemic in one payload: `zine_id` is the **post's** id (hex),
   `key` is the symmetric read key (house `b64_bytes` codec), and `latest_hash` lets the recipient
   identify the newest blob without trial decryption. Authority-free to *receive* (any holder may
-  re-share a key they hold); it grants read, never write.
+  re-share a key they hold); it grants read, never write. One grant, one post: the author's identity
+  is not in the payload, so a grant leaks nothing about what else that pen name has published.
 - **No article payload.** Articles and comments ride the bulletin, not the fan-out. This keeps the
   Signal fan-out cost at zero for a zine that has many readers.
 - **`Unknown`** reuses the tolerant decode Paper landed 2026-10-12; a zine-aware build and a
@@ -172,18 +181,23 @@ pub enum MessagePayload {
 
 ```rust
 pub struct ZineDescriptor {
-    pub zine_id: String,      // pen name public key, hex
+    pub zine_id: String,      // this post's id, minted at create
+    pub pen_id: String,       // the author's seal public key, hex (the identity)
     pub pen_name: String,     // display name chosen by the author
     pub title: String,
     pub sections: Vec<String>,// tags; exist only where members hold them
     pub created_ms: u64,      // author-declared; clamped on ingest
-    pub revision: u64,        // monotonic per zine
+    pub revision: u64,        // monotonic per post
     pub prev_hash: String,    // previous revision's content hash (chain)
     pub body: String,         // rich text (ProseMirror JSON or sanitized HTML)
     pub comments: Vec<ZineComment>, // merged thread, author-curated
 }
 ```
 
+- `zine_id` and `pen_id` are deliberately separate fields: the id is an **address** (what a grant
+  and a blob reference) and the pen name is an **identity** (what a comment is sealed to, what a
+  byline rename follows, what a reader groups by). Phase 1's first shape made the seal key the id,
+  which is what limited a pen name to one post.
 - The blob is **content-addressed** by `hash(bytes)`; the hash is what `ZineGrant.latest_hash` and
   `prev_hash` reference. Authorship is proven by the **pen name's signature** over the canonical
   plaintext (a holder can verify provenance without holding the read key); integrity is **AEAD**, so
@@ -191,7 +205,9 @@ pub struct ZineDescriptor {
 - **Sections are inside the descriptor**, so the relay never sees a tag and the pen name never
   appears on the wire. A section "exists" for a member once they hold a post carrying it.
 - **Edits** are a new blob with `revision + 1` and `prev_hash` pointing at the last; the newest
-  revision a member holds wins. Old revisions age out with the window and are pruned locally.
+  revision a member holds wins. A chain belongs to one post, so publishing a second post starts at
+  revision 1 rather than extending the first. Old revisions age out with the window and are pruned
+  locally.
 
 **Comment blob (opaque to the relay).** Sealed to the pen name's **public** key (ECIES sealed box,
 the `hush-drop-v2` construction already in the tree). The author tries to open each unclassified
@@ -238,13 +254,13 @@ in `main.rs`). All routes **401 when locked**.
 
 | Route | Body | Returns / notes |
 |---|---|---|
-| `GET /api/zines` | — | Local index: my zines + held zines; filters by `?section=` / `?pen=` |
-| `POST /api/zines` | `{pen_name, title, sections[], body}` | Create or edit; produces a new signed blob and publishes it |
-| `GET /api/zines/{zine_id}` | — | Article + merged comment thread (404 before it is held) |
+| `GET /api/zines` | — | Local index: my posts + held posts; filters by `?section=` / `?pen=` (the byline, or a `pen_id` prefix) |
+| `POST /api/zines` | `{zine_id?, title, sections[], body}` | Absent `zine_id` publishes a new post and mints its id; a present one revises that post. Answers with the index **and** the id written, because a create's id is the daemon's to choose. A `zine_id` this vault does not hold is refused, never treated as a create |
+| `GET /api/zines/{zine_id}` | — | The post + merged comment thread (404 before it is held) |
 | `POST /api/zines/{zine_id}/comment` | `{body}` | Seal to the pen-name public key and publish to the bulletin |
 | `POST /api/zines/{zine_id}/accept-comment` | `{comment_hash}` | Merge one pulled comment into the thread; republish |
 | `POST /api/zines/{zine_id}/grant` | `{contact}` | Send `ZineGrant` over the 1:1 session (the key epidemic, author side) |
-| `POST /api/zines/{zine_id}/mute` | `{pen}` | Local mute; no wire effect |
+| `POST /api/zines/{zine_id}/mute` | `{muted}` | Local mute; no wire effect |
 
 Bulletin drain, trial decryption, key re-sharing, and the re-post sweep are daemon-internal. The UI
 sees a local corpus and a **sync status** (drained up to seq N; N unreadable blobs pending a key).
@@ -287,9 +303,15 @@ not "leaves nothing behind."
       vaults with the same identity material mint unrelated pen names.
 - [x] `zines.enc` sidecar: descriptor + revision chain + merged comments + held zines + read keys;
       caps with reasons; round-trip and corruption tests. `crates/hush-daemon/src/zine_store.rs`.
+- [x] **Many posts per pen name** (amended 2026-10-13, before Phase 2 landed). A post's `zine_id` is
+      minted at create and the author's seal key lives in `pen_id`, so one pen name holds many posts
+      with independent chains and independent read keys; `ZinesState::migrate` re-addresses records
+      written by the first shape on the first read. A revision naming a post this vault does not hold
+      is refused rather than treated as a create. `zine_store.rs`, the Zines pane in `app.ts`.
 - [x] `/api/zines/*` local routes; lock = 401 everywhere. `crates/hush-daemon/src/main.rs`
       (`/api/zines`, `/api/zines/pen-name`, `/api/zines/sections`, `/api/zines/{zine_id}`,
-      `/api/zines/{zine_id}/mute`), tested by `zines_api_tests`.
+      `/api/zines/{zine_id}/mute`), tested by `zines_api_tests`. `POST /api/zines` answers with the
+      index plus the id it wrote, because a create's id is the daemon's to choose.
 - [x] ProseMirror editor + toolbar (no CRDT), rendered from local assets.
       `apps/hush-tauri/src/lib/proseSchema.ts` (shared with Paper), `apps/hush-tauri/src/lib/zineStore.ts`,
       the Zines pane in `apps/hush-tauri/src/app.ts` (Rail button, three-column view, pen-name modal,
@@ -304,6 +326,19 @@ from the list — title, byline, tags, body, and facet counts all rendered, and 
 `<strong>` mark through sanitizing. `zines.enc` is ciphertext at rest (`zines_sidecar_is_ciphertext_at_rest`),
 a restart survives (`a_zine_survives_a_restart`), and every route is 401 while locked
 (`every_zine_route_is_401_while_locked`). `cargo test -p hush-daemon`: 157 passed.
+
+**Verified 2026-10-13** for the many-posts reshape, on `peer-a` (a vault holding a real record from
+the first shape: revision 3, two superseded revisions, a read key). `cargo test -p hush-daemon`: 163
+passed; `cargo test --workspace`: green; `npx tsc --noEmit` and `npm run build`: clean; UI suite: 16
+passed. The migration ran once on first read and persisted: the record's id moved from the pen name's
+seal key to a minted uuid, `pen_id` recovered the identity, and revision, history, `prev_hash`, body
+and read key were all intact — and the id was unchanged after a restart, which a second migration
+could not have produced. In the live pane: "Write a post" published a second post under the same pen
+name (two rows, both marked "Yours", the first untouched at rev 3), "Write a new revision" seeded
+itself with that post's own title and body, and publishing it took the first post to rev 4 with three
+history entries while the second stayed at rev 1. The scratch posts were forgotten afterwards, leaving
+the vault with the migrated original only. Problems hit are logged in
+[`DEEPSEEKPROBLEMS.MD`](../../DEEPSEEKPROBLEMS.MD) (2026-10-13 section).
 
 ### Phase 2 — Bulletin lane (broadcast delivery)
 - [ ] Relay: `PUT /b` / `GET /b`, storage without an author column, cap, TTL, per-member rate limit; relay tests (unauthorized publish fails; TTL drops; a drain is not attributable).
