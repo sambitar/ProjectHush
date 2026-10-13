@@ -28,10 +28,11 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | Partly started — **updater + release workflow landed 2026-10-11** (branch `feature/auto-update`); `hush-verify` extraction, `rust-toolchain.toml`, `cargo deny`/`audit` still open |
 | **K — Member calls** | After **C** stabilizes | **17** P2P audio/video between contacts | Planning only |
 | **L — Shared surface** | After **17** Phase 4 (video) | **18** live screen share / co-browse in a conclave | Planning only |
-| **M — Conclave Paper** | Before **17** (voice/video postponed; data-only WebRTC) | **19** collaborative paper ("Etherpad-like") in a conclave | Spec resolved 2026-10-12; **Phases 1–2 (offline core + editor, wire fan-out) landed and dogfooded 2026-10-12** — Tasks 3–8 open, DataChannel liveness next |
+| **M — Conclave Paper** | Before **17** (voice/video postponed; data-only WebRTC) | **19** collaborative paper ("Etherpad-like") in a conclave | ✅ **All eight tasks landed and dogfooded 2026-10-12** |
 | **N — Reading room** | After **19**'s spine (reused); independent of **17**/**18** media | **20** shared reading + discussion in a conclave | Idea captured 2026-10-12; planning only, not grilled |
 | **O — Zines** | After **19**'s spine (reused) + a relay bulletin lane; independent of **17**/**18** media | **21** members-only long-form blogs ("zines") with comments, broadcast on a relay bulletin | Spec resolved 2026-10-12 by grilling; planning only |
 | **P — Neighborhoods** | After **21** (front page) + **11** (public identity, shared crate, Tor egress) | **22** public long-form from Nostr (NIP-23), badged on the zines front page behind a control | Spec resolved 2026-10-13 by grilling; planning only |
+| **Q — Conclave voice** | After **C** stabilizes (same gate as **17**); engine spike shared with **17** Phase 2 | **23** group voice inside a conclave | Forks resolved 2026-10-13 — decisions **delegated to agent judgment, user review pending**; planning only, Phase 1 not approved |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
 
 **Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane. **Zines** (O) is the members-only long-form commons: also a data feature, reusing **19**'s spine, and it is the one task that adds a relay ability (a broadcast bulletin) — also independent of the media plane. It reshapes **Articles** (G) from a native Nostr build into an optional export. **Neighborhoods** (P) is the public counterpart to zines: it reads public Nostr long-form onto the same page, badged and behind a control, and it is where the separate **public identity** lives.
@@ -680,6 +681,46 @@ messaging.
 Nostr egress until the switch is on. Sanitized-only UI (reuses the reads sanitizer).
 
 **Not at launch:** a Hush-run Nostr relay; a follow-based feed; short notes; remote media.
+
+---
+
+### Task 23: Conclave voice — group audio in a conclave
+
+**Status:** **Phase Q** — spec drafted **2026-10-13**; all forks resolved the same day, with the
+decisions **delegated to agent judgment** ("do all by your judgement, I will evaluate later") and
+the reasoning recorded in the task doc's Section 3 **for the user's review**. **Planning only** —
+Phase 1 is not approved.
+
+**Goal:** Trustees in a live conclave can **talk** — end-to-end encrypted, peer-to-peer, no Hush
+server carries media, nothing recorded, a locked vault ends the session. The third conclave surface
+beside chat and Paper, and the small-group answer that sits between Task **17** (1:1 calls only)
+and the deferred LiveKit path (Task **15.3**).
+
+→ **[`docs/tasks/conclave-voice.md`](../tasks/conclave-voice.md)**
+
+**Key decisions resolved (delegated, 2026-10-13):** a **voice room** explicitly joined per trustee
+(room, not a ring — join is the consent); **full mesh** of peer connections for v1 (small,
+mutually trusted set; no hub to fail), hub-star/SFU deferred behind a cap of **8 joined speakers**
+(refuse-with-reason, dogfood measures); **one engine spike for the whole voice plane** — `webrtc-rs`
+reuse is the front-runner, the outcome amends Task 17 §6 in place, and a pivot is logged;
+**`pipewire-rs` capture** first (`cpal`/ALSA fallback) so `PrivateDevices=true` can stand; any
+joined trustee may **open**, the opener may end for all, leave is per-trustee, auto-end at <2,
+`ConclaveEnd` ends any session; **DTLS-SRTP only**, SFrame deferred with a recorded revisit trigger;
+local VAD plus remote **mute flags** (`VoiceMute` control payload), no remote speaking indicators;
+no chat notice and no persistence in v1; the signaling plumbing lands **once, in this task**, with
+Task **17** Phase 1 as a consumer; the ~4 s poll is accepted for dogfood.
+
+**The one decision left to evidence:** the engine spike (task doc Phase 0/2) — every other fork is
+closed.
+
+**Depends on:** conclave fan-out (done), **5h** presence (done), **5c** encrypted store (done),
+the Paper's landed DataPlane patterns (`paper_data.rs`, `stun_url`, tolerant decode — all done).
+**Independent of** Task **17** implementation (shares the engine decision and consumes/provides the
+signaling slice). Task **18** §10 #13 and Task **20** §3 #5 defer here.
+
+**Distro-readiness:** audio capture is the first sandbox exception the daemon genuinely needs
+(PipeWire socket, or `/dev/snd` only if the capture fallback is exercised); extends the shipped
+unit's documented exceptions and the dependency list. Media is never on disk.
 
 ---
 
