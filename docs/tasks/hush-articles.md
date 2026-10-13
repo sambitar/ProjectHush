@@ -8,9 +8,14 @@
 > **Superseded below:** the feed engine, follows/mutes as a discovery mechanism, the relay pool as a
 > product surface, the phase-2 global stream, and the `crates/hush-articles/` product role (it is now
 > **export-only**). **Still relevant:** pen names, the NIP-23 event shape, media hardening, the Tor
-> (`arti`) egress, and the sanitizer/render rules.
+> egress, and the sanitizer/render rules.
+>
+> **Amended 2026-10-13 (neighborhoods):** the export now signs under a **separate public identity**,
+> not the pen-name keys, and the crate gains a **read** lane — see [`neighborhoods.md`](neighborhoods.md)
+> (Task **22** / Phase **P**). Export is explicit, per-post, and re-encodes the body so the public
+> event does not correlate with the private zine.
 
-**Status:** Not implemented. **Index:** Task **11** in [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md) — **reshaped 2026-10-12** to an export bridge for **zines**.
+**Status:** Both halves are implemented in `crates/hush-articles/` as of 2026-10-13: the **read** lane (neighborhoods, Task **22**) and the **export** bridge described here (Task **11**), plus the **comment** lane (NIP-22, neighborhoods Phase **4**). The export is reachable at `POST /api/zines/{id}/export`; the transport is the hand-rolled NIP-01 client, not `arti`. **Index:** Task **11** in [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md) — **reshaped 2026-10-12** to an export bridge for **zines**.
 
 **Goal:** Long-form **pseudonymous publishing** inside Hush: pen names, Nostr-compatible articles, comments, and local social graph — **isolated** from 1:1 messaging identity and from `hush-relay`.
 
@@ -38,14 +43,14 @@ apps/hush-tauri  ──HTTP/UDS──►  hush-daemon  (/articles/*)
                                     │
                                     ▼
                             crates/hush-articles
-                            (rust-nostr, SQLite cache/FTS, feed, drafts)
+                            (read lane: gate, cache, index, NIP-01 client)
                                     │
                                     ▼
-                            arti (Tor) ──► public Nostr relays
-                            (optional: Blossom-style media over Tor)
+                            Tor SOCKS proxy ──► public Nostr relays
+                            (the shell's Tor; optional Blossom-style media later)
 ```
 
-- **`crates/hush-articles/`:** pen-name keys, event build/verify, relay pool, local cache + FTS5 search, feed engine, draft storage.
+- **`crates/hush-articles/`:** the read lane (NIP-23 mapping, the quality gate, the `(pubkey, d)` dedupe, the encrypted cache and index, and a minimal NIP-01 client over the daemon's Tor SOCKS proxy). The pen-name keys, event build/verify, media pipeline, feed engine and drafts described below are the **export** half and are still unbuilt.
 - **Daemon routes** (all behind vault unlock + articles subsystem gate):  
   `feed`, `article`, `search`, `publish`, `comment`, `follow`, `mute`, `drafts`, `pen_names` (exact paths TBD under `/api/articles/…`).
 - **UI:** renders **only sanitized HTML/markdown** from daemon; no raw relay JSON in webview; no remote image URLs (daemon local media URLs only).
@@ -143,7 +148,7 @@ apps/hush-tauri  ──HTTP/UDS──►  hush-daemon  (/articles/*)
 ## Distro-readiness
 
 - Article cache, drafts, FTS DB under **`HUSH_DATA_DIR`**.
-- Tor traffic via **arti** — document in syscall/network inventory (second egress beside messaging relay client).
+- Tor traffic through the **shell's Tor SOCKS proxy** (the same one the relay client and wallet use) — document in the syscall/network inventory (second egress beside the messaging relay client).
 - UI: no auto-open external links; sanitized output only — aligns with [`DISTRO_READINESS.md`](../DISTRO_READINESS.md).
 
 ---
@@ -154,7 +159,7 @@ apps/hush-tauri  ──HTTP/UDS──►  hush-daemon  (/articles/*)
 |---|--------|
 | 1 | Milestone Task 8 defers **“follow-model”** for **messaging** — Articles uses **local** follows only; clarify in product copy. |
 | 2 | **Global “no remote assets”** — articles media is fetched by **daemon**, not webview; OK if UI never holds remote URLs. |
-| 3 | **rust-nostr** + **arti** dependency weight and audit surface — `cargo-deny` before ship. |
+| 3 | **Transport dependency weight and audit surface** — settled 2026-10-13: the read lane uses a hand-rolled minimal NIP-01 client (`tokio-tungstenite`) over the existing Tor SOCKS proxy rather than `rust-nostr` + `arti`, to avoid a second Tor stack beside the one the relay and wallet already use. Re-run `cargo-deny` before ship. |
 | 4 | NIP/kind drift — pin spec version in crate; test vectors. |
 | 5 | Journalists on **persistent USB** — Tor state and cache size on limited partition. |
 | 6 | Relationship to **5d internal mail** vs public articles — separate rails in UI. |

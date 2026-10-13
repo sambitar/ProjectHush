@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
 hex = "0.4"
 hush-core = { path = "../hush-core" }
+hush-articles = { path = "../hush-articles" }
 hush-wallet = { path = "../hush-wallet" }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +29,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time",
 tower-http = { version = "0.6", features = ["cors"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+# Named directly so `main` can install one crypto provider explicitly. rustls
+# 0.23 will not choose between two enabled providers, and this binary enables
+# both (see the install in `main`). The same line, and the same choice, as the
+# desktop shell.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 uuid = { version = "1", features = ["v4"] }
 
 # Reads (HN reader): comment/reader HTML sanitizing, article extraction, cache keys.
@@ -54,3 +60,7 @@ tower = { version = "0.5", features = ["util"] }
 # A real Ed25519 keypair for the zine store tests: a signature that was not
 # really made proves nothing, so the fixture signs rather than stands in.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Verifying an exported article's BIP340 signature under the public identity's
+# own key: the whole point of the export is that a relay's check passes, and a
+# signature this crate merely produced proves nothing about that.
+k256 = { version = "0.13", features = ["schnorr"] }

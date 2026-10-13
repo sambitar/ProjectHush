@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use k256::schnorr::SigningKey as SchnorrSigningKey;
 use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -550,6 +551,68 @@ impl Vault {
         fs::write(self.dir.join(PEN_NAMES_FILE), packed)?;
         Ok(())
     }
+
+    /// The public identity this vault publishes and comments under on the
+    /// public Nostr network, if it has one yet.
+    pub fn public_identity(&self) -> Option<PublicIdentity> {
+        let entry = self.read_public_identity().ok()??;
+        public_identity_of(&entry)
+    }
+
+    /// Mint the public identity.
+    ///
+    /// A second call is refused rather than absorbed, like a pen name: it is an
+    /// identity, and quietly reusing one when the caller expected a new one
+    /// would publish under a key nobody chose.
+    pub fn create_public_identity(&self) -> Result<PublicIdentity, Error> {
+        if self.read_public_identity()?.is_some() {
+            return Err(Error::PublicIdentityExists);
+        }
+        let entry = PublicIdentityEntry::new();
+        let out = public_identity_of(&entry).ok_or(Error::Crypto)?;
+        self.write_public_identity(&entry)?;
+        Ok(out)
+    }
+
+    /// Sign a Nostr event id as the public identity.
+    ///
+    /// `msg` is the 32-byte event id, and the signature is BIP340 over it —
+    /// which is what `msg` already being a SHA-256 digest means. Signing the
+    /// *digest* rather than hashing again is the whole subtlety here: Nostr's
+    /// signature is over `sha256(serialized_event)`, so a signature computed
+    /// over `sha256(sha256(serialized_event))` would be a well-formed Schnorr
+    /// signature that no relay and no other client accepts.
+    ///
+    /// `None` when there is no public identity, so nothing is ever published
+    /// under a key that does not exist. The secret never leaves this method.
+    pub fn public_identity_sign(&self, msg: &[u8]) -> Option<Vec<u8>> {
+        use k256::schnorr::signature::hazmat::PrehashSigner;
+        let entry = self.read_public_identity().ok()??;
+        let signing = entry.signing_key()?;
+        // The default `aux_rand` (all zeroes) is BIP340's deterministic mode.
+        // It costs nothing a reader can detect — verification depends only on
+        // `(r, s)` — and it keeps signing reproducible for a given event.
+        let signature = signing.sign_prehash(msg).ok()?;
+        Some(signature.to_bytes().to_vec())
+    }
+
+    fn read_public_identity(&self) -> Result<Option<PublicIdentityEntry>, Error> {
+        let path = self.dir.join(PUBLIC_IDENTITY_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let plain = decrypt(&self.master, &fs::read(path)?)?;
+        serde_json::from_slice(&plain)
+            .map(Some)
+            .map_err(|_| Error::Corrupt)
+    }
+
+    fn write_public_identity(&self, entry: &PublicIdentityEntry) -> Result<(), Error> {
+        let plain = serde_json::to_vec(entry).map_err(|_| Error::Corrupt)?;
+        let packed = encrypt(&self.master, &plain)?;
+        fs::write(self.dir.join(PUBLIC_IDENTITY_FILE), packed)?;
+        Ok(())
+    }
 }
 
 /// Strip the secrets out of a stored pen-name entry.
@@ -676,6 +739,81 @@ pub fn verify_pen_signature(sign_pk_hex: &str, message: &[u8], signature: &[u8])
         return false;
     };
     vk.verify(message, &sig).is_ok()
+}
+
+/// The public identity this vault publishes and comments under on the public
+/// Nostr network (neighborhoods, Task 22).
+///
+/// One secp256k1 key, because a Nostr identity *is* one keypair: it signs events
+/// and it is the address events name, so there is no second curve to split it
+/// across the way a pen name needs. It is generated here and never derived from
+/// the messaging identity or from any pen name, which is what keeps a public
+/// post from being tied back to the member's account or to the private byline.
+const PUBLIC_IDENTITY_FILE: &str = "public-identity.enc";
+
+#[derive(Clone, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+struct PublicIdentityEntry {
+    /// secp256k1 secret key, hex. The `nsec`; never leaves the vault.
+    secret_hex: String,
+    created_unix: u64,
+}
+
+impl PublicIdentityEntry {
+    fn new() -> Self {
+        // `from_bytes` over the crate's own `random_bytes`, the same way the
+        // pen name's signing key is minted: the RNG trait versions in this tree
+        // do not line up with the ones `k256` re-exports. A random 32-byte
+        // string is a valid secp256k1 scalar with overwhelming probability; the
+        // loop is the honest handling of the case where it is not.
+        let signing = loop {
+            if let Ok(k) = SchnorrSigningKey::from_bytes(&random_bytes::<32>()) {
+                break k;
+            }
+        };
+        Self {
+            secret_hex: hex::encode(signing.to_bytes()),
+            created_unix: now_secs(),
+        }
+    }
+
+    fn signing_key(&self) -> Option<SchnorrSigningKey> {
+        let sk: [u8; 32] = hex::decode(&self.secret_hex).ok()?.try_into().ok()?;
+        SchnorrSigningKey::from_bytes(&sk).ok()
+    }
+}
+
+/// The public identity as the rest of the program sees it: the public key only,
+/// with no secret material in the struct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicIdentity {
+    /// The x-only secp256k1 public key, hex. A Nostr event's `pubkey`.
+    pub pubkey_hex: String,
+    /// The bech32 `npub` encoding of the same key — the human-facing handle.
+    pub npub: String,
+}
+
+/// The public identity a stored entry stands for: the x-only public key in hex
+/// and its bech32 `npub`.
+fn public_identity_of(entry: &PublicIdentityEntry) -> Option<PublicIdentity> {
+    let signing = entry.signing_key()?;
+    let xonly = signing.verifying_key().to_bytes();
+    let xonly = xonly.as_slice();
+    Some(PublicIdentity {
+        pubkey_hex: hex::encode(xonly),
+        npub: npub_of(xonly)?,
+    })
+}
+
+/// The bech32 `npub` for a 32-byte x-only secp256k1 public key.
+///
+/// Nostr's human-facing handle. bech32, not bech32m: `npub`/`nsec` predate the
+/// bech32m checksum and other clients expect the original.
+fn npub_of(xonly: &[u8]) -> Option<String> {
+    if xonly.len() != 32 {
+        return None;
+    }
+    let hrp = bech32::Hrp::parse("npub").ok()?;
+    bech32::encode::<bech32::Bech32>(hrp, xonly).ok()
 }
 
 /// Plaintext bytes per encrypted chunk for [`Vault::put_blob_stream`]. Large
@@ -1109,6 +1247,205 @@ mod tests {
         assert_eq!(
             back.read_encrypted_file("zines.enc").unwrap().unwrap(),
             b"sealed zine state"
+        );
+    }
+
+    #[test]
+    fn a_public_identity_is_minted_once_and_survives_a_reopen() {
+        let d = scratch("public-identity");
+        let vault = Vault::create(&d, "pw").unwrap();
+        assert!(
+            vault.public_identity().is_none(),
+            "a fresh vault has no public identity"
+        );
+
+        let id = vault.create_public_identity().unwrap();
+        assert_eq!(id.pubkey_hex.len(), 64, "the pubkey is a 32-byte key in hex");
+        assert!(id.npub.starts_with("npub1"), "the handle is a bech32 npub");
+
+        assert!(matches!(
+            vault.create_public_identity().unwrap_err(),
+            Error::PublicIdentityExists
+        ));
+
+        let reloaded = Vault::open(&d, "pw").unwrap();
+        assert_eq!(reloaded.public_identity().unwrap(), id);
+    }
+
+    /// The whole point of a separate public identity is that a public post
+    /// cannot be tied back to the member's account or to the private byline.
+    /// Two vaults with the same identity material must mint unrelated public
+    /// identities, and the key must not be derivable from the account, the drop
+    /// key, or a pen name.
+    #[test]
+    fn the_public_identity_is_isolated_from_the_account_and_the_pen_name() {
+        let a = scratch("public-identity-a");
+        let b = scratch("public-identity-b");
+        let va = Vault::create(&a, "pw").unwrap();
+        let vb = Vault::create(&b, "pw").unwrap();
+        let ia = va.create_public_identity().unwrap();
+        let ib = vb.create_public_identity().unwrap();
+        assert_ne!(ia.pubkey_hex, ib.pubkey_hex);
+
+        assert_ne!(ia.pubkey_hex, hex::encode(va.identity_public().0));
+        assert_ne!(ia.pubkey_hex, va.drop_public_key().unwrap_or_default());
+
+        let pen = va.create_pen_name("Ada").unwrap();
+        assert_ne!(ia.pubkey_hex, pen.id);
+        assert_ne!(ia.pubkey_hex, pen.sign_pk);
+    }
+
+    /// The pubkey must be a real Nostr key, not just 32 bytes that look like
+    /// one. `k256`'s x-only encoding is checked against the canonical secp256k1
+    /// generator, and the `npub` against a decode of the same bytes.
+    #[test]
+    fn the_public_identity_pubkey_matches_a_known_secp256k1_vector() {
+        // secret = 1 -> G.x, the generator's x-coordinate.
+        let entry = PublicIdentityEntry {
+            secret_hex: "0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            created_unix: 0,
+        };
+        let id = public_identity_of(&entry).unwrap();
+        assert_eq!(
+            id.pubkey_hex,
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        );
+
+        let (hrp, data) = bech32::decode(&id.npub).unwrap();
+        assert_eq!(hrp.to_string(), "npub");
+        assert_eq!(hex::encode(data), id.pubkey_hex);
+    }
+
+    #[test]
+    fn a_public_identity_is_ciphertext_at_rest() {
+        let d = scratch("public-identity-at-rest");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let id = vault.create_public_identity().unwrap();
+        let raw = fs::read(d.join(PUBLIC_IDENTITY_FILE)).unwrap();
+        let hay = String::from_utf8_lossy(&raw);
+        assert!(!hay.contains(&id.pubkey_hex), "the pubkey is not plaintext");
+        assert!(!hay.contains(&id.npub), "the npub is not plaintext");
+        assert!(!hay.contains("secret_hex"), "the record is not plaintext");
+    }
+
+    #[test]
+    fn a_backup_carries_the_public_identity() {
+        let d = scratch("public-identity-backup");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let id = vault.create_public_identity().unwrap();
+
+        let archive = crate::backup::export_vault(&d).unwrap();
+        let names: Vec<String> = {
+            let mut tar = tar::Archive::new(&archive[..]);
+            tar.entries()
+                .unwrap()
+                .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert!(names.iter().any(|n| n == PUBLIC_IDENTITY_FILE), "{names:?}");
+
+        let restored = scratch("public-identity-restore");
+        crate::backup::import_vault(&restored, &archive).unwrap();
+        let back = Vault::open(&restored, "pw").unwrap();
+        assert_eq!(back.public_identity().unwrap(), id);
+    }
+
+    /// A signature the vault produces must verify under the very key the event
+    /// will name. This is the property an export or a comment depends on: a
+    /// relay checks the signature against `pubkey` and drops the event if it
+    /// does not hold.
+    #[test]
+    fn a_public_identity_signature_verifies_under_its_own_pubkey() {
+        use k256::schnorr::signature::hazmat::PrehashVerifier;
+        let d = scratch("public-identity-sign");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let id = vault.create_public_identity().unwrap();
+
+        // A stand-in event id: what matters is that it is the 32-byte digest.
+        let event_id = Sha256::digest(b"a serialized event");
+        let signature = vault.public_identity_sign(&event_id).unwrap();
+        assert_eq!(signature.len(), 64, "BIP340 is a 64-byte signature");
+
+        let xonly: [u8; 32] = hex::decode(&id.pubkey_hex).unwrap().try_into().unwrap();
+        let verifying = k256::schnorr::VerifyingKey::from_bytes(&xonly).unwrap();
+        let signature = k256::schnorr::Signature::try_from(&signature[..]).unwrap();
+        verifying
+            .verify_prehash(&event_id, &signature)
+            .expect("the signature holds under the published key");
+    }
+
+    /// The subtlety that would make every event this app signs worthless: Nostr
+    /// signs `sha256(serialized_event)`, so the vault must sign the digest it is
+    /// handed rather than hashing it a second time. A doubly-hashed signature is
+    /// still a valid Schnorr signature — it simply verifies against nothing a
+    /// relay computes, so the event is rejected with no clue why.
+    #[test]
+    fn a_public_identity_signature_is_over_the_digest_and_not_a_hash_of_it() {
+        use k256::schnorr::signature::hazmat::PrehashVerifier;
+        let d = scratch("public-identity-sign-prehash");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let id = vault.create_public_identity().unwrap();
+
+        let event_id = Sha256::digest(b"a serialized event");
+        let signature = vault.public_identity_sign(&event_id).unwrap();
+
+        let xonly: [u8; 32] = hex::decode(&id.pubkey_hex).unwrap().try_into().unwrap();
+        let verifying = k256::schnorr::VerifyingKey::from_bytes(&xonly).unwrap();
+        let signature = k256::schnorr::Signature::try_from(&signature[..]).unwrap();
+
+        verifying
+            .verify_prehash(&event_id, &signature)
+            .expect("verified as a signature over the digest");
+
+        // The same bytes read as a message to hash are a different prehash, and
+        // the signature must not verify there. This is what would pass if the
+        // vault called `Signer::sign` instead of `PrehashSigner::sign_prehash`.
+        use k256::schnorr::signature::Verifier;
+        assert!(
+            verifying.verify(&event_id, &signature).is_err(),
+            "the signature is over the digest, not over a hash of it"
+        );
+    }
+
+    /// The vault signs with `sign_prehash` and BIP340's default (all-zero)
+    /// auxiliary randomness. This is BIP340's own test vector 0 — secret key 3,
+    /// all-zero message and `aux_rand` — so a pass here means the call the vault
+    /// makes produces signatures the wider Nostr network accepts, not merely
+    /// signatures that round-trip against our own verifier.
+    #[test]
+    fn signing_a_prehash_matches_the_bip340_test_vector() {
+        use k256::schnorr::signature::hazmat::PrehashSigner;
+        let sk = hex::decode("0000000000000000000000000000000000000000000000000000000000000003")
+            .unwrap();
+        let signing = SchnorrSigningKey::from_bytes(&sk).unwrap();
+        assert_eq!(
+            hex::encode(signing.verifying_key().to_bytes().as_slice()),
+            "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+            "the vector's public key"
+        );
+
+        let signature = signing.sign_prehash(&[0u8; 32]).unwrap();
+        assert_eq!(
+            hex::encode(signature.to_bytes()),
+            concat!(
+                "e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca8215",
+                "25f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c0"
+            )
+        );
+    }
+
+    /// A read must never mint one. Signing without a public identity is `None`,
+    /// and the call leaves the vault without one — a stray export must not be
+    /// the thing that creates the key it publishes under.
+    #[test]
+    fn signing_without_a_public_identity_signs_nothing_and_mints_nothing() {
+        let d = scratch("public-identity-sign-absent");
+        let vault = Vault::create(&d, "pw").unwrap();
+        assert!(vault.public_identity_sign(b"anything").is_none());
+        assert!(
+            vault.public_identity().is_none(),
+            "the failed sign did not mint a key"
         );
     }
 

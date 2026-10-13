@@ -27,6 +27,28 @@ LOG_DIR="${RUN_DIR}/logs"
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 chmod 700 "$RUN_DIR" 2>/dev/null || true
 
+# Tor is bundled as an app resource (src-tauri/resources/tor/) so a packaged
+# build needs no system install. A dev run does not get that for free, and the
+# failure is silent: Tauri resolves the resource directory from the executable,
+# so it looks for the sidecar beside the binary. Here that is
+# /var/tmp/hush-target/debug (target/ is a symlink), which is not even a
+# directory Tauri recognises as cargo output — the check wants a grandparent
+# literally named `target` — so it falls through to /usr/lib/hush-tauri, which
+# does not exist. The shell then reports "Tor was not found" with the sidecar
+# sitting in the repository.
+#
+# Point the shell at the sidecar explicitly, and give the dynamic loader the
+# libevent beside it: that library is not installed system-wide, so the bundled
+# Tor cannot start without it. HUSH_TOR_BIN wins if you have set one, which is
+# the same precedence the app uses.
+TOR_DIR="$ROOT/apps/hush-tauri/src-tauri/resources/tor"
+TOR_BIN=""
+TOR_LIB_DIR=""
+if [[ -x "$TOR_DIR/tor" ]]; then
+  TOR_BIN="${HUSH_TOR_BIN:-$TOR_DIR/tor}"
+  TOR_LIB_DIR="$TOR_DIR"
+fi
+
 [[ -d "$VAULT_DIR" ]] || { echo "No vault at $VAULT_DIR — create one first (hush-cli init)." >&2; exit 1; }
 
 echo "Building UI (Vite) and desktop binary…"
@@ -115,8 +137,22 @@ daemon_ready "$SOCK" || { echo "Daemon did not come up:" >&2; tail -n 20 "$LOG_D
 echo "Daemon started (pid $DAEMON_PID, log $LOG_DIR/daemon.log)"
 
 echo "Opening the desktop window…"
-HUSH_API_URL="unix://$SOCK" HUSH_WINDOW_TITLE="Hush — one" \
-  "$TAURI_BIN" >"$LOG_DIR/ui.log" 2>&1 &
+# Tor is reported before the window opens, because the Relay panel is where the
+# answer would otherwise show up as a failure the reader has to interpret.
+if [[ -n "$TOR_BIN" ]]; then
+  echo "Tor: the bundled sidecar ($TOR_BIN)"
+elif command -v tor >/dev/null 2>&1; then
+  echo "Tor: the system copy ($(command -v tor))"
+else
+  echo "Tor: none found — the Relay panel will say so, and onion mail waits until there is one."
+fi
+UI_ENV=()
+[[ -n "$TOR_BIN" ]] && UI_ENV+=(HUSH_TOR_BIN="$TOR_BIN")
+if [[ -n "$TOR_LIB_DIR" ]]; then
+  UI_ENV+=(LD_LIBRARY_PATH="${TOR_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+fi
+env HUSH_API_URL="unix://$SOCK" HUSH_WINDOW_TITLE="Hush — one" \
+  "${UI_ENV[@]}" "$TAURI_BIN" >"$LOG_DIR/ui.log" 2>&1 &
 UI_PID=$!
 sleep 2
 kill -0 "$UI_PID" 2>/dev/null || { echo "UI exited at startup:" >&2; tail -n 20 "$LOG_DIR/ui.log" >&2; exit 1; }

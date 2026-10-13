@@ -312,6 +312,28 @@ enum Work {
         name: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Neighborhoods: the public identity this vault publishes and comments
+    /// under on the public Nostr network, if it has one yet.
+    PublicIdentityGet {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Neighborhoods: mint the public identity. A create when one already
+    /// exists returns it rather than erroring, so a retried request is not a
+    /// failure to the pane.
+    PublicIdentityCreate {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Neighborhoods: sign a Nostr event id as the public identity.
+    ///
+    /// The 32 bytes are the id, not the serialized event: NIP-01 signs the
+    /// digest, and hashing it again here would produce a signature that verifies
+    /// against nothing a relay computes. Only the digest crosses the channel —
+    /// the key does not — and the answer is `None` when there is no public
+    /// identity, so nothing is ever published under a key that does not exist.
+    PublicIdentitySign {
+        msg: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// Zines: the pen name's seal keypair, secret half included.
     ///
     /// Handed out of the worker because opening a comment is a *policy* step —
@@ -547,6 +569,26 @@ impl From<hush_core::PenName> for PenNameDto {
     }
 }
 
+/// The public identity, as the UI sees it: the public key and its `npub`
+/// handle. The secret half never crosses this boundary — a Nostr event is
+/// signed inside the vault, not here.
+#[derive(Clone, serde::Serialize)]
+pub struct PublicIdentityDto {
+    /// The x-only secp256k1 public key, hex.
+    pub pubkey: String,
+    /// The bech32 `npub` handle.
+    pub npub: String,
+}
+
+impl From<hush_core::PublicIdentity> for PublicIdentityDto {
+    fn from(p: hush_core::PublicIdentity) -> Self {
+        Self {
+            pubkey: p.pubkey_hex,
+            npub: p.npub,
+        }
+    }
+}
+
 pub enum WorkResult {
     Ok,
     Invite(String),
@@ -596,6 +638,13 @@ pub enum WorkResult {
     SecretRemoved,
     /// The zines pen name this vault publishes under; `None` before one exists.
     PenName(Option<PenNameDto>),
+    /// The public identity this vault publishes and comments under on the
+    /// public Nostr network; `None` before one exists.
+    PublicIdentity(Option<PublicIdentityDto>),
+    /// A BIP340 signature over an event id, made by the public identity; `None`
+    /// when there is no public identity to sign with, so an export is never
+    /// published under a key that does not exist.
+    PublicIdentitySignature(Option<Vec<u8>>),
     /// The pen name's seal keypair, secret half included; `None` before one
     /// exists. Only ever held in memory by the caller that asked for it.
     ZineSealKey(Option<hush_core::DropKeyPair>),
@@ -1205,6 +1254,42 @@ impl AccountWorker {
                                         Ok(pen) => WorkResult::PenName(Some(pen.into())),
                                         Err(e) => WorkResult::Err(e.to_string()),
                                     }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::PublicIdentityGet { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::PublicIdentity(
+                                    a.public_identity().map(PublicIdentityDto::from),
+                                ),
+                            };
+                            (reply, result)
+                        }
+                        Work::PublicIdentityCreate { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                // Idempotent: a create when one already exists
+                                // returns it, so a retried request is not a
+                                // failure to the pane.
+                                Some(a) => match a.public_identity() {
+                                    Some(existing) => {
+                                        WorkResult::PublicIdentity(Some(existing.into()))
+                                    }
+                                    None => match a.create_public_identity() {
+                                        Ok(id) => WorkResult::PublicIdentity(Some(id.into())),
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    },
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::PublicIdentitySign { msg, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    WorkResult::PublicIdentitySignature(a.public_identity_sign(&msg))
                                 }
                             };
                             (reply, result)
@@ -1995,6 +2080,27 @@ impl AccountWorker {
             reply,
         })
         .await
+    }
+
+    /// The public identity this vault publishes and comments under on the
+    /// public Nostr network, if it has one yet.
+    pub async fn public_identity(&self) -> WorkResult {
+        self.call(|reply| Work::PublicIdentityGet { reply }).await
+    }
+
+    /// Mint the public identity, returning the one now in force. A create when
+    /// one already exists returns it rather than erroring.
+    pub async fn create_public_identity(&self) -> WorkResult {
+        self.call(|reply| Work::PublicIdentityCreate { reply }).await
+    }
+
+    /// Sign a Nostr event id as the public identity.
+    ///
+    /// The digest crosses the channel rather than the key: the caller builds and
+    /// serializes the event, which is a pure step, and only the signature needs
+    /// the vault.
+    pub async fn public_identity_sign(&self, msg: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::PublicIdentitySign { msg, reply }).await
     }
 
     /// The pen name's seal keypair, for opening what is sealed to it.

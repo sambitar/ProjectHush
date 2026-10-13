@@ -8,6 +8,12 @@ explicitly approved.
 native shape and becomes an optional **export bridge**. Builds on Task **19**'s sidecar-store +
 fan-out spine ([`conclave-paper.md`](conclave-paper.md)); adds one relay ability.
 
+**Neighborhoods (Task 22, 2026-10-13):** the front page can also carry **public** long-form pulled
+from Nostr, on the **same page** behind a control-pane switch and always badged `public post`. Public
+posts use a **separate public identity** (never the pen name) and egress over **Tor**. See
+[`neighborhoods.md`](neighborhoods.md). The earlier "a separate public surface" idea is superseded by
+the mixed page; the badge and the default-off switch are what keep the two sides distinguishable.
+
     10|**Goal:** Every member has a **zine** — a long-form post with a comments section, published under
 their **pen name**, readable by **all members** (not just contacts), end-to-end encrypted, with no
 server holding plaintext. A pen name holds **many** zines: each post is its own zine, with its own
@@ -77,7 +83,7 @@ hold" live in the members' vaults, which is where the availability story actuall
 | Comments | Blobs encrypted to the pen name's **public** key, published to the same lane; the author pulls, merges accepted ones, republishes |
 | Edits | New blobs; a revision pointer in the descriptor, **per post**; old revisions age out with the window and are pruned locally |
 | Browsing | **Newspaper model** — no follows, no subscriptions; the full local index (all / by section / by pen name), local mute per pen name |
-| Beyond Hush | Optional later **export** (Nostr NIP-23), reusing the pen-name keys — a button, not a second product |
+| Beyond Hush | Optional later **export** (Nostr NIP-23) signed under a **separate public identity**, never the pen-name keys — a button, not a second product. The paired **read** lane is **neighborhoods** (Task 22): badged public posts on the same front page behind a control |
 | Scope | **Text-only rich text** (Paper's toolbar: bold/italic/underline, lists, headings) |
 | Milestone | Task **21** / Phase **O** |
 
@@ -454,7 +460,7 @@ Phase 4's remaining box is ticked above: the byline filter landed 2026-10-13.
 ### Phase 5 — Retention, hardening, docs
 - [x] Holder **re-post sweep** (rate-limited, signature-verified) keeps held zines in the window; per-zine and total caps surface reasons.
 - [x] `DISTRO_READINESS.md` (bulletin storage growth on the relay; no new client egress), `THREAT_MODEL.md`, `PROTOCOL.md`.
-- [ ] Optional later: Nostr **export** (sign a NIP-23 event with the pen name; publish over Tor) — the reshaped Task 11.
+- [x] Nostr **export** (sign a NIP-23 event with the **public identity**, never the pen name; publish over Tor) — the reshaped Task 11. **Landed 2026-10-13**: `POST /api/zines/{id}/export`, reachable from the zine page's `Export to neighborhoods`. See [`neighborhoods.md`](neighborhoods.md) Phase **4**.
 
 **Verify:** a zine survives the window on a holder's re-post with the author offline; full dogfood with no plaintext on disk; export produces a verifiable NIP-23 event.
 

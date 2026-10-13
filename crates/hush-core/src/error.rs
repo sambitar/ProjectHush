@@ -78,6 +78,8 @@ pub enum Error {
     PenNameMissing,
     #[error("this vault holds the most pen names it can")]
     PenNameCap,
+    #[error("a public identity already exists")]
+    PublicIdentityExists,
 }
 
 impl From<argon2::Error> for Error {

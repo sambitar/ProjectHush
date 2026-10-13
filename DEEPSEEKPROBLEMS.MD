@@ -13,6 +13,655 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-13 — `pgrep -f` and `pkill -f` matched the shell running them, again
+
+### A self-matching `pgrep` reported a finished build as still running — `OPEN` (recurrence)
+
+Attempted: wait for `cargo build --release -p hush-daemon` to finish by polling
+`pgrep -f "cargo build --release -p hush-daemon"` in a loop.
+
+Symptom: the loop never exited, and the final check printed `STILL BUILDING` while the build log
+already said it was done:
+
+```
+Finished `release` profile [optimized] target(s) in 11m 50s
+```
+
+The poller's own command line contains the literal pattern it searches for, so `pgrep -f` matched
+the polling shell and the answer was permanently "yes". This is a wrong *result*, not just missing
+output — the loop would have run to its cap and the conclusion would have been "still building" about
+a build that had been finished for minutes. The same command run with `pkill -f` instead of `pgrep -f`
+killed the invoking shell outright and returned nothing at all, which is the shape already logged
+twice in this file (the `pkill -f` entries below, marked `FIXED`).
+
+Resolution: none applied — the build had already finished, so the poll was replaced by reading the
+log. The fix that actually works is to stop pattern-matching on the command line: capture the PID
+when launching (`echo $!`) and poll `kill -0 <pid>`, or poll the artifact
+(`cargo build ... && echo done`), or anchor the pattern so it cannot match a shell wrapper
+(`pgrep -f '^/home/sam/\.rustup/.*/cargo build'`). Where a process must be signalled, resolve the PID
+with `pgrep -f` first and pass it to `kill`, never `pkill -f` with a pattern copied from the command
+being typed.
+
+Lesson: the earlier `FIXED` tag on this trap was too generous — the entry documented the anchoring
+fix and the trap still landed twice in one session, once as silence and once as a confidently wrong
+answer. Treat any `-f` pattern that appears in the command being run as self-matching until proven
+otherwise, and prefer PIDs over patterns for both polling and signalling.
+
+---
+
+## 2026-10-13 — The daemon's first TLS handshake panicked and wedged the socket
+
+Trigger: `Public posts` → `Refresh` in a dev run answered "Can't reach the Hush daemon at
+unix:///run/user/1000/hush-one/hush.sock. Start it with: `cargo run -p hush-daemon -- --dir <vault>`".
+
+### Both rustls providers were enabled, so the daemon panicked on its first TLS connection — `FIXED`
+
+Attempted: read the message as a connectivity problem — the daemon was not running, or the socket had
+been cleaned up.
+
+Symptom: the daemon *was* running, and the socket was not merely present but listening:
+
+```
+$ pgrep -af hush-daemon
+328425 .../target/release/hush-daemon --dir .../instances/peer-a --socket /run/user/1000/hush-one/hush.sock
+$ ss -xl | rg hush.sock
+u_str LISTEN 0 4096 /run/user/1000/hush-one/hush.sock 1101577 * 0
+```
+
+Every request on it timed out with zero bytes, which is what the UI rendered as "Can't reach the
+daemon":
+
+```
+$ curl -sS --max-time 5 --unix-socket .../hush.sock http://localhost/api/status
+curl: (28) Operation timed out after 5002 milliseconds with 0 bytes received
+```
+
+The daemon log held the actual cause, one line above the silence:
+
+```
+thread 'tokio-rt-worker' (328428) panicked at .../rustls-0.23.45/src/crypto/mod.rs:249:14:
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make
+sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+```
+
+Cause: rustls 0.23 will not choose a crypto provider when feature unification enables both, and this
+binary enables both. `cargo tree -p hush-daemon -e features -i rustls` shows `ring` arriving from
+`webrtc` → `rtc`/`rtc-dtls` `crypto-ring` and from `reqwest`'s `__rustls-ring`, and `aws-lc-rs`
+arriving from `hush-wallet` → alloy's `reqwest-rustls-tls` and from `electrum-client`'s
+`rustls`/`default`. Both native libraries are linked into the release binary, which is why the
+release build spends time in `aws-lc-sys` and `ring` alike.
+
+This is not a Phase 4 regression. `cargo tree -p hush-articles -e features -i rustls` shows the new
+crate enabling only `rustls/std`, no provider — the collision predates it. What Phase 4 changed is
+that it was the first daemon code path to *open a TLS connection*: the read lane dials `wss://`
+through Tor, the first handshake reached `CryptoProvider::from_crate_features()`, and that returns
+`None` here. The panic killed the runtime worker mid-request and left the listener open, so the
+failure surfaced as an unreachable socket rather than a crash. Anything else in the daemon that
+speaks TLS — electrum, the drop origins — was equally exposed and simply had not been reached.
+
+Resolution: `main` now installs one provider before anything can dial out, the same choice the
+desktop shell already makes for its own client (`apps/hush-tauri/src-tauri/src/irc/tls.rs` builds its
+config from `rustls::crypto::ring`). `crates/hush-daemon/Cargo.toml` names `rustls` directly with the
+`ring` feature rather than relying on a sibling crate's unification to keep the module compiled in.
+The result of the install is deliberately discarded: `AlreadyInstalled` is the only error it can
+return, and it means the job is done either way.
+
+Verified by running the debug daemon against a copy of the dev vault — so the live window's daemon
+and vault lock were left alone — unlocking it, pointing the relay switch at the running Tor's SOCKS
+port, and calling the endpoint that had panicked:
+
+```
+$ curl --unix-socket /tmp/hush-tor-test/hush.sock -X POST http://localhost/api/relay/mode \
+    -d '{"onion":true,"socks":"socks5h://127.0.0.1:44627"}'
+http 204
+$ curl --unix-socket /tmp/hush-tor-test/hush.sock -X POST http://localhost/api/neighborhoods/refresh
+{"articles":[{"address":"30023:893633d3...:gallery-364420b0-...","title":"fake boobs for baby",...
+http 200   real 0m20.540s
+```
+
+`rg -c "panicked|CryptoProvider" /tmp/hush-tor-test/daemon.log` → no matches, the log holds only its
+two startup lines, `/api/status` still answers `200` afterwards, and 68 articles are cached.
+
+The release binary was rebuilt from the same source (11m 50s) and the release artifact was then put
+through the same run against the vault copy, so the verification is of the binary the launcher
+actually starts, not only of the debug build:
+
+```
+$ .../target/release/hush-daemon --dir /tmp/peer-a-tor-test --socket /tmp/hush-tor-test/hush.sock
+unlock http 204
+relay mode http 204
+refresh http 200   real 0m20.030s
+```
+
+`rg -c "panicked|CryptoProvider"` on that log → no matches, `/api/status` answers `200` afterwards,
+and 71 articles are cached — three more than the debug run, so the second refresh reached a live
+relay rather than replaying the cache.
+
+The binary was rebuilt again after the regression test was added (12m 05s, `main.rs` changed), so the
+final artifact was put through the same run once more rather than assumed equivalent to the previous
+one:
+
+```
+unlock http 204
+relay mode http 204
+refresh http 200 in 20.035057s
+```
+
+No panics, `/api/status` answers `200`, and 91 articles are cached. The live daemon was then
+restarted on that binary and answers `200` on the real vault.
+
+A regression test now covers the mechanism, and it was checked against its own failure rather than
+assumed to work. With the install in place:
+
+```
+test tls_provider_tests::the_process_default_tls_provider_is_installed ... ok
+```
+
+With `install_tls_provider` emptied out — the shape a careless refactor would leave behind:
+
+```
+thread 'tls_provider_tests::the_process_default_tls_provider_is_installed' panicked at
+crates/hush-daemon/src/main.rs:10132:9:
+no process-level rustls provider: the first TLS handshake would panic
+test result: FAILED. 0 passed; 1 failed
+```
+
+What the test does not cover, stated rather than implied: it runs the same function `main` runs, so
+it catches a changed or emptied provider but not a deleted call site. That gap is what the doc
+comment on the function is for. All 228 daemon tests pass, and `cargo clippy -p hush-daemon
+--all-targets` reports nothing on the new lines.
+
+One round trip while adding the test: the helper was first inserted between `#[tokio::main]` and
+`async fn main`, which moved the attribute onto the helper and failed the build with "the `async`
+keyword is missing from the function declaration" pointing at `fn install_tls_provider()`. The
+attribute belongs to `main` and cannot have a doc comment or an item wedged between it and the
+function it decorates.
+
+Second round trip, and a trap for any future manual check of this path: the first run against the
+final binary answered `502` in 5.6ms, which reads like the fix failing. It was a stale port. The
+bundled Tor picks a **new random SOCKS port on every start**, and the instance the earlier run used
+(`127.0.0.1:44627`) had been replaced by one on `43115`:
+
+```
+$ ps -eo pid,args | rg resources/tor/tor
+406445 .../resources/tor/tor --defaults-torrc ...
+$ ss -tlnp | rg tor
+LISTEN 0 4096 127.0.0.1:43115 0.0.0.0:* users:(("tor",pid=406445,fd=6))
+```
+
+A `502` that returns in single-digit milliseconds means the SOCKS port refused the connection —
+a dead proxy — not a relay problem. Read the live port off `ss` before pointing anything at Tor, and
+treat a fast `502` as "no proxy there" rather than "the fix did not work".
+
+Lesson: a panic inside a tokio worker leaves the socket listening, so "can't reach the daemon" can
+mean the daemon is up and its runtime is broken. Read the daemon log before believing a connectivity
+message — and when a workspace links two crypto providers, install one explicitly instead of letting
+rustls infer it from crate features.
+
+---
+
+
+Trigger: opening Settings → Relay in a dev run and reading "Tor was not found. Install Tor, or point
+`HUSH_TOR_BIN` at a Tor binary."
+
+### The Relay panel reported Tor missing while the repo shipped one — `FIXED`
+
+Attempted: check the onion path in a running `./scripts/run-one-ui.sh` window.
+
+Symptom: the Relay panel said
+
+```
+Tor was not found. Install Tor, or point HUSH_TOR_BIN at a Tor binary.
+```
+
+Nothing in the repository had been removed — the sidecar is at
+`apps/hush-tauri/src-tauri/resources/tor/tor` and is declared as a Tauri resource. Two independent
+gaps meant the app never looked at it, and neither was visible from the panel's message.
+
+Cause, part one: the resource directory resolves to a path that does not exist. Tauri's
+`resource_dir_from` takes the cargo-output shortcut only when a path component is literally `target`
+(`parts[len - 2] == "target" || parts[len - 3] == "target"`, plus a `.cargo-lock` check). Here
+`target/` is a symlink to `/var/tmp/hush-target`, and `current_exe()` resolves it, so the executable's
+directory is `/var/tmp/hush-target/debug` — `parts[len - 2]` is `debug` and `parts[len - 3]` is
+`hush-target`, so the check fails. The Linux fallback is then
+`/usr/lib/hush-tauri` (via `exe_dir/../lib/<name>`, which does not exist either), a directory this
+machine has never had. Staging the sidecar in `target/debug/tor/` would not have helped on its own:
+cargo does not put `src-tauri/resources/` there.
+
+Cause, part two: the sidecar links `libevent-2.1.so.7`, which is not installed on this machine —
+`ldd` reports `libevent-2.1.so.7 => not found`, and `ldconfig -p` has no entry for it. So even
+pointed at directly, the bundled Tor cannot start without the loader being told about the copy
+beside it. `TorManager::bundled_lib_dir` does exactly that, but only when the binary lives under the
+resource directory, which — per part one — is the one place it was not.
+
+Resolution: `run-one-ui.sh` and `run-two-ui.sh` now hand the window the sidecar and its directory
+(`HUSH_TOR_BIN`, `LD_LIBRARY_PATH`), honouring an existing `HUSH_TOR_BIN` and falling back to a
+system `tor` when there is no sidecar. They also print which of the three they found before the
+window opens, because the panel is a bad place to learn it. Verified with the app's own live test,
+which builds a `TorManager` with no resource directory — exactly the configuration the launcher now
+creates:
+
+```
+HUSH_TOR_BIN=.../resources/tor/tor LD_LIBRARY_PATH=.../resources/tor \
+  cargo test -p hush-tauri --lib -- --ignored
+test tor::tests::bootstraps_with_a_real_tor ... ok   (11.53s)
+```
+
+That closes the "Tor was not found" path and proves the locator honours the override. It does **not**
+yet prove a public relay answers over that circuit — see the entry below.
+
+Lesson, and the reason this is worth an entry rather than a quiet fix: the Phase 2 and Phase 4
+sections in this log recorded "no Tor in this environment" as a fact about the machine. It was also a
+gap in our own launcher, and the binary was in the repository the whole time. A limitation written
+down as environmental should be checked against what the repo already ships before it is used to
+excuse an unverified claim. Two slices were marked "cannot be verified here" on a premise that was
+one script line from being false.
+
+### The read lane now reaches public relays over Tor; the write lane still has not — `OPEN`
+
+Attempted: confirm the read lane and the export/comment path against a real relay now that the
+bundled Tor runs.
+
+Symptom: nothing had exercised `wss://relay.damus.io` and friends through a live circuit. The
+bootstrap was proven; the WebSocket-over-SOCKS request through a real circuit to a real relay was
+not, and the allowlist had never been contacted.
+
+Resolution, reads: done. `POST /api/neighborhoods/refresh` over the bundled Tor's SOCKS port returned
+`200` in 20.5s with articles from the allowlisted relays and cached 68 of them, so the allowlist has
+now been contacted and the read lane is proven against real relays through a real circuit. This also
+required the rustls provider install at the top of this file — the first handshake panicked before it
+could succeed.
+
+Resolution still needed, writes: export a zine and post a comment and confirm a relay returns `OK`.
+Both publish permanently to public relays under the user's public identity, so neither was run
+without the user asking for it.
+
+---
+
+## 2026-10-13 — Neighborhoods: export and commenting (Phase 4)
+
+Trigger: "phase4". Scope: `Export to neighborhoods` (Task 11) and NIP-22 public commenting with
+read-only inbound replies — `hush-articles` (`nip22`, `markdown`, `relay`, `store`, `refresh`),
+`hush-daemon` (the export route, the comment route, the two-pass refresh), and `hush-tauri` (the
+export confirm, the public thread, the gated composer). Verified by `cargo test --workspace`,
+`cargo clippy --workspace --all-targets`, `npx tsc --noEmit`, `npm test` and `npm run build`, all
+green from this turn's output. Not verified against a live relay or Tor, and the composer was not
+driven in a browser — see the two `OPEN` entries.
+
+### Multiple relay hints would have displaced the `pubkey` on an `e` tag — `WORKED AROUND`
+
+Attempted: carry every relay hint a comment had for each `e` tag, the way a general-purpose Nostr
+client does.
+
+Symptom: none observed at runtime, which is the problem. In NIP-01 an `e` tag is positional —
+`["e", <id>, <relay-url>, <pubkey>]` — so the *second* hint URL lands in slot 4 and is read back as
+the author's pubkey. The tag would still parse, and the only visible damage would be a wrong or
+absent `p` on a downstream client, i.e. a silently mis-threaded comment on someone else's relay.
+
+Resolution: at most one relay hint per tag, and only if it is in the allowlist
+(`crates/hush-articles/src/nip22.rs`). The comment is still signed and verified correctly; the cost
+is that a reader who does not know our relays may not find the comment. Lesson: when a wire format
+is positional, "carry everything we know" is not a safe default — the extra data does not fail, it
+overwrites.
+
+### A NIP-22 tag assertion checked the comment id where it meant the article id — `FIXED`
+
+Attempted: assert `e` on a published comment against the id the test had built for the article.
+
+Symptom: the assertion compared against `comment.id` (the event id of the comment itself), so it
+was checking that the tag pointed at the thing it was attached to — which passes for the wrong
+reason on any implementation, or fails while looking like an off-by-one. It failed; that is how it
+was found.
+
+Resolution: the helper now returns the article's *version* event id and the test asserts against
+that. Lesson: a test that builds two ids of the same shape must name them apart, or the assertion
+reads as correct while comparing the wrong pair.
+
+### `&Arc<FakeSource>` did not coerce to `&Arc<dyn RelaySource>` — `FIXED`
+
+Attempted: call `refresh(&fake, ...)` in a test where `fake: Arc<FakeSource>`.
+
+Symptom:
+
+```
+error[E0308]: mismatched types
+expected `&Arc<dyn RelaySource>`
+   found `&Arc<FakeSource>`
+```
+
+Cause: `Arc<T>` does not unsize-coerce behind a shared reference; only `Arc<T> -> Arc<dyn Trait>`
+at the point of construction does. The production call site is fine because the daemon builds the
+`Arc<dyn RelaySource>` once.
+
+Resolution: bind it explicitly — `let source: Arc<dyn RelaySource> = fake.clone();` — then pass
+`&source`. Lesson: the unsize coercion applies to the value, not to a reference to it.
+
+### A test helper moved a value that the assertion then read — `FIXED`
+
+Attempted: build a `CommentPlan`, move it into `event()` to get the signed event, then assert on
+the plan's fields.
+
+Symptom: `error[E0382]: borrow of moved value`. The plan owns the content it frames.
+
+Resolution: `.clone()` at the call, since the test wants both. Lesson: an API that consumes its
+input to produce the event is right (the plan is not reusable), but a test that wants to check both
+sides has to pay for the copy rather than the API carrying an unnecessary `Clone` bound.
+
+### Test helpers in `main.rs` were invisible to the comment test module — `FIXED`
+
+Attempted: reuse `FakeRelay` and `long_form_event` from the neighborhoods test module in the new
+comment test module, both inside the daemon's `main.rs`.
+
+Symptom: `error[E0433]: failed to resolve` — the items were private to their sibling module. Making
+the whole module `pub` to fix it would have leaked test scaffolding into the crate.
+
+Resolution: `pub(super)` on the two items and a `FakeRelay::new(events, comments)` constructor so
+the comment tests can seed replies without reaching into fields. Lesson: sibling test modules are
+not friends in Rust; scope the export to the parent instead of widening the module.
+
+### Clippy flagged an `impl Future` helper as an `async fn in trait` hazard — `FIXED`
+
+Attempted: write the test-only `set_allowlist` helper as `fn set_allowlist(&self, ...) -> impl Future<Output = ...>`.
+
+Symptom: `warning: use of `async fn` in public traits is discouraged` on the surrounding trait, plus
+`async_fn_in_trait` noise that pointed at the helper rather than at a real problem.
+
+Resolution: made it an `async fn`. Lesson: the workaround for the trait lint (returning `impl
+Future` by hand) is itself flagged; when the trait is only ever used inside the crate, plain
+`async fn` is the answer.
+
+### The comment POST's response was dereferenced as non-null — `FIXED`
+
+Attempted: `const out = await api.neighborhoodComment(...); if (out.published) { ... }`.
+
+Symptom:
+
+```
+src/app.ts(6641,11): error TS18047: 'out' is possibly 'null'.
+```
+
+Cause: `request<T>` returns `Promise<T | null>` — it answers `null` for an empty or unreadable body
+— and the export call had handled that but the comment call was written as if the daemon always
+answered.
+
+Resolution: `if (!out) throw new Error("The daemon sent no answer.")`, matching the export path.
+Lesson: the shared `request` helper's nullable return is a property of the helper, not of the
+endpoint; every new call site has to answer it.
+
+### The comment path is verified against a local relay and a stand-in SOCKS proxy — `OPEN`
+
+**See the 2026-10-13 entry "The dev launcher never provided the bundled Tor" above: the premise
+below ("no network and no Tor daemon") was half wrong — there is network, and the sidecar was in the
+repository all along. The bootstrap is now proven; a real relay over a real circuit is still the open
+part.**
+
+Attempted: prove that a comment leaves over Tor and comes back as a reply on the article page.
+
+Symptom: this build environment has no network and no Tor daemon, so the only end-to-end run is
+against a local WebSocket relay with a stand-in SOCKS proxy. That covers framing, the two-pass
+refresh, the signature, the cache, and the refusal paths, but not Tor reachability, not a live
+relay's `OK`, and not a relay that answers with hints or duplicates.
+
+Resolution needed: run the daemon with Tor up and the allowlist pointed at a real relay, post one
+comment from a second vault, and confirm it appears on the first vault's article page after a
+refresh. Until then the Tor claim is inherited from Phase 2, which has the same gap.
+
+### The public composer and thread were not driven in a browser — `OPEN`
+
+Attempted: confirm the thread renders, the identity gate switches to the box after a mint, and a
+posted comment appears without a reload.
+
+Symptom: `tsc`, `npm test` (59 pass, including the six new thread/composer tests) and the production
+build are green, but none of them paint the page. The DOM wiring — the re-parented textarea, the
+`--post-depth` indent, the reply button flipping `postCommentParent` — is verified by reading the
+code only.
+
+Resolution needed: drive the article page in a running app (the `preview-protocol` route), post a
+comment, and confirm the cache write shows up in the thread. This is the same gap recorded for
+Phase 3's switch and article page and is still open for the same reason: the slice was written
+offline.
+
+---
+
+## 2026-10-13 — Neighborhoods: the mixed page (Phase 3)
+
+Trigger: "phase3" after the read lane landed. Scope: the `Public posts` switch, the `public post`
+badge, the lead rule, and `lib/zinesPage.ts` composed over the mixed corpus. The composition is
+covered by unit tests; the switch and the article page were verified by reading the wiring and by a
+green `tsc`/build, **not** by driving the UI (see the last entry).
+
+### `* * *` printed as a bullet instead of a rule — `FIXED`
+
+Attempted: render a horizontal rule with a `/^\s*([-*_])\s*\1\s*\1/` style check placed among the
+other block rules, after the list rule.
+
+Symptom: `* * *` came out as a one-item list. The list regex (`^\s*([-*+]|\d+[.)])\s+`) matches it
+first — `*` is a valid bullet and the next char is a space — so the block was consumed as a bullet
+whose text is `* *`, which then reads as emphasis and prints as a blank bullet.
+
+Resolution: an explicit `isRule()` (`/^\s*([-*_])(?:\s*\1){2,}\s*$/`) evaluated **before** the list
+item, and added to `startsBlock` so a rule also interrupts a paragraph. Lesson: in a hand-rolled
+block parser the order of the rules is the precedence, and `*` is the one marker that is both a rule
+character and a bullet; the more specific rule has to be tested first.
+
+### A link with parentheses in the URL swallowed its own closing paren — `FIXED`
+
+Attempted: parse `[text](url)` with `\(([^()\s]*)\)`.
+
+Symptom: a URL containing a balanced pair, e.g. `javascript:alert(1)`, matched up to the first `)`,
+leaving a stray `)` behind and printing it as literal text after the link.
+
+Resolution: `String.raw`\(((?:[^()\s]|\([^()]*\))+)\)`` — one level of balanced nesting. Lesson: a
+"greedy up to the closing delimiter" pattern is wrong the moment the delimiter can appear inside;
+this is the class of bug that also produces the classic `$1`-residue in link parsers.
+
+### `node --test` could not resolve `./richText` without an extension — `FIXED`
+
+Attempted: import the sanitizer in `markdown.test.ts` the way the app does, as `./richText`.
+
+Symptom:
+
+```
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '.../src/lib/richText'
+imported from .../src/lib/markdown.test.ts
+```
+
+Cause: the tests run under plain Node ESM (`node --test`), whose resolver requires the extension; the
+app's bundler is happy without it. The existing test files in the repo import with the extension
+(`./zinesPage.ts`) — the convention was there and was not followed.
+
+Resolution: import `./richText.ts`, matching the other test files. Lesson: tests execute in Node, not
+through the bundler, so test imports need the same specifier form as the rest of the suite.
+
+### A nullable settings payload was typed as non-null — `FIXED`
+
+Attempted: `const settings = await api.neighborhoodSettings(); this.neighborhoodsShown = settings.default_show;`
+
+Symptom: `tsc` rejected the dereference — `neighborhoodSettings()` is typed to return the DTO or
+`null`, because the daemon can answer with an empty body.
+
+Resolution: `settings?.default_show ?? false`, with a comment recording that a null answer means the
+daemon had nothing to report, which is the same as the default (off). Lesson: a route that can answer
+empty should be typed nullable at the client, and the "nothing to report" case should be folded into
+the default rather than given its own error path.
+
+### The frontend test count was carried forward from memory and was wrong — `FIXED`
+
+Attempted: state the size of the new frontend coverage in the task doc from the working summary
+rather than from the runner.
+
+Symptom: `zinesPage.test.ts` was recorded as 27 tests; `node --test src/lib/zinesPage.test.ts`
+reports **22** (13 for `markdown.test.ts`, both confirmed before the doc was written).
+
+Resolution: re-ran each file and wrote the counts from the runner output. Lesson: a test count in a
+doc is a claim like any other — read it off the command, do not recall it.
+
+### The switch and the article page were not exercised in a running app — `OPEN`
+
+Attempted: verify Phase 3's UI the way the acceptance criteria are phrased ("renders on cards and
+story pages").
+
+Symptom: what is proven is the composition (22 unit tests over the mixed corpus), the renderer (13),
+and that `tsc --noEmit`, `vite build` and the full workspace `cargo test` are green. What is **not**
+proven is any of it on screen: no build of the Tauri shell was launched, the switch was never
+clicked, and a real `neighborhoods.enc` with posts in it was never rendered, because this environment
+has no Tor and therefore no way to fill the cache through the real path.
+
+Resolution needed: run the app, seed the cache (or point the read lane at a local relay), toggle
+`Public posts`, and read a public article end to end. Until then the composition rules are tested and
+the wiring is read, but no pixel of the mixed page has been seen.
+
+---
+
+## 2026-10-13 — Neighborhoods: the read lane (Phase 2)
+
+Trigger: "go" after Phase 1 landed, then the transport choice. The lane — NIP-23 mapping, the quality
+gate, the `(pubkey, d)` dedupe, the encrypted cache, the index, and a hand-rolled NIP-01 client over
+the shell's Tor SOCKS proxy — is built and tested. The Tor path itself is not: see the `OPEN` entry
+below.
+
+### A locked vault answered 503 on `/api/neighborhoods/refresh` — `FIXED`
+
+Attempted: write `neighborhoods_refresh` with the transport check first and the sidecar read after
+it, assuming a lock guard sat in front of the router the way `axum` middleware would.
+
+Symptom: `neighborhoods_read_routes_are_401_while_locked` failed with
+`assertion left == right failed: POST /api/neighborhoods/refresh, left: 503, right: 401`.
+
+Cause: there is no lock middleware. Every route's 401 comes from the worker answering
+`WorkResult::Err("locked")`, which the handler maps through `worker_err`. A handler that answers
+before it reaches the worker never sees the lock, so a locked vault learned whether a transport was
+configured — daemon state leaked to a locked caller, and a break from the "all routes 401 when
+locked" contract the spec states.
+
+Resolution: read the sidecar (worker first) before the transport check, with a comment saying why
+the order matters. Lesson: in `hush-daemon` the lock is a property of the worker call, not of the
+router; any early return that precedes the first worker call bypasses it. New routes need a 401
+test against the locked app, which is what caught this.
+
+### The reading-time floor boundary was miscalculated in a test — `FIXED`
+
+Attempted: assert that a 599-word body fails a 3-minute floor, assuming 599 words was under three
+minutes.
+
+Symptom: `the_floor_admits_a_real_article_and_refuses_a_stub` failed — at 200 wpm, 599 words rounds
+up to 3 minutes and is admitted, so the assertion was wrong, not the gate.
+
+Resolution: asserted the real boundary (401 words in, 400 words out), so the test pins the edge
+rather than an arbitrary interior point. Lesson: a floor test belongs on the boundary; the rounding
+direction (`div_ceil`) is the thing under test.
+
+### The read lane's transport was unwired, then built — `FIXED`
+
+Attempted: land Phase 2's lane logic before choosing a transport, so the pipeline could be verified
+offline. That left `POST /api/neighborhoods/refresh` answering `503 no relay transport is
+configured`, with no fetch exercised.
+
+Resolution: the transport is `hush_articles::RelayClient`, a hand-rolled minimal NIP-01 client — a
+WebSocket (`tokio-tungstenite`) dialled through the SOCKS proxy the shell reports for Tor
+(`relay_socks`), `REQ` → `EVENT` until `EOSE` → `CLOSE`. `RelayClient::via_tor` is the only
+constructor the daemon builds, so there is no clearnet path by construction, and a refresh with no
+Tor is a `503` rather than a direct connection. The `rust-nostr` + `arti` route the docs named was
+rejected: the repo already runs one Tor (an external SOCKS proxy) and `arti` would be a second Tor
+stack beside it.
+
+### The transport is verified against a local relay, not against Tor — `FIXED`
+
+**Closed 2026-10-13 by the entry at the top of this file. The `wss://` branch now has a real
+certificate chain behind it: a refresh through the bundled Tor reached the three allowlisted public
+relays and cached 68 articles.** The text below is the state before that run, kept because the
+distinction it draws — wire and handshake tested, Tor path not — is the one the fix removed.
+
+**Superseded in part by the 2026-10-13 entry above: this environment does have network, and the repo
+ships a Tor binary that the dev launcher was failing to hand to the app. Read that entry first — the
+"no Tor" half of the premise below was our own launcher gap, not a fact about the machine.**
+
+Attempted: prove the fetch end to end.
+
+Symptom: this environment has no network and no Tor, so nothing here can exercise a real circuit or a
+real public relay. What **is** proven: the NIP-01 wire (a `REQ`/`EVENT`/`EOSE`/`CLOSE` round trip
+against a local `tokio-tungstenite` relay), the SOCKS5 handshake (against a stand-in proxy that
+checks the target arrives as a domain name, i.e. `socks5h`), the dead-relay and refused-connect
+paths, and the daemon's real transport construction (a reported-but-dead SOCKS port yields a `502`
+naming the relays).
+
+Resolution needed: run a refresh through a real Tor SOCKS proxy against a live allowlisted relay.
+Until then the wire and the handshake are tested but the Tor path is not, and the TLS branch
+(`wss://` via `client_async_tls_with_config`) has not been exercised against a real certificate
+chain.
+
+Resolved: `POST /api/neighborhoods/refresh` against `socks5h://127.0.0.1:44627` — the bundled Tor the
+dev launcher now starts — returned `200` in 20.5s with articles from `wss://relay.damus.io` and
+friends, and 68 articles are cached. The `wss://` branch is now exercised against real certificate
+chains through a real circuit. Getting there required the provider install at the top of this file:
+the first handshake panicked rather than failing, which is why this entry outlived the launcher fix.
+
+### A SOCKS5 reply match had incompatible arm types — `FIXED`
+
+Attempted: consume the CONNECT reply's bound address with
+`0x01 => stream.read_exact(&mut [0u8; 4]).await?,`.
+
+Symptom:
+
+```
+error[E0308]: `match` arms have incompatible types
+   --> crates/hush-articles/src/socks.rs:64:13
+    |
+ 57 | /     match head[3] {
+ 58 | |         0x01 => stream.read_exact(&mut [0u8; 4]).await?,
+    | |                 --------------------------------------- this is found to be of type `usize`
+```
+
+`read_exact` returns the byte count, so that arm yields `usize` while the braced `0x03` arm yields
+`()`. Resolution: braced every arm so all are `()`. Lesson: `read_exact(..)?` used as a match arm is
+an expression of type `usize`; make it a statement.
+
+---
+
+## 2026-10-13 — Neighborhoods: public identity (Phase 1)
+
+Trigger: "can we start implementing" after the spec in `docs/tasks/neighborhoods.md` (Task 22 /
+Phase P). Phase 1 is the offline public identity: a fresh secp256k1 key in its own encrypted
+sidecar, in the Task 6 backup, isolated from the account and the pen name.
+
+### `cargo test ... | tail` masked cargo's exit code — `FIXED`
+
+Attempted: run the full `hush-core` and `hush-daemon` suites in one command and view the tail of the
+output.
+
+Symptom: the command reported exit code 0, but that was `tail`'s exit code, not cargo's. A failing
+`hush-core` suite would have been invisible above the truncation point while the run still looked
+green.
+
+Resolution: re-ran `cargo test -p hush-core` without a pipe and read the whole output; 115 passed,
+0 failed, including the new vector test. Lesson: a piped cargo run proves nothing about cargo's
+status; pipe only for display and confirm the real exit code separately.
+
+### The worker's create path needed `as_mut`, not `as_ref` — `FIXED`
+
+Attempted: add `PublicIdentityCreate` to the daemon work loop, mirroring `PenNameGet`, which reads
+`account.as_ref()`.
+
+Symptom:
+
+```
+error[E0596]: cannot borrow `*a` as mutable, as it is behind a `&` reference
+    --> crates/hush-daemon/src/account_worker.rs:1265:51
+     |
+1265 | ...   None => match a.create_public_identity() {
+     |                      ^ `a` is a `&` reference, so it cannot be borrowed as mutable
+```
+
+`Account`'s mutating methods take `&mut self` (as `create_pen_name` does), so the create arm must
+hold `account.as_mut()`; the read arm's `as_ref()` is right for the getter.
+
+Resolution: switched the create arm to `as_mut()`. Lesson: in `account_worker.rs` the read arms take
+`as_ref()` and the mutating arms `as_mut()`, and they are not interchangeable even when the
+underlying `Vault` method takes `&self`.
+
+---
+
 ## 2026-10-13 — Zines: the bulletin lane, key epidemic and comments (Phases 2 and 3)
 
 Trigger: "ok i thought you are done .. lets continute with all the phases". The design is in

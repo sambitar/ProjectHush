@@ -23,7 +23,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use account_worker::{AccountWorker, ContactDto, PenNameDto, WorkResult};
+use account_worker::{AccountWorker, ContactDto, PenNameDto, PublicIdentityDto, WorkResult};
 use axum::{
     extract::{Path, Query, State},
     http::{header, Method, StatusCode},
@@ -96,6 +96,15 @@ struct App {
     /// fan-out underneath is what guarantees convergence, so dropping this map
     /// (a restart, a lock) costs latency, never data.
     paper_planes: Mutex<HashMap<String, Arc<paper_data::DataPlane>>>,
+    /// The neighborhoods read lane's transport (Task 22). `None` until a Tor
+    /// relay client is wired in; a refresh with no source is a clear refusal, not
+    /// a silent no-op. Runtime-only and safe to lose.
+    neighborhoods_source: Mutex<Option<Arc<dyn hush_articles::RelaySource>>>,
+    /// The neighborhoods write half: publishing an export or a comment. Separate
+    /// from the source because reading the network and speaking on the member's
+    /// behalf are not the same capability, and the daemon wires them
+    /// independently. `None` until a Tor relay client is wired in.
+    neighborhoods_sink: Mutex<Option<Arc<dyn hush_articles::RelaySink>>>,
 }
 
 #[derive(Serialize)]
@@ -299,6 +308,34 @@ fn api_router(state: Arc<App>) -> Router {
             "/api/zines/{zine_id}/discard-comment",
             post(zines_discard_comment),
         )
+        // Task 11: publish the zine to the neighborhoods as a NIP-23 article.
+        // The same post can be exported again after an edit: NIP-23 is editable
+        // by address, so a re-export replaces the article rather than adding one.
+        .route("/api/zines/{zine_id}/export", post(zines_export))
+        // Neighborhoods (Task 22): the public Nostr read lane. `identity` is
+        // minted on an explicit create, never on a read, so a stray GET cannot
+        // publish under a key nobody chose.
+        .route(
+            "/api/neighborhoods/identity",
+            get(neighborhoods_identity).post(neighborhoods_create_identity),
+        )
+        // The read lane: the cached index, one article, a forced pull, and the
+        // lane's settings. The literal segments are matched ahead of `{addr}`.
+        .route("/api/neighborhoods", get(neighborhoods_index))
+        .route(
+            "/api/neighborhoods/settings",
+            get(neighborhoods_settings).post(neighborhoods_set_settings),
+        )
+        .route("/api/neighborhoods/refresh", post(neighborhoods_refresh))
+        .route("/api/neighborhoods/{addr}", get(neighborhoods_get))
+        // Task 22, comments: one way out, signed by the public identity, and
+        // read-only replies back in. Separate from the zines comment thread in
+        // every way that matters — different store, different key, different
+        // page — so a public comment can never be mistaken for a sealed one.
+        .route(
+            "/api/neighborhoods/{addr}/comment",
+            post(neighborhoods_comment),
+        )
         .route("/api/torrents/state", get(torrents_state))
         .route("/api/torrents/key", post(torrents_set_key))
         .route("/api/torrents/test", post(torrents_test_key))
@@ -405,9 +442,33 @@ pub(crate) async fn force_lock(state: &Arc<App>) {
     paper_planes_shutdown(state).await;
 }
 
+/// Installs the process-level TLS crypto provider.
+///
+/// rustls 0.23 refuses to choose when more than one provider is enabled by
+/// feature unification, and this binary enables two: alloy and electrum pull
+/// `aws-lc-rs`, while `webrtc` and the reqwest paths pull `ring`. Left unset,
+/// the first TLS handshake panics inside a runtime worker — the message is
+/// "Could not automatically determine the process-level CryptoProvider from
+/// Rustls crate features" — and the request that triggered it never answers,
+/// which leaves the socket listening and every later call timing out. That is
+/// how one neighborhoods refresh over `wss://` took the whole daemon down.
+///
+/// Installing one is rustls's documented remedy, and `ring` is the same choice
+/// the desktop shell makes for its own client (`hush-tauri/src-tauri/src/irc/tls.rs`).
+/// The result is discarded on purpose: the only thing `install_default` returns
+/// on failure is the provider that was already installed, which means the job
+/// is done either way.
+///
+/// Called once at the top of `main`, before anything can dial out.
+fn install_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// libsignal protocol futures are not `Send`; account ops run on a dedicated worker thread.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_tls_provider();
+
     let hardening = security::harden_process();
     let args = Args::parse();
     let vault_dir = paths::vault_dir_from_args(args.dir);
@@ -445,6 +506,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay_health: Mutex::new(None),
         relay_probe_inflight: AtomicBool::new(false),
         paper_planes: Mutex::new(HashMap::new()),
+        neighborhoods_source: Mutex::new(None),
+        neighborhoods_sink: Mutex::new(None),
     };
     let state = Arc::new(app);
 
@@ -3915,6 +3978,610 @@ async fn zines_set_pen_name(
     Ok(Json(zines_view(&parsed, None, None, Some(pen_name))))
 }
 
+/// The public identity this vault publishes and comments under on the public
+/// Nostr network (neighborhoods, Task 22). `null` before one exists.
+async fn neighborhoods_identity(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Option<PublicIdentityDto>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    match state.worker.public_identity().await {
+        WorkResult::PublicIdentity(id) => Ok(Json(id)),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Mint the public identity, returning the one now in force.
+///
+/// A create when one already exists returns it rather than erroring: the
+/// caller's question is "which identity do I publish under", and the answer is
+/// the same either way.
+async fn neighborhoods_create_identity(
+    State(state): State<Arc<App>>,
+) -> Result<Json<PublicIdentityDto>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    match state.worker.create_public_identity().await {
+        WorkResult::PublicIdentity(Some(id)) => Ok(Json(id)),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+// --- Neighborhoods: the read lane (Task 22) -------------------------------
+//
+// The crate (`hush-articles`) holds the lane's logic — the gate, the dedupe, the
+// index — and knows nothing of the vault or the network. The daemon owns the
+// sidecar (`neighborhoods.enc`), the routes, and the transport (`App`'s
+// `neighborhoods_source`), which stays `None` until a Tor relay client is wired
+// in. A refresh with no transport is a clear refusal, not a silent no-op.
+
+/// The cap on the allowlist. A curated set, not a firehose.
+const NEIGHBORHOOD_ALLOWLIST_CAP: usize = 50;
+/// The cap on the reading-time floor, in minutes.
+const NEIGHBORHOOD_MINUTES_CAP: u32 = 180;
+
+/// The lane's settings as the UI sees them.
+#[derive(Serialize)]
+struct NeighborhoodSettingsDto {
+    allowlist: Vec<String>,
+    min_minutes: u32,
+    default_show: bool,
+}
+
+impl From<&hush_articles::Settings> for NeighborhoodSettingsDto {
+    fn from(s: &hush_articles::Settings) -> Self {
+        Self {
+            allowlist: s.allowlist.clone(),
+            min_minutes: s.min_minutes,
+            default_show: s.default_show,
+        }
+    }
+}
+
+/// A patch to the settings: the caller sends only the fields it changed.
+#[derive(Deserialize)]
+struct NeighborhoodSettingsBody {
+    allowlist: Option<Vec<String>>,
+    min_minutes: Option<u32>,
+    default_show: Option<bool>,
+}
+
+/// One article in the index. No body, so the index stays a list.
+#[derive(Serialize)]
+struct NeighborhoodSummaryDto {
+    address: String,
+    event_id: String,
+    pubkey: String,
+    d: String,
+    title: String,
+    summary: Option<String>,
+    sections: Vec<String>,
+    created_at: u64,
+    published_at: Option<u64>,
+    reading_minutes: u32,
+}
+
+impl From<&hush_articles::Article> for NeighborhoodSummaryDto {
+    fn from(a: &hush_articles::Article) -> Self {
+        Self {
+            address: a.address(),
+            event_id: a.event_id.clone(),
+            pubkey: a.pubkey.clone(),
+            d: a.d.clone(),
+            title: a.title.clone(),
+            summary: a.summary.clone(),
+            sections: a.sections.clone(),
+            created_at: a.created_at,
+            published_at: a.published_at,
+            reading_minutes: hush_articles::reading_minutes(&a.content),
+        }
+    }
+}
+
+/// One article in full, with its Markdown body. The body is stored as the relay
+/// sent it; rendering and sanitising happen in the UI's one renderer.
+#[derive(Serialize)]
+struct NeighborhoodArticleDto {
+    #[serde(flatten)]
+    summary: NeighborhoodSummaryDto,
+    content: String,
+    /// The thread under this article, oldest first. Empty for an article whose
+    /// replies this vault does not read — which is every article but the ones it
+    /// published itself.
+    replies: Vec<NeighborhoodCommentDto>,
+}
+
+/// One public comment, as the page reads it.
+///
+/// No `mine` flag: whether a comment is this vault's own is a comparison the
+/// page makes against the public identity it already holds, and asking the
+/// worker for that identity on every article open would be a second read of the
+/// vault to answer a question the reader can answer itself.
+#[derive(Serialize)]
+struct NeighborhoodCommentDto {
+    event_id: String,
+    pubkey: String,
+    /// Plaintext, by the spec. The page renders it as text, never as markup: a
+    /// comment is not Markdown, and a stranger's text is not markup here.
+    content: String,
+    created_at: u64,
+    /// The comment this answers, when it answers one rather than the article.
+    parent_id: Option<String>,
+}
+
+impl From<&hush_articles::Comment> for NeighborhoodCommentDto {
+    fn from(c: &hush_articles::Comment) -> Self {
+        Self {
+            event_id: c.event_id.clone(),
+            pubkey: c.pubkey.clone(),
+            content: c.content.clone(),
+            created_at: c.created_at,
+            parent_id: c.parent_id.clone(),
+        }
+    }
+}
+
+fn neighborhood_thread(
+    parsed: &hush_articles::NeighborhoodsState,
+    address: &str,
+) -> Vec<NeighborhoodCommentDto> {
+    parsed
+        .replies_for(address)
+        .iter()
+        .map(NeighborhoodCommentDto::from)
+        .collect()
+}
+
+/// The index payload: what the page shows, plus the facets it can filter by.
+#[derive(Serialize)]
+struct NeighborhoodsView {
+    articles: Vec<NeighborhoodSummaryDto>,
+    sections: Vec<NeighborhoodSectionView>,
+    settings: NeighborhoodSettingsDto,
+}
+
+#[derive(Serialize)]
+struct NeighborhoodSectionView {
+    name: String,
+    count: usize,
+}
+
+fn neighborhoods_view(
+    parsed: &hush_articles::NeighborhoodsState,
+    section: Option<&str>,
+    pubkey: Option<&str>,
+) -> NeighborhoodsView {
+    NeighborhoodsView {
+        articles: parsed
+            .index(section, pubkey)
+            .iter()
+            .map(NeighborhoodSummaryDto::from)
+            .collect(),
+        sections: parsed
+            .sections()
+            .into_iter()
+            .map(|(name, count)| NeighborhoodSectionView { name, count })
+            .collect(),
+        settings: NeighborhoodSettingsDto::from(parsed.settings()),
+    }
+}
+
+/// Read the cache and settings sidecar. A missing file is an empty cache, not an
+/// error: that is the state before the first refresh.
+async fn neighborhoods_state(
+    state: &App,
+) -> Result<hush_articles::NeighborhoodsState, (StatusCode, Json<ApiError>)> {
+    match state.worker.secret_read(hush_articles::STATE_FILE).await {
+        WorkResult::Secret(raw) => hush_articles::NeighborhoodsState::decode(raw.as_deref())
+            .map_err(neighborhoods_internal),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn neighborhoods_persist(
+    state: &App,
+    parsed: &hush_articles::NeighborhoodsState,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let bytes = parsed.encode().map_err(neighborhoods_internal)?;
+    match state.worker.secret_write(hush_articles::STATE_FILE, bytes).await {
+        WorkResult::Ok => Ok(()),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+fn neighborhoods_internal(message: String) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError { error: message }),
+    )
+}
+
+fn neighborhoods_bad_request(message: String) -> (StatusCode, Json<ApiError>) {
+    (StatusCode::BAD_REQUEST, Json(ApiError { error: message }))
+}
+
+/// A relay URL must be a websocket URL with a host. `ws://` is allowed for a
+/// local or onion relay; the shipped allowlist is all `wss://`.
+fn validate_relay_url(url: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let trimmed = url.trim();
+    let host = trimmed
+        .strip_prefix("wss://")
+        .or_else(|| trimmed.strip_prefix("ws://"));
+    match host {
+        Some(host) if !host.trim_matches('/').is_empty() => Ok(()),
+        _ => Err(neighborhoods_bad_request(format!(
+            "`{url}` is not a websocket relay URL"
+        ))),
+    }
+}
+
+#[derive(Deserialize)]
+struct NeighborhoodIndexQuery {
+    section: Option<String>,
+    #[serde(rename = "pub")]
+    pubkey: Option<String>,
+}
+
+/// The cached public index, newest first, filtered by section and author.
+async fn neighborhoods_index(
+    State(state): State<Arc<App>>,
+    Query(query): Query<NeighborhoodIndexQuery>,
+) -> Result<Json<NeighborhoodsView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let parsed = neighborhoods_state(&state).await?;
+    Ok(Json(neighborhoods_view(
+        &parsed,
+        query.section.as_deref(),
+        query.pubkey.as_deref(),
+    )))
+}
+
+/// One article with its body. 404 before it is held: this lane never fetches on
+/// demand, so an address the cache does not carry is simply not here yet.
+async fn neighborhoods_get(
+    State(state): State<Arc<App>>,
+    Path(addr): Path<String>,
+) -> Result<Json<NeighborhoodArticleDto>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let parsed = neighborhoods_state(&state).await?;
+    match parsed.get(&addr) {
+        Some(article) => Ok(Json(NeighborhoodArticleDto {
+            summary: NeighborhoodSummaryDto::from(article),
+            content: article.content.clone(),
+            replies: neighborhood_thread(&parsed, &addr),
+        })),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("no neighborhood article is held for {addr}"),
+            }),
+        )),
+    }
+}
+
+/// Force a pull from the allowlisted relays (the switch-on path).
+async fn neighborhoods_refresh(
+    State(state): State<Arc<App>>,
+) -> Result<Json<NeighborhoodsView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    // Read the sidecar first. There is no lock middleware: a locked vault is a
+    // 401 because the worker says so, so a route must reach the worker before it
+    // can answer anything else. Doing this after the transport check would let a
+    // locked vault learn whether a transport is configured.
+    let mut parsed = neighborhoods_state(&state).await?;
+
+    // The lane reads over Tor or not at all. The shell reports the SOCKS port
+    // when it starts Tor; without it there is no route, and a direct connection
+    // is not one the daemon will take on the user's behalf.
+    let source: Arc<dyn hush_articles::RelaySource> =
+        match state.neighborhoods_source.lock().await.clone() {
+            Some(source) => source,
+            None => {
+                let Some(proxy) = state.relay_socks.lock().await.clone() else {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ApiError {
+                            error: "Tor is not running; neighborhoods are read over Tor only"
+                                .to_string(),
+                        }),
+                    ));
+                };
+                Arc::new(hush_articles::RelayClient::via_tor(proxy))
+            }
+        };
+
+    hush_articles::refresh(&source, &mut parsed, &export_scopes(&state).await?)
+        .await
+        .map_err(|m| (StatusCode::BAD_GATEWAY, Json(ApiError { error: m })))?;
+    neighborhoods_persist(&state, &parsed).await?;
+    Ok(Json(neighborhoods_view(&parsed, None, None)))
+}
+
+/// The threads this vault has a stake in: the addresses of the articles it
+/// published.
+///
+/// The reply pass reads only these. A member who has exported nothing has no
+/// thread anyone could be answering them on, so there is no second request to
+/// make — which is the egress rule applied to the read lane's second half.
+///
+/// Read through the same worker seam as everything else, so a locked vault
+/// refuses here rather than reading a sidecar the caller is not entitled to.
+async fn export_scopes(state: &App) -> Result<Vec<String>, (StatusCode, Json<ApiError>)> {
+    Ok(zines_sidecar(state).await?.export_scopes())
+}
+
+async fn neighborhoods_settings(
+    State(state): State<Arc<App>>,
+) -> Result<Json<NeighborhoodSettingsDto>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let parsed = neighborhoods_state(&state).await?;
+    Ok(Json(NeighborhoodSettingsDto::from(parsed.settings())))
+}
+
+/// Persist a settings patch. Changing the allowlist does not itself read from it;
+/// egress is still the switch, and the switch is not this route.
+async fn neighborhoods_set_settings(
+    State(state): State<Arc<App>>,
+    Json(body): Json<NeighborhoodSettingsBody>,
+) -> Result<Json<NeighborhoodSettingsDto>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = neighborhoods_state(&state).await?;
+    let mut settings = parsed.settings().clone();
+
+    if let Some(allowlist) = body.allowlist {
+        if allowlist.len() > NEIGHBORHOOD_ALLOWLIST_CAP {
+            return Err(neighborhoods_bad_request(format!(
+                "an allowlist holds at most {NEIGHBORHOOD_ALLOWLIST_CAP} relays"
+            )));
+        }
+        for relay in &allowlist {
+            validate_relay_url(relay)?;
+        }
+        settings.allowlist = allowlist;
+    }
+    if let Some(minutes) = body.min_minutes {
+        if minutes > NEIGHBORHOOD_MINUTES_CAP {
+            return Err(neighborhoods_bad_request(format!(
+                "the reading-time floor is at most {NEIGHBORHOOD_MINUTES_CAP} minutes"
+            )));
+        }
+        settings.min_minutes = minutes;
+    }
+    if let Some(default_show) = body.default_show {
+        settings.default_show = default_show;
+    }
+
+    parsed.set_settings(settings);
+    neighborhoods_persist(&state, &parsed).await?;
+    Ok(Json(NeighborhoodSettingsDto::from(parsed.settings())))
+}
+
+// ------------------------------------------------ the public comment (Task 22)
+//
+// The write half of the comment lane. Three things keep it separate from the
+// private thread, and all three are structural:
+//
+// 1. It is signed by the **public identity**, not the pen name, and the two keys
+//    are never derived from one another.
+// 2. It goes to the **public relays** as plaintext. Nothing here seals, and
+//    nothing here can: `CommentPlan` has no read key and no recipient.
+// 3. It is stored in the **neighborhoods** sidecar, beside the articles it
+//    answers, so the private thread's store never learns a public comment
+//    exists.
+//
+// The order of the refusals is the export's: the sidecar first, so a locked
+// vault is a 401 rather than a hint about which keys and relays are configured;
+// then the article, then the body, then the parent, then the identity, and only
+// then is anything signed. A comment that could not go out must not be cached as
+// though it had.
+
+/// The cap on a comment, in characters. A comment is a reply, not an article:
+/// the long-form lane is where writing lives.
+const NEIGHBORHOOD_COMMENT_CHARS: usize = 2000;
+
+/// A comment to post, and what it answers.
+#[derive(Deserialize)]
+struct NeighborhoodCommentBody {
+    body: String,
+    /// The comment this answers, when it answers one rather than the article.
+    /// Absent or empty is a top-level comment.
+    #[serde(default)]
+    parent_id: Option<String>,
+}
+
+/// What posting a comment answers with: the thread as it now stands.
+///
+/// The thread rather than the one comment, because the page shows a thread and
+/// the caller should not have to splice its own words into a list it did not
+/// build.
+#[derive(Serialize)]
+struct NeighborhoodCommentView {
+    address: String,
+    /// The id of the event that went out, hex.
+    event_id: String,
+    /// Whether a relay took it. `false` means the comment is not public: unlike
+    /// an export there is no address to retry, so it is not cached either.
+    published: bool,
+    /// Why the publish failed, when it did. Empty on success.
+    publish_error: String,
+    replies: Vec<NeighborhoodCommentDto>,
+}
+
+/// Post a NIP-22 comment on a public article, signed by the public identity.
+async fn neighborhoods_comment(
+    State(state): State<Arc<App>>,
+    Path(addr): Path<String>,
+    Json(body): Json<NeighborhoodCommentBody>,
+) -> Result<Json<NeighborhoodCommentView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = neighborhoods_state(&state).await?;
+
+    // The article must be held. A comment names the version it was written
+    // against, so commenting on something this vault does not hold would mean
+    // guessing at an event id — and a guessed one points a reader at nothing.
+    let article = parsed.get(&addr).cloned().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("no neighborhood article is held for {addr}"),
+            }),
+        )
+    })?;
+
+    let content = body.body.trim();
+    if content.is_empty() {
+        return Err(neighborhoods_bad_request(
+            "a comment needs something in it".to_string(),
+        ));
+    }
+    if content.chars().count() > NEIGHBORHOOD_COMMENT_CHARS {
+        return Err(neighborhoods_bad_request(format!(
+            "a comment is at most {NEIGHBORHOOD_COMMENT_CHARS} characters"
+        )));
+    }
+
+    // A reply has to answer a comment this vault holds **in this thread**.
+    // NIP-22 keeps the article as the root whatever is answered, so a parent
+    // from another thread would file the reply under the wrong article — and a
+    // parent this vault cannot read is one whose author it cannot name.
+    let parent = match body
+        .parent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => {
+            let held = parsed
+                .replies_for(&addr)
+                .into_iter()
+                .find(|c| c.event_id == id)
+                .ok_or_else(|| {
+                    neighborhoods_bad_request(format!(
+                        "no comment {id} is held in the thread under {addr}"
+                    ))
+                })?;
+            Some(hush_articles::CommentParent {
+                event_id: held.event_id,
+                pubkey: held.pubkey,
+            })
+        }
+        None => None,
+    };
+
+    // The same refusal as the export: the identity is minted deliberately, so a
+    // comment refuses rather than creating the key it would speak under.
+    let identity = match state.worker.public_identity().await {
+        WorkResult::PublicIdentity(Some(id)) => id,
+        WorkResult::PublicIdentity(None) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "mint a public identity before commenting in the neighborhoods"
+                        .to_string(),
+                }),
+            ))
+        }
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+
+    let relays = parsed.settings().allowlist.clone();
+    if relays.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "no relays are configured; add one in Neighborhoods settings before commenting"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    let sink: Arc<dyn hush_articles::RelaySink> = match state.neighborhoods_sink.lock().await.clone()
+    {
+        Some(sink) => sink,
+        None => {
+            let Some(proxy) = state.relay_socks.lock().await.clone() else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError {
+                        error: "Tor is not running; comments are posted over Tor only".to_string(),
+                    }),
+                ));
+            };
+            Arc::new(hush_articles::RelayClient::via_tor(proxy))
+        }
+    };
+
+    let now_s = paper_now_ms() / 1000;
+    let plan = hush_articles::CommentPlan {
+        root: hush_articles::CommentRoot {
+            address: addr.clone(),
+            event_id: article.event_id.clone(),
+            pubkey: article.pubkey.clone(),
+        },
+        parent,
+        content: content.to_string(),
+        relays: relays.clone(),
+    };
+
+    let unsigned = plan
+        .event(&identity.pubkey, now_s)
+        .map_err(neighborhoods_bad_request)?;
+    let id_bytes = unsigned.id_bytes().map_err(neighborhoods_internal)?;
+    let signature = match state.worker.public_identity_sign(id_bytes.to_vec()).await {
+        WorkResult::PublicIdentitySignature(Some(sig)) => sig,
+        WorkResult::PublicIdentitySignature(None) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "mint a public identity before commenting in the neighborhoods"
+                        .to_string(),
+                }),
+            ))
+        }
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+    let event = unsigned.signed(&signature).map_err(neighborhoods_internal)?;
+
+    // A comment that no relay took is not public, so it is not cached: unlike an
+    // export there is no address to come back to, and showing the member their
+    // own words in a thread they cannot point anyone at would be a lie the page
+    // has no way to correct later.
+    let (published, publish_error) = match sink.publish(&relays, &event).await {
+        Ok(report) => {
+            eprintln!("hush-daemon: commented on {addr}: {}", report.summary());
+            (true, String::new())
+        }
+        Err(message) => {
+            eprintln!("hush-daemon: commenting on {addr} failed: {message}");
+            (false, message)
+        }
+    };
+
+    if published {
+        parsed.absorb_replies(vec![hush_articles::Comment {
+            event_id: event.id.clone(),
+            pubkey: identity.pubkey.clone(),
+            content: content.to_string(),
+            created_at: now_s,
+            root: addr.clone(),
+            parent_id: plan.parent.as_ref().map(|p| p.event_id.clone()),
+        }]);
+        neighborhoods_persist(&state, &parsed).await?;
+    }
+
+    Ok(Json(NeighborhoodCommentView {
+        address: addr.clone(),
+        event_id: event.id,
+        published,
+        publish_error,
+        replies: neighborhood_thread(&parsed, &addr),
+    }))
+}
+
 fn zine_not_held(zine_id: &str) -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::NOT_FOUND,
@@ -3922,6 +4589,224 @@ fn zine_not_held(zine_id: &str) -> (StatusCode, Json<ApiError>) {
             error: format!("no zine is held for {zine_id}"),
         }),
     )
+}
+
+// ------------------------------------------------------ the export (Task 11)
+//
+// The one-way door from a private zine to a public NIP-23 article. Three things
+// make it one-way, and all three are structural rather than checks:
+//
+// 1. `ExportPlan` has no field for a comment thread, a revision history, a read
+//    key or a pen name, so there is nowhere for the private parts to be carried.
+// 2. The body is re-encoded from the sanitized HTML to Markdown, so the wire
+//    carries text rather than the author's stored markup.
+// 3. The `d` that links the private post to the public article is stored on
+//    `ZineFile` and never in the descriptor, which is what is sealed and
+//    published — so the link does not travel with the blob.
+//
+// A publish that fails is not a lost article: the address is recorded either
+// way, and a retry publishes the same address rather than a second one.
+
+/// What an export answers with: the article's address, and the post as it now
+/// stands.
+///
+/// `ZineView` is flattened rather than nested so the reader page can show
+/// "published" without a second request, and so the shape is still a zine to a
+/// caller that only reads that half.
+#[derive(serde::Serialize)]
+struct ZineExportView {
+    zine_id: String,
+    /// The NIP-23 `d` this article lives at. Minted once, stable across every
+    /// re-export.
+    d: String,
+    /// The NIP-01 address `30023:pubkey:d`. This is what a NIP-22 comment
+    /// references, and it is stable across edits.
+    address: String,
+    /// The shareable handle, with the allowlist as relay hints.
+    naddr: String,
+    /// The id of the event that was published, hex.
+    event_id: String,
+    /// The public key the article is signed by, hex.
+    pubkey: String,
+    /// When the article first went public, seconds. Set once.
+    published_at: u64,
+    /// Whether a relay took it. `false` is not a lost article: the address is
+    /// recorded and the retry publishes the same one.
+    published: bool,
+    /// Why the publish failed, when it did. Empty on success.
+    publish_error: String,
+    #[serde(flatten)]
+    view: ZineView,
+}
+
+/// Publish a zine to the neighborhoods as a NIP-23 article.
+///
+/// The order of the refusals matters as much as the publish does: the sidecar is
+/// read first, so a locked vault is a 401 rather than a hint about which keys
+/// and relays are configured; then the post, then the public identity, then the
+/// allowlist, and only then is an address minted. An export that could not go
+/// out must not leave a `d` behind for the next attempt to find and reuse.
+async fn zines_export(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+) -> Result<Json<ZineExportView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = zines_sidecar(&state).await?;
+
+    let zine = parsed
+        .get(&zine_id)
+        .cloned()
+        .ok_or_else(|| zine_not_held(&zine_id))?;
+    // A held zine is someone else's post. Publishing it would sign the author's
+    // words under this vault's public identity, which is a different person
+    // saying it.
+    if !zine.authored {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "only a zine this vault wrote can be published; a held one belongs to its author"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    // The article is signed by the public identity, which is a separate key from
+    // the pen name and from the account. Minting it is a deliberate act, so a
+    // stray export refuses rather than creating the identity it would publish
+    // under.
+    let identity = match state.worker.public_identity().await {
+        WorkResult::PublicIdentity(Some(id)) => id,
+        WorkResult::PublicIdentity(None) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "mint a public identity before publishing to the neighborhoods"
+                        .to_string(),
+                }),
+            ))
+        }
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+
+    let relays = neighborhoods_state(&state).await?.settings().allowlist.clone();
+    if relays.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "no relays are configured; add one in Neighborhoods settings before publishing"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    // The write half of the lane, wired the same way the read half is: over Tor
+    // or not at all. A direct connection is not one the daemon takes on the
+    // member's behalf.
+    let sink: Arc<dyn hush_articles::RelaySink> = match state.neighborhoods_sink.lock().await.clone()
+    {
+        Some(sink) => sink,
+        None => {
+            let Some(proxy) = state.relay_socks.lock().await.clone() else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError {
+                        error: "Tor is not running; articles are published over Tor only".to_string(),
+                    }),
+                ));
+            };
+            Arc::new(hush_articles::RelayClient::via_tor(proxy))
+        }
+    };
+
+    // The body is re-encoded from the sanitized HTML the daemon stores to
+    // Markdown, which is what NIP-23 clients render. The stored HTML never
+    // travels: a public client would show the tags as text.
+    let markdown = reads::rich_text_to_markdown(&zine.descriptor.body);
+    let now_ms = paper_now_ms();
+    let now_s = now_ms / 1000;
+
+    // Minted and persisted before the event is built, so a publish that failed
+    // does not move the address on the retry.
+    let export = parsed
+        .export_address(&zine_id, &identity.pubkey, now_s)
+        .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: m })))?;
+    zines_persist(&state, &parsed).await?;
+
+    let plan = hush_articles::ExportPlan {
+        d: export.d.clone(),
+        title: zine.descriptor.title.clone(),
+        // A zine has no author-written summary, so the card preview is the
+        // article's own opening prose rather than a placeholder.
+        summary: hush_articles::summary_of(&markdown),
+        sections: zine.descriptor.sections.clone(),
+        markdown,
+        published_at: export.published_at,
+    };
+
+    let unsigned = plan
+        .event(&identity.pubkey, now_s)
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    // The digest, not the serialized event: NIP-01 signs `sha256(...)` of the
+    // array, and hashing it again here would produce a signature that verifies
+    // against nothing a relay computes.
+    let id_bytes = unsigned
+        .id_bytes()
+        .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: m })))?;
+    let signature = match state.worker.public_identity_sign(id_bytes.to_vec()).await {
+        WorkResult::PublicIdentitySignature(Some(sig)) => sig,
+        WorkResult::PublicIdentitySignature(None) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "mint a public identity before publishing to the neighborhoods"
+                        .to_string(),
+                }),
+            ))
+        }
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+    let event = unsigned
+        .signed(&signature)
+        .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: m })))?;
+
+    // A refusal is a status, not a lost article: the address is recorded either
+    // way, and the next export publishes the same one.
+    let (published, publish_error) = match sink.publish(&relays, &event).await {
+        Ok(report) => {
+            eprintln!("hush-daemon: exported zine {zine_id}: {}", report.summary());
+            (true, String::new())
+        }
+        Err(message) => {
+            eprintln!("hush-daemon: exporting zine {zine_id} failed: {message}");
+            (false, message)
+        }
+    };
+
+    parsed.record_export(&zine_id, &event.id, now_ms);
+    zines_persist(&state, &parsed).await?;
+
+    let naddr = plan
+        .naddr(&identity.pubkey, &relays)
+        .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: m })))?;
+    let updated = parsed
+        .get(&zine_id)
+        .cloned()
+        .ok_or_else(|| zine_not_held(&zine_id))?;
+
+    Ok(Json(ZineExportView {
+        zine_id,
+        d: plan.d.clone(),
+        address: plan.address(&identity.pubkey),
+        naddr,
+        event_id: event.id,
+        pubkey: identity.pubkey,
+        published_at: export.published_at,
+        published,
+        publish_error,
+        view: ZineView { zine: updated },
+    }))
 }
 
 /// Fetch the raw papers sidecar bytes through the worker and decode them.
@@ -5263,6 +6148,8 @@ mod drops_api_tests {
             relay_health: Mutex::new(None),
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
+            neighborhoods_source: Mutex::new(None),
+            neighborhoods_sink: Mutex::new(None),
         })
     }
 
@@ -5541,6 +6428,8 @@ mod wallet_api_tests {
             relay_health: Mutex::new(None),
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
+            neighborhoods_source: Mutex::new(None),
+            neighborhoods_sink: Mutex::new(None),
         });
         app.wallet
             .apply_relay(false, Some(TEST_SOCKS.to_string()))
@@ -6061,6 +6950,8 @@ mod notes_api_tests {
             relay_health: Mutex::new(None),
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
+            neighborhoods_source: Mutex::new(None),
+            neighborhoods_sink: Mutex::new(None),
         })
     }
 
@@ -7219,6 +8110,291 @@ async fn zines_route_is_empty_until_a_pen_name_exists() {
 }
 
 #[tokio::test]
+async fn neighborhoods_identity_routes_are_401_while_locked() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+    for (method, uri, body) in [
+        ("GET", "/api/neighborhoods/identity", None),
+        ("POST", "/api/neighborhoods/identity", Some("{}")),
+    ] {
+        let (status, _) = request(&router, method, uri, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn a_public_identity_is_minted_once_then_read_back() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+
+    // No identity before one is minted: a read does not create one.
+    let (status, view) = request(&router, "GET", "/api/neighborhoods/identity", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert!(view.is_null(), "a fresh vault has no public identity");
+
+    // An explicit create mints it.
+    let (status, created) =
+        request(&router, "POST", "/api/neighborhoods/identity", Some("{}")).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let npub = created["npub"].as_str().unwrap().to_string();
+    let pubkey = created["pubkey"].as_str().unwrap().to_string();
+    assert!(npub.starts_with("npub1"), "{npub}");
+    assert_eq!(pubkey.len(), 64);
+
+    // A second create returns the same identity rather than minting a new one,
+    // so a retried request does not publish under a new key.
+    let (status, again) =
+        request(&router, "POST", "/api/neighborhoods/identity", Some("{}")).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["pubkey"], pubkey);
+
+    // And the read now returns it.
+    let (status, view) = request(&router, "GET", "/api/neighborhoods/identity", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["pubkey"], pubkey);
+}
+
+// --- Neighborhoods: the read lane (Task 22) -------------------------------
+
+/// A relay that returns a fixed batch per kind, so the lane is exercised without
+/// a network. The transport is what this stands in for; the gate, dedupe, cache,
+/// index, and routes are real.
+pub(super) struct FakeRelay {
+    events: Vec<hush_articles::RawEvent>,
+    /// What the reply pass is served. The lane asks with a different filter, so
+    /// one stub answers both halves of a refresh.
+    comments: Vec<hush_articles::RawEvent>,
+}
+
+impl FakeRelay {
+    /// A relay with articles and no comments: what a refresh reads before
+    /// anything has been exported.
+    pub(super) fn articles(events: Vec<hush_articles::RawEvent>) -> Arc<Self> {
+        Self::new(events, Vec::new())
+    }
+
+    /// A relay that answers both halves of a refresh.
+    pub(super) fn new(
+        events: Vec<hush_articles::RawEvent>,
+        comments: Vec<hush_articles::RawEvent>,
+    ) -> Arc<Self> {
+        Arc::new(Self { events, comments })
+    }
+}
+
+#[async_trait::async_trait]
+impl hush_articles::RelaySource for FakeRelay {
+    async fn fetch(
+        &self,
+        _relays: &[String],
+        filter: &hush_articles::Filter,
+    ) -> Result<Vec<hush_articles::RawEvent>, String> {
+        if filter.kinds == vec![hush_articles::KIND_LONG_FORM] {
+            Ok(self.events.clone())
+        } else {
+            Ok(self.comments.clone())
+        }
+    }
+}
+
+pub(super) fn long_form_event(
+    pubkey: &str,
+    d: &str,
+    created_at: u64,
+    body: &str,
+) -> hush_articles::RawEvent {
+    serde_json::from_value(serde_json::json!({
+        "id": format!("{pubkey}-{d}-{created_at}"),
+        "pubkey": pubkey,
+        "created_at": created_at,
+        "kind": hush_articles::KIND_LONG_FORM,
+        "tags": [["d", d], ["title", "A title"], ["t", "Rust"]],
+        "content": body,
+    }))
+    .unwrap()
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+#[tokio::test]
+async fn neighborhoods_read_routes_are_401_while_locked() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+    for (method, uri, body) in [
+        ("GET", "/api/neighborhoods", None),
+        ("GET", "/api/neighborhoods/settings", None),
+        ("POST", "/api/neighborhoods/settings", Some("{}")),
+        ("POST", "/api/neighborhoods/refresh", None),
+        ("GET", "/api/neighborhoods/30023:aa:kept", None),
+    ] {
+        let (status, _) = request(&router, method, uri, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn the_settings_start_curated_and_a_patch_touches_only_what_it_names() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+
+    let (status, view) = request(&router, "GET", "/api/neighborhoods/settings", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["min_minutes"], 3);
+    assert_eq!(view["default_show"], false, "public posts are hidden until opted in");
+    assert!(view["allowlist"].as_array().unwrap().len() >= 3);
+
+    let (status, view) = request(
+        &router,
+        "POST",
+        "/api/neighborhoods/settings",
+        Some(r#"{"min_minutes": 5, "default_show": true}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["min_minutes"], 5);
+    assert_eq!(view["default_show"], true);
+    assert!(
+        view["allowlist"].as_array().unwrap().len() >= 3,
+        "an unmentioned field is untouched"
+    );
+
+    // And it survives a fresh read of the sidecar.
+    let (status, view) = request(&router, "GET", "/api/neighborhoods/settings", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["min_minutes"], 5);
+    assert_eq!(view["default_show"], true);
+}
+
+#[tokio::test]
+async fn an_allowlist_entry_that_is_not_a_relay_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+    let (status, view) = request(
+        &router,
+        "POST",
+        "/api/neighborhoods/settings",
+        Some(r#"{"allowlist": ["https://relay.example"]}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{view}");
+}
+
+#[tokio::test]
+async fn a_refresh_without_tor_is_refused_not_silent() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+    let (status, view) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "with no Tor there is no route, and the lane says so rather than reading in the clear: {view}"
+    );
+}
+
+/// The daemon builds the real transport when the shell has reported a Tor SOCKS
+/// port. With the proxy dead, every relay fails and the refresh is a 502 naming
+/// them — not a silent success, and not a direct connection.
+#[tokio::test]
+async fn a_refresh_with_tor_reported_but_unreachable_is_a_gateway_error() {
+    let dir = TempDir::new().unwrap();
+    let app = unlocked_app(dir.path()).await;
+    // A port that was bound and released: nothing is listening on it.
+    let dead = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    };
+    *app.relay_socks.lock().await = Some(dead.to_string());
+    let router = api_router(app);
+
+    let (status, view) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "the real Tor transport is built and every relay fails: {view}"
+    );
+    assert!(
+        view["error"].as_str().unwrap().contains("relay"),
+        "the failure names the relays: {view}"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_gates_caches_and_serves_the_index() {
+    let dir = TempDir::new().unwrap();
+    let app = unlocked_app(dir.path()).await;
+    *app.neighborhoods_source.lock().await = Some(FakeRelay::articles(vec![
+        long_form_event("aa", "kept", 20, &"word ".repeat(800)),
+        long_form_event("aa", "stub", 20, "too short"),
+        hush_articles::RawEvent {
+            kind: 1,
+            ..long_form_event("bb", "note", 20, &"word ".repeat(800))
+        },
+    ]));
+    let router = api_router(app);
+
+    let (status, view) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(
+        view["articles"].as_array().unwrap().len(),
+        1,
+        "the stub and the note are refused: {view}"
+    );
+    assert_eq!(view["articles"][0]["address"], "30023:aa:kept");
+    assert_eq!(view["articles"][0]["reading_minutes"], 4);
+    assert!(
+        view["articles"][0].get("content").is_none(),
+        "the index carries no body"
+    );
+    assert_eq!(view["sections"][0]["name"], "rust");
+    assert_eq!(view["sections"][0]["count"], 1);
+
+    // The index reads back from the sidecar and filters by section.
+    let (status, view) = request(&router, "GET", "/api/neighborhoods?section=rust", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["articles"].as_array().unwrap().len(), 1);
+    let (status, view) = request(&router, "GET", "/api/neighborhoods?section=nope", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert!(view["articles"].as_array().unwrap().is_empty());
+
+    // The article page carries the body; an address not held is a 404.
+    let (status, view) = request(&router, "GET", "/api/neighborhoods/30023:aa:kept", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert!(view["content"].as_str().unwrap().starts_with("word"));
+    let (status, _) = request(&router, "GET", "/api/neighborhoods/30023:aa:missing", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_neighborhoods_sidecar_is_ciphertext_at_rest() {
+    let dir = TempDir::new().unwrap();
+    let app = unlocked_app(dir.path()).await;
+    const TITLE: &str = "atrest-title-marker";
+    let mut event = long_form_event("aa", "kept", 20, &"word ".repeat(800));
+    event.tags[1][1] = TITLE.to_string();
+    *app.neighborhoods_source.lock().await = Some(FakeRelay::articles(vec![event]));
+    let router = api_router(app);
+
+    let (status, _) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sidecar = std::fs::read(dir.path().join(hush_articles::STATE_FILE))
+        .expect("neighborhoods.enc exists after a refresh");
+    assert!(!sidecar.is_empty(), "sidecar is not empty");
+    assert!(
+        !contains(&sidecar, TITLE.as_bytes()),
+        "the cached title is not in the clear on disk"
+    );
+    assert!(
+        !contains(&sidecar, b"word word word"),
+        "the cached body is not in the clear on disk"
+    );
+}
+
+#[tokio::test]
 async fn a_pen_name_is_minted_then_renamed_without_moving_the_address() {
     let dir = TempDir::new().unwrap();
     let router = api_router(unlocked_app(dir.path()).await);
@@ -8036,5 +9212,933 @@ mod zines_bulletin_tests {
             "the article is stored either way"
         );
         assert_eq!(created["zines"][0]["revision"], 1);
+    }
+}
+
+/// The export (Task 11): a private zine re-encoded as a public NIP-23 article.
+///
+/// The transport is a stub, because what has to hold is not that a relay was
+/// reached but that the *event* is one a relay would accept: the right kind, the
+/// tags the gate reads, the body as Markdown rather than stored HTML, no private
+/// state anywhere in it, and a signature that verifies under the pubkey the
+/// event names. A fake sink is what lets all of that be asserted.
+#[cfg(test)]
+mod zine_export_api_tests {
+    use super::*;
+    use crate::notes_api_tests::{request, unlocked_app};
+    use hush_articles::{Event, PublishReport, RelaySink};
+    use tempfile::TempDir;
+
+    /// A sink that keeps what it was handed and answers a fixed verdict.
+    ///
+    /// Shared with the comment tests: a comment is published the same way an
+    /// export is, so the stub that stands in for the network is the same one.
+    pub(super) struct FakeSink {
+        /// The event ids it was asked to publish, in order.
+        seen: std::sync::Mutex<Vec<Event>>,
+        /// What to answer with. `Err` is a total failure, as a network with no
+        /// reachable relay is.
+        verdict: Result<(), String>,
+    }
+
+    impl FakeSink {
+        pub(super) fn accepting() -> Arc<Self> {
+            Arc::new(Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                verdict: Ok(()),
+            })
+        }
+
+        pub(super) fn refusing(reason: &str) -> Arc<Self> {
+            Arc::new(Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                verdict: Err(reason.to_string()),
+            })
+        }
+
+        pub(super) fn events(&self) -> Vec<Event> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RelaySink for FakeSink {
+        async fn publish(
+            &self,
+            relays: &[String],
+            event: &Event,
+        ) -> Result<PublishReport, String> {
+            self.seen.lock().unwrap().push(event.clone());
+            match &self.verdict {
+                Ok(()) => Ok(PublishReport {
+                    accepted: relays.to_vec(),
+                    refused: Vec::new(),
+                }),
+                Err(reason) => Err(reason.clone()),
+            }
+        }
+    }
+
+    /// A vault with a byline, a post, a public identity, an allowlist and a
+    /// stubbed sink: the whole state an export needs, in one place.
+    ///
+    /// The `TempDir` is returned rather than dropped: the worker holds the vault
+    /// path, so deleting the directory while the app is still in use would pull
+    /// the vault out from under it.
+    async fn exportable(
+        sink: Arc<FakeSink>,
+    ) -> (TempDir, Arc<App>, axum::Router, String, String) {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        *app.neighborhoods_sink.lock().await = Some(sink);
+        let router = api_router(app.clone());
+
+        let (status, pen) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"ada"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{pen}");
+
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"title":"On relays","sections":["Rust","Nostr"],"body":"<p>hello <strong>world</strong></p><p>Second.</p>"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let zine_id = created["zine_id"].as_str().unwrap().to_string();
+
+        let (status, identity) = request(
+            &router,
+            "POST",
+            "/api/neighborhoods/identity",
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{identity}");
+        let pubkey = identity["pubkey"].as_str().unwrap().to_string();
+
+        // One relay, so the event's relay hints and the publish target are both
+        // non-empty and known.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/neighborhoods/settings",
+            Some(r#"{"allowlist":["wss://relay.example"],"min_minutes":1,"default_show":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        (dir, app, router, zine_id, pubkey)
+    }
+
+    pub(super) fn verify(event: &Event) {
+        use k256::schnorr::signature::hazmat::PrehashVerifier;
+        let xonly: [u8; 32] = hex::decode(&event.pubkey).unwrap().try_into().unwrap();
+        let verifying = k256::schnorr::VerifyingKey::from_bytes(&xonly).unwrap();
+        let signature = k256::schnorr::Signature::try_from(
+            hex::decode(&event.sig).unwrap().as_slice(),
+        )
+        .unwrap();
+        let id: [u8; 32] = hex::decode(&event.id).unwrap().try_into().unwrap();
+        verifying
+            .verify_prehash(&id, &signature)
+            .expect("a relay checks exactly this, against exactly this key");
+    }
+
+    /// The article that goes out is the one the gate and every other NIP-23
+    /// client will read: the kind, the `d` and `title` the gate requires, the
+    /// sections as `t`, a derived summary, the body as Markdown, and a signature
+    /// over the id under the pubkey the event names.
+    #[tokio::test]
+    async fn an_export_publishes_a_signed_nip23_article() {
+        let sink = FakeSink::accepting();
+        let (_dir, _app, router, zine_id, pubkey) = exportable(sink.clone()).await;
+
+        let (status, out) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["published"], true, "{out}");
+        assert_eq!(out["publish_error"], "", "{out}");
+        assert_eq!(out["pubkey"], pubkey);
+        assert_eq!(out["d"].as_str().unwrap().len(), 32, "a 16-byte mint in hex");
+        assert_eq!(
+            out["address"],
+            format!("30023:{pubkey}:{}", out["d"].as_str().unwrap())
+        );
+        assert!(out["naddr"].as_str().unwrap().starts_with("naddr1"), "{out}");
+        assert_eq!(out["event_id"].as_str().unwrap().len(), 64);
+        assert!(out["zine"]["export"].is_object(), "the address is recorded");
+
+        let events = sink.events();
+        assert_eq!(events.len(), 1, "one event, to the one relay");
+        let event = &events[0];
+        assert_eq!(event.kind, 30023);
+        assert_eq!(event.pubkey, pubkey);
+        assert_eq!(event.id, out["event_id"].as_str().unwrap());
+        verify(event);
+
+        let tag = |name: &str| -> Option<String> {
+            event
+                .tags
+                .iter()
+                .find(|t| t[0] == name)
+                .map(|t| t[1].clone())
+        };
+        assert_eq!(tag("d"), Some(out["d"].as_str().unwrap().to_string()));
+        assert_eq!(tag("title"), Some("On relays".to_string()));
+        assert_eq!(tag("published_at"), Some(out["published_at"].to_string()));
+        let sections: Vec<String> = event
+            .tags
+            .iter()
+            .filter(|t| t[0] == "t")
+            .map(|t| t[1].clone())
+            .collect();
+        assert_eq!(sections, vec!["rust", "nostr"], "sections travel as `t`");
+        assert!(
+            tag("summary").unwrap().starts_with("hello world"),
+            "a card preview is derived from the body: {event:?}"
+        );
+
+        // The body is Markdown, not the stored HTML: a public client would show
+        // the tags as text.
+        assert!(event.content.contains("hello **world**"), "{}", event.content);
+        assert!(!event.content.contains("<p>"), "{}", event.content);
+        assert!(event.content.contains("Second."), "{}", event.content);
+        // And the address the app recorded is the one it published.
+        let (_, one) = request(&router, "GET", &format!("/api/zines/{zine_id}"), None).await;
+        assert_eq!(one["zine"]["export"]["d"], out["d"]);
+        assert_eq!(one["zine"]["export"]["last_event_id"], out["event_id"]);
+        assert_eq!(one["zine"]["export"]["published_at"], out["published_at"]);
+    }
+
+    /// The one-way door, asserted on the bytes that leave: a comment thread, a
+    /// revision history, the read key and the byline have nowhere to go. The
+    /// `d` is the interesting one — it is the only thing that could tie the
+    /// private post to the public article, and it must not be the zine id.
+    #[tokio::test]
+    async fn nothing_private_reaches_the_article() {
+        let sink = FakeSink::accepting();
+        let (_dir, _app, router, zine_id, _) = exportable(sink.clone()).await;
+
+        let (status, out) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let (_, one) = request(&router, "GET", &format!("/api/zines/{zine_id}"), None).await;
+        let read_key = one["zine"]["read_key"].as_str().unwrap().to_string();
+
+        let event = &sink.events()[0];
+        let haystack = format!("{}{}", event.content, serde_json::to_string(&event.tags).unwrap());
+        for forbidden in [
+            "read_key",
+            "pen_name",
+            "pen_id",
+            "zine_id",
+            "prev_hash",
+            "comments",
+            "signature",
+            &read_key,
+            &zine_id,
+        ] {
+            assert!(
+                !haystack.contains(forbidden),
+                "`{forbidden}` reached the article: {haystack}"
+            );
+        }
+        assert_ne!(
+            out["d"].as_str().unwrap(),
+            zine_id,
+            "the address is not the post id, or the link would be public"
+        );
+        assert!(
+            !event.tags.iter().any(|t| t[0] == "a" || t[0] == "e"),
+            "no reference back to anything private: {:?}",
+            event.tags
+        );
+    }
+
+    /// A re-export is an edit at the same address. The `d` and `published_at`
+    /// must not move — a new `d` would publish a second article beside the
+    /// first, and a moved `published_at` would claim the article was written
+    /// later than it was — while the content and the id do.
+    #[tokio::test]
+    async fn a_second_export_reuses_the_address_and_moves_only_the_content() {
+        let sink = FakeSink::accepting();
+        let (_dir, _app, router, zine_id, _) = exportable(sink.clone()).await;
+
+        let (status, first) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        let (status, edited) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(&format!(
+                r#"{{"zine_id":"{zine_id}","title":"On relays, again","sections":["rust"],"body":"<p>rewritten</p>"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["revision"], 2);
+
+        let (status, second) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+
+        assert_eq!(second["d"], first["d"], "the address is the article's");
+        assert_eq!(second["address"], first["address"]);
+        assert_eq!(second["published_at"], first["published_at"]);
+        assert_ne!(second["event_id"], first["event_id"], "an edit is a new event");
+
+        let events = sink.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, 30023);
+        assert_eq!(events[1].content, "rewritten");
+        assert_eq!(
+            events[0].tags.iter().find(|t| t[0] == "d"),
+            events[1].tags.iter().find(|t| t[0] == "d"),
+            "the same `d` both times"
+        );
+        verify(&events[1]);
+    }
+
+    /// A refusal is a status, not a lost article: the address is recorded either
+    /// way, so the retry publishes the same one rather than a second article.
+    #[tokio::test]
+    async fn a_refused_publish_keeps_the_address_for_the_retry() {
+        let sink = FakeSink::refusing("wss://relay.example: connection refused");
+        let (_dir, _app, router, zine_id, _) = exportable(sink).await;
+
+        let (status, out) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["published"], false);
+        assert!(
+            out["publish_error"].as_str().unwrap().contains("connection refused"),
+            "{out}"
+        );
+        assert_eq!(
+            out["zine"]["export"]["d"], out["d"],
+            "the address is minted before the publish, so a failure does not move it"
+        );
+
+        let (status, retry) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retry}");
+        assert_eq!(retry["d"], out["d"], "the retry publishes the same article");
+        assert_eq!(retry["published_at"], out["published_at"]);
+    }
+
+    /// An export must not be the thing that mints the identity it publishes
+    /// under, and it must not leave an address behind for a retry to find when
+    /// it could not go out at all.
+    #[tokio::test]
+    async fn an_export_before_a_public_identity_is_refused_and_mints_nothing() {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        *app.neighborhoods_sink.lock().await = Some(FakeSink::accepting());
+        let router = api_router(app);
+
+        let (status, pen) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"ada"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{pen}");
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"title":"On relays","body":"<p>hello</p>"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let zine_id = created["zine_id"].as_str().unwrap().to_string();
+
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+        assert!(
+            err["error"].as_str().unwrap().contains("public identity"),
+            "{err}"
+        );
+
+        let (_, one) = request(&router, "GET", &format!("/api/zines/{zine_id}"), None).await;
+        assert!(one["zine"]["export"].is_null(), "no address was minted");
+        let (status, identity) = request(&router, "GET", "/api/neighborhoods/identity", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(identity.is_null(), "and no identity was created either");
+    }
+
+    /// An empty allowlist is a configuration problem, not a gateway problem, and
+    /// it is refused before an address is minted: an export that cannot go out
+    /// must leave nothing behind.
+    #[tokio::test]
+    async fn an_export_with_no_relays_is_refused_and_mints_nothing() {
+        let sink = FakeSink::accepting();
+        let (_dir, _app, router, zine_id, _) = exportable(sink.clone()).await;
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/neighborhoods/settings",
+            Some(r#"{"allowlist":[],"min_minutes":1,"default_show":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("no relays"), "{err}");
+        assert!(sink.events().is_empty(), "nothing was sent anywhere");
+
+        let (_, one) = request(&router, "GET", &format!("/api/zines/{zine_id}"), None).await;
+        assert!(one["zine"]["export"].is_null(), "no address was minted");
+    }
+
+    /// The export route is as private as the sidecar: a locked vault is a 401
+    /// before any of the policy above runs.
+    #[tokio::test]
+    async fn the_export_route_is_401_while_locked() {
+        use crate::notes_api_tests::build_app;
+        let dir = TempDir::new().unwrap();
+        let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+        let (status, _) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{}/export", "a".repeat(64)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+/// Public commenting (Task 22, Phase 4): the write half of the comment lane.
+///
+/// The transport is a stub, because what has to hold is not that a relay was
+/// reached but that the *event* is the NIP-22 one other clients read: the right
+/// kind, the root tags that scope it to the article, the parent tags that scope a
+/// reply to the comment it answers, plaintext, and a signature that verifies
+/// under the public identity. And that the private thread is not involved at all.
+#[cfg(test)]
+mod neighborhood_comment_api_tests {
+    use super::*;
+    use crate::notes_api_tests::{request, unlocked_app};
+    use crate::zine_export_api_tests::{verify, FakeSink};
+    use crate::zines_api_tests::{long_form_event, FakeRelay};
+    use tempfile::TempDir;
+
+    /// A comment event as a relay would serve it.
+    fn comment_event(
+        id: &str,
+        root: &str,
+        parent: Option<&str>,
+        created_at: u64,
+        body: &str,
+    ) -> hush_articles::RawEvent {
+        let mut tags = vec![
+            serde_json::json!(["A", root]),
+            serde_json::json!(["K", hush_articles::KIND_LONG_FORM.to_string()]),
+            serde_json::json!(["P", "cc"]),
+        ];
+        match parent {
+            Some(parent) => {
+                tags.push(serde_json::json!(["e", parent]));
+                tags.push(serde_json::json!(["k", hush_articles::KIND_COMMENT.to_string()]));
+                tags.push(serde_json::json!(["p", "dd"]));
+            }
+            None => tags.push(serde_json::json!(["k", hush_articles::KIND_LONG_FORM.to_string()])),
+        }
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "pubkey": "cc",
+            "created_at": created_at,
+            "kind": hush_articles::KIND_COMMENT,
+            "tags": tags,
+            "content": body,
+        }))
+        .unwrap()
+    }
+
+    async fn set_allowlist(router: &axum::Router) {
+        let (status, _) = request(
+            router,
+            "POST",
+            "/api/neighborhoods/settings",
+            Some(r#"{"allowlist":["wss://relay.example"],"min_minutes":1,"default_show":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A vault with one article published and its thread readable: a byline, a
+    /// post, a public identity, an allowlist, a stubbed sink, and a stubbed relay
+    /// holding the article the export produced plus whatever `comments` builds.
+    ///
+    /// The export runs first so the address is the real one — the address is what
+    /// a comment is scoped to, so a made-up one would test the mapping against
+    /// something no member will ever have. `comments` is a function of that
+    /// address for the same reason.
+    ///
+    /// Returns the address, the public key, and the id of the article version the
+    /// relay serves — the last because a top-level comment's `e` tag names it.
+    async fn published(
+        sink: Arc<FakeSink>,
+        comments: impl FnOnce(&str) -> Vec<hush_articles::RawEvent>,
+    ) -> (TempDir, axum::Router, String, String, String) {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        *app.neighborhoods_sink.lock().await = Some(sink);
+        let router = api_router(app.clone());
+
+        let (status, pen) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"ada"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{pen}");
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"title":"On relays","body":"<p>hello</p>"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let zine_id = created["zine_id"].as_str().unwrap().to_string();
+
+        let (status, identity) = request(&router, "POST", "/api/neighborhoods/identity", Some("{}")).await;
+        assert_eq!(status, StatusCode::OK, "{identity}");
+        let pubkey = identity["pubkey"].as_str().unwrap().to_string();
+
+        set_allowlist(&router).await;
+
+        let (status, out) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/export"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let address = out["address"].as_str().unwrap().to_string();
+        let d = out["d"].as_str().unwrap().to_string();
+
+        // The relay now serves back the article that was published, plus
+        // whatever the test wants the thread to hold.
+        let article = long_form_event(&pubkey, &d, 20, &"word ".repeat(800));
+        let article_id = article.id.clone();
+        *app.neighborhoods_source.lock().await = Some(FakeRelay::new(
+            vec![article],
+            comments(&address),
+        ));
+
+        let (status, view) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(
+            view["articles"].as_array().unwrap().len(),
+            1,
+            "the published article is cached: {view}"
+        );
+
+        (dir, router, address, pubkey, article_id)
+    }
+
+    fn tag(event: &hush_articles::Event, name: &str) -> Option<String> {
+        event
+            .tags
+            .iter()
+            .find(|t| t[0] == name)
+            .map(|t| t[1].clone())
+    }
+
+    /// The comment that goes out is the one NIP-22 clients read: kind 1111,
+    /// plaintext, scoped to the article with both the root and the parent tags,
+    /// and signed by the public identity rather than the pen name.
+    #[tokio::test]
+    async fn a_comment_is_published_as_a_signed_nip22_event() {
+        let sink = FakeSink::accepting();
+        let (_dir, router, address, pubkey, article_id) = published(sink.clone(), |_| vec![]).await;
+
+        let (status, out) = request(
+            &router,
+            "POST",
+            &format!("/api/neighborhoods/{address}/comment"),
+            Some(r#"{"body":"  Worth reading.  "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["published"], true, "{out}");
+        assert_eq!(out["publish_error"], "", "{out}");
+        assert_eq!(out["address"], address);
+        assert_eq!(out["event_id"].as_str().unwrap().len(), 64);
+
+        // The thread comes back with the comment already in it: the page shows a
+        // thread, so it should not have to splice its own words in.
+        let replies = out["replies"].as_array().unwrap();
+        assert_eq!(replies.len(), 1, "{out}");
+        assert_eq!(replies[0]["content"], "Worth reading.");
+        assert_eq!(replies[0]["pubkey"], pubkey);
+        assert!(replies[0]["parent_id"].is_null(), "a top-level comment");
+
+        // The export went out first; the comment is the second event.
+        let events = sink.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let event = &events[1];
+        assert_eq!(event.kind, 1111);
+        assert_eq!(event.pubkey, pubkey);
+        assert_eq!(event.content, "Worth reading.", "plaintext, trimmed");
+        assert_eq!(event.id, out["event_id"].as_str().unwrap());
+        verify(event);
+
+        assert_eq!(tag(event, "A").as_deref(), Some(address.as_str()));
+        assert_eq!(tag(event, "K").as_deref(), Some("30023"));
+        assert_eq!(tag(event, "P").as_deref(), Some(pubkey.as_str()));
+        assert_eq!(
+            tag(event, "a").as_deref(),
+            Some(address.as_str()),
+            "a top-level comment's parent is the article"
+        );
+        assert_eq!(tag(event, "k").as_deref(), Some("30023"));
+        assert_eq!(tag(event, "p").as_deref(), Some(pubkey.as_str()));
+        assert_eq!(
+            tag(event, "e").as_deref(),
+            Some(article_id.as_str()),
+            "the parent event id is the article version's, not the comment's"
+        );
+    }
+
+    /// A reply keeps the article as its root and moves only the parent, which is
+    /// the whole of NIP-22 threading.
+    #[tokio::test]
+    async fn a_reply_scopes_to_the_article_and_names_the_comment_it_answers() {
+        let sink = FakeSink::accepting();
+        let (_dir, router, address, pubkey, _article_id) = published(sink.clone(), |address| {
+            vec![
+                // A comment in a thread this vault did not ask for. A relay
+                // answers what it likes; it is not one of its threads.
+                comment_event("other-thread", "30023:zz:elsewhere", None, 5, "not ours"),
+                comment_event("parent-1", address, None, 10, "first"),
+                comment_event("child-1", address, Some("parent-1"), 11, "answering"),
+            ]
+        })
+        .await;
+
+        // The article read carries the thread, oldest first, with the reply's
+        // parent named — and nothing from a thread this vault did not ask for.
+        let (status, article) =
+            request(&router, "GET", &format!("/api/neighborhoods/{address}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{article}");
+        let replies = article["replies"].as_array().unwrap();
+        assert_eq!(replies.len(), 2, "{article}");
+        assert_eq!(replies[0]["content"], "first");
+        assert!(replies[0]["parent_id"].is_null());
+        assert_eq!(replies[1]["content"], "answering");
+        assert_eq!(replies[1]["parent_id"], "parent-1");
+
+        // Replying to the comment, not the article.
+        let (status, out) = request(
+            &router,
+            "POST",
+            &format!("/api/neighborhoods/{address}/comment"),
+            Some(r#"{"body":"Same here.","parent_id":"parent-1"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+
+        let events = sink.events();
+        let event = &events[events.len() - 1];
+        assert_eq!(event.kind, 1111);
+        assert_eq!(
+            tag(event, "A").as_deref(),
+            Some(address.as_str()),
+            "the root stays the article"
+        );
+        assert_eq!(tag(event, "K").as_deref(), Some("30023"));
+        assert_eq!(tag(event, "P").as_deref(), Some(pubkey.as_str()));
+        assert_eq!(
+            tag(event, "e").as_deref(),
+            Some("parent-1"),
+            "the parent is the comment"
+        );
+        assert_eq!(
+            tag(event, "k").as_deref(),
+            Some("1111"),
+            "the parent kind is what tells a reply from a top-level comment"
+        );
+        assert_eq!(tag(event, "p").as_deref(), Some("cc"), "the parent's author");
+        assert!(
+            event.tags.iter().all(|t| t[0] != "a"),
+            "a reply has no lowercase address tag: the parent is a comment: {:?}",
+            event.tags
+        );
+        verify(event);
+
+        // And the thread now holds three, with the reply where it belongs.
+        let (_, article) =
+            request(&router, "GET", &format!("/api/neighborhoods/{address}"), None).await;
+        let replies = article["replies"].as_array().unwrap();
+        assert_eq!(replies.len(), 3, "{article}");
+        assert_eq!(replies[2]["parent_id"], "parent-1");
+    }
+
+    /// A comment names the version it was written against, so commenting on
+    /// something this vault does not hold would mean guessing at an event id.
+    #[tokio::test]
+    async fn commenting_on_an_article_this_vault_does_not_hold_is_a_404() {
+        let sink = FakeSink::accepting();
+        let (_dir, router, _address, _pubkey, _article_id) =
+            published(sink.clone(), |_| vec![]).await;
+
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/neighborhoods/30023:aa:missing/comment",
+            Some(r#"{"body":"hello"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+        assert!(sink.events().len() == 1, "nothing was sent");
+    }
+
+    /// A parent this vault cannot read is one whose author it cannot name, and a
+    /// parent from another thread would file the reply under the wrong article.
+    #[tokio::test]
+    async fn a_reply_to_a_comment_that_is_not_held_is_refused() {
+        let sink = FakeSink::accepting();
+        let (_dir, router, address, _, _article_id) = published(sink.clone(), |_| vec![]).await;
+
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/neighborhoods/{address}/comment"),
+            Some(r#"{"body":"hello","parent_id":"not-held"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(
+            err["error"].as_str().unwrap().contains("not-held"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_oversized_comment_is_refused() {
+        let sink = FakeSink::accepting();
+        let (_dir, router, address, _, _article_id) = published(sink.clone(), |_| vec![]).await;
+
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/neighborhoods/{address}/comment"),
+            Some(r#"{"body":"   "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+
+        let huge = "x".repeat(NEIGHBORHOOD_COMMENT_CHARS + 1);
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/neighborhoods/{address}/comment"),
+            Some(&format!(r#"{{"body":"{huge}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("at most"), "{err}");
+        assert_eq!(sink.events().len(), 1, "only the export was ever sent");
+    }
+
+    /// A comment must not be the thing that mints the identity it speaks under.
+    #[tokio::test]
+    async fn commenting_before_a_public_identity_is_refused_and_mints_nothing() {
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        *app.neighborhoods_sink.lock().await = Some(FakeSink::accepting());
+        // An article in the cache, with no identity in the vault: the cache is
+        // filled by a refresh, which mints nothing.
+        *app.neighborhoods_source.lock().await =
+            Some(FakeRelay::articles(vec![long_form_event(
+                "aa",
+                "kept",
+                20,
+                &"word ".repeat(800),
+            )]));
+        let router = api_router(app);
+
+        let (status, _) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/neighborhoods/30023:aa:kept/comment",
+            Some(r#"{"body":"hello"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+        assert!(
+            err["error"].as_str().unwrap().contains("public identity"),
+            "{err}"
+        );
+
+        let (status, identity) = request(&router, "GET", "/api/neighborhoods/identity", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(identity.is_null(), "and no identity was created either");
+    }
+
+    /// A comment no relay took is not public, so it is not cached. Unlike an
+    /// export there is no address to come back to, and showing the member their
+    /// own words in a thread they cannot point anyone at would be a lie the page
+    /// has no way to correct later.
+    #[tokio::test]
+    async fn a_comment_no_relay_took_is_not_cached_as_though_it_had_been() {
+        let sink = FakeSink::refusing("wss://relay.example: connection refused");
+        let dir = TempDir::new().unwrap();
+        let app = unlocked_app(dir.path()).await;
+        *app.neighborhoods_sink.lock().await = Some(sink.clone());
+        let router = api_router(app.clone());
+
+        request(&router, "POST", "/api/zines/pen-name", Some(r#"{"name":"ada"}"#)).await;
+        let (_, created) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"title":"On relays","body":"<p>hello</p>"}"#),
+        )
+        .await;
+        let zine_id = created["zine_id"].as_str().unwrap().to_string();
+        let (_, identity) = request(&router, "POST", "/api/neighborhoods/identity", Some("{}")).await;
+        let pubkey = identity["pubkey"].as_str().unwrap().to_string();
+        set_allowlist(&router).await;
+
+        // The export refuses too, so seed the cache with the article directly:
+        // what is under test is the comment, not the export.
+        *app.neighborhoods_source.lock().await = Some(FakeRelay::articles(vec![
+            long_form_event(&pubkey, "seed", 20, &"word ".repeat(800)),
+        ]));
+        let (status, _) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let address = format!("30023:{pubkey}:seed");
+
+        let (status, out) = request(
+            &router,
+            "POST",
+            &format!("/api/neighborhoods/{address}/comment"),
+            Some(r#"{"body":"hello"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["published"], false);
+        assert!(
+            out["publish_error"].as_str().unwrap().contains("connection refused"),
+            "{out}"
+        );
+        assert!(
+            out["replies"].as_array().unwrap().is_empty(),
+            "nothing is cached for a comment that never went out: {out}"
+        );
+
+        // And it is not there on a fresh read either.
+        let (_, article) =
+            request(&router, "GET", &format!("/api/neighborhoods/{address}"), None).await;
+        assert!(article["replies"].as_array().unwrap().is_empty(), "{article}");
+        let _ = zine_id;
+    }
+
+    /// The comment route is as private as the sidecar: a locked vault is a 401
+    /// before any of the policy above runs.
+    #[tokio::test]
+    async fn the_comment_route_is_401_while_locked() {
+        use crate::notes_api_tests::build_app;
+        let dir = TempDir::new().unwrap();
+        let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/neighborhoods/30023:aa:kept/comment",
+            Some(r#"{"body":"hello"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[cfg(test)]
+mod tls_provider_tests {
+    use super::*;
+
+    /// Guards the install `main` performs before the daemon can dial out.
+    ///
+    /// Covers the mechanism rather than the call site: it runs the same function
+    /// `main` runs, so changing the provider or emptying the function fails here.
+    /// Deleting only the call from `main` would not — that is what the comment on
+    /// the function is for, and it is why this test names the failure it stands in
+    /// for rather than assuming it cannot return.
+    #[test]
+    fn the_process_default_tls_provider_is_installed() {
+        install_tls_provider();
+
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "no process-level rustls provider: the first TLS handshake would panic"
+        );
+
+        // The path that panicked in the field — a client asking for the process
+        // default instead of naming a provider. With two providers enabled and
+        // none installed, `builder()` panics here rather than failing a request.
+        let _ = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
     }
 }

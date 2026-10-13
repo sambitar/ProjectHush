@@ -291,6 +291,63 @@ pub struct ZineRevision {
     pub replaced_ms: u64,
 }
 
+/// One zine's public life on the Nostr network, once it has one.
+///
+/// Local only, and deliberately **not** in the descriptor. The descriptor is
+/// what gets sealed and published to the bulletin, so a `d` living there would
+/// hand anyone holding the read key the link between the private post and the
+/// public article — the one thing the export must not create. Keeping it here
+/// means the link never travels.
+///
+/// The `d` is minted on the first export and then stable forever, because
+/// NIP-23 is editable *by address*: a second export under a new `d` would
+/// publish a second article beside the first rather than updating it. And it is
+/// deliberately not the `zine_id`, which would be a stable public link back to
+/// a private post.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ZineExport {
+    /// The NIP-23 `d` tag. Minted once, never moved.
+    #[serde(default)]
+    pub d: String,
+    /// The public key the article is signed by, hex. A local copy of what is
+    /// already public: it is in every event that went out, and holding it here
+    /// is what lets the UI show the `30023:pubkey:d` address without asking the
+    /// vault for the identity on every render.
+    #[serde(default)]
+    pub pubkey: String,
+    /// When the article first went public, seconds. Set once, never moved: an
+    /// edit is a new event at the same address, and `published_at` is the first
+    /// publish rather than the latest.
+    #[serde(default)]
+    pub published_at: u64,
+    /// The id of the event this vault published last, hex. A local fact, kept so
+    /// the UI can say which revision is public.
+    #[serde(default)]
+    pub last_event_id: String,
+    /// When this vault last published, ms. Local fact, never published.
+    #[serde(default)]
+    pub published_ms: u64,
+}
+
+impl ZineExport {
+    /// Mint the export address for a zine that is going public for the first
+    /// time. Opaque rather than a title slug: a slug would move when the title
+    /// changes, which NIP-23 reads as a different article.
+    pub fn mint(pubkey: &str, published_at: u64) -> Self {
+        use rand::{RngCore, TryRngCore};
+
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.unwrap_err().fill_bytes(&mut bytes);
+        Self {
+            d: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            pubkey: pubkey.trim().to_ascii_lowercase(),
+            published_at,
+            last_event_id: String::new(),
+            published_ms: 0,
+        }
+    }
+}
+
 /// One zine in this vault: the head, its history, and the local facts about
 /// holding it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -331,6 +388,10 @@ pub struct ZineFile {
     /// Local mute. No wire effect — the zine is still held and still counted.
     #[serde(default)]
     pub muted: bool,
+    /// This zine's public export, once it has one. Absent until the first
+    /// export: a zine that has never been published has no address to name.
+    #[serde(default)]
+    pub export: Option<ZineExport>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -409,6 +470,10 @@ pub struct ZineSummary {
     pub authored: bool,
     pub muted: bool,
     pub unreadable: bool,
+    /// This post's public life, once it has one. Absent until the first export,
+    /// so a row can say "not published" rather than guessing.
+    #[serde(default)]
+    pub export: Option<ZineExport>,
 }
 
 /// Normalise a section label: trimmed, collapsed whitespace, length-capped.
@@ -596,6 +661,7 @@ impl ZinesState {
                 authored: z.authored,
                 muted: z.muted,
                 unreadable: z.unreadable,
+                export: z.export.clone(),
             })
             .collect();
         // Newest first, by the author's own clock — clamped on write, so a
@@ -718,6 +784,7 @@ impl ZinesState {
             expected_blob: String::new(),
             pending_comments: Vec::new(),
             muted: false,
+            export: None,
             updated_ms: now_ms,
         });
         Ok((id, 1))
@@ -1043,6 +1110,66 @@ impl ZinesState {
         self.get(zine_id).map(|z| z.head_blob.clone()).unwrap_or_default()
     }
 
+    /// This post's public export, minting the address on the first call.
+    ///
+    /// Minted and persisted *before* the event is built, so a publish that
+    /// failed does not move the address on the retry: NIP-23 is editable by
+    /// address, and a second `d` would publish a second article beside the
+    /// first instead of updating it.
+    pub fn export_address(
+        &mut self,
+        zine_id: &str,
+        pubkey: &str,
+        now_s: u64,
+    ) -> Result<ZineExport, String> {
+        let file = self
+            .get_mut(zine_id)
+            .ok_or_else(|| "no post with that id is held".to_string())?;
+        if file.export.is_none() {
+            file.export = Some(ZineExport::mint(pubkey, now_s));
+        }
+        file.export
+            .clone()
+            .ok_or_else(|| "the export address could not be minted".to_string())
+    }
+
+    /// Record the event a revision went out as.
+    ///
+    /// `updated_ms` is deliberately untouched: publishing is not editing, and
+    /// reordering the author's own list because a post went public would be a
+    /// local side effect of a remote act.
+    pub fn record_export(&mut self, zine_id: &str, event_id: &str, at_ms: u64) -> bool {
+        match self.get_mut(zine_id) {
+            Some(file) => match file.export.as_mut() {
+                Some(export) => {
+                    export.last_event_id = event_id.to_string();
+                    export.published_ms = at_ms;
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Every article this vault has published, as NIP-01 addresses
+    /// (`30023:pubkey:d`).
+    ///
+    /// This is the set of threads the read lane has a stake in: the comments
+    /// under them are the only ones a refresh asks for, because they are the
+    /// only ones this vault can be answered on. A post that has never been
+    /// exported is not in here, and a post whose export failed *is* — the
+    /// address was minted before the publish, so the thread is already the right
+    /// one to read even before the article lands.
+    pub fn export_scopes(&self) -> Vec<String> {
+        self.zines
+            .iter()
+            .filter_map(|z| z.export.as_ref())
+            .filter(|e| !e.d.is_empty() && !e.pubkey.is_empty())
+            .map(|e| format!("{}:{}:{}", hush_articles::KIND_LONG_FORM, e.pubkey, e.d))
+            .collect()
+    }
+
     /// A post's read key, decoded, when this vault holds one.
     pub fn read_key(&self, zine_id: &str) -> Option<[u8; 32]> {
         use base64::{engine::general_purpose::STANDARD, Engine};
@@ -1133,6 +1260,7 @@ impl ZinesState {
             expected_blob: latest_hash.to_string(),
             pending_comments: Vec::new(),
             muted: false,
+            export: None,
             updated_ms: now_ms,
         });
         true
@@ -1190,6 +1318,7 @@ impl ZinesState {
                 expected_blob: String::new(),
                 pending_comments: Vec::new(),
                 muted: false,
+                export: None,
                 updated_ms: now_ms,
             });
             return Ok(Ingest::NewPost);
@@ -1548,6 +1677,9 @@ mod zine_store_tests {
     /// The vault's pen name: the seal public key in production, a fixed string
     /// here. A post id is minted by the store, so no test chooses one.
     const PEN: &str = "pen-ada";
+    /// A public identity's key, hex: the secp256k1 generator, as in the vault's
+    /// own vector. Fixed here because the export address is derived from it.
+    const PUBKEY: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
     fn draft(title: &str, body: &str) -> ZineDraft {
         ZineDraft {
@@ -1708,8 +1840,90 @@ mod zine_store_tests {
             expected_blob: String::new(),
             pending_comments: Vec::new(),
             muted: false,
+            export: None,
             updated_ms: NOW,
         }
+    }
+
+    /// The export address is minted once and never moves.
+    ///
+    /// NIP-23 is editable *by address*: a second export under a new `d` would
+    /// publish a second article beside the first rather than updating it. So the
+    /// mint has to be idempotent, and it has to be durable before the event is
+    /// built — a publish that failed must not move the address on the retry.
+    #[test]
+    fn an_export_address_is_minted_once_and_never_moves() {
+        let mut s = with_zine();
+        let id = the_id(&s);
+        assert!(s.get(&id).unwrap().export.is_none(), "nothing public yet");
+
+        let first = s.export_address(&id, PUBKEY, 1_700_000_000).unwrap();
+        assert_eq!(first.d.len(), 32, "16 random bytes in hex");
+        assert_eq!(first.pubkey, PUBKEY);
+        assert_eq!(first.published_at, 1_700_000_000);
+        assert!(first.last_event_id.is_empty(), "nothing published yet");
+
+        // A later call, even with a different clock, is the same address: the
+        // article is the one that was already published.
+        let again = s.export_address(&id, PUBKEY, 1_800_000_000).unwrap();
+        assert_eq!(again.d, first.d);
+        assert_eq!(again.published_at, first.published_at, "set once, never moved");
+
+        // And it survives a round trip, which is what makes it the address a
+        // retry publishes to rather than a value that changes on every load.
+        let back = decode(Some(&s.encode().unwrap())).unwrap();
+        assert_eq!(back.get(&id).unwrap().export.as_ref().unwrap().d, first.d);
+    }
+
+    #[test]
+    fn an_export_address_for_an_unknown_post_is_refused() {
+        let mut s = with_zine();
+        assert!(s.export_address("nope", PUBKEY, 1).is_err());
+    }
+
+    /// Publishing is not editing: recording an export must not reorder the
+    /// author's own list, which is what `updated_ms` drives.
+    #[test]
+    fn recording_an_export_keeps_the_event_and_leaves_the_edit_time_alone() {
+        let mut s = with_zine();
+        let id = the_id(&s);
+        s.export_address(&id, PUBKEY, 1_700_000_000).unwrap();
+        let edited = s.get(&id).unwrap().updated_ms;
+
+        assert!(s.record_export(&id, "ab".repeat(32).as_str(), NOW + 5_000));
+        let after = s.get(&id).unwrap();
+        let export = after.export.as_ref().unwrap();
+        assert_eq!(export.last_event_id, "ab".repeat(32));
+        assert_eq!(export.published_ms, NOW + 5_000);
+        assert_eq!(after.updated_ms, edited, "a publish is not an edit");
+
+        // A post with no export record has nothing to record into, and one this
+        // vault does not hold is refused rather than silently created.
+        assert!(!s.record_export("nope", "ab", NOW));
+        let mut fresh = ZinesState::default();
+        fresh.zines.push(held_post("bb22", "pen-bob"));
+        assert!(!fresh.record_export("bb22", "ab", NOW));
+    }
+
+    /// The export is local state, so it is not in the descriptor — which is
+    /// what is sealed and published. A `d` inside the blob would hand anyone
+    /// holding the read key the link between the private post and the public
+    /// article, which is the one thing the export must not create.
+    #[test]
+    fn the_export_is_not_carried_in_the_sealed_descriptor() {
+        let mut s = with_zine();
+        let id = the_id(&s);
+        let export = s.export_address(&id, PUBKEY, 1_700_000_000).unwrap();
+        s.record_export(&id, "ab", NOW);
+
+        let blob = ZineBlob::new(s.get(&id).unwrap().descriptor.clone(), "pk".into(), String::new());
+        let wire = serde_json::to_string(&blob).unwrap();
+        assert!(
+            !wire.contains(&export.d),
+            "the export address reached the sealed blob: {wire}"
+        );
+        assert!(!wire.contains("last_event_id"), "{wire}");
+        assert!(!wire.contains("published_at"), "{wire}");
     }
 
     #[test]

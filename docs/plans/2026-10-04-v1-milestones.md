@@ -31,9 +31,10 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **M — Conclave Paper** | Before **17** (voice/video postponed; data-only WebRTC) | **19** collaborative paper ("Etherpad-like") in a conclave | Spec resolved 2026-10-12; **Phases 1–2 (offline core + editor, wire fan-out) landed and dogfooded 2026-10-12** — Tasks 3–8 open, DataChannel liveness next |
 | **N — Reading room** | After **19**'s spine (reused); independent of **17**/**18** media | **20** shared reading + discussion in a conclave | Idea captured 2026-10-12; planning only, not grilled |
 | **O — Zines** | After **19**'s spine (reused) + a relay bulletin lane; independent of **17**/**18** media | **21** members-only long-form blogs ("zines") with comments, broadcast on a relay bulletin | Spec resolved 2026-10-12 by grilling; planning only |
+| **P — Neighborhoods** | After **21** (front page) + **11** (public identity, shared crate, Tor egress) | **22** public long-form from Nostr (NIP-23), badged on the zines front page behind a control | Spec resolved 2026-10-13 by grilling; planning only |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
 
-**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane. **Zines** (O) is the members-only long-form commons: also a data feature, reusing **19**'s spine, and it is the one task that adds a relay ability (a broadcast bulletin) — also independent of the media plane. It reshapes **Articles** (G) from a native Nostr build into an optional export.
+**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane. **Zines** (O) is the members-only long-form commons: also a data feature, reusing **19**'s spine, and it is the one task that adds a relay ability (a broadcast bulletin) — also independent of the media plane. It reshapes **Articles** (G) from a native Nostr build into an optional export. **Neighborhoods** (P) is the public counterpart to zines: it reads public Nostr long-form onto the same page, badged and behind a control, and it is where the separate **public identity** lives.
 
 Detailed specs follow **by task ID** (1, 2, …). Dependency order is in the table above.
 
@@ -71,7 +72,7 @@ Use before closing slices on Tasks **1, 2, 5, 5c, 6, 7, 10**. Full rules: [`DIST
 | `crates/hush-daemon/` | Unlock, local API |
 | `crates/hush-cli/` | Send/recv without GUI |
 | `apps/hush-tauri/` | Contacts, conversation, send file, vault status |
-| `crates/hush-articles/` | (Task 11) Nostr **export** of a zine (NIP-23) — **planned**; native long-form is Task **21** (`hush-core`/`hush-daemon`, no new crate) |
+| `crates/hush-articles/` | Nostr-facing crate: (Task **22**) the **neighborhoods** read lane and (Task **11**) the **export** of a zine (NIP-23) — **both built 2026-10-13**; native long-form is Task **21** (`hush-core`/`hush-daemon`, no new crate) |
 
 ---
 
@@ -436,26 +437,35 @@ Reached from a **Vault bento tile** that opens the board full-bleed.
 
 **Status:** **Reshaped** — **Phase G**, now optional and **after 21**. The native long-form surface is
 **zines** (Task **21** / Phase **O**); this task is now only the **export** path that pushes a zine
-beyond the membership.
+beyond the membership. **The export bridge landed 2026-10-13** as part of neighborhoods Phase **4**:
+`POST /api/zines/{id}/export` re-encodes the body to Markdown, strips the private thread and history
+(by construction — `ExportPlan` has no field for them), signs under the public identity, publishes
+NIP-23 over Tor and waits on each relay's `OK`, reporting `published` rather than pretending. The
+address is recorded before the send, so a refused export retries at the same address. Verified
+against a local relay, not against a live one.
 
 **Why it changed:** zines deliver members-only E2EE long-form on rails the capsule already has
 (Task **19**'s spine plus one relay bulletin lane) with no second network stack and no public
 metadata. Nostr's value is **reach to a public audience** and interop with other clients — real, but
-not the native shape. Both reuse the same **pen-name keys**.
+not the native shape. Both reuse the same **public identity** — a key separate from the pen name and
+the messaging identity, introduced by Task **22** ([`neighborhoods.md`](../tasks/neighborhoods.md)).
 
 **Goal (reshaped):** an optional action that **exports** a zine as a **NIP-23** event, signed with
-its pen-name key and published over **Tor** (`arti`) to a curated relay list — the "vault→publish"
-arc from the knowledge-layer roadmap, as a button rather than a parallel product.
+the vault's **public identity** (a key separate from the pen name and the messaging identity) and
+published over **Tor** to a curated relay list — the "vault→publish" arc from the knowledge-layer
+roadmap, as a button rather than a parallel product. The pen name is never the signer: a public post
+must not be linkable to the private byline it was written under.
 
 Full design (pen names, relay pool, media, NIPs) is retained for the parts that still apply:
 
 → **[`docs/tasks/hush-articles.md`](../tasks/hush-articles.md)** — now scoped to **export**; its
 feed / follow / relay-pool sections are superseded by zines.
 
-**Crate:** `crates/hush-articles/` on **rust-nostr** (export only); UI never talks to relays directly.
+**Crate:** `crates/hush-articles/` — the export bridge (Task **11**) and the neighborhoods read lane (Task **22**). The read lane's transport is a hand-rolled minimal NIP-01 client over the shell's Tor SOCKS proxy, not `rust-nostr` + `arti` (settled 2026-10-13); the UI never talks to relays directly.
 
-**Depends on:** Task **21** (zine + pen-name keys), **6** (backup includes pen-name keys), **5c**
-(encrypted local store). **Independent** of `hush-relay` / libsignal messaging.
+**Depends on:** Task **21** (zine), Task **22** (the public identity and the shared crate), **6**
+(backup includes the public identity), **5c** (encrypted local store). **Independent** of
+`hush-relay` / libsignal messaging.
 
 **Distro-readiness:** document the **second egress** (Nostr over Tor) — DR-18; sanitized-only UI.
 
@@ -642,6 +652,34 @@ work.
 **Distro-readiness:** no new client egress (the bulletin is the existing relay); relay storage grows
 with the corpus (its own cap + TTL); the optional Nostr export adds the Tor egress already tracked
 as DR-18.
+
+---
+
+### Task 22: Neighborhoods — public long-form from Nostr
+
+**Status:** **Phase P** — spec resolved **2026-10-13 by grilling**. Phases **1** (public identity), **2** (read lane), **3** (the mixed page) and **4** (export and commenting) landed 2026-10-13. Phase **5** (hardening and docs) is next; the two Phase 4 gaps are the same offline-build gaps as before — no live relay/Tor run and no browser drive of the composer.
+
+**Goal:** The zines front page can also carry **public** long-form pulled from Nostr (NIP-23), on the
+**same page** behind a control-pane switch and always badged `public post`. Public posts are read
+over **Tor**, curated to **articles rather than notes**, cached locally, and commented under a
+**separate public identity** — never the pen name.
+
+→ **[`docs/tasks/neighborhoods.md`](../tasks/neighborhoods.md)**
+
+**Key decisions:** one mixed front page with a default-off `Public posts` switch and a `public post`
+badge; admission gate `kind:30023` **and** `d` **and** `title` from a curated relay allowlist with a
+reading-time floor; **no** follows, no ranking, no Hush-run relay; a separate per-vault public
+identity; explicit per-post export; read-only inbound replies; one sanitizer. Introduces the public
+identity and the shared Nostr crate that Task **11**'s export consumes.
+
+**Depends on:** Task **21** (the front page and store patterns), Task **19**'s spine. Provides the
+public identity + crate for Task **11** (export). **Independent of** `hush-relay` / libsignal
+messaging.
+
+**Distro-readiness:** a new **Tor egress** beside the messaging relay client (DR-18), **lazy** — no
+Nostr egress until the switch is on. Sanitized-only UI (reuses the reads sanitizer).
+
+**Not at launch:** a Hush-run Nostr relay; a follow-based feed; short notes; remote media.
 
 ---
 

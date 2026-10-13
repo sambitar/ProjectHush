@@ -12,13 +12,19 @@ import type {
   TorrentItemDto,
   TorrentLibraryEntryDto,
   TorrentsStateDto,
+  NeighborhoodArticleDto,
+  NeighborhoodCommentDto,
+  NeighborhoodsViewDto,
   NotesStateDto,
+  PublicIdentityDto,
   WalletChain,
   WalletChainDto,
   WalletNetworkMode,
   WalletStateDto,
   WalletTokenDto,
   ZinePendingCommentDto,
+  ZineExportDto,
+  ZineExportViewDto,
   ZineSummaryDto,
   ZineViewDto,
   ZinesViewDto,
@@ -210,13 +216,27 @@ import {
   zineEditorHtml,
   zineEditorIsDirty,
 } from "./lib/zineStore";
-import type { ZinesSectionCount } from "./lib/zinesPage";
+import type {
+  FrontPageStory,
+  PublicCommentNode,
+  StorySource,
+  ZinesSectionCount,
+} from "./lib/zinesPage";
 import {
+  badgeOf,
   byByline,
   bylineOf,
+  flattenThread,
   groupBySection,
   leadOf,
+  newestFirst,
+  postStory,
+  publicByline,
+  publicThread,
   sectionCounts,
+  zineStory,
+  zineExportAddress,
+  PUBLIC_POST_BADGE,
 } from "./lib/zinesPage";
 import {
   dropById,
@@ -247,7 +267,8 @@ import { avatarWithPresence, createAvatarEl, initialsFor } from "./components/ui
 import { RichTextEditor } from "./components/ui/RichTextEditor";
 import { ContactPicker } from "./components/ui/ContactPicker";
 import { OverflowMenu } from "./components/ui/OverflowMenu";
-import { bodyToDisplayHtml, isBlankHtml } from "./lib/richText";
+import { bodyToDisplayHtml, isBlankHtml, sanitizeHtml } from "./lib/richText";
+import { markdownToHtml } from "./lib/markdown";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
 import { IrcPane } from "./features/irc/ircPane";
 import {
@@ -748,6 +769,61 @@ export class App {
   private zinesMineOnly = false;
   private zinesShowMuted = true;
   /**
+   * The public read lane's cached index, or null before it has been read.
+   *
+   * Held even while `Public posts` is off: the switch is a view control over a
+   * corpus this vault already holds, and the pane has to know whether there is
+   * anything to offer before it offers it.
+   */
+  private neighborhoodsView: NeighborhoodsViewDto | null = null;
+  private neighborhoodsLoading = false;
+  private neighborhoodsError: string | null = null;
+  /**
+   * The `Public posts` switch.
+   *
+   * Off unless the saved default says otherwise. Turning it on is this lane's
+   * opt-in: it is the one action that lets the daemon pull from the relays, so
+   * nothing leaves for Nostr while it is off.
+   */
+  private neighborhoodsShown = false;
+  /** Whether the saved default has been read, so a later load cannot clobber a
+   *  choice the reader has already made this session. */
+  private neighborhoodsDefaultRead = false;
+  /** The open public post, with its body. */
+  private neighborhoodsDetail: NeighborhoodArticleDto | null = null;
+  private neighborhoodsDetailError: string | null = null;
+  /**
+   * The public identity this vault publishes and comments under, and whether the
+   * daemon has been asked for it yet.
+   *
+   * Read once, when a public post is opened, because it is a vault read and a
+   * post is opened far more often than an identity is minted. `null` *after* a
+   * read means the vault holds none — which is the state a comment cannot leave
+   * from, so the composer says so and offers the mint rather than letting the
+   * reader write and then fail.
+   */
+  private publicIdentity: PublicIdentityDto | null = null;
+  private publicIdentityRead = false;
+  private publicIdentityBusy = false;
+  private publicIdentityError: string | null = null;
+  /**
+   * The public comment being written on the open post, and the comment it
+   * answers.
+   *
+   * Held outside the DOM for the same reason the sealed comment box is: the pane
+   * re-renders on a poll, and a half-typed comment must not go with it. The two
+   * boxes are separate pieces of state on purpose — a public comment and a sealed
+   * one are different acts with different consequences, and one draft must never
+   * be posted as the other.
+   */
+  private postCommentDraft = "";
+  private postCommentBusy = false;
+  private postCommentError: string | null = null;
+  /** The comment being answered, or null for a comment on the article itself. */
+  private postCommentParent: string | null = null;
+  /** The stable host for the public comment box, built once per open post. */
+  private postCommentHost: HTMLTextAreaElement | null = null;
+  /**
    * Where the front page was scrolled when a story was opened, so coming back
    * lands the reader where they left rather than at the masthead. Captured on
    * the way in, applied after the pane has layout, cleared once used.
@@ -755,6 +831,8 @@ export class App {
   private pendingZinesScroll: number | null = null;
   /** The zine open in the reading pane. */
   private zinesOpenId: string | null = null;
+  /** Which lane the open story came from, so the reader knows what to paint. */
+  private zinesOpenSource: StorySource | null = null;
   private zinesDetail: ZineViewDto | null = null;
   private zinesDetailError: string | null = null;
   /**
@@ -815,6 +893,18 @@ export class App {
    * reader and a half-typed comment must not go with it.
    */
   private zinesCommentHost: HTMLTextAreaElement | null = null;
+  /**
+   * The export dialog (Task 11): which zine is being published to the
+   * neighborhoods, and what came back.
+   *
+   * The result is held rather than toasted because the address is the thing the
+   * author needs afterwards — it is what a comment references and what they
+   * paste to a reader — and a toast that has faded is not an address.
+   */
+  private zinesExportId: string | null = null;
+  private zinesExportBusy = false;
+  private zinesExportError: string | null = null;
+  private zinesExportResult: ZineExportViewDto | null = null;
   private conclaveCreateOpen = false;
   /**
    * The in-progress create-conclave form.
@@ -1443,6 +1533,7 @@ export class App {
     this.zinesView = null;
     this.zinesDetail = null;
     this.zinesOpenId = null;
+    this.zinesOpenSource = null;
     this.zinesSection = null;
     this.zinesPen = null;
     this.zinesMineOnly = false;
@@ -1451,10 +1542,33 @@ export class App {
     this.zinesError = null;
     this.zinesDetailError = null;
     this.zinesPenNameOpen = false;
+    // The public lane. The switch itself goes back to off and its saved default
+    // is re-read on the next visit: a lock is not a reason to keep reading a
+    // public network the moment the vault opens again.
+    this.neighborhoodsView = null;
+    this.neighborhoodsDetail = null;
+    this.neighborhoodsDetailError = null;
+    this.neighborhoodsError = null;
+    this.neighborhoodsShown = false;
+    this.neighborhoodsDefaultRead = false;
+    // The public identity is key material, so a locked vault has none to show —
+    // and a comment drafted against the old one must not survive the lock.
+    this.publicIdentity = null;
+    this.publicIdentityRead = false;
+    this.publicIdentityError = null;
+    this.postCommentDraft = "";
+    this.postCommentParent = null;
+    this.postCommentError = null;
+    this.postCommentHost = null;
     this.zinesForgetId = null;
     this.zinesShareId = null;
     this.zinesShareContact = "";
     this.zinesShareError = null;
+    // The export dialog is about a vault that is now closed, and the address it
+    // was showing came out of it.
+    this.zinesExportId = null;
+    this.zinesExportResult = null;
+    this.zinesExportError = null;
     this.zinesCommentDraft = "";
     this.zinesCommentError = null;
     clearReadsStore();
@@ -1635,6 +1749,7 @@ export class App {
     if (this.zinesPenNameOpen) this.root.appendChild(this.renderZinesPenNameModal());
     if (this.zinesForgetId) this.root.appendChild(this.renderZinesForgetModal());
     if (this.zinesShareId) this.root.appendChild(this.renderZinesShareModal());
+    if (this.zinesExportId) this.root.appendChild(this.renderZinesExportModal());
     if (this.pendingUpdate) this.root.appendChild(this.renderUpdatePrompt());
   }
 
@@ -5038,6 +5153,91 @@ export class App {
     }
     this.zinesLoading = false;
     if (this.rail === "zines") this.render();
+    // The public lane rides along: it is part of the same page, and reading its
+    // cache is not egress, so the pane can know whether to offer the switch.
+    void this.neighborhoodsLoad();
+  }
+
+  /**
+   * Read the public lane's cached index, and the saved switch default once.
+   *
+   * Reading the cache is not egress: it is the daemon's own encrypted store. So
+   * this runs whether or not the switch is on — the pane needs to know whether
+   * there is anything to offer, and a reader who opted in last session should not
+   * have to flip a switch that already remembers them.
+   */
+  private async neighborhoodsLoad(): Promise<void> {
+    if (this.neighborhoodsLoading) return;
+    this.neighborhoodsLoading = true;
+    try {
+      if (!this.neighborhoodsDefaultRead) {
+        const settings = await api.neighborhoodSettings();
+        this.neighborhoodsDefaultRead = true;
+        // A null answer is the daemon having nothing to report, which is the
+        // same as the default: off.
+        this.neighborhoodsShown = settings?.default_show ?? false;
+      }
+      this.neighborhoodsView = await api.neighborhoods();
+      this.neighborhoodsError = null;
+    } catch (e) {
+      this.neighborhoodsError =
+        e instanceof AppError
+          ? e.message
+          : "Couldn't read the public posts this vault holds.";
+    }
+    this.neighborhoodsLoading = false;
+    if (this.rail === "zines") this.render();
+  }
+
+  /**
+   * Pull from the allowlisted relays over Tor.
+   *
+   * The lane's only egress, and the only place it happens. A failure is reported
+   * beside the switch rather than replacing the page: the cache is still worth
+   * reading, so a reader whose Tor is down still gets what was pulled last time.
+   */
+  private async neighborhoodsRefresh(): Promise<void> {
+    if (this.neighborhoodsLoading) return;
+    this.neighborhoodsLoading = true;
+    this.neighborhoodsError = null;
+    if (this.rail === "zines") this.render();
+    try {
+      this.neighborhoodsView = await api.refreshNeighborhoods();
+    } catch (e) {
+      this.neighborhoodsError =
+        e instanceof AppError ? e.message : "Couldn't reach the relays.";
+    }
+    this.neighborhoodsLoading = false;
+    if (this.rail === "zines") this.render();
+  }
+
+  /**
+   * The `Public posts` switch.
+   *
+   * Turning it on is the opt-in that lets this page read a public network, so it
+   * saves itself as the default and pulls once. Turning it off only hides the
+   * posts: hiding a story is not a reason to throw it away, and the cache stays
+   * for the next time the reader asks.
+   */
+  private async zinesSetPublicPosts(on: boolean): Promise<void> {
+    this.neighborhoodsShown = on;
+    // A new corpus is a new page: open it at the masthead, and drop a section
+    // filter the new corpus may no longer carry.
+    this.pendingZinesScroll = null;
+    if (
+      this.zinesSection &&
+      !this.zinesSections().some((s) => s.name === this.zinesSection)
+    ) {
+      this.zinesSection = null;
+    }
+    this.render();
+    try {
+      await api.setNeighborhoodSettings({ default_show: on });
+    } catch {
+      // A default that did not save is not worth a page-level error: the switch
+      // still works for this session, which is what the reader asked for.
+    }
+    if (on) await this.neighborhoodsRefresh();
   }
 
   /**
@@ -5048,18 +5248,28 @@ export class App {
    * the two can never disagree: a control that hides stories hides them from
    * the strip as well.
    */
-  private zinesHeld(): ZineSummaryDto[] {
-    let held = this.zinesView?.zines ?? [];
-    if (this.zinesMineOnly) held = this.zinesMine();
-    if (!this.zinesShowMuted) held = held.filter((z) => !z.muted);
-    return byByline(held, this.zinesPen);
+  private zinesHeld(): FrontPageStory[] {
+    // `Mine only` is by pen name, and a public post is signed by the separate
+    // public identity rather than the pen name, so a post is not "mine" here:
+    // the lane is left out rather than printed under a byline that did not
+    // write it.
+    let held: FrontPageStory[] = this.zinesMineOnly
+      ? this.zinesMine().map(zineStory)
+      : (this.zinesView?.zines ?? []).map(zineStory);
+    if (!this.zinesMineOnly && this.neighborhoodsShown) {
+      held = held.concat((this.neighborhoodsView?.articles ?? []).map(postStory));
+    }
+    if (!this.zinesShowMuted) held = held.filter((s) => !s.muted);
+    // Both lanes in one newest-first order: the page is one newspaper, not two
+    // lists stacked on each other.
+    return byByline(newestFirst(held), this.zinesPen);
   }
 
   /** The front page's stories: the held corpus, narrowed by the active section. */
-  private zinesFiltered(): ZineSummaryDto[] {
+  private zinesFiltered(): FrontPageStory[] {
     const held = this.zinesHeld();
     const section = this.zinesSection;
-    return section ? held.filter((z) => z.sections.includes(section)) : held;
+    return section ? held.filter((s) => s.sections.includes(section)) : held;
   }
 
   /** The section strip, in the order the page files its stories under it. */
@@ -5109,35 +5319,60 @@ export class App {
     return (this.zinesView?.zines ?? []).filter((z) => z.authored);
   }
 
-  /** Open a story on its own page. */
-  private async zinesOpen(zineId: string): Promise<void> {
+  /** Open a story on its own page. The lane decides which reader paints it. */
+  private async zinesOpen(id: string, source: StorySource): Promise<void> {
     if (this.zinesEditing) this.zinesDiscardDraft();
     // Opening a story leaves the front page, so remember where it was: the
     // reader coming back should land where they were reading, not at the top.
     const front = this.root.querySelector<HTMLElement>(".zines-page");
     if (front && !this.zinesOpenId) this.pendingZinesScroll = front.scrollTop;
-    this.zinesOpenId = zineId;
+    this.zinesOpenId = id;
+    this.zinesOpenSource = source;
     this.zinesDetail = null;
     this.zinesDetailError = null;
+    this.neighborhoodsDetail = null;
+    this.neighborhoodsDetailError = null;
     // A comment belongs to the story it was typed on, so opening another story
     // starts a fresh box rather than carrying the text across.
     this.zinesCommentHost = null;
     this.zinesCommentDraft = "";
     this.zinesCommentError = null;
     this.zinesCommentBusyHash = null;
+    // The public box is a different box on a different page, so it is reset with
+    // the story too — including the comment it was answering.
+    this.postCommentHost = null;
+    this.postCommentDraft = "";
+    this.postCommentError = null;
+    this.postCommentParent = null;
     this.render();
     try {
-      const detail = await api.zinesGet(zineId);
-      // The selection can move while the request is in flight; a late reply
-      // must not paint over whatever the user is looking at now.
-      if (this.zinesOpenId !== zineId) return;
-      this.zinesDetail = detail;
+      // A late reply must not paint over whatever the user is looking at now, so
+      // every path below re-checks the selection before it stores anything.
+      if (source === "post") {
+        // The identity is read alongside the article because the composer has to
+        // be able to say whether commenting is possible before the reader writes
+        // anything. It is one vault read, once per session.
+        void this.publicIdentityLoad();
+        const detail = await api.neighborhoodArticle(id);
+        if (this.zinesOpenId !== id) return;
+        this.neighborhoodsDetail = detail;
+      } else {
+        const detail = await api.zinesGet(id);
+        if (this.zinesOpenId !== id) return;
+        this.zinesDetail = detail;
+      }
     } catch (e) {
-      if (this.zinesOpenId !== zineId) return;
-      this.zinesDetailError =
-        e instanceof AppError ? e.message : "Couldn't open that zine.";
+      if (this.zinesOpenId !== id) return;
+      const message =
+        e instanceof AppError
+          ? e.message
+          : source === "post"
+            ? "Couldn't open that post."
+            : "Couldn't open that zine.";
+      if (source === "post") this.neighborhoodsDetailError = message;
+      else this.zinesDetailError = message;
     }
-    if (this.rail === "zines" && this.zinesOpenId === zineId) this.render();
+    if (this.rail === "zines" && this.zinesOpenId === id) this.render();
   }
 
   /**
@@ -5246,7 +5481,7 @@ export class App {
       const publishedId = view?.zine_id ?? revising ?? null;
       this.zinesDiscardDraft();
       if (publishedId) {
-        void this.zinesOpen(publishedId);
+        void this.zinesOpen(publishedId, "zine");
       } else if (this.rail === "zines") {
         this.render();
       }
@@ -5568,6 +5803,33 @@ export class App {
         this.zinesSetView(this.zinesMineOnly, on),
       ),
     );
+
+    // The lane's own switch, below a rule: it is not a view control like the two
+    // above but the opt-in that lets this page read a public network.
+    const publicPosts = document.createElement("div");
+    publicPosts.className = "zines-public";
+    publicPosts.appendChild(
+      this.zinesToggle("Public posts", this.neighborhoodsShown, (on) =>
+        void this.zinesSetPublicPosts(on),
+      ),
+    );
+    if (this.neighborhoodsShown) {
+      const note = document.createElement("p");
+      note.className = "zines-public-note text-12 muted";
+      note.textContent =
+        this.neighborhoodsError ??
+        "Read over Tor from your neighborhood relays. Public, permanent, and not yours to remove.";
+      publicPosts.appendChild(note);
+      const refresh = document.createElement("button");
+      refresh.type = "button";
+      refresh.className = "btn-secondary text-13 pressable zines-public-refresh";
+      refresh.textContent = this.neighborhoodsLoading ? "Reading…" : "Refresh";
+      refresh.disabled = this.neighborhoodsLoading;
+      refresh.onclick = () => void this.neighborhoodsRefresh();
+      publicPosts.appendChild(refresh);
+    }
+    controls.appendChild(publicPosts);
+
     col.appendChild(controls);
     return col;
   }
@@ -5654,11 +5916,14 @@ export class App {
       empty.className = "zines-note muted text-13";
       empty.textContent = this.zinesEmptyNote();
       page.appendChild(empty);
+      const offer = this.renderZinesOfferPublic();
+      if (offer) page.appendChild(offer);
       return page;
     }
 
-    // The lead is the newest story the reader has not muted; the rest of the
-    // page is everything else, in the same newest-first order.
+    // The lead is a private zine whenever one is visible, and the newest unmuted
+    // story within that lane; the rest of the page is everything else, newest
+    // first. A public post leads only on a page with no private zine at all.
     const lead = leadOf(stories);
     if (!lead) return page; // Unreachable: an empty corpus returned above.
     const rest = stories.filter((z) => z !== lead);
@@ -5682,7 +5947,30 @@ export class App {
     if (this.zinesPen) return `Nothing here is signed by ${this.zinesPen}.`;
     if (this.zinesSection) return `Nothing in ${this.zinesSection} yet.`;
     if (this.zinesMineOnly) return "You haven't published anything yet.";
+    if (this.neighborhoodsShown && !(this.neighborhoodsView?.articles.length ?? 0)) {
+      return "Nothing here yet, and nothing has been read from neighborhoods. Press Refresh to look.";
+    }
     return "Nothing here yet. Write the first one, or wait for one to arrive.";
+  }
+
+  /**
+   * The way to turn public posts on, offered where the page is emptiest.
+   *
+   * A corpus of one or two zines is the state this page starts in, and a switch
+   * buried in the pane is not an answer to "there is nothing here". Offered only
+   * when there is something behind it and the switch is off, so it never invites
+   * a pull that would come back empty.
+   */
+  private renderZinesOfferPublic(): HTMLElement | null {
+    if (this.neighborhoodsShown) return null;
+    const held = this.neighborhoodsView?.articles.length ?? 0;
+    if (!held) return null;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-secondary pressable zines-offer-public";
+    btn.textContent = `Show ${held} public post${held === 1 ? "" : "s"} from neighborhoods`;
+    btn.onclick = () => void this.zinesSetPublicPosts(true);
+    return btn;
   }
 
   /**
@@ -5789,7 +6077,7 @@ export class App {
   }
 
   /** Everything under the lead, filed by section, with the unsectioned last. */
-  private renderZinesGroups(stories: ZineSummaryDto[]): HTMLElement {
+  private renderZinesGroups(stories: FrontPageStory[]): HTMLElement {
     const wrap = document.createElement("div");
     wrap.className = "zines-groups";
     const order = this.zinesSections().map((s) => s.name);
@@ -5806,10 +6094,10 @@ export class App {
   }
 
   /** A run of stories as cards. */
-  private renderZinesGrid(stories: ZineSummaryDto[]): HTMLElement {
+  private renderZinesGrid(stories: FrontPageStory[]): HTMLElement {
     const grid = document.createElement("div");
     grid.className = "zines-grid";
-    for (const z of stories) grid.appendChild(this.renderZineCard(z, false));
+    for (const story of stories) grid.appendChild(this.renderZineCard(story, false));
     return grid;
   }
 
@@ -5818,23 +6106,40 @@ export class App {
    *
    * The lead is the same content in a bigger treatment rather than a different
    * shape, so there is one place that decides what a story says about itself:
-   * its section, whether it is yours, its headline, a taste of the body, and
-   * the byline line.
+   * which lane it came from, its section, whether it is yours, its headline, a
+   * taste of the body, and the byline line.
+   *
+   * The lane shows up in exactly two ways. A public post carries the badge, in
+   * the kicker where a reader sees it before the headline, because it is the one
+   * thing on this card that says the story left the membership. And the meta line
+   * is the lane's own facts: a zine has revisions and a comment count, a post has
+   * a reading time and the date its author published it.
    */
-  private renderZineCard(z: ZineSummaryDto, lead: boolean): HTMLElement {
+  private renderZineCard(story: FrontPageStory, lead: boolean): HTMLElement {
+    const zine = story.zine;
+    const badge = badgeOf(story);
     const card = document.createElement("article");
-    card.className = `zine-card pressable${lead ? " lead" : ""}${z.muted ? " muted-card" : ""}`;
+    // The lane is stated by the badge in the kicker, not by the card's own
+    // class: styling may reinforce it, but a reader must never have to infer the
+    // lane from how an item looks.
+    card.className = `zine-card pressable${lead ? " lead" : ""}${story.muted ? " muted-card" : ""}`;
 
-    if (z.sections.length || z.authored) {
+    if (badge || story.sections.length || zine?.authored) {
       const kicker = document.createElement("div");
       kicker.className = "zine-card-kicker";
-      if (z.sections.length) {
+      if (badge) {
+        const mark = document.createElement("span");
+        mark.className = "zine-card-public";
+        mark.textContent = badge;
+        kicker.appendChild(mark);
+      }
+      if (story.sections.length) {
         const section = document.createElement("span");
         section.className = "zine-card-section";
-        section.textContent = z.sections[0];
+        section.textContent = story.sections[0];
         kicker.appendChild(section);
       }
-      if (z.authored) {
+      if (zine?.authored) {
         const mine = document.createElement("span");
         mine.className = "zine-card-mine";
         mine.textContent = "Yours";
@@ -5846,15 +6151,18 @@ export class App {
     const title = document.createElement("button");
     title.type = "button";
     title.className = "zine-card-title";
-    title.textContent = z.title || "Untitled";
-    title.onclick = () => void this.zinesOpen(z.zine_id);
+    title.textContent = story.title || "Untitled";
+    title.onclick = () => void this.zinesOpen(story.id, story.source);
     card.appendChild(title);
 
-    if (z.preview) {
-      const preview = document.createElement("p");
-      preview.className = "zine-card-preview";
-      preview.textContent = z.preview;
-      card.appendChild(preview);
+    // A zine's taste of the body is its own; a post's is the summary its author
+    // wrote, which may be absent. Neither is ever the body itself.
+    const preview = zine?.preview || story.post?.summary || "";
+    if (preview) {
+      const p = document.createElement("p");
+      p.className = "zine-card-preview";
+      p.textContent = preview;
+      card.appendChild(p);
     }
 
     const meta = document.createElement("div");
@@ -5862,29 +6170,34 @@ export class App {
     // The byline is a control, not text: it is the only place a reader can learn
     // a name they did not already know, so clicking it is how the page narrows
     // to that byline. A story with no byline yet has nothing to click.
-    if (z.pen_name) {
+    if (story.byline) {
       const byline = document.createElement("button");
       byline.type = "button";
       byline.className = "zine-byline pressable";
-      byline.textContent = z.pen_name;
-      byline.title = `Everything signed by ${z.pen_name}`;
-      byline.onclick = () => this.zinesFilterByByline(z.pen_name);
+      byline.textContent = story.byline;
+      byline.title = `Everything signed by ${story.byline}`;
+      byline.onclick = () => this.zinesFilterByByline(story.byline);
       meta.appendChild(byline);
     }
     const bits: string[] = [];
     // A story whose blob has not been opened has no byline to click, but the
     // line still has to say so rather than start with a separator.
-    if (!z.pen_name) bits.push(bylineOf(z));
-    if (z.revision > 1) bits.push(`rev ${z.revision}`);
-    if (z.comments) {
-      bits.push(`${z.comments} comment${z.comments === 1 ? "" : "s"}`);
+    if (story.source === "zine" && !story.byline) bits.push(bylineOf(story));
+    if (zine) {
+      if (zine.revision > 1) bits.push(`rev ${zine.revision}`);
+      if (zine.comments) {
+        bits.push(`${zine.comments} comment${zine.comments === 1 ? "" : "s"}`);
+      }
+      if (zine.pending) {
+        bits.push(`${zine.pending} waiting for you`);
+      }
+      bits.push(readsTimeAgo(Math.floor(zine.updated_ms / 1000)));
+      if (zine.muted) bits.push("muted");
+      if (zine.unreadable) bits.push("unreadable");
+    } else if (story.post) {
+      bits.push(`${story.post.reading_minutes} min read`);
+      bits.push(readsTimeAgo(story.post.created_at));
     }
-    if (z.pending) {
-      bits.push(`${z.pending} waiting for you`);
-    }
-    bits.push(readsTimeAgo(Math.floor(z.updated_ms / 1000)));
-    if (z.muted) bits.push("muted");
-    if (z.unreadable) bits.push("unreadable");
     if (bits.length) {
       const rest = document.createElement("span");
       rest.className = "zine-card-meta-rest";
@@ -5912,6 +6225,27 @@ export class App {
     back.onclick = () => this.zinesBackToFront();
     reader.appendChild(back);
 
+    // The frame — the way back, the page it sits on — is shared. The article is
+    // not: a public post and a private zine are different things to be reading,
+    // and this page says which one it is rather than dressing one as the other.
+    if (this.zinesOpenSource === "post") {
+      if (this.neighborhoodsDetailError) {
+        const err = document.createElement("p");
+        err.className = "zines-note muted text-13";
+        err.textContent = this.neighborhoodsDetailError;
+        reader.appendChild(err);
+      } else if (this.neighborhoodsDetail?.address === id) {
+        reader.appendChild(this.renderNeighborhoodArticle(this.neighborhoodsDetail));
+      } else {
+        const loading = document.createElement("p");
+        loading.className = "zines-note muted text-13";
+        loading.textContent = "Opening…";
+        reader.appendChild(loading);
+      }
+      page.appendChild(reader);
+      return page;
+    }
+
     if (this.zinesDetailError) {
       const err = document.createElement("p");
       err.className = "zines-note muted text-13";
@@ -5934,15 +6268,393 @@ export class App {
     return page;
   }
 
+  /**
+   * A public post on its own page.
+   *
+   * The badge and the honest copy are the point of this page. A reader arrives
+   * from a page of members' zines, so the layout is familiar — and the one thing
+   * a familiar layout must not imply is that the story in it is private. So the
+   * page says, before the body: this left the membership, it is on a public
+   * network, and it cannot be taken back.
+   *
+   * Replies are read-only here. Commenting publicly is a separate act with its
+   * own phase, and a composer that looked like the zine one would suggest this
+   * page writes to the same place. It does not.
+   */
+  private renderNeighborhoodArticle(post: NeighborhoodArticleDto): HTMLElement {
+    const article = document.createElement("article");
+    article.className = "zine-article";
+
+    const head = document.createElement("header");
+    head.className = "zine-article-head";
+    const badge = document.createElement("span");
+    badge.className = "zine-card-public";
+    badge.textContent = PUBLIC_POST_BADGE;
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.textContent = post.title || "Untitled";
+
+    const byline = document.createElement("p");
+    byline.className = "zine-article-byline text-13 muted";
+    const name = publicByline(post.pubkey);
+    if (name) {
+      const who = document.createElement("button");
+      who.type = "button";
+      who.className = "zine-byline pressable";
+      who.textContent = name;
+      who.title = `Everything signed by ${name}`;
+      who.onclick = () => this.zinesFilterByByline(name);
+      byline.appendChild(who);
+    }
+    const rest = document.createElement("span");
+    rest.className = "zine-article-byline-rest";
+    rest.textContent = ` · ${[`${post.reading_minutes} min read`, readsTimeAgo(post.created_at)].join(" · ")}`;
+    byline.appendChild(rest);
+    head.append(badge, h, byline);
+
+    if (post.sections.length) {
+      const tags = document.createElement("div");
+      tags.className = "zine-article-tags";
+      for (const s of post.sections) {
+        const tag = document.createElement("button");
+        tag.type = "button";
+        tag.className = "zine-tag pressable";
+        tag.textContent = s;
+        tag.onclick = () => {
+          this.zinesSection = s;
+          this.zinesOpenId = null;
+          this.zinesOpenSource = null;
+          this.neighborhoodsDetail = null;
+          // Landing on the front page under a new filter: it starts at the
+          // masthead, not where this reader left the unfiltered page.
+          this.pendingZinesScroll = null;
+          this.render();
+        };
+        tags.appendChild(tag);
+      }
+      head.appendChild(tags);
+    }
+    article.appendChild(head);
+
+    const copy = document.createElement("p");
+    copy.className = "zines-public-copy text-13";
+    copy.textContent =
+      "Public. This was published to the Nostr network, so it is permanent, it is not removable, and it is not part of the membership. Reading it here reads this vault's own copy: the daemon fetched it over Tor, and opening it makes no request.";
+    article.appendChild(copy);
+
+    const body = document.createElement("div");
+    body.className = "zine-article-body";
+    // Markdown written by a stranger, so it is rendered by a renderer that
+    // escapes before it does anything else, then put through the same sanitizer
+    // every other body in this app goes through. A link that survives both is
+    // still not navigable: `guardLinks` intercepts the click.
+    body.innerHTML = sanitizeHtml(markdownToHtml(post.content));
+    article.appendChild(body);
+    this.guardLinks(body);
+
+    article.appendChild(this.renderPostReplies(post.replies));
+    article.appendChild(this.renderPostComposer());
+    return article;
+  }
+
+  /**
+   * The public thread under an article, read-only.
+   *
+   * Read-only is the honest description: a public comment is on a public network,
+   * and the only thing this page can do about one is stop showing it locally. The
+   * copy says so rather than offering a control that would not mean anything. And
+   * it is not the sealed thread a private zine keeps — different store, different
+   * key, different people able to read it — so the two are drawn as different
+   * things and never merged.
+   */
+  private renderPostReplies(replies: NeighborhoodCommentDto[]): HTMLElement {
+    const section = document.createElement("section");
+    section.className = "post-comments";
+    const h = document.createElement("h2");
+    h.className = "text-17";
+    h.textContent = replies.length ? `Replies (${replies.length})` : "Replies";
+    section.appendChild(h);
+
+    if (!replies.length) {
+      const none = document.createElement("p");
+      none.className = "zines-note muted text-13";
+      none.textContent =
+        "No replies are held. This vault reads the replies to the articles it published, over Tor, when Public posts is refreshed.";
+      section.appendChild(none);
+      return section;
+    }
+
+    // The tree is built from the flat cache, then flattened back for drawing:
+    // one row per comment, indented by the depth the tree gave it.
+    for (const node of flattenThread(publicThread(replies))) {
+      section.appendChild(this.renderPostComment(node));
+    }
+    return section;
+  }
+
+  private renderPostComment(node: PublicCommentNode): HTMLElement {
+    const { comment, depth } = node;
+    const row = document.createElement("div");
+    row.className = "post-comment";
+    // The indent is the depth, not a nesting of elements: a thread of strangers'
+    // words is not the place to find out what a deeply nested container does.
+    row.style.setProperty("--post-depth", String(depth));
+
+    const meta = document.createElement("div");
+    meta.className = "post-comment-meta text-12 muted";
+    const mine = this.publicIdentity?.pubkey === comment.pubkey;
+    meta.textContent = `${mine ? "you" : publicByline(comment.pubkey)} · ${readsTimeAgo(comment.created_at)}`;
+    const text = document.createElement("div");
+    text.className = "post-comment-body text-13";
+    // Plaintext, by the spec, and rendered as text: a comment is not Markdown,
+    // and a stranger's text is not markup here.
+    text.textContent = comment.content;
+    row.append(meta, text);
+
+    const answering = this.postCommentParent === comment.event_id;
+    const reply = document.createElement("button");
+    reply.type = "button";
+    reply.className = "post-comment-reply pressable text-12";
+    reply.textContent = answering ? "Cancel reply" : "Reply";
+    reply.onclick = () => {
+      this.postCommentParent = answering ? null : comment.event_id;
+      this.postCommentError = null;
+      this.render();
+    };
+    row.appendChild(reply);
+    return row;
+  }
+
+  /**
+   * The way to comment on a public article.
+   *
+   * The composer is gated on the public identity, because a comment cannot leave
+   * without one: the key is what signs it. Rather than let the reader write and
+   * then fail, the box is replaced by the state — "checking", "you have none, here
+   * is how to get one", or the box itself.
+   */
+  private renderPostComposer(): HTMLElement {
+    const box = document.createElement("section");
+    box.className = "post-composer";
+    const h = document.createElement("h2");
+    h.className = "text-17";
+    h.textContent = this.postCommentParent ? "Reply publicly" : "Comment publicly";
+    box.appendChild(h);
+
+    const note = document.createElement("p");
+    note.className = "zines-note muted text-12";
+    note.textContent = this.postCommentParent
+      ? "Signed by your public identity, in the same thread as the article. Permanent, and linkable to that identity."
+      : "Signed by your public identity — not your pen name — and posted to the public relays over Tor. Permanent and not removable. This is not the sealed thread a private zine keeps.";
+    box.appendChild(note);
+
+    if (this.publicIdentityBusy && !this.publicIdentityRead) {
+      box.appendChild(this.postNote("Checking your public identity…"));
+      return box;
+    }
+    if (this.publicIdentityError) {
+      box.appendChild(this.postNote(this.publicIdentityError, "zine-error"));
+      box.appendChild(this.postIdentityButton("Try again", () => void this.publicIdentityLoad()));
+      return box;
+    }
+    if (!this.publicIdentityRead) {
+      box.appendChild(this.postNote("Checking your public identity…"));
+      return box;
+    }
+    if (!this.publicIdentity) {
+      box.appendChild(
+        this.postNote(
+          "This vault has no public identity yet. Commenting and publishing both sign under one, kept separate from your pen name and your account.",
+        ),
+      );
+      box.appendChild(
+        this.postIdentityButton(
+          this.publicIdentityBusy ? "Creating…" : "Create a public identity",
+          () => void this.publicIdentityMint(),
+        ),
+      );
+      return box;
+    }
+
+    if (this.postCommentParent) {
+      const who = document.createElement("p");
+      who.className = "post-reply-to text-12 muted";
+      who.textContent = `Replying to ${this.postCommentParent.slice(0, 8)}…`;
+      box.appendChild(who);
+    }
+
+    // The host is built once per open post and re-parented, the same doctrine as
+    // the sealed comment box: a poll repaints the page under the reader.
+    if (!this.postCommentHost) {
+      const host = document.createElement("textarea");
+      host.className = "post-composer-input";
+      host.rows = 3;
+      host.maxLength = 2000;
+      host.placeholder = "Say something worth reading.";
+      host.value = this.postCommentDraft;
+      host.oninput = () => {
+        this.postCommentDraft = host.value;
+      };
+      this.postCommentHost = host;
+    }
+    box.appendChild(this.postCommentHost);
+
+    if (this.postCommentError) {
+      box.appendChild(this.postNote(this.postCommentError, "zine-error"));
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "post-composer-actions";
+    const post = document.createElement("button");
+    post.type = "button";
+    post.className = "btn-primary pressable";
+    post.textContent = this.postCommentBusy ? "Posting…" : "Post comment";
+    post.disabled = this.postCommentBusy;
+    post.onclick = () => void this.postCommentPublish();
+    actions.appendChild(post);
+    if (this.postCommentParent) {
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "btn-secondary pressable";
+      cancel.textContent = "Cancel";
+      cancel.onclick = () => {
+        this.postCommentParent = null;
+        this.postCommentError = null;
+        this.render();
+      };
+      actions.appendChild(cancel);
+    }
+    box.appendChild(actions);
+    return box;
+  }
+
+  private postNote(text: string, extra = ""): HTMLElement {
+    const p = document.createElement("p");
+    p.className = `zines-note text-13${extra ? ` ${extra}` : ""}`;
+    p.textContent = text;
+    return p;
+  }
+
+  private postIdentityButton(label: string, onclick: () => void): HTMLElement {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-secondary pressable post-identity";
+    btn.textContent = label;
+    btn.disabled = this.publicIdentityBusy;
+    btn.onclick = onclick;
+    return btn;
+  }
+
   /** Back to the front page, where the reader left it. */
   private zinesBackToFront(): void {
     this.zinesOpenId = null;
+    this.zinesOpenSource = null;
     this.zinesDetail = null;
     this.zinesDetailError = null;
+    this.neighborhoodsDetail = null;
+    this.neighborhoodsDetailError = null;
     this.zinesCommentHost = null;
     this.zinesCommentDraft = "";
     this.zinesCommentError = null;
+    this.postCommentHost = null;
+    this.postCommentDraft = "";
+    this.postCommentError = null;
+    this.postCommentParent = null;
     this.render();
+  }
+
+  /**
+   * Read the public identity, once.
+   *
+   * A read never mints one: the identity is key material, and a page that minted
+   * it on open would put a member's words under a key nobody chose. `null` is a
+   * real answer — "this vault has none" — and the composer answers it.
+   */
+  private async publicIdentityLoad(): Promise<void> {
+    if (this.publicIdentityRead || this.publicIdentityBusy) return;
+    this.publicIdentityBusy = true;
+    this.render();
+    try {
+      this.publicIdentity = await api.publicIdentity();
+      this.publicIdentityRead = true;
+      this.publicIdentityError = null;
+    } catch (e) {
+      this.publicIdentityError =
+        e instanceof AppError ? e.message : "Couldn't read your public identity.";
+    }
+    this.publicIdentityBusy = false;
+    this.render();
+  }
+
+  /**
+   * Mint the public identity.
+   *
+   * Offered where it is needed rather than buried in settings, because the state
+   * it unblocks is the one the reader is in: a comment cannot be posted without
+   * one, and telling them so without offering the way out is a dead end.
+   */
+  private async publicIdentityMint(): Promise<void> {
+    if (this.publicIdentityBusy) return;
+    this.publicIdentityBusy = true;
+    this.publicIdentityError = null;
+    this.render();
+    try {
+      this.publicIdentity = await api.createPublicIdentity();
+      this.publicIdentityRead = true;
+      showToast("Public identity created.", { kind: "success" });
+    } catch (e) {
+      this.publicIdentityError =
+        e instanceof AppError ? e.message : "Couldn't create a public identity.";
+    }
+    this.publicIdentityBusy = false;
+    this.render();
+  }
+
+  /**
+   * Post the public comment being written on the open post.
+   *
+   * The daemon answers with the whole thread rather than the one comment, so the
+   * page shows the comment where it belongs instead of splicing it in and hoping
+   * it matches what a relay will serve later. The draft is kept when nothing took
+   * it: unlike an export there is no address to retry, so the words are the only
+   * thing that would be lost.
+   */
+  private async postCommentPublish(): Promise<void> {
+    const address = this.zinesOpenId;
+    if (!address || this.postCommentBusy) return;
+    const body = this.postCommentDraft.trim();
+    if (!body) {
+      this.postCommentError = "An empty comment is not worth posting.";
+      this.render();
+      return;
+    }
+    this.postCommentBusy = true;
+    this.postCommentError = null;
+    this.render();
+    try {
+      const out = await api.neighborhoodComment(
+        address,
+        body,
+        this.postCommentParent ?? undefined,
+      );
+      if (this.zinesOpenId !== address) return;
+      if (!out) throw new Error("The daemon sent no answer.");
+      if (out.published) {
+        if (this.neighborhoodsDetail) this.neighborhoodsDetail.replies = out.replies;
+        this.postCommentDraft = "";
+        this.postCommentParent = null;
+        if (this.postCommentHost) this.postCommentHost.value = "";
+        showToast("Comment posted to the neighborhoods.", { kind: "success" });
+      } else {
+        this.postCommentError =
+          out.publish_error || "No relay took that comment. Nothing was published.";
+      }
+    } catch (e) {
+      this.postCommentError =
+        e instanceof AppError ? e.message : "Couldn't post that comment.";
+    }
+    this.postCommentBusy = false;
+    if (this.zinesOpenId === address) this.render();
   }
 
   private renderZineArticle(detail: ZineViewDto): HTMLElement {
@@ -6018,6 +6730,23 @@ export class App {
         );
       actions.appendChild(revise);
     }
+    // The one-way door, offered only on a post this vault wrote: a held zine is
+    // someone else's, and publishing it would sign their words under this
+    // vault's public identity. It is a separate act from revising, because
+    // publishing to a public network is not the same decision as editing.
+    if (authored && !unreadable) {
+      const publish = document.createElement("button");
+      publish.type = "button";
+      publish.className = "btn-secondary pressable zine-export";
+      publish.textContent = detail.zine.export
+        ? "Update public article"
+        : "Export to neighborhoods";
+      publish.title = detail.zine.export
+        ? "Replace the public article with this revision. Same address, so readers and comments follow."
+        : "Publish this article to the neighborhoods as a public post. Your thread, your history and your pen name stay in the vault.";
+      publish.onclick = () => this.zinesExportOpen(descriptor.zine_id);
+      actions.appendChild(publish);
+    }
     if (authored) {
       const rename = document.createElement("button");
       rename.type = "button";
@@ -6073,6 +6802,15 @@ export class App {
       actions.appendChild(forget);
     }
     article.appendChild(actions);
+
+    // What the public knows, when anything does. The address is shown in full
+    // because it is the handle a reader needs — it is what a comment references
+    // and what someone can look the article up by — and because an author who
+    // has published to a public network should be able to see exactly what they
+    // published under.
+    if (authored && detail.zine.export) {
+      article.appendChild(this.renderZinePublicStatus(detail.zine.export));
+    }
 
     if (unreadable) {
       const held = document.createElement("p");
@@ -6431,6 +7169,257 @@ export class App {
         this.zinesPenNameError = null;
         this.render();
       }
+    };
+    return back;
+  }
+
+  /**
+   * The line that says the article is public, and where.
+   *
+   * An export is the one act in Zines that leaves the membership, so the state
+   * it leaves behind is stated plainly and permanently: the address, when it
+   * first went public, and a way to copy the handle. A badge that only said
+   * "published" would leave the author unable to find, or cite, what they
+   * published.
+   */
+  private renderZinePublicStatus(exported: ZineExportDto): HTMLElement {
+    const address = zineExportAddress(exported);
+    const row = document.createElement("p");
+    row.className = "zines-note zine-public-status text-13";
+    const label = document.createElement("span");
+    label.textContent = exported.published_ms
+      ? `Public since ${readsTimeAgo(Math.floor(exported.published_at))} at `
+      : "Public at ";
+    const code = document.createElement("code");
+    code.className = "zine-public-address";
+    code.textContent = address;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "btn-secondary pressable zine-copy-address";
+    copy.textContent = "Copy address";
+    copy.title =
+      "Copy the address a public comment references: 30023:pubkey:d. It stays the same across edits.";
+    copy.onclick = () => {
+      void navigator.clipboard.writeText(address);
+      showToast("Article address copied.", { kind: "success" });
+    };
+    row.append(label, code, copy);
+    return row;
+  }
+
+  /** Open the export confirmation for one zine. */
+  private zinesExportOpen(zineId: string): void {
+    this.zinesExportId = zineId;
+    this.zinesExportResult = null;
+    this.zinesExportError = null;
+    this.render();
+  }
+
+  private zinesExportClose(): void {
+    this.zinesExportId = null;
+    this.zinesExportResult = null;
+    this.zinesExportError = null;
+    this.render();
+  }
+
+  /**
+   * Publish the open zine to the neighborhoods.
+   *
+   * The article is durable before the relay is asked: a `published: false`
+   * answer still leaves the address recorded and the same article on the next
+   * attempt, which is what makes a retry safe. So a refusal is shown as a
+   * status with the address, not as a failed export.
+   */
+  private async zinesExport(): Promise<void> {
+    const zineId = this.zinesExportId;
+    if (!zineId || this.zinesExportBusy) return;
+    this.zinesExportBusy = true;
+    this.zinesExportError = null;
+    this.render();
+    try {
+      const out = await api.zinesExport(zineId);
+      if (this.zinesExportId !== zineId) return;
+      // An empty body would mean the route answered with nothing, which the
+      // daemon never does; treating it as a failure is better than painting an
+      // address out of undefined.
+      if (!out) throw new Error("The daemon returned no export.");
+      this.zinesExportResult = out;
+      // The index carries the export too, so a re-render of the front page
+      // shows the badge without a second round trip.
+      if (this.zinesView) {
+        this.zinesView = {
+          ...this.zinesView,
+          zines: this.zinesView.zines.map((z) =>
+            z.zine_id === zineId ? { ...z, export: out.zine.export } : z,
+          ),
+        };
+      }
+      if (this.zinesOpenId === zineId) this.zinesDetail = { zine: out.zine };
+    } catch (e) {
+      if (this.zinesExportId !== zineId) return;
+      this.zinesExportError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.zinesExportBusy = false;
+      this.render();
+    }
+  }
+
+  /**
+   * The export dialog: what leaves the vault, and then where it went.
+   *
+   * The confirmation is the point of it. An export is the one-way door in
+   * Zines, and the honest version of "this cannot be undone" is a list of what
+   * is being published — the title, the sections and the body — beside what is
+   * not: the thread, the revision history, the read key and the pen name. The
+   * author should not have to infer that from a button label.
+   */
+  private renderZinesExportModal(): HTMLElement {
+    const zineId = this.zinesExportId!;
+    const row = this.zinesView?.zines.find((z) => z.zine_id === zineId);
+    const title = row?.title || "This zine";
+    const already = row?.export ?? null;
+
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal zine-export-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Export this zine to the neighborhoods");
+
+    const result = this.zinesExportResult;
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = result
+      ? result.published
+        ? "Published to the neighborhoods"
+        : "The article is ready, but no relay took it"
+      : already
+        ? "Update the public article?"
+        : "Export to the neighborhoods?";
+    modal.appendChild(h);
+
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-2)";
+    if (result) {
+      p.textContent = result.published
+        ? `${title} is public at the address below. Anyone can read it, and it stays at this address when you edit it.`
+        : `${title} is recorded at the address below, and nothing left this machine. Exporting again publishes the same article rather than a second one.`;
+    } else {
+      p.textContent = already
+        ? `${title} is already public. This replaces that article with the current revision — same address, so anyone reading it, and any comment on it, still finds it.`
+        : `${title} is published as a public article: its title, its sections and its body. Anyone can read it, and it cannot be recalled.`;
+    }
+    modal.appendChild(p);
+
+    if (!result) {
+      // The list is the confirmation. Each line is a thing that leaves, or a
+      // thing that does not, stated rather than implied.
+      const leaves = document.createElement("ul");
+      leaves.className = "zine-export-list text-13";
+      const lines: Array<[boolean, string]> = [
+        [true, "The title and the section tags"],
+        [true, "The body, converted to Markdown"],
+        [false, "Your comment thread"],
+        [false, "Your revision history"],
+        [false, "Your pen name and your read key"],
+      ];
+      for (const [goes, text] of lines) {
+        const li = document.createElement("li");
+        li.className = goes ? "zine-export-goes" : "zine-export-stays";
+        li.textContent = text;
+        leaves.appendChild(li);
+      }
+      modal.appendChild(leaves);
+      const note = document.createElement("p");
+      note.className = "muted text-13";
+      note.style.marginTop = "var(--space-2)";
+      note.textContent =
+        "Published over Tor, under your public identity — not your pen name and not your account. The relay stores the article; the vault keeps the link between the two.";
+      modal.appendChild(note);
+    }
+
+    if (result) {
+      const box = document.createElement("div");
+      box.className = "zine-export-result";
+      const label = document.createElement("span");
+      label.className = "text-13 muted";
+      label.textContent = "Address";
+      const code = document.createElement("code");
+      code.className = "zine-public-address";
+      code.textContent = result.address;
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "btn-secondary pressable";
+      copy.textContent = "Copy";
+      copy.onclick = () => {
+        void navigator.clipboard.writeText(result.address);
+        showToast("Article address copied.", { kind: "success" });
+      };
+      box.append(label, code, copy);
+      modal.appendChild(box);
+
+      const handle = document.createElement("p");
+      handle.className = "muted text-13";
+      handle.style.marginTop = "var(--space-2)";
+      handle.textContent = `Shareable handle: ${result.naddr}`;
+      modal.appendChild(handle);
+
+      if (!result.published && result.publish_error) {
+        const err = document.createElement("p");
+        err.className = "zines-note zine-error text-13";
+        err.textContent = result.publish_error;
+        modal.appendChild(err);
+      }
+    }
+
+    if (this.zinesExportError) {
+      const err = document.createElement("p");
+      err.className = "zines-note zine-error text-13";
+      err.textContent = this.zinesExportError;
+      modal.appendChild(err);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    if (result) {
+      const done = document.createElement("button");
+      done.type = "button";
+      done.className = "btn-primary pressable";
+      done.textContent = "Done";
+      done.onclick = () => this.zinesExportClose();
+      actions.appendChild(done);
+      // A refused publish is worth another try: the address is fixed, so a
+      // second attempt publishes the same article rather than a second one.
+      if (!result.published) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "btn-secondary pressable";
+        retry.textContent = "Try again";
+        retry.disabled = this.zinesExportBusy;
+        retry.onclick = () => void this.zinesExport();
+        actions.appendChild(retry);
+      }
+    } else {
+      const confirm = document.createElement("button");
+      confirm.type = "button";
+      confirm.className = "btn-primary pressable zine-export-confirm";
+      confirm.textContent = already ? "Update article" : "Publish article";
+      confirm.disabled = this.zinesExportBusy;
+      confirm.onclick = () => void this.zinesExport();
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "btn-secondary pressable";
+      cancel.textContent = "Cancel";
+      cancel.onclick = () => this.zinesExportClose();
+      actions.append(confirm, cancel);
+    }
+    modal.appendChild(actions);
+
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back && !this.zinesExportBusy) this.zinesExportClose();
     };
     return back;
   }

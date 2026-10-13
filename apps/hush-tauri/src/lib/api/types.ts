@@ -616,11 +616,13 @@ export interface ZineSummaryDto {
   muted: boolean;
   /** Held but not yet openable — a blob arrived before its key did. */
   unreadable: boolean;
+  /** This post's public life, once it has one. Absent until the first export,
+   *  so a row can say "not published" rather than guessing. */
+  export: ZineExportDto | null;
 }
 
 /** One comment the author has merged into the thread. */
-export interface ZineCommentDto {
-  hash: string;
+export interface ZineCommentDto {  hash: string;
   /** Whatever the commenter signed with. This vault records what was claimed
    *  and leaves the judgement to the reader. */
   author: string;
@@ -670,6 +672,28 @@ export interface ZineDescriptorDto {
   comments: ZineCommentDto[];
 }
 
+/** One zine's public life on the Nostr network, once it has one.
+ *
+ *  Absent until the first export. Local only: the `d` links this private post to
+ *  a public article, so it never travels inside the sealed blob. */
+export interface ZineExportDto {
+  /** The NIP-23 `d` tag: the addressable id within the author's namespace.
+   *  Minted on the first export and stable forever, because NIP-23 is editable
+   *  by address and a new `d` would publish a second article instead of
+   *  updating the first. Deliberately not the `zine_id`. */
+  d: string;
+  /** The public key the article is signed by, hex. Already public — it is in
+   *  every event that went out — and held here so the `30023:pubkey:d` address
+   *  can be shown without fetching the identity. */
+  pubkey: string;
+  /** When the article first went public, unix seconds. Set once. */
+  published_at: number;
+  /** The id of the event this vault published last, hex. */
+  last_event_id: string;
+  /** When this vault last published, unix milliseconds. Local fact. */
+  published_ms: number;
+}
+
 /** One zine in this vault: the head, its history, and the local facts about
  *  holding it. */
 export interface ZineFileDto {
@@ -682,6 +706,8 @@ export interface ZineFileDto {
   /** Pulled comments waiting for this vault's decision. Author-side only. */
   pending_comments: ZinePendingCommentDto[];
   muted: boolean;
+  /** This zine's public export, once it has one. */
+  export: ZineExportDto | null;
   updated_ms: number;
 }
 
@@ -693,6 +719,108 @@ export interface PenNameDto {
   name: string;
   /** The signing public key, hex. Provenance, published with a blob. */
   sign_pk: string;
+}
+
+/** The public identity this vault publishes and comments under on the public
+ *  Nostr network (neighborhoods). The public key only: the secret half never
+ *  leaves the vault, because a Nostr event is signed inside it. */
+export interface PublicIdentityDto {
+  /** The x-only secp256k1 public key, hex. A Nostr event's `pubkey`. */
+  pubkey: string;
+  /** The bech32 `npub` handle. */
+  npub: string;
+}
+
+/** The neighborhoods read lane's settings (Task 22). */
+export interface NeighborhoodSettingsDto {
+  /** The relays read from. A curated set with no Hush-run relay; user-editable. */
+  allowlist: string[];
+  /** The reading-time floor, in whole minutes. */
+  min_minutes: number;
+  /** Whether the front page shows public posts by default. Off by default,
+   *  because showing them is what triggers egress. */
+  default_show: boolean;
+}
+
+/** One public article in the neighborhoods index. No body: the index is a list. */
+export interface NeighborhoodSummaryDto {
+  /** The NIP-01 addressable id, the `a` tag: `30023:pubkey:d`. */
+  address: string;
+  /** The event id of the version this was mapped from. */
+  event_id: string;
+  pubkey: string;
+  /** The `d` tag: the addressable id within the author's namespace. */
+  d: string;
+  title: string;
+  summary: string | null;
+  /** Normalised `t` tags. */
+  sections: string[];
+  created_at: number;
+  published_at: number | null;
+  /** Reading time in whole minutes, at 200 wpm. */
+  reading_minutes: number;
+}
+
+/** One public article in full, with its Markdown body. */
+export interface NeighborhoodArticleDto extends NeighborhoodSummaryDto {
+  /** The Markdown body, as the relay sent it. Render through the one sanitizer. */
+  content: string;
+  /** The thread under this article, oldest first. Empty for an article whose
+   *  replies this vault does not read — every article but the ones it published
+   *  itself. */
+  replies: NeighborhoodCommentDto[];
+}
+
+/** One public comment, as the page reads it.
+ *
+ *  `content` is plaintext, by the spec. Render it as text, never as markup: a
+ *  comment is not Markdown, and a stranger's text is not markup here. */
+export interface NeighborhoodCommentDto {
+  event_id: string;
+  /** The commenter's public key, hex. A key, not a name: the lane fetches no
+   *  kind:0 metadata, so the page names the key it holds. */
+  pubkey: string;
+  content: string;
+  created_at: number;
+  /** The comment this answers, when it answers one rather than the article. */
+  parent_id: string | null;
+}
+
+/** `POST /api/neighborhoods/{addr}/comment`: the thread as it now stands.
+ *
+ *  The thread rather than the one comment, because the page shows a thread and
+ *  the caller should not have to splice its own words into a list it did not
+ *  build. */
+export interface NeighborhoodCommentViewDto {
+  address: string;
+  /** The id of the event that went out, hex. */
+  event_id: string;
+  /** Whether a relay took it. `false` means the comment is not public: unlike an
+   *  export there is no address to retry, so it is not cached either. */
+  published: boolean;
+  /** Why the publish failed, when it did. Empty on success. */
+  publish_error: string;
+  replies: NeighborhoodCommentDto[];
+}
+
+/** A section facet: the tag and how many held articles carry it. */
+export interface NeighborhoodSectionDto {
+  name: string;
+  count: number;
+}
+
+/** The neighborhoods index: what the page shows, plus its facets and settings. */
+export interface NeighborhoodsViewDto {
+  articles: NeighborhoodSummaryDto[];
+  sections: NeighborhoodSectionDto[];
+  settings: NeighborhoodSettingsDto;
+}
+
+/** A patch to the neighborhoods settings: send only what changed. */
+export interface NeighborhoodSettingsPatch {
+  allowlist?: string[];
+  min_minutes?: number;
+  default_show?: boolean;
 }
 
 /** One row of the section facet. */
@@ -741,6 +869,30 @@ export interface ZinesWriteDto extends ZinesViewDto {
   revision: number;
   /** Whether the sealed blob reached the relay. `false` is not a lost write:
    *  the bytes are held and the re-post sweep sends them again. */
+  published: boolean;
+  /** Why the publish failed, when it did. Empty on success. */
+  publish_error: string;
+}
+
+/** `POST /api/zines/{id}/export`: the article's public address, and the post as
+ *  it now stands. Flattened rather than nested, so the reader page can show
+ *  "published" without a second request. */
+export interface ZineExportViewDto extends ZineViewDto {
+  zine_id: string;
+  /** The NIP-23 `d` the article lives at. Stable across every re-export. */
+  d: string;
+  /** The NIP-01 address `30023:pubkey:d`. What a NIP-22 comment references. */
+  address: string;
+  /** The shareable handle, with the allowlist as relay hints. */
+  naddr: string;
+  /** The id of the event that was published, hex. */
+  event_id: string;
+  /** The public key the article is signed by, hex. */
+  pubkey: string;
+  /** When the article first went public, unix seconds. */
+  published_at: number;
+  /** Whether a relay took it. `false` is not a lost article: the address is
+   *  recorded and the retry publishes the same one. */
   published: boolean;
   /** Why the publish failed, when it did. Empty on success. */
   publish_error: string;

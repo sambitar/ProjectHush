@@ -109,6 +109,17 @@ else
 fi
 TAURI_BIN="${BIN}/hush-tauri"
 
+# The bundled Tor sidecar, for the reason spelled out in run-one-ui.sh: a dev run
+# does not resolve the app's resource directory, so the sidecar has to be handed
+# to the window directly, along with the libevent it links against.
+TOR_DIR="${ROOT}/apps/hush-tauri/src-tauri/resources/tor"
+TOR_BIN=""
+TOR_LIB_DIR=""
+if [[ -x "$TOR_DIR/tor" ]]; then
+  TOR_BIN="${HUSH_TOR_BIN:-$TOR_DIR/tor}"
+  TOR_LIB_DIR="$TOR_DIR"
+fi
+
 LOG_DIR="${RUN_DIR}/logs"
 PIDS=()
 RELAY_PID=""
@@ -347,11 +358,30 @@ else
 
   UI_NAMES=(alice-ui bob-ui)
   UI_PIDS=()
-  HUSH_API_URL="unix://${SOCK_A}" HUSH_WINDOW_TITLE="Hush — Alice" \
-    "$TAURI_BIN" >"$LOG_DIR/alice-ui.log" 2>&1 &
+  # See run-one-ui.sh: the bundled Tor is an app resource a packaged build finds
+  # beside itself, but a dev run resolves the resource directory from the
+  # executable and misses it, so the Relay panel would report no Tor. Hand the
+  # windows the sidecar and its libevent instead.
+  UI_ENV=()
+  if [[ -n "$TOR_BIN" ]]; then
+    UI_ENV+=(HUSH_TOR_BIN="$TOR_BIN")
+  fi
+  if [[ -n "$TOR_LIB_DIR" ]]; then
+    UI_ENV+=(LD_LIBRARY_PATH="${TOR_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+  fi
+  if [[ -n "$TOR_BIN" ]]; then
+    echo "Tor: the bundled sidecar ($TOR_BIN)"
+  elif command -v tor >/dev/null 2>&1; then
+    echo "Tor: the system copy ($(command -v tor))"
+  else
+    echo "Tor: none found — the Relay panel will say so, and onion mail waits until there is one."
+  fi
+  echo ""
+  env HUSH_API_URL="unix://${SOCK_A}" HUSH_WINDOW_TITLE="Hush — Alice" \
+    "${UI_ENV[@]}" "$TAURI_BIN" >"$LOG_DIR/alice-ui.log" 2>&1 &
   UI_PIDS+=($!)
-  HUSH_API_URL="unix://${SOCK_B}" HUSH_WINDOW_TITLE="Hush — Bob" \
-    "$TAURI_BIN" >"$LOG_DIR/bob-ui.log" 2>&1 &
+  env HUSH_API_URL="unix://${SOCK_B}" HUSH_WINDOW_TITLE="Hush — Bob" \
+    "${UI_ENV[@]}" "$TAURI_BIN" >"$LOG_DIR/bob-ui.log" 2>&1 &
   UI_PIDS+=($!)
   PIDS+=("${UI_PIDS[@]}")
 

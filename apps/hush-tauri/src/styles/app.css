@@ -4057,6 +4057,28 @@ button.library-item-main {
   accent-color: var(--accent);
 }
 
+/* The lane's own switch, set apart from the two view controls above it: those
+   decide what of this vault's corpus to show, and this one decides whether a
+   public network is read at all. */
+.zines-public {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--border);
+}
+
+.zines-public-note {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.zines-public-refresh,
+.zines-offer-public {
+  align-self: flex-start;
+}
+
 /* --- The front page ------------------------------------------------------- */
 
 .zines-page {
@@ -4182,6 +4204,29 @@ button.library-item-main {
 .zine-card-mine {
   color: var(--accent-strong);
   font-weight: 700;
+}
+
+/* The badge is a stamp, not a section. A public post is the exception on this
+   page, so it is boxed in the warning palette rather than tinted with the
+   accent: the accent reads as "yours", which is the opposite of what this is. */
+.zine-card-public {
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--warning-soft);
+  color: var(--warning-text);
+  font-weight: 700;
+}
+
+/* The honest copy on a public post's own page. Set apart from the body so it
+   reads as the page talking rather than as the author's opening line. */
+.zines-public-copy {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-left: 3px solid var(--warning-text);
+  border-radius: var(--radius-sm);
+  background: var(--warning-soft);
+  color: var(--warning-text);
+  line-height: 1.5;
 }
 
 /* Headlines are the one place in this app that is set in serif: it is what a
@@ -4521,6 +4566,105 @@ button.library-item-main {
   color: var(--danger);
 }
 
+/* --- Public replies on a neighborhoods article ---------------------------- */
+
+/* A public comment is not the sealed thread of a private zine: it is out on a
+   public network, signed by a key the reader never picked, and this page can
+   only choose not to draw it. It is set apart from the zine's own comments
+   rather than merged with them, because they are different things held in
+   different stores under different keys. */
+.post-comments,
+.post-composer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.post-comments h2,
+.post-composer h2 {
+  margin: 0;
+}
+
+/* Indent is depth, carried as a number rather than as nested elements. The
+   clamp is on the drawing side too: a thread of strangers' words is not the
+   place to find out how a deeply nested container behaves. */
+.post-comment {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  margin-left: calc(var(--post-depth, 0) * var(--space-4));
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.post-comment-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.post-comment-body {
+  white-space: pre-wrap;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.post-comment-reply {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent-strong);
+  cursor: pointer;
+}
+
+.post-comment-reply:hover {
+  text-decoration: underline;
+}
+
+.post-reply-to {
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  border-left: 2px solid var(--accent);
+}
+
+.post-composer-input {
+  width: 100%;
+  min-height: 76px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.post-composer-input:focus {
+  outline: none;
+  border-color: var(--accent-strong);
+}
+
+.post-composer-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.post-composer-actions .btn-primary,
+.post-composer-actions .btn-secondary,
+.post-identity {
+  width: auto;
+}
+
+.post-identity {
+  align-self: flex-start;
+}
+
 /* The active byline filter, on the page it narrows. It sits between the strip
    and the stories because that is what it is: a second narrowing of the page,
    with its own way out. */
@@ -4701,8 +4845,69 @@ button.library-item-main {
 /* --- The modals ----------------------------------------------------------- */
 
 .zine-pen-modal,
-.zine-forget-modal {
+.zine-forget-modal,
+.zine-export-modal {
   max-width: 460px;
+}
+
+/* What leaves, and what does not: a list rather than a sentence, so the author
+   can see both halves at once. A leading marker distinguishes them without
+   relying on colour alone. */
+.zine-export-list {
+  margin: var(--space-3) 0 0;
+  padding-left: var(--space-4);
+  list-style: none;
+}
+
+.zine-export-list li {
+  position: relative;
+  padding-left: var(--space-4);
+  margin-bottom: var(--space-1);
+}
+
+.zine-export-list li::before {
+  position: absolute;
+  left: 0;
+}
+
+.zine-export-goes::before {
+  content: "→";
+}
+
+.zine-export-stays::before {
+  content: "×";
+}
+
+.zine-export-stays {
+  color: var(--text-muted);
+}
+
+.zine-export-result {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  flex-wrap: wrap;
+}
+
+/* The article's address, on the article and in the dialog. Monospaced and
+   selectable in full: it is the handle a reader needs, not decoration. */
+.zine-public-address {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.zine-public-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.zine-copy-address {
+  font-size: 12px;
+  padding: 2px var(--space-2);
 }
 
 .zine-pen-error {
