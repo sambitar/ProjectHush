@@ -28,6 +28,10 @@ import type {
   WalletNetworkMode,
   WalletSendDto,
   WalletStateDto,
+  ZineDraftDto,
+  ZinesViewDto,
+  ZineViewDto,
+  PenNameDto,
 } from "./types";
 
 type Transport =
@@ -565,4 +569,41 @@ export const api = {
       body: JSON.stringify({ address }),
     }),
   walletWipe: () => request<null>("/api/wallet/wipe", { method: "POST" }),
+  // --- Zines (a member's own publication, and the ones they hold). Local and
+  // offline in Phase 1: authoring, storing, and reading in this vault. Every
+  // route goes through the worker, so a locked vault answers 401 without any
+  // of these being touched. The pen name is taken from the vault, never from
+  // the request. ---
+  zinesIndex: (filter: { section?: string; pen?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (filter.section) q.set("section", filter.section);
+    if (filter.pen) q.set("pen", filter.pen);
+    const suffix = q.toString();
+    return request<ZinesViewDto>(`/api/zines${suffix ? `?${suffix}` : ""}`);
+  },
+  zinesGet: (zineId: string) =>
+    request<ZineViewDto>(`/api/zines/${encodeURIComponent(zineId)}`),
+  zinesWrite: (draft: ZineDraftDto) =>
+    request<ZinesViewDto>("/api/zines", {
+      method: "POST",
+      body: JSON.stringify(draft),
+    }),
+  /** An explicit flag rather than a toggle, so a double-click cannot land in
+   *  the state the user did not ask for. */
+  zinesMute: (zineId: string, muted = true) =>
+    request<ZinesViewDto>(`/api/zines/${encodeURIComponent(zineId)}/mute`, {
+      method: "POST",
+      body: JSON.stringify({ muted }),
+    }),
+  /** Forget a zine locally. Not a retraction. */
+  zinesForget: (zineId: string) =>
+    request<ZinesViewDto>(`/api/zines/${encodeURIComponent(zineId)}`, {
+      method: "DELETE",
+    }),
+  zinesPenName: () => request<PenNameDto | null>("/api/zines/pen-name"),
+  zinesSetPenName: (name: string) =>
+    request<ZinesViewDto>("/api/zines/pen-name", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
 };

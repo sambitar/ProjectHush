@@ -580,3 +580,129 @@ export interface WalletSendDto {
   /** Satoshi, and only for Bitcoin: an Ethereum fee is unknown until it mines. */
   fee_sat: number | null;
 }
+
+// --- Zines (a member's own publication, and the ones they hold) --------------
+//
+// Phase 1 is local and offline: this vault authors one zine under its pen name
+// and holds whatever else it has been given. `zine_id` is the pen name's seal
+// public key, so it is the address a comment is sealed to and the identity a
+// revision chain is signed under — not a random id.
+
+/** One entry in the local index. Deliberately not the whole article: a list of
+ *  five hundred bodies would be megabytes of JSON for a screen of titles. */
+export interface ZineSummaryDto {
+  zine_id: string;
+  /** The byline shown to readers. Chosen by the author, so it can change
+   *  without the address moving. */
+  pen_name: string;
+  title: string;
+  /** Normalised (lowercased, trimmed) tags. */
+  sections: string[];
+  /** Unix milliseconds. */
+  created_ms: number;
+  updated_ms: number;
+  /** Monotonic per zine, from 1. */
+  revision: number;
+  comments: number;
+  /** A short plain-text taste of the body, for the list row. */
+  preview: string;
+  /** Whether this vault is the author. Only the author's pen name can publish
+   *  a new revision, because only it can sign one. */
+  authored: boolean;
+  /** Local mute: no wire effect, the zine is still held and still counted. */
+  muted: boolean;
+  /** Held but not yet openable — a blob arrived before its key did. */
+  unreadable: boolean;
+}
+
+/** One comment the author has merged into the thread. */
+export interface ZineCommentDto {
+  hash: string;
+  /** Whatever the commenter signed with. This vault records what was claimed
+   *  and leaves the judgement to the reader. */
+  author: string;
+  body: string;
+  created_ms: number;
+  /** When this vault merged it: a local fact, never published. */
+  merged_ms: number;
+}
+
+/** A superseded revision, kept so a mistake can be undone. */
+export interface ZineRevisionDto {
+  revision: number;
+  hash: string;
+  title: string;
+  body: string;
+  sections: string[];
+  replaced_ms: number;
+}
+
+/** The article itself, as it is stored. */
+export interface ZineDescriptorDto {
+  zine_id: string;
+  pen_name: string;
+  title: string;
+  sections: string[];
+  created_ms: number;
+  revision: number;
+  /** The content hash of the previous revision; empty at revision 1. */
+  prev_hash: string;
+  /** Sanitized HTML. Never injected without a trip through `bodyToDisplayHtml`. */
+  body: string;
+  comments: ZineCommentDto[];
+}
+
+/** One zine in this vault: the head, its history, and the local facts about
+ *  holding it. */
+export interface ZineFileDto {
+  descriptor: ZineDescriptorDto;
+  /** Superseded revisions, newest first. */
+  history: ZineRevisionDto[];
+  authored: boolean;
+  read_key: string | null;
+  unreadable: boolean;
+  muted: boolean;
+  updated_ms: number;
+}
+
+/** The pen name this vault publishes under. No secret material crosses this
+ *  boundary: the private half never leaves the vault. */
+export interface PenNameDto {
+  /** The seal public key, hex: the address a comment is sealed to. */
+  id: string;
+  name: string;
+  /** The signing public key, hex. Provenance, published with a blob. */
+  sign_pk: string;
+}
+
+/** One row of the section facet. */
+export interface ZineSectionDto {
+  name: string;
+  count: number;
+}
+
+/** The whole pane in one response: the index, the section facet, and the pen
+ *  name. Three round trips to paint one screen would be three chances to
+ *  render a pane that disagrees with itself. */
+export interface ZinesViewDto {
+  zines: ZineSummaryDto[];
+  sections: ZineSectionDto[];
+  /** Absent until a byline has been chosen: publishing before then is refused
+   *  with a reason rather than minting one silently. */
+  pen_name: PenNameDto | null;
+}
+
+/** `GET /api/zines/{id}` */
+export interface ZineViewDto {
+  zine: ZineFileDto;
+}
+
+/** `POST /api/zines`. An absent `zine_id` means "the caller's own pen name",
+ *  which is the only case Phase 1 can author. */
+export interface ZineDraftDto {
+  zine_id?: string;
+  title: string;
+  sections: string[];
+  /** Sanitized HTML. */
+  body: string;
+}

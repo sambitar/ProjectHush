@@ -298,6 +298,20 @@ enum Work {
         name: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Zines: the pen name this vault publishes under, if it has one yet.
+    PenNameGet {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Zines: mint a pen name (create when absent, rename when present).
+    ///
+    /// One command for both because the caller — the zines pane — wants the same
+    /// answer either way ("the pen name I now publish under"), and a separate
+    /// create/rename pair would make the UI decide which one applies from a
+    /// snapshot that may already be stale.
+    PenNameSet {
+        name: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// Torrents pane: load the encrypted sidecar state (None when never saved).
     TorrentsStateGet {
         reply: oneshot::Sender<WorkResult>,
@@ -478,6 +492,29 @@ pub struct ContactDto {
     pub mail_vault: Option<String>,
 }
 
+/// The zines pen name, as the UI sees it: a byline and two public keys. No
+/// secret material crosses this boundary, and the private half never leaves the
+/// vault — a pen name is only useful if the daemon signs with it.
+#[derive(Clone, serde::Serialize)]
+pub struct PenNameDto {
+    /// `zine_id`: the seal public key, hex. The address a comment is sealed to.
+    pub id: String,
+    /// The byline shown to readers.
+    pub name: String,
+    /// The signing public key, hex. Provenance, published with a blob.
+    pub sign_pk: String,
+}
+
+impl From<hush_core::PenName> for PenNameDto {
+    fn from(p: hush_core::PenName) -> Self {
+        Self {
+            id: p.id,
+            name: p.name,
+            sign_pk: p.sign_pk,
+        }
+    }
+}
+
 pub enum WorkResult {
     Ok,
     Invite(String),
@@ -525,6 +562,8 @@ pub enum WorkResult {
     /// A named vault sidecar was deleted. Deleting is idempotent, so this
     /// carries no "did it exist" flag: either way the name is now absent.
     SecretRemoved,
+    /// The zines pen name this vault publishes under; `None` before one exists.
+    PenName(Option<PenNameDto>),
     /// The record id of the saved draft.
     DraftSaved(String),
     Blob(Vec<u8>),
@@ -1097,6 +1136,34 @@ impl AccountWorker {
                                     Ok(_) => WorkResult::SecretRemoved,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
+                            };
+                            (reply, result)
+                        }
+                        Work::PenNameGet { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    WorkResult::PenName(a.pen_name().map(PenNameDto::from))
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::PenNameSet { name, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    // Create when there is none, rename when
+                                    // there is: the pane's question is "what am
+                                    // I publishing under", not "does one exist".
+                                    let outcome = match a.pen_name() {
+                                        Some(_) => a.rename_pen_name(&name),
+                                        None => a.create_pen_name(&name),
+                                    };
+                                    match outcome {
+                                        Ok(pen) => WorkResult::PenName(Some(pen.into())),
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
                             };
                             (reply, result)
                         }
@@ -1817,6 +1884,20 @@ impl AccountWorker {
     pub async fn reads_state_put(&self, bytes: Vec<u8>) -> WorkResult {
         self.call(|reply| Work::ReadsStatePut { bytes, reply })
             .await
+    }
+
+    /// The zines pen name this vault publishes under, if it has one yet.
+    pub async fn pen_name(&self) -> WorkResult {
+        self.call(|reply| Work::PenNameGet { reply }).await
+    }
+
+    /// Mint or rename the zines pen name, returning the one now in force.
+    pub async fn set_pen_name(&self, name: &str) -> WorkResult {
+        self.call(|reply| Work::PenNameSet {
+            name: name.to_string(),
+            reply,
+        })
+        .await
     }
 
     /// Read a named encrypted vault sidecar. The caller owns the name and the

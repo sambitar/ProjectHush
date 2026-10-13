@@ -55,7 +55,7 @@ pub use relay_client::{
     is_v3_onion_host, normalize_relay_base, normalize_relay_base_with, validate_onion_relay,
     validate_socks_proxy, HttpPolicy, RelayClient,
 };
-pub use vault::{BlobId, DropDrainKey, IdentityPub, Vault};
+pub use vault::{BlobId, DropDrainKey, IdentityPub, PenName, Vault};
 
 /// Queue credential derivation, shared by the client and the relay.
 ///
@@ -63,3 +63,11 @@ pub use vault::{BlobId, DropDrainKey, IdentityPub, Vault};
 /// the client side alone. Exposed as one function rather than the whole module:
 /// the rest of `crypto` handles key material and has no business being public.
 pub use crypto::queue_delivery_token;
+
+/// Content addressing: the hash a zine blob is named by, and the one its
+/// revision chain links through.
+///
+/// Re-exported for the same reason as the credential derivation above — a hash
+/// two implementations can disagree about is not an address. The rest of
+/// `crypto` handles key material and stays private.
+pub use crypto::sha256;

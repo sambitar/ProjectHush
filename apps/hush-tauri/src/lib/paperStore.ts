@@ -13,26 +13,16 @@ import {
 } from "y-protocols/awareness";
 import { EditorState, Plugin, type Command } from "prosemirror-state";
 import { EditorView } from "prosemirror-view";
-import {
-  Schema,
-  type MarkType,
-  type NodeType,
-  type Node as PMNode,
-} from "prosemirror-model";
 import { keymap } from "prosemirror-keymap";
-import { baseKeymap, chainCommands, setBlockType, toggleMark } from "prosemirror-commands";
-import {
-  bulletList,
-  orderedList,
-  listItem,
-  wrapInList,
-  splitListItem,
-  liftListItem,
-  sinkListItem,
-} from "prosemirror-schema-list";
-import { icon, type IconName } from "./icons";
+import { baseKeymap, chainCommands, toggleMark } from "prosemirror-commands";
+import { splitListItem, liftListItem, sinkListItem } from "prosemirror-schema-list";
 import { AppError, api } from "./api/daemon";
 import { conclaveById } from "./conclaveStore";
+import {
+  buildToolbar,
+  richTextSchema as schema,
+  toolbarButtons,
+} from "./proseSchema";
 import {
   fromBase64,
   isDecodable,
@@ -117,104 +107,6 @@ function applyRemote(ydoc: Y.Doc, b64: string): void {
   if (!isDecodable(bytes)) return;
   Y.applyUpdate(ydoc, bytes, "remote");
 }
-
-// --- The paper schema: v1 scope is bold/italic/underline, lists, headings. ---
-
-const schema = new Schema({
-  nodes: {
-    doc: { content: "block+" },
-    paragraph: {
-      group: "block",
-      content: "inline*",
-      parseDOM: [{ tag: "p" }],
-      toDOM(): [string, number] {
-        return ["p", 0];
-      },
-    },
-    heading: {
-      group: "block",
-      content: "inline*",
-      defining: true,
-      attrs: { level: { default: 1 } },
-      parseDOM: [1, 2, 3].map((level) => ({
-        tag: `h${level}`,
-        attrs: { level },
-      })),
-      toDOM(node: PMNode): [string, number] {
-        return [`h${node.attrs.level}`, 0];
-      },
-    },
-    bullet_list: {
-      ...bulletList,
-      content: "list_item+",
-      group: "block",
-    },
-    ordered_list: {
-      ...orderedList,
-      content: "list_item+",
-      group: "block",
-    },
-    list_item: {
-      ...listItem,
-      content: "paragraph block*",
-    },
-    text: { group: "inline" },
-    hard_break: {
-      group: "inline",
-      inline: true,
-      selectable: false,
-      parseDOM: [{ tag: "br" }],
-      toDOM(): [string, number] {
-        return ["br", 0];
-      },
-    },
-  },
-  marks: {
-    bold: {
-      parseDOM: [
-        { tag: "strong" },
-        { tag: "b" },
-        {
-          style: "font-weight",
-          getAttrs: (v: string) => (/^(bold|[5-9]\d{2,})$/.test(v) ? {} : false),
-        },
-      ],
-      toDOM(): [string, number] {
-        return ["strong", 0];
-      },
-    },
-    italic: {
-      parseDOM: [
-        { tag: "em" },
-        { tag: "i" },
-        {
-          style: "font-style",
-          getAttrs: (v: string) => (v === "italic" ? {} : false),
-        },
-      ],
-      toDOM(): [string, number] {
-        return ["em", 0];
-      },
-    },
-    underline: {
-      parseDOM: [
-        { tag: "u" },
-        {
-          style: "text-decoration",
-          getAttrs: (v: string) => (v === "underline" ? {} : false),
-        },
-      ],
-      toDOM(): [string, number] {
-        return ["u", 0];
-      },
-    },
-  },
-});
-
-// prosemirror-schema-list's node specs are typed against their own schema;
-// after the spreads above the composite is the paper's own.
-type PaperMark = MarkType;
-type PaperNode = NodeType;
 
 // --- The session: one paper open at a time (one conclave is on screen). ----
 
@@ -534,38 +426,6 @@ export async function createPaper(
 
 // --- Editor binding --------------------------------------------------------
 
-/** Mark is active at the selection? (Toolbar pressed state.) */
-function markActive(state: EditorState, type: PaperMark): boolean {
-  const { from, $from, to, empty } = state.selection;
-  if (empty) return !!type.isInSet(state.storedMarks || $from.marks());
-  return state.doc.rangeHasMark(from, to, type);
-}
-
-function blockType(
-  state: EditorState,
-  type: PaperNode,
-  attrs?: Record<string, unknown>,
-): boolean {
-  const $from = state.selection.$from;
-  for (let d = $from.depth; d >= 0; d--) {
-    const node = $from.node(d);
-    if (node.type === type) {
-      return attrs
-        ? Object.entries(attrs).every(([k, v]) => node.attrs[k] === v)
-        : true;
-    }
-  }
-  return false;
-}
-
-interface ToolbarButton {
-  label?: string;
-  icon?: IconName;
-  title: string;
-  active: (state: EditorState) => boolean;
-  run: Command;
-}
-
 /**
  * Build the editor (toolbar + ProseMirror surface) into `container`. The DOM
  * subtree stays stable across the app's wholesale re-renders: `render()` moves
@@ -604,62 +464,10 @@ export function attachEditor(
       return true;
     };
 
-  const buttons: ToolbarButton[] = [
-    {
-      icon: "bold",
-      title: "Bold (Ctrl+B)",
-      active: (st) => markActive(st, schema.marks.bold),
-      run: (st, dispatch) => toggleMark(schema.marks.bold)(st, dispatch),
-    },
-    {
-      icon: "italic",
-      title: "Italic (Ctrl+I)",
-      active: (st) => markActive(st, schema.marks.italic),
-      run: (st, dispatch) => toggleMark(schema.marks.italic)(st, dispatch),
-    },
-    {
-      icon: "underline",
-      title: "Underline (Ctrl+U)",
-      active: (st) => markActive(st, schema.marks.underline),
-      run: (st, dispatch) => toggleMark(schema.marks.underline)(st, dispatch),
-    },
-    {
-      label: "H1",
-      title: "Heading 1",
-      active: (st) => blockType(st, schema.nodes.heading, { level: 1 }),
-      run: (st, dispatch) => setBlockType(schema.nodes.heading, { level: 1 })(st, dispatch),
-    },
-    {
-      label: "H2",
-      title: "Heading 2",
-      active: (st) => blockType(st, schema.nodes.heading, { level: 2 }),
-      run: (st, dispatch) => setBlockType(schema.nodes.heading, { level: 2 })(st, dispatch),
-    },
-    {
-      label: "H3",
-      title: "Heading 3",
-      active: (st) => blockType(st, schema.nodes.heading, { level: 3 }),
-      run: (st, dispatch) => setBlockType(schema.nodes.heading, { level: 3 })(st, dispatch),
-    },
-    {
-      label: "Body",
-      title: "Plain paragraph",
-      active: (st) => blockType(st, schema.nodes.paragraph),
-      run: (st, dispatch) => setBlockType(schema.nodes.paragraph)(st, dispatch),
-    },
-    {
-      icon: "list",
-      title: "Bulleted list",
-      active: (st) => blockType(st, schema.nodes.bullet_list),
-      run: (st, dispatch, view) => wrapInList(schema.nodes.bullet_list)(st, dispatch, view),
-    },
-    {
-      icon: "listOrdered",
-      title: "Numbered list",
-      active: (st) => blockType(st, schema.nodes.ordered_list),
-      run: (st, dispatch, view) => wrapInList(schema.nodes.ordered_list)(st, dispatch, view),
-    },
-  ];
+  const buttons = toolbarButtons({
+    undo: withUndo((um) => um.undo()),
+    redo: withUndo((um) => um.redo()),
+  });
 
   const keys: Record<string, Command> = {
     "Mod-b": (st, dispatch) => toggleMark(schema.marks.bold)(st, dispatch),
@@ -678,37 +486,32 @@ export function attachEditor(
 
   const wrap = document.createElement("div");
   wrap.className = "paper-editor";
-  const toolbar = document.createElement("div");
-  toolbar.className = "rich-editor-toolbar paper-toolbar";
-  toolbar.setAttribute("role", "toolbar");
-  toolbar.setAttribute("aria-label", "Paper formatting");
-  const els: HTMLButtonElement[] = [];
-  for (const b of buttons) {
-    const el = document.createElement("button");
-    el.type = "button";
-    el.className = "rich-editor-btn pressable paper-toolbar-btn";
-    el.title = b.title;
-    el.setAttribute("aria-label", b.title);
-    el.setAttribute("aria-pressed", "false");
-    // Icons are the house icon set; the type buttons carry their label.
-    // Either way the button must not steal the caret.
-    if (b.icon) {
-      el.appendChild(icon(b.icon));
-    } else {
-      const t = document.createElement("span");
-      t.className = "paper-toolbar-label";
-      t.textContent = b.label ?? "";
-      el.appendChild(t);
-    }
-    // mousedown is suppressed so focusing the button never blurs the editor.
-    el.addEventListener("mousedown", (e) => e.preventDefault());
-    toolbar.appendChild(el);
-    els.push(el);
+  // The toolbar is built before the view exists, which is why it takes a
+  // getter: nothing inside reads the view until a click or a state change,
+  // both of which happen long after construction.
+  const toolbar = buildToolbar(buttons, () => view, "Paper formatting");
+
+  // The frame goes up in document order before the view exists: ProseMirror
+  // appends its own DOM into the element it is given, so the toolbar has to be
+  // in place first or it would end up underneath the editor.
+  if (readOnly) {
+    // No toolbar: every command it offers would be refused by the daemon.
+    const note = document.createElement("p");
+    note.className = "paper-readonly-note muted text-13";
+    note.textContent = "This conclave has ended, so the paper is read-only.";
+    wrap.appendChild(note);
+  } else {
+    wrap.appendChild(toolbar.el);
   }
 
   const surface = document.createElement("div");
   surface.className = "paper-surface";
   surface.style.setProperty("--paper-caret", authorColor(me));
+  // The scroll container goes into the frame *before* the view exists:
+  // `new EditorView(place)` appends its own DOM into `place`, so appending
+  // `view.dom` afterwards would move the editor back out and leave this
+  // element detached — the surface would render with none of its styling.
+  wrap.appendChild(surface);
 
   // The toolbar's pressed state follows the editor's state, refreshed from a
   // plugin view callback rather than a `dispatchTransaction` override:
@@ -720,7 +523,7 @@ export function attachEditor(
   // `update(view)` hands the view in, so nothing reads it early.
   const toolbarSync = new Plugin({
     view: () => ({
-      update: (v: EditorView) => refreshActive(v),
+      update: () => toolbar.refresh(),
     }),
   });
 
@@ -748,33 +551,9 @@ export function attachEditor(
 
   // Handlers bind after the view exists; clicking applies the command to the
   // live view and returns focus to the editor.
-  for (const [i, b] of buttons.entries()) {
-    els[i].addEventListener("click", () => {
-      view.focus();
-      b.run(view.state, (tr) => view.dispatch(tr), view);
-    });
-  }
+  toolbar.refresh();
 
-  function refreshActive(v: EditorView): void {
-    for (const [i, b] of buttons.entries()) {
-      const el = toolbar.children[i] as HTMLElement;
-      const on = b.active(v.state);
-      el.classList.toggle("active", on);
-      el.setAttribute("aria-pressed", on ? "true" : "false");
-    }
-  }
-  refreshActive(view);
-
-  if (readOnly) {
-    // No toolbar: every command it offers would be refused by the daemon.
-    const note = document.createElement("p");
-    note.className = "paper-readonly-note muted text-13";
-    note.textContent = "This conclave has ended, so the paper is read-only.";
-    wrap.appendChild(note);
-  } else {
-    wrap.appendChild(toolbar);
-  }
-  wrap.appendChild(view.dom);
+  // `view.dom` is already inside `surface`; appending it here would move it.
   container.appendChild(wrap);
   editor = view;
   return view;

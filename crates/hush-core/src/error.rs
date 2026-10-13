@@ -72,6 +72,12 @@ pub enum Error {
     DropKeyExists,
     #[error("no drop key exists yet")]
     DropKeyMissing,
+    #[error("a pen name already exists — rename it instead")]
+    PenNameExists,
+    #[error("no pen name exists yet")]
+    PenNameMissing,
+    #[error("this vault holds the most pen names it can")]
+    PenNameCap,
 }
 
 impl From<argon2::Error> for Error {

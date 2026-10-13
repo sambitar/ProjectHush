@@ -13,6 +13,98 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-12 — Zines Phase 1 (implementation and live verification)
+
+Trigger: "implement Zines as a new button in Rail". Scope: the pen-name keypair in the vault, the
+`zines.enc` sidecar, the `/api/zines/*` routes, and the Rail pane with a ProseMirror editor. The
+four entries below were all found by driving the finished slice in the real UI, not by the suite.
+
+### An authored zine was stored with no read key, so its own body never rendered — `FIXED`
+
+Attempted: publish a zine from the Rail pane and open it.
+
+Symptom: the list row, the byline, the tags, and the facet counts all updated, and the article head
+rendered — but the body was missing. `GET /api/zines/{id}` returned `"read_key": null` for a zine
+this vault had just authored, and the UI showed "This vault has no read key for this zine."
+
+Root cause: `ZineFile::read_key` documents that "Phase 1 mints it for our own zine so the field is
+populated before anything publishes", but `ZinesState::write` set `read_key: None` on create. The
+doc described the intent; the code did not implement it. Every other symptom of a successful publish
+was present, which is what kept it invisible — the store tests never asserted on the field.
+
+Resolution: `mint_read_key()` (32 random bytes, base64) is called on create; `backfill_read_keys()`
+mints one for any authored zine that predates the change and `zines_sidecar` persists the result, so
+the upgrade runs once on the first read rather than waiting for the next edit. A held zine is left
+alone — only the author holds the plaintext. Verified live: the existing zine on `peer-a` gained a
+32-byte key on the first read after the rebuild, the key is stable across reads, and the article body
+now renders with its `<strong>` mark intact.
+
+Lesson: a doc comment that states a behavior is not evidence the behavior exists. The check that
+would have caught this is an assertion on the field, not on the endpoint's status code.
+
+### The article guard refused a zine the vault had written itself — `FIXED`
+
+Attempted: same run, before the daemon fix was in.
+
+Symptom: even with a body present in the descriptor, `renderZineArticle` returned early.
+
+Root cause: the guard was `if (!read_key)`, which is true for a held zine that has not been given its
+key yet **and** for an authored zine whose key was never minted. Only the first is a real "cannot
+read" state; an authored zine's plaintext is in the vault's own descriptor.
+
+Resolution: the guard is now `if (!read_key && !authored)`. Held separately from the daemon fix on
+purpose: the two are independent, and either one alone would have hidden the other's bug.
+
+### `richText.ts` was clobbered when the ProseMirror schema was extracted — `FIXED`
+
+Attempted: create a shared ProseMirror schema for Paper and Zines by writing a new module.
+
+Symptom: the write landed on `apps/hush-tauri/src/lib/richText.ts`, overwriting the existing
+mail-body sanitizer (`escapeHtml`, `sanitizeHtml`, `bodyToDisplayHtml`, `htmlToText`, `isBlankHtml`).
+Mail bodies would have rendered through the editor's schema instead of the sanitizer.
+
+Root cause: the new module was named after the concept rather than after what it holds, and the name
+collided with a file that already owned a different concern.
+
+Resolution: the original `richText.ts` was restored from git and the new code went to
+`proseSchema.ts`. The sanitizer and the editor schema are separate files with separate jobs.
+
+Lesson: check for an existing file at the target path before writing a new one, especially when the
+name is the obvious one.
+
+### An `EditorView` mounted into a detached element, so the editor rendered unstyled — `FIXED`
+
+Attempted: mount ProseMirror into a host container that a re-render could re-parent.
+
+Symptom: the editor host was in the DOM, but the ProseMirror surface was not — no toolbar styling,
+no cursor. The same bug appeared in both Paper and Zines, because both were written the same way.
+
+Root cause: `new EditorView(surface)` mounts **into** `surface`, and the code then called
+`wrap.appendChild(view.dom)`, which moved `view.dom` out of `surface` into `wrap` and left `surface`
+detached. The ordering looked right in the source and was only visible in the rendered DOM.
+
+Resolution: `surface` is appended to `wrap` first, then `new EditorView(surface)` is constructed, and
+the redundant `wrap.appendChild(view.dom)` is gone. Both call sites were fixed.
+
+### The publish button stayed disabled after typing — `FIXED`
+
+Attempted: type into the draft editor and publish.
+
+Symptom: the button was enabled for a seeded draft and stayed disabled for an in-place edit, so a
+user who typed a new article could not publish it.
+
+Root cause: `publish.disabled = !zineEditorIsDirty()` was evaluated at render time, and ProseMirror
+edits mutate the document in place without triggering an app re-render.
+
+Resolution: `renderZinesDraft` keeps a reference to the publish button and `zinesDraftChanged()` is
+called from `dispatchTransaction` on `tr.docChanged`, so the button updates in place.
+
+Lesson: an in-place editor inside a render-on-demand UI needs an explicit change channel back to the
+UI. Re-rendering on every keystroke would have been the other option, and it would have thrown away
+the cursor.
+
+---
+
 ## 2026-10-12 — Zines spec (design, docs-only)
 
 Trigger: the user proposed member blogs with comments, broadcast to all members, and asked to grill

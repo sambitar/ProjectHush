@@ -1068,6 +1068,22 @@ impl Account {
         self.vault.rotate_drop_keypair()
     }
 
+    /// The zines pen name this vault publishes under, if it has one yet.
+    pub fn pen_name(&self) -> Option<crate::PenName> {
+        self.vault.pen_name()
+    }
+
+    /// Mint a pen name (refused when one already exists).
+    pub fn create_pen_name(&mut self, name: &str) -> Result<crate::PenName, Error> {
+        self.vault.create_pen_name(name)
+    }
+
+    /// Rename the current pen name. The keys do not move, so nothing already
+    /// published under this byline changes its address.
+    pub fn rename_pen_name(&mut self, name: &str) -> Result<crate::PenName, Error> {
+        self.vault.rename_pen_name(name)
+    }
+
     /// Drain every drop slot this account still holds a key for.
     ///
     /// One pass: for each drain key — current first, then retired ones — fetch

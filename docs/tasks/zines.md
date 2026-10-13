@@ -279,13 +279,31 @@ not "leaves nothing behind."
 - [x] Decisions in Section 2 resolved and recorded (2026-10-12).
 - [ ] `THREAT_MODEL.md` addendum (Section 7) and `PROTOCOL.md` bulletin subsection when implementation starts.
 
-### Phase 1 — Pen names, store, editor (offline, no network)
-- [ ] Pen-name keypair in the vault (isolated from messaging keys); backup manifest carries it.
-- [ ] `zines.enc` sidecar: descriptor + revision chain + merged comments + held zines + read keys; caps with reasons; round-trip and corruption tests.
-- [ ] `/api/zines/*` local routes; lock = 401 everywhere.
-- [ ] ProseMirror editor + toolbar (no CRDT), rendered from local assets.
+### Phase 1 — Pen names, store, editor (offline, no network) — landed 2026-10-12
+- [x] Pen-name keypair in the vault (isolated from messaging keys); backup manifest carries it.
+      `crates/hush-core/src/vault.rs` (`PEN_NAMES_FILE`, `create_pen_name`, `rename_pen_name`),
+      `crates/hush-core/src/account.rs`, `crates/hush-daemon/src/account_worker.rs`. The isolation
+      test asserts the pen-name id differs from both the identity key and the drop key, and that two
+      vaults with the same identity material mint unrelated pen names.
+- [x] `zines.enc` sidecar: descriptor + revision chain + merged comments + held zines + read keys;
+      caps with reasons; round-trip and corruption tests. `crates/hush-daemon/src/zine_store.rs`.
+- [x] `/api/zines/*` local routes; lock = 401 everywhere. `crates/hush-daemon/src/main.rs`
+      (`/api/zines`, `/api/zines/pen-name`, `/api/zines/sections`, `/api/zines/{zine_id}`,
+      `/api/zines/{zine_id}/mute`), tested by `zines_api_tests`.
+- [x] ProseMirror editor + toolbar (no CRDT), rendered from local assets.
+      `apps/hush-tauri/src/lib/proseSchema.ts` (shared with Paper), `apps/hush-tauri/src/lib/zineStore.ts`,
+      the Zines pane in `apps/hush-tauri/src/app.ts` (Rail button, three-column view, pen-name modal,
+      forget confirmation), `apps/hush-tauri/src/styles/app.css`.
 
-**Verify:** author a zine with sections, restart — it survives; lock — every route 401s and `zines.enc` on disk is ciphertext; `cargo test -p hush-daemon`.
+**Verify:** author a zine with sections, restart — it survives; lock — every route 401s and `zines.enc`
+on disk is ciphertext; `cargo test -p hush-daemon`.
+
+**Verified 2026-10-12** in the real UI (Vite on 5173 against the daemon on 9876): a pen name was
+minted, an article was authored with sections `rust, notes` and a bold run, published, and reopened
+from the list — title, byline, tags, body, and facet counts all rendered, and the body carried its
+`<strong>` mark through sanitizing. `zines.enc` is ciphertext at rest (`zines_sidecar_is_ciphertext_at_rest`),
+a restart survives (`a_zine_survives_a_restart`), and every route is 401 while locked
+(`every_zine_route_is_401_while_locked`). `cargo test -p hush-daemon`: 157 passed.
 
 ### Phase 2 — Bulletin lane (broadcast delivery)
 - [ ] Relay: `PUT /b` / `GET /b`, storage without an author column, cap, TTL, per-member rate limit; relay tests (unauthorized publish fails; TTL drops; a drain is not attributable).
@@ -305,6 +323,11 @@ not "leaves nothing behind."
 - [ ] Unreadable-blob indicator and empty states; honest copy from Section 7.
 
 **Verify:** a corpus of several zines browses by section and pen name; a muted pen name disappears locally with no wire effect.
+
+**Note (2026-10-12):** the index, the section facet, newest-first ordering with clamped timestamps,
+the local mute, and the unreadable/empty states all landed with Phase 1 — `ZinesState::index` takes
+both filters and the pane renders the facets. What Phase 4 still owes is the pen-name filter in the
+UI and a corpus to browse, so the boxes stay unticked.
 
 ### Phase 5 — Retention, hardening, docs
 - [ ] Holder **re-post sweep** (rate-limited, signature-verified) keeps held zines in the window; per-zine and total caps surface reasons.

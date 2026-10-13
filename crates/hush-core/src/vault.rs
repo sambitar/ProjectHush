@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+
 use crate::crypto::{
     decrypt, derive_master_key, encrypt, random_bytes, sha256, MASTER_KEY_LEN, SALT_LEN,
 };
@@ -461,6 +462,72 @@ impl Vault {
         fs::write(self.dir.join(DROP_KEYS_FILE), packed)?;
         Ok(())
     }
+
+    /// The pen name this vault publishes under, if it has one yet.
+    pub fn pen_name(&self) -> Option<PenName> {
+        let file = self.read_pen_names().ok()??;
+        Some(public_pen_name(&file.current))
+    }
+
+    /// Mint a pen name. A second call is refused rather than silently absorbed,
+    /// like the drop key: a pen name is an identity, and quietly reusing one
+    /// when the caller expected a new one is the kind of thing that ends up
+    /// published under the wrong byline.
+    pub fn create_pen_name(&self, name: &str) -> Result<PenName, Error> {
+        if self.read_pen_names()?.is_some() {
+            return Err(Error::PenNameExists);
+        }
+        let entry = PenNameEntry::new(name);
+        let out = public_pen_name(&entry);
+        self.write_pen_names(&PenNamesFile {
+            current: entry,
+            others: Vec::new(),
+        })?;
+        Ok(out)
+    }
+
+    /// Rename the current pen name.
+    ///
+    /// A display name is not an identity, so this does not touch either key and
+    /// nothing already published changes its `zine_id`. Refused when there is
+    /// no pen name to rename, so a rename cannot create one by accident.
+    pub fn rename_pen_name(&self, name: &str) -> Result<PenName, Error> {
+        let mut file = self.read_pen_names()?.ok_or(Error::PenNameMissing)?;
+        file.current.name = name.trim().to_string();
+        let out = public_pen_name(&file.current);
+        self.write_pen_names(&file)?;
+        Ok(out)
+    }
+
+    fn read_pen_names(&self) -> Result<Option<PenNamesFile>, Error> {
+        let path = self.dir.join(PEN_NAMES_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let plain = decrypt(&self.master, &fs::read(path)?)?;
+        serde_json::from_slice(&plain)
+            .map(Some)
+            .map_err(|_| Error::Corrupt)
+    }
+
+    fn write_pen_names(&self, file: &PenNamesFile) -> Result<(), Error> {
+        if file.others.len() + 1 > PEN_NAMES_CAP {
+            return Err(Error::PenNameCap);
+        }
+        let plain = serde_json::to_vec(file).map_err(|_| Error::Corrupt)?;
+        let packed = encrypt(&self.master, &plain)?;
+        fs::write(self.dir.join(PEN_NAMES_FILE), packed)?;
+        Ok(())
+    }
+}
+
+/// Strip the secrets out of a stored pen-name entry.
+fn public_pen_name(entry: &PenNameEntry) -> PenName {
+    PenName {
+        id: entry.zine_id(),
+        name: entry.name.clone(),
+        sign_pk: entry.sign_pk_hex.clone(),
+    }
 }
 
 /// How many retired drop keys keep draining after a rotation. The relay's TTL
@@ -469,6 +536,92 @@ impl Vault {
 const RETIRED_DROP_KEYS: usize = 3;
 
 const DROP_KEYS_FILE: &str = "drop-keys.enc";
+
+/// The zine pen names this vault publishes under.
+///
+/// Its own file rather than a field in the vault record, for the same reason
+/// the drop keys have one: a pen name is a **key**, and a key belongs in
+/// ciphertext that is decrypted only while the vault is unlocked. Every file in
+/// the vault directory is carried by [`crate::backup::export_vault`], so a
+/// pen name is backed up by existing, without an entry in the manifest.
+const PEN_NAMES_FILE: &str = "pen-names.enc";
+
+/// How many pen names one vault may hold. Multiple pen names are a later
+/// feature; the cap exists now so the sidecar cannot grow without bound.
+const PEN_NAMES_CAP: usize = 16;
+
+/// A pen name: the identity a zine is published under, and the two keys that
+/// make it usable.
+///
+/// Two keys, not one, because a pen name has to do two different things and no
+/// single curve does both:
+///
+/// - **seal** — X25519, so a stranger can seal a comment to it. This is the
+///   **address**: `zine_id` is this key in hex, because the id is what a
+///   commenter encrypts to and what a `ZineGrant` names, so it has to be
+///   derivable from the key the crypto actually uses.
+/// - **sign** — Ed25519, so authorship can be proven. Verification material,
+///   not an address, so it travels with the blob rather than in the id.
+///
+/// Both are generated here and never derived from the messaging identity, which
+/// is what makes a pen name *isolated*: nothing in this file can be computed
+/// from the Signal keys, so publishing under a pen name cannot be tied to a
+/// member's account even by someone holding their messaging private key.
+#[derive(Clone, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+struct PenNameEntry {
+    /// The display name the author chose. Free text, local, and only ever
+    /// published inside an encrypted descriptor.
+    name: String,
+    seal_sk_hex: String,
+    seal_pk_hex: String,
+    sign_sk_hex: String,
+    sign_pk_hex: String,
+    created_unix: u64,
+}
+
+impl PenNameEntry {
+    fn new(name: &str) -> Self {
+        let seal = crate::drop::drop_keypair();
+        // `from_bytes` over the crate's own `random_bytes`, the same way the
+        // vault's device and identity keys are minted: `SigningKey::generate`
+        // wants a `rand_core` that is a version behind the one in this tree.
+        let signing = SigningKey::from_bytes(&random_bytes::<32>());
+        Self {
+            name: name.trim().to_string(),
+            seal_sk_hex: hex::encode(seal.sk),
+            seal_pk_hex: hex::encode(seal.pk),
+            sign_sk_hex: hex::encode(signing.to_bytes()),
+            sign_pk_hex: hex::encode(signing.verifying_key().to_bytes()),
+            created_unix: now_secs(),
+        }
+    }
+
+    /// The address a zine is named by: the seal public key, hex.
+    fn zine_id(&self) -> String {
+        self.seal_pk_hex.clone()
+    }
+}
+
+#[derive(Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
+struct PenNamesFile {
+    /// The pen name new work is published under.
+    current: PenNameEntry,
+    /// Other pen names this vault holds. Multiple pen names are a later
+    /// feature; the list exists so adding one is additive, not a migration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    others: Vec<PenNameEntry>,
+}
+
+/// A pen name as the rest of the program sees it: the display name and the two
+/// public keys, with no secret material in the struct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PenName {
+    /// `zine_id`: the seal public key, hex. What a comment is sealed to.
+    pub id: String,
+    pub name: String,
+    /// The signing public key, hex. Provenance, published with a blob.
+    pub sign_pk: String,
+}
 
 /// Plaintext bytes per encrypted chunk for [`Vault::put_blob_stream`]. Large
 /// enough that per-chunk overhead is negligible, small enough that peak memory
@@ -761,6 +914,113 @@ mod tests {
 
         let reloaded = Vault::open(&d, "pw").unwrap();
         assert_eq!(reloaded.drop_public_key().unwrap(), vault.drop_public_key().unwrap());
+    }
+
+    #[test]
+    fn a_pen_name_is_minted_once_and_survives_a_reopen() {
+        let d = scratch("pen-name");
+        let vault = Vault::create(&d, "pw").unwrap();
+        assert!(vault.pen_name().is_none(), "a fresh vault has no pen name");
+
+        let pen = vault.create_pen_name("  Ada  ").unwrap();
+        assert_eq!(pen.name, "Ada", "the display name is trimmed");
+        assert_eq!(pen.id.len(), 64, "the id is a 32-byte key in hex");
+        assert_eq!(pen.sign_pk.len(), 64);
+        assert_ne!(pen.id, pen.sign_pk, "the address and the signing key differ");
+
+        assert!(matches!(
+            vault.create_pen_name("someone else").unwrap_err(),
+            Error::PenNameExists
+        ));
+
+        let reloaded = Vault::open(&d, "pw").unwrap();
+        assert_eq!(reloaded.pen_name().unwrap(), pen);
+    }
+
+    #[test]
+    fn renaming_a_pen_name_keeps_both_keys() {
+        let d = scratch("pen-name-rename");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let before = vault.create_pen_name("Ada").unwrap();
+        let after = vault.rename_pen_name("Ada Lovelace").unwrap();
+        assert_eq!(after.name, "Ada Lovelace");
+        assert_eq!(after.id, before.id, "a display name is not an identity");
+        assert_eq!(after.sign_pk, before.sign_pk);
+        assert_eq!(Vault::open(&d, "pw").unwrap().pen_name().unwrap(), after);
+    }
+
+    #[test]
+    fn renaming_without_a_pen_name_is_refused_rather_than_creating_one() {
+        let d = scratch("pen-name-rename-missing");
+        let vault = Vault::create(&d, "pw").unwrap();
+        assert!(matches!(
+            vault.rename_pen_name("nobody").unwrap_err(),
+            Error::PenNameMissing
+        ));
+        assert!(vault.pen_name().is_none());
+    }
+
+    #[test]
+    fn pen_names_are_isolated_from_the_messaging_identity() {
+        // The point of a pen name is that it cannot be tied to the account.
+        // Two vaults with the same identity material must still mint unrelated
+        // pen names, and a pen name must not be derivable from the drop key.
+        let a = scratch("pen-name-a");
+        let b = scratch("pen-name-b");
+        let va = Vault::create(&a, "pw").unwrap();
+        let vb = Vault::create(&b, "pw").unwrap();
+        let pa = va.create_pen_name("Ada").unwrap();
+        let pb = vb.create_pen_name("Ada").unwrap();
+        assert_ne!(pa.id, pb.id);
+        assert_ne!(pa.id, hex::encode(va.identity_public().0));
+        assert_ne!(pa.id, va.drop_public_key().unwrap_or_default());
+        assert_ne!(pa.sign_pk, pa.id);
+    }
+
+    #[test]
+    fn a_pen_name_is_ciphertext_at_rest() {
+        let d = scratch("pen-name-at-rest");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let pen = vault.create_pen_name("Ada Lovelace").unwrap();
+        let raw = fs::read(d.join(PEN_NAMES_FILE)).unwrap();
+        let hay = String::from_utf8_lossy(&raw);
+        assert!(!hay.contains("Ada Lovelace"), "the display name is not plaintext");
+        assert!(!hay.contains(&pen.id), "the address is not plaintext");
+        assert!(!hay.contains(&pen.sign_pk), "the signing key is not plaintext");
+    }
+
+    #[test]
+    fn a_backup_carries_the_pen_name_and_the_zines_sidecar() {
+        // The acceptance criterion for zines Phase 1 is that a backup carries
+        // the pen name. `export_vault` walks the vault directory, so the check
+        // that matters is that the pen name and the zines sidecar are *files in
+        // it* — a pen name kept anywhere else would be silently dropped from
+        // every backup, and the only symptom would be a restored vault that
+        // cannot publish under its own byline.
+        let d = scratch("pen-name-backup");
+        let vault = Vault::create(&d, "pw").unwrap();
+        let pen = vault.create_pen_name("Ada").unwrap();
+        vault.write_encrypted_file("zines.enc", b"sealed zine state").unwrap();
+
+        let archive = crate::backup::export_vault(&d).unwrap();
+        let names: Vec<String> = {
+            let mut tar = tar::Archive::new(&archive[..]);
+            tar.entries()
+                .unwrap()
+                .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert!(names.iter().any(|n| n == PEN_NAMES_FILE), "{names:?}");
+        assert!(names.iter().any(|n| n == "zines.enc"), "{names:?}");
+
+        let restored = scratch("pen-name-restore");
+        crate::backup::import_vault(&restored, &archive).unwrap();
+        let back = Vault::open(&restored, "pw").unwrap();
+        assert_eq!(back.pen_name().unwrap(), pen);
+        assert_eq!(
+            back.read_encrypted_file("zines.enc").unwrap().unwrap(),
+            b"sealed zine state"
+        );
     }
 
     /// Vaults written before format v2 derived the master key from the

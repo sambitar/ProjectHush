@@ -18,6 +18,9 @@ import type {
   WalletNetworkMode,
   WalletStateDto,
   WalletTokenDto,
+  ZineSummaryDto,
+  ZineViewDto,
+  ZinesViewDto,
 } from "./lib/api/types";
 import {
   HK_NEWS,
@@ -197,6 +200,16 @@ import {
   paperSession,
 } from "./lib/paperStore";
 import {
+  attachZineEditor,
+  closeZineEditor,
+  parseSections,
+  penNameLabel,
+  shortId,
+  zineEditorHasFocus,
+  zineEditorHtml,
+  zineEditorIsDirty,
+} from "./lib/zineStore";
+import {
   dropById,
   verifiedCount,
   visibleDrops,
@@ -241,6 +254,7 @@ type Rail =
   | "chats"
   | "trusts"
   | "conclaves"
+  | "zines"
   | "reads"
   | "torrents"
   | "irc"
@@ -646,6 +660,54 @@ export class App {
    * same doctrine as the reader pane's stable DOM).
    */
   private paperHost: HTMLElement | null = null;
+  /**
+   * The Zines pane's state.
+   *
+   * Phase 1 is local and offline: this vault authors one zine under its pen
+   * name and holds whatever else it has been given. Everything the pane needs
+   * to paint — the index, the section facet, the pen name — arrives in one
+   * `ZinesViewDto`, because three round trips would be three chances to render
+   * a pane that disagrees with itself.
+   */
+  private zinesView: ZinesViewDto | null = null;
+  private zinesLoading = false;
+  private zinesError: string | null = null;
+  /** The active section filter, or null for the whole corpus. */
+  private zinesSection: string | null = null;
+  /** The zine open in the reading pane. */
+  private zinesOpenId: string | null = null;
+  private zinesDetail: ZineViewDto | null = null;
+  private zinesDetailError: string | null = null;
+  /**
+   * Whether the draft editor is up, and which zine it is revising.
+   *
+   * `zinesDraftZineId` is null for the pen name's first zine: the daemon takes
+   * the byline from the vault and treats an absent id as "my own", which is the
+   * only thing Phase 1 can author.
+   */
+  private zinesEditing = false;
+  private zinesDraftZineId: string | null = null;
+  /** The draft's title and raw section input, held outside the DOM for the
+   *  same reason the conclave form is: a re-render rebuilds the fields. */
+  private zinesDraftTitle = "";
+  private zinesDraftSections = "";
+  /** The body the editor is seeded with when the host is first built. Held
+   *  here because `render()` rebuilds the pane around the editor. */
+  private zinesDraftSeedHtml = "";
+  /**
+   * The stable host for the draft editor, built once per draft and re-parented
+   * into the fresh pane on every re-render — the same doctrine as `paperHost`.
+   */
+  private zinesEditorHost: HTMLElement | null = null;
+  /**
+   * Set by the editor's change callback, so Publish can be enabled in place
+   * without re-rendering the pane the author is typing in.
+   */
+  private zinesPublishBtn: HTMLButtonElement | null = null;
+  private zinesPenNameOpen = false;
+  private zinesPenNameDraft = "";
+  private zinesPenNameError: string | null = null;
+  private zinesForgetId: string | null = null;
   private conclaveCreateOpen = false;
   /**
    * The in-progress create-conclave form.
@@ -1239,7 +1301,8 @@ export class App {
         this.readsAddOpen ||
         this.profileNick !== null ||
         this.trustDeleteNick !== null ||
-        (this.conclaveTab === "paper" && paperHasFocus());
+        (this.conclaveTab === "paper" && paperHasFocus()) ||
+        (this.rail === "zines" && (this.zinesEditing || zineEditorHasFocus()));
       if (
         (r.messages.length || presenceChanged || mailboxChanged || conclavesChanged) &&
         !editing
@@ -1265,6 +1328,19 @@ export class App {
     closePaper();
     this.paperHost = null;
     this.conclaveTab = "chat";
+    // The draft editor's doc is the only copy of an unpublished revision, and
+    // every zines route answers 401 once the vault is locked. Phase 1 has no
+    // local persistence for a draft, so it is discarded rather than left on
+    // screen looking publishable.
+    this.zinesDiscardDraft();
+    this.zinesView = null;
+    this.zinesDetail = null;
+    this.zinesOpenId = null;
+    this.zinesSection = null;
+    this.zinesError = null;
+    this.zinesDetailError = null;
+    this.zinesPenNameOpen = false;
+    this.zinesForgetId = null;
     clearReadsStore();
     clearNotesStore();
     clearTorrentsStore();
@@ -1366,6 +1442,10 @@ export class App {
       shell.appendChild(this.renderTrusts());
     } else if (this.rail === "conclaves") {
       shell.appendChild(this.renderConclaves());
+    } else if (this.rail === "zines") {
+      shell.appendChild(this.renderZinesNav());
+      shell.appendChild(this.renderZinesList());
+      shell.appendChild(this.renderZinesMain());
     } else if (this.rail === "reads") {
       shell.appendChild(this.renderReadsNav());
       shell.appendChild(this.renderReadsList());
@@ -1423,6 +1503,8 @@ export class App {
     if (this.readsConfirmUrl) this.root.appendChild(this.renderReadsConfirm());
     if (this.torrentsDeleteId) this.root.appendChild(this.renderTorrentsDeleteModal());
     if (this.notesViewingId) this.root.appendChild(this.renderNoteViewModal());
+    if (this.zinesPenNameOpen) this.root.appendChild(this.renderZinesPenNameModal());
+    if (this.zinesForgetId) this.root.appendChild(this.renderZinesForgetModal());
     if (this.pendingUpdate) this.root.appendChild(this.renderUpdatePrompt());
   }
 
@@ -1627,6 +1709,14 @@ export class App {
           if (changed && this.rail === "conclaves" && !this.conclaveCreateOpen) this.render();
         });
       }
+      if (id === "zines") {
+        // Leaving the rail closes the draft: the editor's doc is the only copy
+        // of an unpublished revision, and keeping it mounted would let a
+        // cancelled draft reappear on the next visit.
+        void this.zinesLoad();
+      } else if (this.zinesEditing) {
+        this.zinesDiscardDraft();
+      }
       if (id === "reads") {
         // Refresh the source list every time the pane opens (user feeds may
         // have changed elsewhere / while locked only the built-in shows).
@@ -1684,6 +1774,7 @@ export class App {
     rail.appendChild(this.railBtn("chats", "Chats", "chats", unreadTotal()));
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
     rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
+    rail.appendChild(this.railBtn("zines", "Zines", "zines"));
     rail.appendChild(this.railBtn("reads", "Reads", "reads"));
     rail.appendChild(
       this.railBtn(
@@ -4779,6 +4870,853 @@ export class App {
     } catch {
       return url;
     }
+  }
+
+  // --- Zines (a member's own publication, and the ones they hold) ------------
+  //
+  // Phase 1 is local and offline: this vault authors one zine under its pen
+  // name and reads whatever else it holds. There is no bulletin, no key
+  // epidemic, and no comment arriving from a peer yet, so every route here
+  // talks to the local daemon and nothing else. The newspaper model is the
+  // shape: a pull-only corpus, filtered by section, newest first.
+
+  /**
+   * Load the pane.
+   *
+   * The whole index, the section facet, and the pen name come back in one
+   * response — three round trips to paint one screen would be three chances to
+   * render a pane that disagrees with itself. The index is fetched unfiltered
+   * and the section is applied on screen, so the facet and the list are always
+   * read from the same payload.
+   */
+  private async zinesLoad(): Promise<void> {
+    this.zinesLoading = true;
+    this.zinesError = null;
+    if (this.rail === "zines") this.render();
+    try {
+      const view = await api.zinesIndex();
+      this.zinesView = view ?? null;
+    } catch (e) {
+      this.zinesError =
+        e instanceof AppError ? e.message : "Couldn't load your zines.";
+    }
+    this.zinesLoading = false;
+    if (this.rail === "zines") this.render();
+  }
+
+  /** The corpus as the list shows it, narrowed by the active section. */
+  private zinesFiltered(): ZineSummaryDto[] {
+    const all = this.zinesView?.zines ?? [];
+    const section = this.zinesSection;
+    return section ? all.filter((z) => z.sections.includes(section)) : all;
+  }
+
+  /** This vault's own zine, if the pen name has published one. */
+  private zinesOwn(): ZineSummaryDto | undefined {
+    const id = this.zinesView?.pen_name?.id;
+    return id ? this.zinesView?.zines.find((z) => z.zine_id === id) : undefined;
+  }
+
+  /** Open a zine in the reading pane. */
+  private async zinesOpen(zineId: string): Promise<void> {
+    if (this.zinesEditing) this.zinesDiscardDraft();
+    this.zinesOpenId = zineId;
+    this.zinesDetail = null;
+    this.zinesDetailError = null;
+    this.render();
+    try {
+      const detail = await api.zinesGet(zineId);
+      // The selection can move while the request is in flight; a late reply
+      // must not paint over whatever the user is looking at now.
+      if (this.zinesOpenId !== zineId) return;
+      this.zinesDetail = detail;
+    } catch (e) {
+      if (this.zinesOpenId !== zineId) return;
+      this.zinesDetailError =
+        e instanceof AppError ? e.message : "Couldn't open that zine.";
+    }
+    if (this.rail === "zines" && this.zinesOpenId === zineId) this.render();
+  }
+
+  /**
+   * A keystroke in the draft.
+   *
+   * Deliberately not a re-render: the editor is a third-party view and
+   * re-parenting it mid-keystroke is how a caret ends up in the wrong
+   * paragraph. The one thing that has to change is Publish, which stays
+   * disabled until there is something to publish.
+   */
+  private zinesDraftChanged(): void {
+    const btn = this.zinesPublishBtn;
+    if (btn && btn.textContent !== "Publishing…") btn.disabled = false;
+  }
+
+  /**
+   * Open the draft editor for a new revision.
+   *
+   * `zineId` is the zine being revised, or null for the pen name's first zine:
+   * the daemon takes the byline from the vault and treats an absent id as "my
+   * own", which is the only thing Phase 1 can author.
+   */
+  private zinesStartDraft(
+    zineId: string | null,
+    title: string,
+    sections: string,
+    seedHtml: string,
+  ): void {
+    closeZineEditor();
+    this.zinesEditorHost = null;
+    this.zinesEditing = true;
+    this.zinesDraftZineId = zineId;
+    this.zinesDraftTitle = title;
+    this.zinesDraftSections = sections;
+    this.zinesDraftSeedHtml = seedHtml;
+    this.zinesPublishBtn = null;
+    this.render();
+  }
+
+  /**
+   * Drop the draft and its editor.
+   *
+   * A draft lives only in the editor's document — Phase 1 has nowhere to keep
+   * an unpublished revision — so discarding it is the honest end state rather
+   * than leaving it on screen looking publishable after the vault locked or the
+   * rail moved on.
+   */
+  private zinesDiscardDraft(): void {
+    closeZineEditor();
+    this.zinesEditorHost = null;
+    this.zinesEditing = false;
+    this.zinesDraftZineId = null;
+    this.zinesDraftTitle = "";
+    this.zinesDraftSections = "";
+    this.zinesDraftSeedHtml = "";
+    this.zinesPublishBtn = null;
+  }
+
+  /** Revise the open zine, seeded with what it currently holds. */
+  private zinesRevise(zineId: string, title: string, sections: string[], body: string): void {
+    this.zinesStartDraft(zineId, title, sections.join(", "), body);
+  }
+
+  /**
+   * Publish the draft as a new revision.
+   *
+   * The editor's document is read *before* the button is disabled, because
+   * publishing tears the editor down on success and the doc goes with it.
+   */
+  private async zinesPublish(btn: HTMLButtonElement): Promise<void> {
+    const title = this.zinesDraftTitle.trim();
+    if (!title) {
+      this.announce("A zine needs a title.");
+      this.zinesDraftTitleError();
+      return;
+    }
+    const body = zineEditorHtml();
+    const sections = parseSections(this.zinesDraftSections);
+    const revising = this.zinesDraftZineId;
+    btn.disabled = true;
+    btn.textContent = "Publishing…";
+    try {
+      const view = await api.zinesWrite({
+        zine_id: revising ?? undefined,
+        title,
+        sections,
+        body,
+      });
+      if (view) this.zinesView = view;
+      // The id to read back is the pen name's own: a first publish has no
+      // draft id yet, and the daemon answers with the pen name it used.
+      const publishedId = revising ?? view?.pen_name?.id ?? null;
+      this.zinesDiscardDraft();
+      if (publishedId) {
+        void this.zinesOpen(publishedId);
+      } else if (this.rail === "zines") {
+        this.render();
+      }
+    } catch (e) {
+      // The draft survives a refusal: the daemon validates the body it is
+      // given, and a rejected publish must not cost the author their writing.
+      btn.disabled = false;
+      btn.textContent = "Publish";
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't publish that zine.",
+      );
+    }
+  }
+
+  /** Mark the title field, so a refused publish points at the field at fault. */
+  private zinesDraftTitleError(): void {
+    const input = this.root.querySelector<HTMLInputElement>(".zine-title-input");
+    if (input) {
+      input.classList.add("invalid");
+      input.focus();
+    }
+  }
+
+  private async zinesToggleMute(zineId: string, muted: boolean): Promise<void> {
+    try {
+      const view = await api.zinesMute(zineId, muted);
+      if (view) this.zinesView = view;
+    } catch (e) {
+      this.announce(e instanceof AppError ? e.message : "Couldn't change that.");
+    }
+    if (this.rail === "zines") this.render();
+  }
+
+  private async zinesForget(zineId: string): Promise<void> {
+    this.zinesForgetId = null;
+    try {
+      const view = await api.zinesForget(zineId);
+      if (view) this.zinesView = view;
+      if (this.zinesOpenId === zineId) {
+        this.zinesOpenId = null;
+        this.zinesDetail = null;
+        this.zinesDetailError = null;
+      }
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't forget that zine.",
+      );
+    }
+    if (this.rail === "zines") this.render();
+  }
+
+  private async zinesSavePenName(): Promise<void> {
+    const name = this.zinesPenNameDraft.trim();
+    if (!name) {
+      this.zinesPenNameError = "A pen name needs a byline.";
+      this.render();
+      return;
+    }
+    try {
+      const view = await api.zinesSetPenName(name);
+      if (view) this.zinesView = view;
+      this.zinesPenNameOpen = false;
+      this.zinesPenNameError = null;
+    } catch (e) {
+      this.zinesPenNameError =
+        e instanceof AppError ? e.message : "Couldn't set that pen name.";
+    }
+    if (this.rail === "zines") this.render();
+  }
+
+  /**
+   * The left column: who this vault publishes as, what it can write, and the
+   * section facet.
+   */
+  private renderZinesNav(): HTMLElement {
+    const col = document.createElement("div");
+    col.className = "zines-nav";
+
+    const head = document.createElement("div");
+    head.className = "conv-list-header";
+    const h = document.createElement("span");
+    h.className = "text-22";
+    h.textContent = "Zines";
+    head.appendChild(h);
+    col.appendChild(head);
+
+    const penName = this.zinesView?.pen_name ?? null;
+    const card = document.createElement("div");
+    card.className = "zine-pen-card";
+    if (penName) {
+      const byline = document.createElement("div");
+      byline.className = "zine-pen-name text-15";
+      byline.textContent = penNameLabel(penName);
+      const addr = document.createElement("div");
+      addr.className = "zine-pen-id text-12 muted";
+      addr.textContent = shortId(penName.id);
+      addr.title = penName.id;
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "zine-pen-rename pressable";
+      rename.textContent = "Change";
+      rename.onclick = () => {
+        this.zinesPenNameOpen = true;
+        this.zinesPenNameDraft = penName.name;
+        this.zinesPenNameError = null;
+        this.render();
+      };
+      card.append(byline, addr, rename);
+    } else {
+      const p = document.createElement("p");
+      p.className = "zine-pen-id text-13 muted";
+      p.textContent =
+        "Choose a pen name to publish under. It is a separate key, kept with your vault, and it never touches your messaging identity.";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn-primary pressable zine-pen-choose";
+      btn.textContent = "Choose a pen name";
+      btn.onclick = () => {
+        this.zinesPenNameOpen = true;
+        this.zinesPenNameDraft = "";
+        this.zinesPenNameError = null;
+        this.render();
+      };
+      card.append(p, btn);
+    }
+    col.appendChild(card);
+
+    if (penName) {
+      const own = this.zinesOwn();
+      const write = document.createElement("button");
+      write.type = "button";
+      write.className = "btn-primary pressable zines-write";
+      write.textContent = own ? "Write a new revision" : "Write a zine";
+      write.onclick = () =>
+        this.zinesStartDraft(own?.zine_id ?? null, own?.title ?? "", own?.sections.join(", ") ?? "", "");
+      col.appendChild(write);
+    }
+
+    const list = document.createElement("div");
+    list.className = "zines-facet";
+    const total = this.zinesView?.zines.length ?? 0;
+    list.appendChild(
+      this.zinesFacetRow("All", null, total, this.zinesSection === null),
+    );
+    for (const s of this.zinesView?.sections ?? []) {
+      list.appendChild(
+        this.zinesFacetRow(s.name, s.name, s.count, this.zinesSection === s.name),
+      );
+    }
+    col.appendChild(list);
+    return col;
+  }
+
+  private zinesFacetRow(
+    label: string,
+    section: string | null,
+    count: number,
+    active: boolean,
+  ): HTMLElement {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `zines-facet-row pressable${active ? " active" : ""}`;
+    const name = document.createElement("span");
+    name.className = "text-13";
+    name.textContent = label;
+    const n = document.createElement("span");
+    n.className = "zines-facet-count text-12 muted";
+    n.textContent = String(count);
+    btn.append(name, n);
+    btn.onclick = () => {
+      this.zinesSection = section;
+      this.render();
+    };
+    return btn;
+  }
+
+  /** The middle column: the corpus, newest first. */
+  private renderZinesList(): HTMLElement {
+    const col = document.createElement("div");
+    col.className = "zines-list";
+
+    const head = document.createElement("div");
+    head.className = "conv-list-header";
+    const title = document.createElement("span");
+    title.className = "text-15 muted";
+    title.textContent = this.zinesSection ?? "All zines";
+    head.appendChild(title);
+    col.appendChild(head);
+
+    if (this.zinesError) {
+      const err = document.createElement("p");
+      err.className = "zines-status muted text-13";
+      err.textContent = this.zinesError;
+      col.appendChild(err);
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "btn-secondary pressable zines-retry";
+      retry.textContent = "Try again";
+      retry.onclick = () => void this.zinesLoad();
+      col.appendChild(retry);
+      return col;
+    }
+    if (this.zinesLoading && !this.zinesView) {
+      const loading = document.createElement("p");
+      loading.className = "zines-status muted text-13";
+      loading.textContent = "Loading…";
+      col.appendChild(loading);
+      return col;
+    }
+
+    const rows = this.zinesFiltered();
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "zines-status muted text-13";
+      empty.textContent = this.zinesSection
+        ? "Nothing in this section."
+        : "Nothing here yet. Write the first one, or wait for one to arrive.";
+      col.appendChild(empty);
+      return col;
+    }
+    for (const z of rows) col.appendChild(this.renderZinesRow(z));
+    return col;
+  }
+
+  private renderZinesRow(z: ZineSummaryDto): HTMLElement {
+    const row = document.createElement("article");
+    row.className = `zines-row pressable${this.zinesOpenId === z.zine_id ? " open" : ""}${z.muted ? " muted-row" : ""}`;
+
+    const top = document.createElement("div");
+    top.className = "zines-row-top";
+    const title = document.createElement("button");
+    title.type = "button";
+    title.className = "zines-row-title text-15";
+    title.textContent = z.title || "Untitled";
+    title.onclick = () => void this.zinesOpen(z.zine_id);
+    top.appendChild(title);
+    if (z.authored) {
+      const mine = document.createElement("span");
+      mine.className = "zines-row-mine text-12";
+      mine.textContent = "Yours";
+      top.appendChild(mine);
+    }
+    row.appendChild(top);
+
+    if (z.preview) {
+      const preview = document.createElement("p");
+      preview.className = "zines-row-preview text-13 muted";
+      preview.textContent = z.preview;
+      row.appendChild(preview);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "zines-row-meta text-12 muted";
+    const bits: string[] = [z.pen_name || "unknown byline"];
+    if (z.sections.length) bits.push(z.sections.join(", "));
+    if (z.revision > 1) bits.push(`rev ${z.revision}`);
+    if (z.comments) {
+      bits.push(`${z.comments} comment${z.comments === 1 ? "" : "s"}`);
+    }
+    bits.push(readsTimeAgo(Math.floor(z.updated_ms / 1000)));
+    if (z.muted) bits.push("muted");
+    if (z.unreadable) bits.push("unreadable");
+    meta.textContent = bits.join(" · ");
+    row.appendChild(meta);
+    return row;
+  }
+
+  /** The right column: the article, the draft editor, or nothing. */
+  private renderZinesMain(): HTMLElement {
+    const main = document.createElement("div");
+    main.className = "zines-main";
+    if (this.zinesEditing) return this.renderZinesDraft(main);
+
+    const id = this.zinesOpenId;
+    if (!id) {
+      const empty = document.createElement("div");
+      empty.className = "zines-empty";
+      empty.appendChild(icon("zines"));
+      const p = document.createElement("p");
+      p.className = "muted text-15";
+      p.textContent = this.zinesView?.zines.length
+        ? "Pick something to read."
+        : "A zine is a page you publish under a pen name, stored encrypted in your vault.";
+      empty.appendChild(p);
+      main.appendChild(empty);
+      return main;
+    }
+    if (this.zinesDetailError) {
+      const err = document.createElement("p");
+      err.className = "zines-status muted text-13";
+      err.textContent = this.zinesDetailError;
+      main.appendChild(err);
+      return main;
+    }
+    const detail = this.zinesDetail;
+    if (!detail || detail.zine.descriptor.zine_id !== id) {
+      const loading = document.createElement("p");
+      loading.className = "zines-status muted text-13";
+      loading.textContent = "Opening…";
+      main.appendChild(loading);
+      return main;
+    }
+    main.appendChild(this.renderZineArticle(detail));
+    return main;
+  }
+
+  private renderZineArticle(detail: ZineViewDto): HTMLElement {
+    const { descriptor, history, authored, muted, unreadable, read_key } = detail.zine;
+    const article = document.createElement("article");
+    article.className = "zine-article";
+
+    const head = document.createElement("header");
+    head.className = "zine-article-head";
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.textContent = descriptor.title || "Untitled";
+    const byline = document.createElement("p");
+    byline.className = "zine-article-byline text-13 muted";
+    const bits: string[] = [descriptor.pen_name || "unknown byline"];
+    bits.push(readsTimeAgo(Math.floor(descriptor.created_ms / 1000)));
+    if (descriptor.revision > 1) bits.push(`revision ${descriptor.revision}`);
+    byline.textContent = bits.join(" · ");
+    head.append(h, byline);
+
+    if (descriptor.sections.length) {
+      const tags = document.createElement("div");
+      tags.className = "zine-article-tags";
+      for (const s of descriptor.sections) {
+        const tag = document.createElement("button");
+        tag.type = "button";
+        tag.className = "zine-tag pressable";
+        tag.textContent = s;
+        tag.onclick = () => {
+          this.zinesSection = s;
+          this.zinesOpenId = null;
+          this.zinesDetail = null;
+          this.render();
+        };
+        tags.appendChild(tag);
+      }
+      head.appendChild(tags);
+    }
+    article.appendChild(head);
+
+    const actions = document.createElement("div");
+    actions.className = "zine-article-actions";
+    if (authored && !unreadable) {
+      const revise = document.createElement("button");
+      revise.type = "button";
+      revise.className = "btn-secondary pressable";
+      revise.textContent = "Write a new revision";
+      revise.onclick = () =>
+        this.zinesRevise(
+          descriptor.zine_id,
+          descriptor.title,
+          descriptor.sections,
+          descriptor.body,
+        );
+      actions.appendChild(revise);
+    }
+    if (authored) {
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "btn-secondary pressable";
+      rename.textContent = "Change pen name";
+      rename.onclick = () => {
+        this.zinesPenNameOpen = true;
+        this.zinesPenNameDraft = this.zinesView?.pen_name?.name ?? descriptor.pen_name;
+        this.zinesPenNameError = null;
+        this.render();
+      };
+      actions.appendChild(rename);
+    }
+    const mute = document.createElement("button");
+    mute.type = "button";
+    mute.className = "btn-secondary pressable";
+    mute.textContent = muted ? "Unmute" : "Mute";
+    mute.title = muted
+      ? "Count this zine again"
+      : "Stop this zine being counted as new. It stays in your vault.";
+    mute.onclick = () => void this.zinesToggleMute(descriptor.zine_id, !muted);
+    actions.appendChild(mute);
+    if (!authored) {
+      const forget = document.createElement("button");
+      forget.type = "button";
+      forget.className = "btn-secondary pressable zine-forget";
+      forget.textContent = "Forget";
+      forget.title =
+        "Stop holding this zine. Not a retraction: other holders keep their copy.";
+      forget.onclick = () => {
+        this.zinesForgetId = descriptor.zine_id;
+        this.render();
+      };
+      actions.appendChild(forget);
+    }
+    article.appendChild(actions);
+
+    if (unreadable) {
+      const held = document.createElement("p");
+      held.className = "zines-status muted text-13";
+      held.textContent =
+        "This zine is held but not openable yet: the blob arrived before the key that unlocks it. It will open by itself once the key does.";
+      article.appendChild(held);
+      return article;
+    }
+    if (!read_key && !authored) {
+      const held = document.createElement("p");
+      held.className = "zines-status muted text-13";
+      held.textContent = "This vault has no read key for this zine.";
+      article.appendChild(held);
+      return article;
+    }
+
+    const body = document.createElement("div");
+    body.className = "zine-article-body";
+    // Sanitized on the way in: the body is whatever a holder's vault stored,
+    // and a holder is not trusted to have sanitized it.
+    body.innerHTML = bodyToDisplayHtml(descriptor.body);
+    article.appendChild(body);
+
+    if (descriptor.comments.length) {
+      const thread = document.createElement("section");
+      thread.className = "zine-comments";
+      const th = document.createElement("h2");
+      th.className = "text-17";
+      th.textContent = `Comments (${descriptor.comments.length})`;
+      thread.appendChild(th);
+      for (const c of descriptor.comments) {
+        const row = document.createElement("div");
+        row.className = "zine-comment";
+        const meta = document.createElement("div");
+        meta.className = "zine-comment-meta text-12 muted";
+        meta.textContent = `${c.author || "unknown"} · ${readsTimeAgo(Math.floor(c.created_ms / 1000))}`;
+        const text = document.createElement("div");
+        text.className = "zine-comment-body text-13";
+        text.textContent = c.body;
+        row.append(meta, text);
+        thread.appendChild(row);
+      }
+      article.appendChild(thread);
+    }
+
+    if (history.length) {
+      const past = document.createElement("section");
+      past.className = "zine-history";
+      const ph = document.createElement("h2");
+      ph.className = "text-17";
+      ph.textContent = `Earlier revisions (${history.length})`;
+      past.appendChild(ph);
+      for (const r of history) {
+        const row = document.createElement("div");
+        row.className = "zine-history-row";
+        const meta = document.createElement("div");
+        meta.className = "zine-comment-meta text-12 muted";
+        meta.textContent = `revision ${r.revision} · ${r.title || "Untitled"} · ${readsTimeAgo(Math.floor(r.replaced_ms / 1000))}`;
+        row.appendChild(meta);
+        const body = document.createElement("div");
+        body.className = "zine-history-body text-13";
+        body.innerHTML = bodyToDisplayHtml(r.body);
+        row.appendChild(body);
+        past.appendChild(row);
+      }
+      article.appendChild(past);
+    }
+    return article;
+  }
+
+  /** The draft form: title, sections, and the shared rich-text editor. */
+  private renderZinesDraft(main: HTMLElement): HTMLElement {
+    const form = document.createElement("div");
+    form.className = "zine-draft";
+
+    const head = document.createElement("div");
+    head.className = "zine-draft-head";
+    const h = document.createElement("h2");
+    h.className = "text-17";
+    h.textContent = this.zinesDraftZineId
+      ? "New revision"
+      : this.zinesOwn()
+        ? "New revision"
+        : "Write a zine";
+    head.appendChild(h);
+    const hint = document.createElement("p");
+    hint.className = "muted text-12";
+    hint.textContent =
+      "Published under your pen name and stored encrypted in your vault. Publishing adds a revision to the chain; earlier ones are kept.";
+    head.appendChild(hint);
+    form.appendChild(head);
+
+    const titleField = document.createElement("label");
+    titleField.className = "zine-field";
+    const titleLabel = document.createElement("span");
+    titleLabel.className = "text-13";
+    titleLabel.textContent = "Title";
+    const titleInput = document.createElement("input");
+    titleInput.type = "text";
+    titleInput.className = "zine-title-input";
+    titleInput.placeholder = "A title for this zine";
+    titleInput.value = this.zinesDraftTitle;
+    titleInput.oninput = () => {
+      this.zinesDraftTitle = titleInput.value;
+      titleInput.classList.remove("invalid");
+    };
+    titleField.append(titleLabel, titleInput);
+    form.appendChild(titleField);
+
+    const sectionField = document.createElement("label");
+    sectionField.className = "zine-field";
+    const sectionLabel = document.createElement("span");
+    sectionLabel.className = "text-13";
+    sectionLabel.textContent = "Sections";
+    const sectionInput = document.createElement("input");
+    sectionInput.type = "text";
+    sectionInput.className = "zine-sections-input";
+    sectionInput.placeholder = "rust, networking";
+    sectionInput.value = this.zinesDraftSections;
+    sectionInput.oninput = () => {
+      this.zinesDraftSections = sectionInput.value;
+    };
+    const sectionHint = document.createElement("span");
+    sectionHint.className = "muted text-12";
+    sectionHint.textContent = "Comma-separated tags. They stay inside the vault.";
+    sectionField.append(sectionLabel, sectionInput, sectionHint);
+    form.appendChild(sectionField);
+
+    // The editor host is built once per draft and re-parented on every
+    // re-render, so the caret and the undo history survive a background repaint.
+    if (!this.zinesEditorHost) {
+      const host = document.createElement("div");
+      host.className = "zine-editor";
+      attachZineEditor(host, this.zinesDraftSeedHtml, () => this.zinesDraftChanged());
+      this.zinesEditorHost = host;
+    }
+    form.appendChild(this.zinesEditorHost);
+
+    const footer = document.createElement("div");
+    footer.className = "zine-draft-actions";
+    const publish = document.createElement("button");
+    publish.type = "button";
+    publish.className = "btn-primary pressable";
+    publish.textContent = "Publish";
+    // An untouched draft would append a revision identical to the last one, so
+    // the button waits for a keystroke. Read from the store rather than a flag
+    // of our own: a re-render can happen while the editor is already dirty.
+    publish.disabled = !zineEditorIsDirty();
+    publish.onclick = () => void this.zinesPublish(publish);
+    this.zinesPublishBtn = publish;
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Discard";
+    cancel.onclick = () => {
+      this.zinesDiscardDraft();
+      this.render();
+    };
+    footer.append(publish, cancel);
+    form.appendChild(footer);
+    main.appendChild(form);
+    return main;
+  }
+
+  private renderZinesPenNameModal(): HTMLElement {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal zine-pen-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Pen name");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = this.zinesView?.pen_name ? "Change pen name" : "Choose a pen name";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-2)";
+    p.textContent =
+      "This is the byline readers see. The key behind it lives in your vault and is separate from your messaging identity, so changing the byline does not move the address your zine is published under.";
+    modal.append(h, p);
+
+    const field = document.createElement("label");
+    field.className = "zine-field";
+    const label = document.createElement("span");
+    label.className = "text-13";
+    label.textContent = "Byline";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "zine-pen-input";
+    input.placeholder = "How you sign your work";
+    input.value = this.zinesPenNameDraft;
+    input.oninput = () => {
+      this.zinesPenNameDraft = input.value;
+      this.zinesPenNameError = null;
+    };
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void this.zinesSavePenName();
+      }
+    };
+    field.append(label, input);
+    modal.appendChild(field);
+
+    if (this.zinesPenNameError) {
+      const err = document.createElement("p");
+      err.className = "zine-pen-error text-13";
+      err.textContent = this.zinesPenNameError;
+      modal.appendChild(err);
+    }
+
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn-primary pressable";
+    save.textContent = "Save";
+    save.onclick = () => void this.zinesSavePenName();
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.zinesPenNameOpen = false;
+      this.zinesPenNameError = null;
+      this.render();
+    };
+    row.append(save, cancel);
+    modal.appendChild(row);
+
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.zinesPenNameOpen = false;
+        this.zinesPenNameError = null;
+        this.render();
+      }
+    };
+    return back;
+  }
+
+  private renderZinesForgetModal(): HTMLElement {
+    const zineId = this.zinesForgetId!;
+    const row = this.zinesView?.zines.find((z) => z.zine_id === zineId);
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal zine-forget-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Forget this zine");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Forget this zine?";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-2)";
+    p.textContent = `${row?.title || "This zine"} is dropped from this vault. It is not a retraction: any other holder keeps their copy, and nothing already published is withdrawn.`;
+    modal.append(h, p);
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const confirm = document.createElement("button");
+    confirm.type = "button";
+    confirm.className = "btn-primary pressable";
+    confirm.textContent = "Forget";
+    confirm.onclick = () => void this.zinesForget(zineId);
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.zinesForgetId = null;
+      this.render();
+    };
+    actions.append(confirm, cancel);
+    modal.appendChild(actions);
+
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.zinesForgetId = null;
+        this.render();
+      }
+    };
+    return back;
   }
 
   private renderReadsNav(): HTMLElement {

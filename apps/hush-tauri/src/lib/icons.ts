@@ -75,6 +75,9 @@ import {
   Copy,
   Bell,
   BellOff,
+  Newspaper,
+  Undo2,
+  Redo2,
   type IconNode,
 } from "lucide";
 
@@ -157,6 +160,9 @@ const ICONS = {
   bell: Bell,
   bellOff: BellOff,
   irc: Terminal,
+  zines: Newspaper,
+  undo: Undo2,
+  redo: Redo2,
 } satisfies Record<string, IconNode>;
 
 /**

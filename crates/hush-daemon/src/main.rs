@@ -13,6 +13,7 @@ mod torrents;
 mod torrents_store;
 mod ui_prefs;
 mod wallet;
+mod zine_store;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,7 +23,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use account_worker::{AccountWorker, ContactDto, WorkResult};
+use account_worker::{AccountWorker, ContactDto, PenNameDto, WorkResult};
 use axum::{
     extract::{Path, Query, State},
     http::{header, Method, StatusCode},
@@ -275,6 +276,17 @@ fn api_router(state: Arc<App>) -> Router {
             get(paper_presence).post(paper_publish_presence),
         )
         .route("/api/paper/{conclave_id}/hub/rehome", post(paper_rehome))
+        // Zines (Task 21, Phase 1 — local only). The literal `pen-name` segment
+        // is matched ahead of the `{zine_id}` parameter, and cannot collide with
+        // a real zine: an id is a 32-byte pen-name key in hex.
+        .route("/api/zines", get(zines_index).post(zines_write))
+        .route("/api/zines/pen-name", get(zines_pen_name).post(zines_set_pen_name))
+        .route("/api/zines/sections", get(zines_sections))
+        .route(
+            "/api/zines/{zine_id}",
+            get(zines_get).delete(zines_forget),
+        )
+        .route("/api/zines/{zine_id}/mute", post(zines_mute))
         .route("/api/torrents/state", get(torrents_state))
         .route("/api/torrents/key", post(torrents_set_key))
         .route("/api/torrents/test", post(torrents_test_key))
@@ -3004,6 +3016,307 @@ fn paper_view_of(
 
 const PAPER_NOT_FOUND: (&str, StatusCode) = ("no paper in this conclave", StatusCode::NOT_FOUND);
 
+// ---------------------------------------------------------------------------
+// Zines (Task 21, Phase 1)
+// ---------------------------------------------------------------------------
+//
+// Local and offline: authoring, storing, and reading a zine in this vault. The
+// bulletin, the key epidemic, and comments arriving from other members are
+// later phases; the routes below are the ones that need no network. Every route
+// goes through the worker, so a locked vault answers 401 without any of these
+// types being touched.
+
+/// The whole zines pane in one response: the index, the section facet, and the
+/// pen name. Three round trips to paint one screen would be three chances to
+/// render a pane that disagrees with itself.
+#[derive(serde::Serialize)]
+struct ZinesView {
+    zines: Vec<zine_store::ZineSummary>,
+    sections: Vec<ZineSectionView>,
+    pen_name: Option<PenNameDto>,
+}
+
+#[derive(serde::Serialize)]
+struct ZineSectionView {
+    name: String,
+    count: usize,
+}
+
+/// The filters `GET /api/zines` accepts. Both are optional and both are
+/// advisory: an unknown section is an empty list, not an error, because a
+/// section that has gone away is not a failure to answer.
+#[derive(serde::Deserialize)]
+struct ZinesQuery {
+    #[serde(default)]
+    section: Option<String>,
+    #[serde(default)]
+    pen: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ZineView {
+    zine: zine_store::ZineFile,
+}
+
+#[derive(serde::Deserialize)]
+struct ZineMuteBody {
+    /// Absent means "mute"; `false` unmutes. An explicit flag rather than a
+    /// toggle, so a double-click cannot land in the state the user did not ask
+    /// for.
+    #[serde(default = "yes")]
+    muted: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Fetch the raw zines sidecar bytes through the worker and decode them.
+///
+/// Authored zines that predate the read key being minted at create time are
+/// backfilled here and the result persisted, so the migration runs once, on the
+/// first read after the upgrade, rather than waiting for the next edit.
+async fn zines_sidecar(
+    state: &App,
+) -> Result<zine_store::ZinesState, (StatusCode, Json<ApiError>)> {
+    let mut parsed = match state.worker.secret_read(zine_store::STATE_FILE).await {
+        WorkResult::Secret(raw) => zine_store::decode(raw.as_deref()).map_err(|m| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError { error: m }),
+            )
+        })?,
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+    if parsed.backfill_read_keys() {
+        zines_persist(state, &parsed).await?;
+    }
+    Ok(parsed)
+}
+
+/// Persist the zines sidecar wholesale.
+async fn zines_persist(
+    state: &App,
+    parsed: &zine_store::ZinesState,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let bytes = parsed.encode().map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    match state.worker.secret_write(zine_store::STATE_FILE, bytes).await {
+        WorkResult::Ok => Ok(()),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn zines_pen_name_dto(state: &App) -> Result<Option<PenNameDto>, (StatusCode, Json<ApiError>)> {
+    match state.worker.pen_name().await {
+        WorkResult::PenName(pen) => Ok(pen),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+fn zines_view(
+    state: &zine_store::ZinesState,
+    section: Option<&str>,
+    pen: Option<&str>,
+    pen_name: Option<PenNameDto>,
+) -> ZinesView {
+    ZinesView {
+        zines: state.index(section, pen),
+        sections: state
+            .sections()
+            .into_iter()
+            .map(|(name, count)| ZineSectionView { name, count })
+            .collect(),
+        pen_name,
+    }
+}
+
+/// The local corpus: every zine this vault holds, filtered by section and by
+/// pen name. Pull-only — there is no feed and nothing to subscribe to.
+async fn zines_index(
+    State(state): State<Arc<App>>,
+    Query(query): Query<ZinesQuery>,
+) -> Result<Json<ZinesView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let parsed = zines_sidecar(&state).await?;
+    let pen_name = zines_pen_name_dto(&state).await?;
+    Ok(Json(zines_view(
+        &parsed,
+        query.section.as_deref(),
+        query.pen.as_deref(),
+        pen_name,
+    )))
+}
+
+/// The section facet on its own, for a caller that only wants the tags.
+async fn zines_sections(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<ZineSectionView>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let parsed = zines_sidecar(&state).await?;
+    Ok(Json(
+        parsed
+            .sections()
+            .into_iter()
+            .map(|(name, count)| ZineSectionView { name, count })
+            .collect(),
+    ))
+}
+
+/// One zine: the article, its history, and the merged comment thread.
+async fn zines_get(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+) -> Result<Json<ZineView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let parsed = zines_sidecar(&state).await?;
+    let zine = parsed
+        .get(&zine_id)
+        .ok_or_else(|| zine_not_held(&zine_id))?
+        .clone();
+    Ok(Json(ZineView { zine }))
+}
+
+/// Create the pen name's zine, or write a new revision of it.
+///
+/// The pen name is taken from the vault, never from the request: a caller does
+/// not get to choose which byline it publishes under, because that would let a
+/// stale or hostile caller write under an identity it does not hold. Publishing
+/// before a pen name exists is refused with a reason rather than minting one
+/// silently — a byline is a deliberate act, and one created by a stray POST
+/// would be a byline nobody chose.
+async fn zines_write(
+    State(state): State<Arc<App>>,
+    Json(draft): Json<zine_store::ZineDraft>,
+) -> Result<Json<ZinesView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let Some(pen_name) = zines_pen_name_dto(&state).await? else {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "choose a pen name before writing a zine".to_string(),
+            }),
+        ));
+    };
+    let mut parsed = zines_sidecar(&state).await?;
+    // The draft may name a zine, but only the caller's own: a held zine is
+    // refused inside the store, and a draft naming someone else's id would
+    // otherwise create a *new* zine under that id.
+    let zine_id = draft
+        .zine_id
+        .as_deref()
+        .filter(|id| *id == pen_name.id)
+        .unwrap_or(&pen_name.id)
+        .to_string();
+    parsed
+        .write(&zine_id, &pen_name.name, draft, paper_now_ms())
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    zines_persist(&state, &parsed).await?;
+    Ok(Json(zines_view(&parsed, None, None, Some(pen_name))))
+}
+
+/// Set the local mute flag. Local only: no wire effect, and the zine is still
+/// held and still counted.
+async fn zines_mute(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+    Json(body): Json<ZineMuteBody>,
+) -> Result<Json<ZinesView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = zines_sidecar(&state).await?;
+    if !parsed.set_muted(&zine_id, body.muted, paper_now_ms()) {
+        // Either there is no such zine, or it was already in that state. Both
+        // answers are the same to the caller, but only the first is an error.
+        if parsed.get(&zine_id).is_none() {
+            return Err(zine_not_held(&zine_id));
+        }
+    }
+    zines_persist(&state, &parsed).await?;
+    let pen_name = zines_pen_name_dto(&state).await?;
+    Ok(Json(zines_view(&parsed, None, None, pen_name)))
+}
+
+/// Forget a zine locally. Not a retraction: in Phase 2 the blobs are on the
+/// bulletin and in every holder's vault, and this only stops this vault from
+/// keeping them.
+async fn zines_forget(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+) -> Result<Json<ZinesView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = zines_sidecar(&state).await?;
+    if !parsed.forget(&zine_id) {
+        return Err(zine_not_held(&zine_id));
+    }
+    zines_persist(&state, &parsed).await?;
+    let pen_name = zines_pen_name_dto(&state).await?;
+    Ok(Json(zines_view(&parsed, None, None, pen_name)))
+}
+
+/// The pen name this vault publishes under.
+async fn zines_pen_name(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Option<PenNameDto>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    Ok(Json(zines_pen_name_dto(&state).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct PenNameBody {
+    #[serde(default)]
+    name: String,
+}
+
+/// Mint or rename the pen name, returning the one now in force.
+///
+/// Both operations land here because the caller's question is the same either
+/// way. The byline also moves on every zine this pen name already wrote, since a
+/// display name is not an identity: the address does not move, so nothing
+/// already published is invalidated.
+async fn zines_set_pen_name(
+    State(state): State<Arc<App>>,
+    Json(body): Json<PenNameBody>,
+) -> Result<Json<ZinesView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "a pen name needs a byline".to_string(),
+            }),
+        ));
+    }
+    let pen_name = match state.worker.set_pen_name(name).await {
+        WorkResult::PenName(Some(pen)) => pen,
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+    // The byline the UI shows on existing articles follows the pen name, so the
+    // rename is applied to the corpus in the same request that mints it.
+    let mut parsed = zines_sidecar(&state).await?;
+    if parsed.rename_byline(&pen_name.id, &pen_name.name, paper_now_ms()) {
+        zines_persist(&state, &parsed).await?;
+    }
+    Ok(Json(zines_view(&parsed, None, None, Some(pen_name))))
+}
+
+fn zine_not_held(zine_id: &str) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            error: format!("no zine is held for {zine_id}"),
+        }),
+    )
+}
+
 /// Fetch the raw papers sidecar bytes through the worker and decode them.
 async fn paper_sidecar(
     state: &App,
@@ -5480,7 +5793,7 @@ mod paper_api_tests {
 
     /// A marker could straddle a buffer edge; sliding windows make the
     /// substring check honest for any needle shorter than the file.
-    fn windows_are_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    pub(crate) fn windows_are_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         if needle.is_empty() || haystack.len() < needle.len() {
             return false;
         }
@@ -6275,4 +6588,391 @@ mod paper_api_tests {
         );
         assert!(hub.peers().is_empty(), "the channel is closed");
     }
+}
+
+/// Zines (Task 21, Phase 1): the local corpus over the routes.
+#[cfg(test)]
+mod zines_api_tests {
+    use super::*;
+    use crate::notes_api_tests::{build_app, request, unlocked_app};
+    use crate::paper_api_tests::windows_are_subslice;
+    use tempfile::TempDir;
+// -----------------------------------------------------------------------
+// Zines (Task 21, Phase 1)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn zines_route_is_empty_until_a_pen_name_exists() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+
+    let (status, view) = request(&router, "GET", "/api/zines", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["zines"].as_array().unwrap().len(), 0);
+    assert_eq!(view["sections"].as_array().unwrap().len(), 0);
+    assert!(view["pen_name"].is_null(), "no byline yet");
+
+    // Writing before choosing a byline is refused, not silently published
+    // under one nobody chose.
+    let (status, err) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(r#"{"title":"First","body":"<p>hello</p>"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(err["error"].as_str().unwrap().contains("pen name"), "{err}");
+}
+
+#[tokio::test]
+async fn a_pen_name_is_minted_then_renamed_without_moving_the_address() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+
+    let (status, view) = request(
+        &router,
+        "POST",
+        "/api/zines/pen-name",
+        Some(r#"{"name":"  Ada  "}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let id = view["pen_name"]["id"].as_str().unwrap().to_string();
+    assert_eq!(view["pen_name"]["name"], "Ada", "the byline is trimmed");
+    assert_eq!(id.len(), 64);
+
+    // A blank byline is refused rather than minting an unnamed identity.
+    let (status, _) = request(
+        &router,
+        "POST",
+        "/api/zines/pen-name",
+        Some(r#"{"name":"   "}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, renamed) = request(
+        &router,
+        "POST",
+        "/api/zines/pen-name",
+        Some(r#"{"name":"Ada Lovelace"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    assert_eq!(renamed["pen_name"]["name"], "Ada Lovelace");
+    assert_eq!(
+        renamed["pen_name"]["id"], id,
+        "a byline is not an identity: the address did not move"
+    );
+
+    let (status, got) = request(&router, "GET", "/api/zines/pen-name", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["name"], "Ada Lovelace");
+}
+
+#[tokio::test]
+async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+    let (_, pen) = request(
+        &router,
+        "POST",
+        "/api/zines/pen-name",
+        Some(r#"{"name":"ada"}"#),
+    )
+    .await;
+    let id = pen["pen_name"]["id"].as_str().unwrap().to_string();
+
+    // Create.
+    let (status, created) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(r#"{"title":"On relays","sections":["Rust","rust","Networking"],"body":"<p>hello <strong>world</strong></p>"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let row = &created["zines"][0];
+    assert_eq!(row["title"], "On relays");
+    assert_eq!(row["revision"], 1);
+    assert_eq!(row["zine_id"], id, "the id is the pen name");
+    assert_eq!(row["authored"], true);
+    assert_eq!(row["preview"], "hello world");
+    assert_eq!(
+        row["sections"].as_array().unwrap().len(),
+        2,
+        "`Rust` and `rust` are one section"
+    );
+        assert_eq!(created["sections"][0]["count"], 1);
+        let names: Vec<&str> = created["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"rust") && names.contains(&"networking"), "{names:?}");
+
+    // Edit: a new revision, chained to the one before it.
+    let (status, edited) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(&format!(
+            r#"{{"zine_id":"{id}","title":"On relays, again","sections":["rust"],"body":"<p>second</p>"}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    assert_eq!(edited["zines"][0]["revision"], 2);
+    assert_eq!(edited["zines"][0]["title"], "On relays, again");
+
+    // The chain and the history are visible on the article.
+    let (status, one) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["zine"]["descriptor"]["revision"], 2);
+    assert_eq!(
+        one["zine"]["descriptor"]["prev_hash"].as_str().unwrap().len(),
+        64,
+        "revision 2 points back at revision 1's content hash"
+    );
+    assert_eq!(one["zine"]["history"][0]["revision"], 1);
+    assert_eq!(one["zine"]["history"][0]["title"], "On relays");
+    assert_eq!(one["zine"]["authored"], true);
+
+    // Filters.
+    let (_, by_section) = request(&router, "GET", "/api/zines?section=rust", None).await;
+    assert_eq!(by_section["zines"].as_array().unwrap().len(), 1);
+    let (_, by_missing) = request(&router, "GET", "/api/zines?section=nope", None).await;
+    assert_eq!(
+        by_missing["zines"].as_array().unwrap().len(),
+        0,
+        "an unknown section is an empty list, not an error"
+    );
+    let (_, by_pen) = request(&router, "GET", "/api/zines?pen=AD", None).await;
+    assert_eq!(by_pen["zines"].as_array().unwrap().len(), 1);
+
+    // Mute, then unmute.
+    let (status, muted) = request(&router, "POST", &format!("/api/zines/{id}/mute"), Some("{}")).await;
+    assert_eq!(status, StatusCode::OK, "{muted}");
+    assert_eq!(muted["zines"][0]["muted"], true);
+    let (_, unmuted) = request(
+        &router,
+        "POST",
+        &format!("/api/zines/{id}/mute"),
+        Some(r#"{"muted":false}"#),
+    )
+    .await;
+    assert_eq!(unmuted["zines"][0]["muted"], false);
+
+    // Forget.
+    let (status, gone) = request(&router, "DELETE", &format!("/api/zines/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{gone}");
+    assert_eq!(gone["zines"].as_array().unwrap().len(), 0);
+    let (status, _) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_draft_naming_someone_elses_zine_writes_under_our_own_byline() {
+    // The pen name comes from the vault, never from the request: a caller
+    // does not choose which byline it publishes under, so a stale id must
+    // not create a second zine under an identity we do not hold.
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+    let (_, pen) = request(
+        &router,
+        "POST",
+        "/api/zines/pen-name",
+        Some(r#"{"name":"ada"}"#),
+    )
+    .await;
+    let mine = pen["pen_name"]["id"].as_str().unwrap().to_string();
+    let theirs = "b".repeat(64);
+
+    let (status, view) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(&format!(
+            r#"{{"zine_id":"{theirs}","title":"Not mine","body":"<p>x</p>"}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["zines"].as_array().unwrap().len(), 1);
+    assert_eq!(view["zines"][0]["zine_id"], mine, "it landed under our byline");
+    let (status, _) = request(&router, "GET", &format!("/api/zines/{theirs}"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_zine_that_is_not_held_is_404_with_a_reason() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+    let ghost = "c".repeat(64);
+    for (method, uri, body) in [
+        ("GET", format!("/api/zines/{ghost}"), None),
+        ("DELETE", format!("/api/zines/{ghost}"), None),
+        ("POST", format!("/api/zines/{ghost}/mute"), Some("{}")),
+    ] {
+        let (status, err) = request(&router, method, &uri, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+        assert!(err["error"].as_str().unwrap().contains("no zine"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn every_zine_route_is_401_while_locked() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+    let id = "a".repeat(64);
+    for (method, uri, body) in [
+        ("GET", "/api/zines".to_string(), None),
+        ("GET", "/api/zines/sections".to_string(), None),
+        ("GET", "/api/zines/pen-name".to_string(), None),
+        (
+            "POST",
+            "/api/zines/pen-name".to_string(),
+            Some(r#"{"name":"ada"}"#),
+        ),
+        // Well-formed bodies: the 401 must come from the lock, not from
+        // JSON extraction failing first.
+        (
+            "POST",
+            "/api/zines".to_string(),
+            Some(r#"{"title":"t","body":"<p>b</p>"}"#),
+        ),
+        ("GET", format!("/api/zines/{id}"), None),
+        ("DELETE", format!("/api/zines/{id}"), None),
+        ("POST", format!("/api/zines/{id}/mute"), Some("{}")),
+    ] {
+        let (status, _) = request(&router, method, &uri, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+}
+
+/// A draft zine is as private as a draft message: the sidecar lives in the
+/// vault dir for the life of the machine, so its bytes must never be the
+/// article. The byline is a marker too — a pen name is an identity, and a
+/// cleartext byline next to a cleartext title would be the whole graph.
+#[tokio::test]
+async fn zines_sidecar_is_ciphertext_at_rest() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+
+    const BYLINE: &str = "atrest-byline-marker";
+    const TITLE: &str = "atrest-title-marker";
+    const BODY: &str = "atrest-body-marker";
+    const SECTION: &str = "atrest-section-marker";
+
+    let (status, pen) = request(
+        &router,
+        "POST",
+        "/api/zines/pen-name",
+        Some(&format!(r#"{{"name":"{BYLINE}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pen}");
+    let (status, created) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(&format!(
+            r#"{{"title":"{TITLE}","sections":["{SECTION}"],"body":"<p>{BODY}</p>"}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+
+    let sidecar = std::fs::read(dir.path().join(zine_store::STATE_FILE))
+        .expect("zines.enc exists after a write");
+    assert!(!sidecar.is_empty(), "sidecar is not empty");
+    for marker in [BYLINE, TITLE, BODY, SECTION] {
+        assert!(
+            !windows_are_subslice(&sidecar, marker.as_bytes()),
+            "{marker} appears in plaintext on disk"
+        );
+    }
+    // The pen name's own file is a key, so it is ciphertext too.
+    let pen_file = std::fs::read(dir.path().join("pen-names.enc")).expect("pen-names.enc");
+    assert!(!windows_are_subslice(&pen_file, BYLINE.as_bytes()));
+
+    // Sanity: the markers were real, so the check above was not vacuous.
+    let (status, got) = request(&router, "GET", "/api/zines", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(got.to_string().contains(TITLE));
+    assert!(got.to_string().contains(BODY));
+}
+
+#[tokio::test]
+async fn a_hostile_body_is_sanitized_on_the_way_in() {
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+    request(
+        &router,
+        "POST",
+        "/api/zines/pen-name",
+        Some(r#"{"name":"ada"}"#),
+    )
+    .await;
+    let (status, view) = request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(r#"{"title":"t","body":"<p>ok</p><script>alert(1)</script><a href=\"javascript:alert(1)\">x</a>"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let id = view["zines"][0]["zine_id"].as_str().unwrap();
+    let (_, one) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
+    let body = one["zine"]["descriptor"]["body"].as_str().unwrap();
+    assert!(body.contains("<p>ok</p>"), "{body}");
+    assert!(!body.contains("script"), "{body}");
+    assert!(!body.contains("javascript:"), "{body}");
+}
+
+#[tokio::test]
+async fn a_zine_survives_a_restart() {
+    // The acceptance criterion for Phase 1: author a zine, restart, and it
+    // is still there — which means the sidecar has to be read back through
+    // a fresh worker, not just held in memory.
+    let dir = TempDir::new().unwrap();
+    let router = api_router(unlocked_app(dir.path()).await);
+    let (_, pen) = request(
+        &router,
+        "POST",
+        "/api/zines/pen-name",
+        Some(r#"{"name":"ada"}"#),
+    )
+    .await;
+    let id = pen["pen_name"]["id"].as_str().unwrap().to_string();
+    request(
+        &router,
+        "POST",
+        "/api/zines",
+        Some(r#"{"title":"Persisted","sections":["rust"],"body":"<p>still here</p>"}"#),
+    )
+    .await;
+
+    // A brand-new worker over the same vault dir: the daemon restarting.
+    let worker = AccountWorker::spawn();
+    assert!(matches!(
+        worker.unlock(&dir.path().to_path_buf(), "pw").await,
+        WorkResult::Ok
+    ));
+    let restarted = api_router(build_app(dir.path(), worker, true));
+    let (status, view) = request(&restarted, "GET", "/api/zines", None).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["zines"][0]["title"], "Persisted");
+    assert_eq!(view["zines"][0]["zine_id"], id);
+    assert_eq!(view["pen_name"]["name"], "ada");
+    assert_eq!(view["sections"][0]["name"], "rust");
+    let (status, one) = request(&restarted, "GET", &format!("/api/zines/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(one["zine"]["descriptor"]["body"]
+        .as_str()
+        .unwrap()
+        .contains("still here"));
+}
 }

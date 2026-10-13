@@ -242,7 +242,7 @@ impl AlgoliaItem {
             html: self
                 .text
                 .as_deref()
-                .map(sanitize_hn_html)
+                .map(sanitize_rich_text)
                 .unwrap_or_default(),
             children,
         })
@@ -348,11 +348,18 @@ pub fn parse_feed(bytes: &[u8]) -> std::result::Result<(String, Vec<StoryDto>), 
 // Sanitizing
 // ---------------------------------------------------------------------------
 
-/// The one HTML allow-list for everything user-visible from the network:
-/// HN comment fragments and reader-mode article bodies. Structural tags from
-/// articles (headings) ride along; everything else is stripped, not escaped,
-/// so a hostile page contributes text at most.
-pub fn sanitize_hn_html(raw: &str) -> String {
+/// The one HTML allow-list for user-visible rich text: HN comment fragments,
+/// reader-mode article bodies, and a zine's body. Structural tags from
+/// articles (headings) ride along; everything else is stripped, not escaped, so
+/// a hostile page contributes text at most.
+///
+/// Zines are authored locally rather than fetched, but they are sanitized here
+/// anyway and with the same list: a body is stored, re-read, and eventually
+/// sealed and published, so it is untrusted input at the moment it is written —
+/// the boundary rule is to validate where the data enters, and the editor is not
+/// the only thing that can post to the route. `u`/`s` are the two marks the
+/// Paper toolbar offers that HN never emits.
+pub fn sanitize_rich_text(raw: &str) -> String {
     let mut tags = HashSet::new();
     for t in [
         "p",
@@ -361,6 +368,8 @@ pub fn sanitize_hn_html(raw: &str) -> String {
         "em",
         "b",
         "strong",
+        "u",
+        "s",
         "code",
         "pre",
         "blockquote",
@@ -485,7 +494,7 @@ pub fn extract_article(html: &str) -> Result<ReaderDto> {
     } else {
         out
     };
-    let html = sanitize_hn_html(&rendered);
+    let html = sanitize_rich_text(&rendered);
     if html.trim().is_empty() {
         return Err(ReadsError::NoContent);
     }
@@ -715,7 +724,7 @@ impl ReadsClient {
             created_at: item.created_at_i,
             hn_url: format!("{HN_ITEM_URL}{id}"),
         };
-        let text_html = item.text.as_deref().map(sanitize_hn_html);
+        let text_html = item.text.as_deref().map(sanitize_rich_text);
         let comments = item
             .children
             .into_iter()
@@ -953,7 +962,7 @@ mod reads_tests {
     fn comment_html_is_sanitized_to_the_allow_list() {
         let raw = "<p>hi <a href=\"javascript:alert(1)\">evil</a> <a href=\"https://ok.example/x\">ok</a>\
                    <script>alert(1)</script><i>em</i><table><tr><td>junk</td></tr></table>";
-        let clean = sanitize_hn_html(raw);
+        let clean = sanitize_rich_text(raw);
         assert!(!clean.contains("script"), "{clean}");
         assert!(!clean.to_lowercase().contains("javascript:"), "{clean}");
         assert!(
