@@ -28,9 +28,10 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | Partly started — **updater + release workflow landed 2026-10-11** (branch `feature/auto-update`); `hush-verify` extraction, `rust-toolchain.toml`, `cargo deny`/`audit` still open |
 | **K — Member calls** | After **C** stabilizes | **17** P2P audio/video between contacts | Planning only |
 | **L — Shared surface** | After **17** Phase 4 (video) | **18** live screen share / co-browse in a conclave | Planning only |
+| **N — Reading room** | After **19**'s spine (reused); independent of **17**/**18** media | **20** shared reading + discussion in a conclave | Idea captured 2026-10-12; planning only, not grilled |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
 
-**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce.
+**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane.
 
 Detailed specs follow **by task ID** (1, 2, …). Dependency order is in the table above.
 
@@ -519,6 +520,44 @@ Full design, build order, and acceptance criteria:
 **Depends on:** Task **17** Phase 4 (video), Task **17** Phase 1 (tolerant decode + signaling plumbing, shared), **5h** presence, conclave fan-out, **5c** opaque transport. **Independent of** **5d** / **16** / **11** / **10**.
 
 **Distro-readiness:** new runtime deps (`xdg-desktop-portal` ScreenCast/RemoteDesktop, PipeWire, GStreamer encode plugins, an input-injection backend); second egress (self-hosted STUN); daemon portal/input/systemd exceptions; no frames on disk — see the task doc.
+
+---
+
+### Task 20: Conclave Reading Room — shared reading + discussion (planning only)
+
+**Status:** **Phase N** — idea captured 2026-10-12 from discussion; **planning only**, and **not
+grilled to decision level** (the task doc's Section 3 questions are genuinely open).
+
+**Goal:** A conclave reads **one document together** — an ebook, a paper, an article — and talks
+about it. One trustee opens the document into the room; every joined trustee sees it; the
+presenter's position (chapter / page / paragraph) is shared so the group stays on the same passage;
+anyone can detach and rejoin. Discussion rides the conclave's existing chat and can be **anchored to
+a passage**. No streaming, no screen share, no server, no vendor.
+
+→ **[`docs/tasks/conclave-reading-room.md`](../tasks/conclave-reading-room.md)**
+
+**Why it is not a watch party:** a screen share (Task **18**) or a rented virtual browser
+(Hyperbeam) shares **pixels** — a media problem that needs UDP and puts a hub or a vendor in the
+path. A reading room shares **a position** — a number — which is a data problem the existing relay
+fan-out already solves. It is therefore cheaper, simpler, and more private, and it needs no media
+plane.
+
+**Key decisions captured:** Hush-native, no third-party service; one document per session; the room
+is driven to a passage (follow the presenter, with detach and an explicit lock mode proposed);
+discussion anchored to a passage; relay-only in v1 (no DataChannel); Milestone Task **20** / Phase
+**N**.
+
+**Open questions:** "forced" vs "follow" UX; large-document transfer (the inline conclave-file cap
+of `MAX_INLINE_FILE_BYTES` = 256 KiB is too small for a book — needs a chunked per-trustee transfer
+or a larger dedicated cap); format support (text/HTML/EPUB first via the `Reads` extractor +
+sanitizer; PDF later); whether anchored notes persist; voice (Task **17**).
+
+**Depends on:** Task **19**'s fan-out + sidecar spine (reused, not duplicated), conclave fan-out
+(done), **5c** encrypted store (done). **Reuses** `Reads`' extraction + sanitizer. **Independent
+of** **17** / **18** media work — it is data-only and does not wait on the postponed video plane.
+
+**Distro-readiness:** no new runtime deps if the renderer ships as local assets; document the
+renderer's asset footprint and the document-size cap.
 
 ---
 
