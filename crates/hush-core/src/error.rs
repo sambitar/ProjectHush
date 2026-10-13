@@ -80,6 +80,14 @@ pub enum Error {
     PenNameCap,
     #[error("a public identity already exists")]
     PublicIdentityExists,
+    #[error("a voice session is already open in this conclave")]
+    VoiceSessionExists,
+    #[error("no voice session is open in this conclave")]
+    VoiceNoSession,
+    #[error("the voice room is full")]
+    VoiceCapReached,
+    #[error("you are not in this voice session")]
+    VoiceNotJoined,
 }
 
 impl From<argon2::Error> for Error {

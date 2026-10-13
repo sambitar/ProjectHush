@@ -18,6 +18,7 @@ mod relay_client;
 mod signal;
 mod signal_persist;
 mod vault;
+mod voice;
 mod wire;
 
 pub use account::{Account, Contact, DropInboxReport, MailOutcome, PendingInvite};
@@ -50,8 +51,10 @@ pub use message::{
 };
 pub use payload::{
     ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeState,
-    MailAttachment, DEFAULT_PAPER_TITLE, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS,
+    VoiceDescriptor, MailAttachment, DEFAULT_PAPER_TITLE, MAX_INLINE_FILE_BYTES,
+    MAX_MAIL_ATTACHMENTS,
 };
+pub use voice::{VoiceEffect, VoiceManager, VoiceMember, VoiceSession, MAX_VOICE_SPEAKERS};
 pub use prekey::{OneTimePreKey, PreKeyRecord};
 pub use relay_client::{
     is_v3_onion_host, normalize_relay_base, normalize_relay_base_with, validate_onion_relay,

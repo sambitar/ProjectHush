@@ -3148,6 +3148,19 @@ impl Account {
                         dirty = true;
                         continue;
                     }
+                    // A voice payload is not a chat message, so it must not
+                    // reach `out` as one (Task 23). Interim until the voice
+                    // routing lands in this slice: skipped without deleting the
+                    // blob, so the gap between the two steps loses nothing —
+                    // the same interim the Paper payloads used. Once routed,
+                    // these are consumed like papers.
+                    MessagePayload::VoiceOpen { .. }
+                    | MessagePayload::VoiceOffer { .. }
+                    | MessagePayload::VoiceAnswer { .. }
+                    | MessagePayload::VoiceMute { .. }
+                    | MessagePayload::VoiceLeave { .. } => {
+                        continue;
+                    }
                     // A tag this build does not know, from one that does.
                     // Consumed and dropped: it can never be interpreted here,
                     // and leaving it would re-deliver it on every poll forever.

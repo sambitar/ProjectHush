@@ -1982,7 +1982,9 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         | MessagePayload::ConclaveUpdate { .. }
         | MessagePayload::ConclaveEnd { .. } => None,
         // A paper payload is not a chat message either: it is routed into the
-        // paper store, never the inbox. An unknown tag has no rendering at all.
+        // paper store, never the inbox. A voice payload (Task 23) likewise
+        // never renders in the inbox — its state surfaces through /api/voice/*.
+        // An unknown tag has no rendering at all.
         MessagePayload::PaperState { .. }
         | MessagePayload::PaperDelta { .. }
         | MessagePayload::PaperSnapshot { .. }
@@ -1990,6 +1992,11 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         | MessagePayload::PaperHub { .. }
         | MessagePayload::PaperOffer { .. }
         | MessagePayload::PaperAnswer { .. }
+        | MessagePayload::VoiceOpen { .. }
+        | MessagePayload::VoiceOffer { .. }
+        | MessagePayload::VoiceAnswer { .. }
+        | MessagePayload::VoiceMute { .. }
+        | MessagePayload::VoiceLeave { .. }
         | MessagePayload::Unknown => None,
     }
 }
