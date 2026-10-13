@@ -3513,20 +3513,6 @@ async fn paper_inherit_hub(state: &Arc<App>, conclave_id: &str) -> bool {
     }
 }
 
-/// Whether the conclave a paper belongs to has ended.
-///
-/// Read from the chat log through the worker, because the roster is the vault's
-/// and the daemon keeps no second copy of it. A worker that cannot answer is
-/// reported as "not ended": a locked vault fails the paper route that follows
-/// anyway, and a transient read error must not turn into a vault that silently
-/// refuses to save an edit.
-async fn paper_conclave_ended(state: &Arc<App>, conclave_id: &str) -> bool {
-    match state.worker.conclaves().await {
-        WorkResult::Conclaves(list) => list.iter().any(|c| c.id == conclave_id && c.ended),
-        _ => false,
-    }
-}
-
 /// The refusal a paper write gets when the conclave no longer allows one.
 ///
 /// Two cases, and they are not the same sentence:

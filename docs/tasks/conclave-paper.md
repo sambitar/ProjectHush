@@ -281,11 +281,11 @@ copy of the paper their vault already held, exactly as they keep conclave messag
 **Verify:** three-way edit with distinct colours/cursors; kick the creator mid-session — the convener becomes hub and liveness resumes; lock the hub — peers degrade; a locked editor's queued edits land on unlock and merge cleanly. Verified 2026-10-12 by `./scripts/paper-dogfood.sh` (23 checks), which drives the daemon API with the editor's own bytes rather than typing in a window.
 
 ### Phase 5 — Polish — landed 2026-10-12
-- [x] Toolbar completeness check against the v1 scope; empty state ("Start the paper"); read-only rendering after `ConclaveEnd`.
+- [x] Toolbar completeness check against the v1 scope; empty state ("Start the paper"); read-only rendering after `ConclaveEnd`. *Amended 2026-10-12: this box was ticked while the read-only surface was unreachable — `conclavePane` returned at its `ended` branch before the Chat | Paper pill was built, so an ended conclave had no tab strip and `renderPaperSurface` never ran. Fixed, then verified in the live UI: the ended conclave now shows the pill, the document, and "This conclave has ended, so the paper is read-only." with no toolbar and `contenteditable` off.*
 - [x] Error states (NAT-limited, hub gone, caps) with actionable copy.
 - [x] `DISTRO_READINESS.md` updates: `yrs` + `webrtc-rs` dependencies, STUN config surface, sandbox notes (no new devices; SCTP egress).
 
-**Verify:** full three-daemon dogfood session, including an ended conclave rendering read-only papers in every vault. Verified 2026-10-12. `cargo deny` / `cargo audit` were **not** run — neither tool is installed in this environment; adding them to CI is separate work.
+**Verify:** full three-daemon dogfood session, including an ended conclave rendering read-only papers in every vault. Verified 2026-10-12 (24 checks on a re-run of the same day; the read-only half of that check is the daemon's — readable, writes refused — and the UI half is the live-UI check above). `cargo deny` / `cargo audit` were **not** run — neither tool is installed in this environment; adding them to CI is separate work.
 
 ---
 

@@ -13,6 +13,138 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-12 — Conclave Paper, verification follow-up (ended-conclave read-only)
+
+Trigger: an independent browser-verification pass over the finished Paper slice, run against the
+two-peer dev stack. It found one real UI defect, one stale-build blocker, and one tooling limit. The
+defect is the reason this section exists: the plan's read-only box had been ticked, and the tick was
+wrong.
+
+### An ended conclave hid the paper, so the read-only editor was unreachable — `FIXED`
+
+Attempted: verify "the paper renders read-only after `ConclaveEnd`" in the live UI, in an ended
+conclave (`9aeb64a4`, "Browser paper verify", which had a real converged document in it).
+
+Symptom: the ended view was correct as far as it went — `Ended — read only` in the header, the
+member row, and "This conclave has ended. Its history stays here, and no one can send in it." — but
+`[role=tab]` was `[]` and `.ProseMirror` was `null`. There was no Chat | Paper pill, so there was no
+way to reach the paper at all, and the read-only notice it was supposed to show
+("This conclave has ended, so the paper is read-only.") never appeared on any path.
+
+Root cause: `conclavePane` returned at its `ended` branch *before* the tab strip was built and
+before `renderPaperSurface` — the only caller of `attachEditor` — so for an ended conclave neither
+the pill nor the paper surface was ever constructed. `attachEditor`'s `readOnly` path was reachable
+only for the other refusal case (a vault that is no longer a joined trustee), which is not the case
+its copy names.
+
+This was a UI bug contradicting a deliberate daemon design, not a missing feature: `GET
+/api/paper/{id}` stays `200` on an ended conclave, and the daemon's own test says so in as many words
+(`an_ended_conclave_paper_refuses_writes`: "The document is still readable — read-only, not gone").
+The UI was hiding a document it was built to show, and the plan's Phase 5 box had been ticked against
+the plan rather than against the running app.
+
+Resolution: the ended branch now builds the pill first and keeps both surfaces — the paper renders
+read-only (no toolbar, `contenteditable` off, the reason note), and only the composer is dropped, so
+the chat surface is unchanged. Verified live on `peer-a`: `[role=tab]` = `["Chat", "Paper"]` with the
+paper tab selected, `.paper-readonly-note` present, `.ProseMirror` `innerText` = the converged
+document text, `contenteditable="false"`, 0 toolbar buttons; the chat tab still shows the ended note
+with no composer; and a live (unended) conclave still renders its 11 toolbar buttons and an editable
+surface. The plan and task docs now carry the correction.
+
+Lesson: a read-only surface has two halves — refusing the write and still showing the document — and
+a suite that asserts the refusal (daemon) plus a component test that asserts the flag (UI) can both
+be green while the app renders neither. The check that would have caught it is a DOM assertion in an
+*ended* conclave, which is what this pass added.
+
+### The read-only notice named the wrong reason for a kicked trustee — `FIXED`
+
+Attempted: same pass; read the copy on the read-only path.
+
+Symptom: `attachEditor(..., readOnly: true)` hard-coded "This conclave has ended, so the paper is
+read-only.", but `readOnly` was also true for a vault that is no longer a joined trustee — kicked, or
+an invitation never accepted. A kicked trustee on a perfectly live conclave was told the conclave had
+ended.
+
+Resolution: `attachEditor` now takes the refusal's **reason string** (`null` = editable) instead of a
+boolean, and the sentence is chosen by `paperReadOnlyReason()` from the roster the pane already reads.
+Found and fixed in the same pass as the entry above; logged separately because it is a different bug
+in a different layer, and it survived the earlier "verified" tick for the same reason.
+
+### The live daemons were an older build than the source — again — `FIXED`
+
+Attempted: verify fan-out and live cursors through the running two-peer dev stack.
+
+Symptom: the same tell as the earlier entry of this name, which is why it is worth saying that the
+tell was **not** learned: `GET /api/paper/{id}/presence` and `POST /api/paper/{id}/hub/rehome`
+returned `404` with an **empty** body on both daemons, and `GET /api/paper/{id}` answered `200` but
+serialised no `fast_path` field, which the current `PaperView` always writes. So the running
+processes were a create/get/update-era build: no fan-out, no presence, no fast path. Two claims
+(convergence, cursors) could not be tested at all, and a verification pass came back inconclusive for
+reasons that had nothing to do with the code.
+
+Resolution: rebuild, restart, and re-check rather than assume. The live `peer-a` daemon now
+serialises `"fast_path": {"path": "relay", "live_peers": 0}` and answers `POST
+/api/paper/{id}/hub/rehome` with `422` and a real deserialisation message (`missing field 'hub'`)
+instead of an empty `404`; `peer-b` answers `401 {"error":"locked"}` on the presence route while a
+bogus route on the same daemon is `404`, which shows routing resolves before the lock check, so the
+route exists there too. `peer-b`'s `fast_path` field could not be read while it is locked, and is
+recorded as unchecked rather than assumed.
+
+Both unverified claims were then closed against the current build: `./scripts/paper-dogfood.sh` on a
+fresh three-daemon run, 24 checks, 0 failures — descriptor and delta fan-out in both directions,
+byte-identical convergence, the late joiner's catch-up snapshot, the DataChannel proven with the
+relay left undrained, lock degradation and recovery, cursors with name and colour in both directions,
+re-home, succession on a kicked hub, and an ended paper that is read-only and still readable. The
+UI-level half was confirmed separately: in the live "UI paper verify" conclave, Alice's editor
+renders `ALICE-BROWSER-7Q4BOB-BROWSER-3Z9`, i.e. both authors' text in one document.
+
+Lesson: this is a recurrence, and the earlier entry already had the diagnosis and the tell. What was
+missing was the habit, not the knowledge — so the fix that matters is procedural: treat "restart the
+daemons" as the first step of a verification pass against a running stack, not as the step after a
+claim comes back unverified. A stale binary in the same slot as the last one will look like the last
+one's bug.
+
+### Multi-tab interaction is pinned to one tab — `WORKED AROUND`
+
+Attempted: drive Alice's window and Bob's window in the same browser session to watch cursors cross.
+
+Symptom: `browser_navigate`, `browser_click` and `browser_type` all acted on a single controlled tab
+regardless of `viewId` or a `browser_tabs select` first, so the second peer's UI could not be driven
+directly. Bob's window was instead driven by injecting a same-origin
+`<iframe src="http://127.0.0.1:5173/?api=http://127.0.0.1:9877">` into the controlled tab and using
+CDP `Runtime.evaluate` for clicks and reads. A dev-server hot reload mid-pass wipes that iframe and
+resets the view, so the workaround is only stable while no file is being edited.
+
+Tooling-related, not a repo problem: it costs time and it is why the earlier pass leaned on daemon
+API evidence for the two-sided claims. Not fixed here — the fix belongs in the browser tooling.
+
+### Two dead-code warnings in a build that was otherwise clean — `FIXED`
+
+Attempted: read the dogfood run's build output rather than only its check results.
+
+Symptom: `cargo build -p hush-daemon` warned that `paper_conclave_ended` (main.rs) is never used, and
+that `COMMENTS_CAP`, `normalize_comment_body` and `merge_comment` (zine_store.rs) are never used.
+Both are real signals, and they are not the same signal.
+
+Root cause, paper: `paper_conclave_ended` was superseded by the inline `conclave.ended` check inside
+`paper_write_refusal` and left behind. Genuinely dead, so deleted.
+
+Root cause, zines: the comment plumbing is Phase 3 work — the task doc has "Comments: seal to the
+pen-name public key, publish, pull, trial-decrypt, merge, republish" as an unchecked Phase 3 box —
+but Phase 1b delivered the sidecar shape it needs, and the unit tests are the only caller today. A
+`#[cfg(test)]` caller does not count as a use for dead-code analysis, which is why a tested function
+reads as unused in a normal build.
+
+Resolution: the paper helper is gone; the three comment items carry `#[allow(dead_code)]` with a
+comment saying Phase 3 is what reaches them from a route. Verified: `cargo build -p hush-daemon` is
+clean for `main.rs`, `zine_store.rs` and the paper modules, and `cargo test -p hush-daemon` is 157
+passed / 0 failed. The remaining warnings in that build are pre-existing and in `torbox.rs`.
+
+Lesson: a "never used" warning is a question about intent, and the answer differs per item — delete
+what was superseded, annotate what is staged. Leaving it unread makes the next real one invisible.
+
+---
+
 ## 2026-10-12 — Zines Phase 1 (implementation and live verification)
 
 Trigger: "implement Zines as a new button in Rail". Scope: the pen-name keypair in the vault, the

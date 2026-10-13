@@ -360,11 +360,30 @@ not seen:
 - **Daemon:** `paper_write_refusal` refuses a write with `403 FORBIDDEN` when the conclave is ended
   or the writer is not a joined trustee, and the refusal is a reason string rather than a silent
   drop.
-- **UI:** `attachEditor(readOnly: true)` builds no toolbar, sets `aria-readonly="true"` and
-  `contenteditable` off, and shows "This conclave has ended, so the paper is read-only." Cursors
-  still render, because the document is still shared — it is frozen, not gone.
+- **UI:** `attachEditor` builds no toolbar, sets `aria-readonly="true"` and `contenteditable` off,
+  and shows the refusal's reason. Cursors still render, because the document is still shared — it is
+  frozen, not gone.
 - **Caps** surface their reason: the sidecar's doc and snapshot caps return the reason string the
   routes turn into the API error, the `notes_store` pattern.
+
+**Step 4 correction — 2026-10-12, verification follow-up.** The read-only editor was unreachable for
+the case it names. `conclavePane` returned at its `ended` branch *before* the Chat | Paper pill was
+built, so an ended conclave rendered the history and the ended note with no tab strip at all, and
+`renderPaperSurface` — the only caller of `attachEditor` — never ran. The daemon had it right the
+whole time: `GET /api/paper/{id}` stays `200` on an ended conclave, and
+`an_ended_conclave_paper_refuses_writes` asserts exactly that ("read-only, not gone"), so the UI was
+hiding a document it was built to show. The ended branch now builds the pill and keeps both surfaces:
+the paper renders read-only with its note and no toolbar, and only the composer is dropped. Two
+smaller things came out of the same pass: `attachEditor` takes the refusal's **reason string** rather
+than a boolean, because a kicked trustee was being told "This conclave has ended" when it had not,
+and the dead `paper_conclave_ended` helper (superseded by the inline check in `paper_write_refusal`)
+is gone.
+
+Verified in the live UI on `peer-a`, ended conclave `9aeb64a4`: `[role=tab]` = `["Chat", "Paper"]`,
+the paper tab selected, `.paper-readonly-note` = "This conclave has ended, so the paper is read-only.",
+`.ProseMirror` `innerText` = the converged document text, `contenteditable="false"`, 0 toolbar
+buttons; the chat tab keeps its ended note and has no composer. A live (unended) conclave still
+renders the toolbar's 11 buttons and an editable surface.
 
 **Step 2 record — 2026-10-12.** Presence rides the DataChannel and nothing else: the editor
 publishes its awareness (cursor as a Yjs relative position, plus the author's identity and colour)

@@ -48,6 +48,10 @@ const BODY_SOFT_CAP: usize = 256 * 1024;
 const HISTORY_CAP: usize = 32;
 
 /// Merged comments kept per zine.
+///
+/// Phase 3 is what reaches this from a route; until then only the unit tests
+/// do, which is why the build reports it unused.
+#[allow(dead_code)]
 const COMMENTS_CAP: usize = 512;
 
 /// Sections (tags) per zine. A section is free text inside the encrypted
@@ -276,6 +280,11 @@ fn preview_of(body: &str) -> String {
 }
 
 /// Whether a comment body is worth merging: an empty one is not a comment.
+///
+/// Sanitised on the way in, the same as an article body, so a merged thread
+/// cannot carry markup the reader's sanitizer would strip anyway. Phase 3 wires
+/// the route that calls this; until then only the unit tests do.
+#[allow(dead_code)]
 fn normalize_comment_body(raw: &str) -> String {
     crate::reads::sanitize_rich_text(raw)
 }
@@ -501,6 +510,10 @@ impl ZinesState {
     /// an unaccepted one is simply never here. Idempotent on `hash`, because the
     /// same blob can arrive on every drain and a thread that grows a duplicate on
     /// each pass is a thread nobody can read.
+    ///
+    /// Phase 3 is what calls this from a route; until then only the unit tests
+    /// do, which is why the build reports it unused.
+    #[allow(dead_code)]
     pub fn merge_comment(
         &mut self,
         zine_id: &str,

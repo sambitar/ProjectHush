@@ -431,17 +431,20 @@ export async function createPaper(
  * subtree stays stable across the app's wholesale re-renders: `render()` moves
  * this element, it never rebuilds it, so focus and selection survive.
  *
- * `readOnly` is the ended-conclave case: the daemon refuses every paper write
- * once the conclave has ended and the relay refuses the fan-out behind it, so
- * the surface must not invite an edit it cannot deliver. Cursors still render —
- * the document is still shared, it is just frozen.
+ * `readOnlyReason` is the refusal the daemon would give, in the words the
+ * surface should show, or `null` when the paper is editable. There are two
+ * reasons — an ended conclave, and a vault that is no longer a joined trustee —
+ * and they are not the same sentence, so the note says which one applies.
+ * Cursors still render either way: the document is still shared, it is just
+ * frozen.
  */
 export function attachEditor(
   s: PaperSession,
   container: HTMLElement,
   me: string,
-  readOnly = false,
+  readOnlyReason: string | null = null,
 ): EditorView {
+  const readOnly = readOnlyReason !== null;
   const fragment = s.ydoc.getXmlFragment(FRAGMENT_NAME);
   // The cursor plugin writes into the local awareness state, so the identity it
   // publishes has to exist before the plugin is attached.
@@ -494,11 +497,11 @@ export function attachEditor(
   // The frame goes up in document order before the view exists: ProseMirror
   // appends its own DOM into the element it is given, so the toolbar has to be
   // in place first or it would end up underneath the editor.
-  if (readOnly) {
+  if (readOnlyReason !== null) {
     // No toolbar: every command it offers would be refused by the daemon.
     const note = document.createElement("p");
     note.className = "paper-readonly-note muted text-13";
-    note.textContent = "This conclave has ended, so the paper is read-only.";
+    note.textContent = readOnlyReason;
     wrap.appendChild(note);
   } else {
     wrap.appendChild(toolbar.el);

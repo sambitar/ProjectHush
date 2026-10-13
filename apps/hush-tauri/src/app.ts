@@ -413,6 +413,30 @@ function updateProgressLabel(p: UpdateProgress): string {
   return "Starting the download…";
 }
 
+/**
+ * Why this vault cannot edit a conclave's paper, in the words the surface
+ * shows, or `null` when it can.
+ *
+ * Two reasons, and they are not the same sentence: an ended conclave is
+ * read-only on every peer, while a vault that is no longer a joined trustee
+ * (kicked, or an invitation never accepted) has the fan-out refused. The daemon
+ * refuses both writes, so the editor must not offer one either.
+ */
+function paperReadOnlyReason(
+  conclave: Conclave | undefined,
+  me: string,
+): string | null {
+  if (!conclave) return null;
+  if (conclave.ended) {
+    return "This conclave has ended, so the paper is read-only.";
+  }
+  const mine = conclave.trustees.find((t) => t.accountId === me);
+  if (mine?.state !== "joined") {
+    return "You are no longer a trustee of this conclave, so the paper is read-only.";
+  }
+  return null;
+}
+
 export class App {
   private root: HTMLElement;
   private status: StatusResponse | null = null;
@@ -3332,14 +3356,25 @@ export class App {
     }
     scroll.scrollTop = scroll.scrollHeight;
 
+    // Chat and Paper are the two surfaces of the same meeting; the pill swaps
+    // between them without touching the header or the members row. Built before
+    // the ended check because an ended conclave keeps both surfaces.
+    const tabs = this.renderConclaveTabs();
+
     // An ended conclave is read-only: the history is shown, but there is no
-    // composer.
+    // composer. The paper stays reachable — the daemon keeps it readable and
+    // refuses only the writes — so the tab strip and the read-only editor are
+    // drawn here too, rather than the whole meeting collapsing to one note.
     if (conclave.ended) {
+      if (this.conclaveTab === "paper") {
+        pane.append(header, members, tabs, this.renderPaperSurface(conclave.id, me));
+        return pane;
+      }
       const note = document.createElement("div");
       note.className = "conclave-ended-note muted text-13";
       note.textContent =
         "This conclave has ended. Its history stays here, and no one can send in it.";
-      pane.append(header, members, scroll, note);
+      pane.append(header, members, tabs, scroll, note);
       return pane;
     }
 
@@ -3392,9 +3427,6 @@ export class App {
     composer.appendChild(inner);
     syncSend();
 
-    // Chat and Paper are the two surfaces of the same meeting; the pill swaps
-    // between them without touching the header or the members row.
-    const tabs = this.renderConclaveTabs();
     if (this.conclaveTab === "paper") {
       pane.append(header, members, tabs, this.renderPaperSurface(conclave.id, me));
       return pane;
@@ -3509,13 +3541,11 @@ export class App {
     }
     try {
       const conclave = conclaveById(conclaveId);
-      const mine = conclave?.trustees.find((t) => t.accountId === me);
       // An ended conclave is read-only on every peer, and so is one this vault
       // is no longer a joined trustee of (kicked, or an invitation never
       // accepted): the daemon refuses the write and the relay refuses the
       // fan-out behind it, so the surface must not invite an edit.
-      const readOnly = !!conclave && (conclave.ended || mine?.state !== "joined");
-      attachEditor(s, host, me, readOnly);
+      attachEditor(s, host, me, paperReadOnlyReason(conclave, me));
     } catch (e) {
       // render() clears the root before it rebuilds, so a throw here would
       // abort the whole paint and leave a blank window. The editor is the one
