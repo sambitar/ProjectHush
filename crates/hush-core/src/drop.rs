@@ -148,6 +148,18 @@ fn recipient_public_key(recipient_pk: &[u8; KEY_LEN]) -> Result<KeyPublic, Error
 /// Seal `pkg` to the holder of `recipient_pk`. The sender contributes only an
 /// ephemeral key: nothing in the container identifies them or permits a reply.
 pub fn seal_to_key(pkg: &DropPackage, recipient_pk: &[u8; KEY_LEN]) -> Result<Vec<u8>, Error> {
+    let plaintext = serde_json::to_vec(pkg).map_err(|_| Error::BadDrop)?;
+    seal_bytes_to_key(&plaintext, recipient_pk)
+}
+
+/// Seal an arbitrary plaintext to the holder of `recipient_pk`.
+///
+/// The same container as [`seal_to_key`], without the drop payload's shape: a
+/// zine comment is sealed to a pen name's public key and is not a drop, and
+/// wrapping it in a `DropPackage` to reuse the typed entry point would put a
+/// subject and an attachment list in front of every comment. The recipient is
+/// the same kind of key either way, so the container is the same.
+pub fn seal_bytes_to_key(plaintext: &[u8], recipient_pk: &[u8; KEY_LEN]) -> Result<Vec<u8>, Error> {
     let recipient = recipient_public_key(recipient_pk)?;
     let eph = KeyPair::generate(&mut OsRng.unwrap_err());
     let eph_pk = public_bytes(&eph.public_key);
@@ -168,11 +180,10 @@ pub fn seal_to_key(pkg: &DropPackage, recipient_pk: &[u8; KEY_LEN]) -> Result<Ve
 
     let key = drop_key(recipient_pk, &eph_pk, &shared);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*key));
-    let plaintext = serde_json::to_vec(pkg).map_err(|_| Error::BadDrop)?;
     let ct = cipher
         .encrypt(
             XNonce::from_slice(&nonce_bytes),
-            Payload { msg: &plaintext, aad: &header },
+            Payload { msg: plaintext, aad: &header },
         )
         .map_err(|_| Error::Crypto)?;
     header.extend_from_slice(&ct);
@@ -182,6 +193,17 @@ pub fn seal_to_key(pkg: &DropPackage, recipient_pk: &[u8; KEY_LEN]) -> Result<Ve
 /// Open a container sealed to this keypair. A wrong or unrelated key fails the
 /// AEAD tag check; a tampered header or body fails with it.
 pub fn open_with_key(bytes: &[u8], key: &DropKeyPair) -> Result<DropPackage, Error> {
+    let plaintext = open_bytes_with_key(bytes, key)?;
+    serde_json::from_slice(&plaintext).map_err(|_| Error::BadDrop)
+}
+
+/// Open a container sealed to this keypair, returning the raw plaintext.
+///
+/// The half of [`open_with_key`] that does not assume the payload is a drop.
+/// A failure means the container was not sealed to this key — for a comment
+/// inbox that is not an error but the ordinary answer to "is this one mine?",
+/// which is why the error is distinguishable at all.
+pub fn open_bytes_with_key(bytes: &[u8], key: &DropKeyPair) -> Result<Vec<u8>, Error> {
     if bytes.len() <= DROP_V2_HEADER_LEN || bytes[..4] != DROP_MAGIC {
         return Err(Error::BadDrop);
     }
@@ -201,13 +223,12 @@ pub fn open_with_key(bytes: &[u8], key: &DropKeyPair) -> Result<DropPackage, Err
 
     let key = drop_key(&key.pk, &eph_pk, &shared);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&*key));
-    let plaintext = cipher
+    cipher
         .decrypt(
             XNonce::from_slice(&nonce_bytes),
             Payload { msg: &bytes[DROP_V2_HEADER_LEN..], aad: header },
         )
-        .map_err(|_| Error::DropNotForThisKey)?;
-    serde_json::from_slice(&plaintext).map_err(|_| Error::BadDrop)
+        .map_err(|_| Error::DropNotForThisKey)
 }
 
 pub fn encode_drop_pk(pk: &[u8; KEY_LEN]) -> String {
@@ -309,6 +330,46 @@ mod tests {
             open_with_key(&short, &drop_keypair()),
             Err(Error::BadDrop)
         ));
+    }
+
+    /// The raw-bytes half of the sealed box, which is what a zine comment uses:
+    /// same container, plaintext that is not a `DropPackage`.
+    #[test]
+    fn raw_bytes_seal_and_open_under_the_same_container() {
+        let recipient = drop_keypair();
+        let plaintext = br#"{"zine_id":"abc","body":"<p>hello</p>"}"#;
+        let bytes = seal_bytes_to_key(plaintext, &recipient.pk).unwrap();
+        assert!(is_drop_container(&bytes), "the container is the drop container");
+        assert_eq!(open_bytes_with_key(&bytes, &recipient).unwrap(), plaintext);
+
+        // A typed open of a raw container is a decode failure, not a crash: the
+        // bytes are not a drop package.
+        assert!(matches!(
+            open_with_key(&bytes, &recipient),
+            Err(Error::BadDrop)
+        ));
+
+        // And a typed container opens as raw bytes too, so the two halves are
+        // the same construction rather than two formats.
+        let typed = seal_to_key(&sample(), &recipient.pk).unwrap();
+        let raw = open_bytes_with_key(&typed, &recipient).unwrap();
+        assert!(serde_json::from_slice::<DropPackage>(&raw).is_ok());
+    }
+
+    #[test]
+    fn a_raw_container_for_someone_else_does_not_open() {
+        let recipient = drop_keypair();
+        let other = drop_keypair();
+        let bytes = seal_bytes_to_key(b"not for you", &recipient.pk).unwrap();
+        assert!(matches!(
+            open_bytes_with_key(&bytes, &other),
+            Err(Error::DropNotForThisKey)
+        ));
+
+        let mut tampered = bytes.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(open_bytes_with_key(&tampered, &recipient).is_err());
     }
 
     #[test]

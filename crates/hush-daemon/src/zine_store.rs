@@ -1,10 +1,8 @@
 //! Zines — the members-only long-form corpus: every member's own blog, held in
 //! this vault as an encrypted sidecar.
 //!
-//! Phase 1 is **offline and local**: a zine is authored here, stored here, and
-//! read here. Nothing in this module talks to a relay or a session. The schema
-//! is nonetheless the wire schema, because Phase 2 publishes exactly these
-//! bytes and a migration later would have to re-sign every revision:
+//! Phase 1 was **offline and local**: a zine is authored here, stored here, and
+//! read here. Phase 2 adds the wire, and the schema here is that wire schema:
 //!
 //! - A **zine** is one long-form article: a **post**. Its author is a **pen
 //!   name** ([`ZineDescriptor::pen_id`]), and one pen name holds **many** posts
@@ -17,12 +15,27 @@
 //!   and one allow-list for every rich-text surface beats two renderers that
 //!   can disagree.
 //! - Every write is a **new revision** carrying the hash of the one before it,
-//!   so a holder can tell a superseded blob from the head without holding the
-//!   read key. The chain is what makes "the newest revision a member holds
-//!   wins" decidable.
+//!   so a reader with the key can tell a superseded revision from the head. The
+//!   chain is what makes "the newest revision a member holds wins" decidable.
 //! - **Comments** are merged, not appended: a comment exists in this vault only
 //!   once the author has accepted it. Moderation is entirely author-side, and an
-//!   unaccepted comment simply is not here.
+//!   unaccepted comment sits in [`ZineFile::pending_comments`] until it is.
+//!
+//! What Phase 2 adds on top of that:
+//!
+//! - [`ZineBlob`] is what is sealed under a post's read key and published: the
+//!   descriptor, the author's signing key, and a signature over the descriptor's
+//!   canonical bytes. The signature is what makes a revision *the author's* —
+//!   every reader holds the read key, so without it any reader could forge an
+//!   edit. It is inside the sealed box rather than beside it, because a signing
+//!   key in the clear on the relay would be a stable author pseudonym, and the
+//!   bulletin is meant to be one flat opaque log.
+//! - [`ZineCommentBlob`] is what a commenter seals to the author's pen name and
+//!   publishes. Anyone who can read a post can write one, no session needed, and
+//!   the author is the only one who can open it.
+//! - [`HeldBlob`] is a sealed blob this vault keeps the *bytes* of, whether or
+//!   not it can open it yet: unreadable is a state, not an error, because the
+//!   key may still arrive and a re-post does not need one.
 //!
 //! Everything here is a user secret — a draft zine is as private as a draft
 //! message — so the sidecar (`zines.enc`, via
@@ -52,8 +65,26 @@ const HISTORY_CAP: usize = 32;
 ///
 /// Phase 3 is what reaches this from a route; until then only the unit tests
 /// do, which is why the build reports it unused.
-#[allow(dead_code)]
 const COMMENTS_CAP: usize = 512;
+
+/// Comments pulled from the bulletin and not yet accepted, per zine. Separate
+/// from the merged thread because the author has not decided about these yet.
+const PENDING_CAP: usize = 512;
+
+/// Sealed blobs this vault keeps the bytes of, and their total size.
+///
+/// Both are needed: a count alone lets 512 maximum-size blobs sit in a sidecar
+/// that is decrypted on every read, and a byte cap alone lets a flood of tiny
+/// blobs grow an unbounded JSON array. Text keeps the real totals in low
+/// megabytes; these are the ceiling that makes the worst case finite.
+///
+/// A cap rather than a limit on the corpus: a blob is the only copy of a
+/// revision's bytes, so going over evicts rather than refuses — a drain that
+/// refused would lose the blob for good, because the cursor moves on either way.
+/// Superseded revisions go first; an unopened blob is worth the most, because a
+/// key may still arrive and it may be the only copy.
+pub const BLOBS_CAP: usize = 1024;
+pub const BLOB_BYTES_CAP: usize = 32 * 1024 * 1024;
 
 /// Sections (tags) per zine. A section is free text inside the encrypted
 /// descriptor; the cap keeps the facet index and the UI honest.
@@ -118,9 +149,10 @@ pub struct ZineDescriptor {
 ///
 /// `hash` is the content hash of the comment blob as it arrived, so the same
 /// comment cannot be merged twice and a reader can be told which blob a line
-/// came from. `author` is whatever the commenter signed with — this vault does
-/// not decide who they are, it records what they claimed and leaves the judgement
-/// to the person reading.
+/// came from. `author` is the byline the commenter claimed: a comment arrives
+/// through an anonymous sealed box, so there is no sender to verify and this
+/// vault does not decide who they are. It records what was claimed and leaves
+/// the judgement to the person reading.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ZineComment {
     pub hash: String,
@@ -135,6 +167,106 @@ pub struct ZineComment {
     pub merged_ms: u64,
 }
 
+/// What is sealed under a post's read key and published to the bulletin.
+///
+/// The descriptor is the article; `sign_pk` and `signature` are its provenance,
+/// and they travel *inside* the sealed box rather than beside it. A signing key
+/// in the clear would be a stable pseudonym for its author, which is exactly
+/// what the bulletin must not offer: one flat log, nothing to group by.
+///
+/// The signature covers [`canonical_bytes`] of the descriptor — the descriptor
+/// with `prev_hash` cleared, so a revision can be signed before it is chained,
+/// and so the same article signed twice yields the same content hash.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ZineBlob {
+    /// Envelope version, so a later change is a refusal rather than a misread.
+    #[serde(default)]
+    pub v: u32,
+    /// The pen name's Ed25519 public key, hex.
+    #[serde(default)]
+    pub sign_pk: String,
+    /// Base64 signature over the descriptor's canonical bytes.
+    #[serde(default)]
+    pub signature: String,
+    pub descriptor: ZineDescriptor,
+}
+
+/// The envelope version this build writes and accepts.
+pub const BLOB_VERSION: u32 = 1;
+
+impl ZineBlob {
+    /// Wrap a descriptor with its provenance, at the current version.
+    pub fn new(descriptor: ZineDescriptor, sign_pk: String, signature: String) -> Self {
+        Self {
+            v: BLOB_VERSION,
+            sign_pk,
+            signature,
+            descriptor,
+        }
+    }
+
+    /// The bytes a signature is made over and checked against.
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        canonical_bytes(&self.descriptor)
+    }
+}
+
+/// What a commenter seals to the author's pen name and publishes.
+///
+/// No signature and no identity beyond the byline: the box is anonymous, so
+/// there is nothing to verify and no sender to record. `zine_id` is inside the
+/// sealed plaintext because the author holds many posts and one pen name is the
+/// address for all of them.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ZineCommentBlob {
+    #[serde(default)]
+    pub v: u32,
+    pub zine_id: String,
+    /// The byline the commenter claimed. Free text, never checked.
+    #[serde(default)]
+    pub author: String,
+    /// Sanitized HTML.
+    #[serde(default)]
+    pub body: String,
+    /// Commenter-declared, clamped by the author on ingest.
+    #[serde(default)]
+    pub created_ms: u64,
+}
+
+impl ZineCommentBlob {
+    pub fn new(zine_id: String, author: String, body: String, created_ms: u64) -> Self {
+        Self {
+            v: BLOB_VERSION,
+            zine_id,
+            author,
+            body,
+            created_ms,
+        }
+    }
+}
+
+/// One sealed blob this vault holds the bytes of.
+///
+/// The bytes are kept, not just the parsed form, for two reasons: a re-post
+/// sweep sends them again to keep a zine inside the relay's TTL, and a blob that
+/// could not be opened yet is held until a key arrives. Neither needs the
+/// plaintext, which is why unreadable is a flag rather than a reason to drop it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct HeldBlob {
+    /// SHA-256 of `body`, hex: the address the relay dedups on and the value a
+    /// grant names.
+    pub hash: String,
+    /// The sealed bytes, base64.
+    pub body: String,
+    /// When the relay accepted it, ms, or the local time it was published.
+    /// Drives the re-post sweep, oldest first.
+    #[serde(default)]
+    pub inserted_at: u64,
+    /// Whether this vault has opened it. Unreadable is a state, not an error.
+    #[serde(default)]
+    pub readable: bool,
+}
+
 /// A superseded revision, kept so a mistake can be undone and so a holder can
 /// answer "is this blob older than what I have?".
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -143,6 +275,12 @@ pub struct ZineRevision {
     /// The content hash of this revision's canonical bytes.
     #[serde(default)]
     pub hash: String,
+    /// The address of the sealed blob that carried this revision, when this
+    /// vault has seen it. `hash` is derived from the plaintext, so it is only
+    /// computable by someone holding the key; this is the value the relay and a
+    /// grant name, and it is what a re-post sends.
+    #[serde(default)]
+    pub blob_hash: String,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -175,6 +313,21 @@ pub struct ZineFile {
     /// discarded, so the retry sweep can classify it later.
     #[serde(default)]
     pub unreadable: bool,
+    /// The address of the sealed blob carrying the head revision, when this
+    /// vault has it. This is what a grant names, because a recipient can match
+    /// it by hashing bytes rather than by opening anything.
+    #[serde(default)]
+    pub head_blob: String,
+    /// The address a grant named as the newest revision the sender held, when
+    /// this vault has not opened it yet. A drain that meets this address opens
+    /// it directly with the granted key instead of trying keys on every blob,
+    /// which is the whole point of the grant carrying a hash.
+    #[serde(default)]
+    pub expected_blob: String,
+    /// Comments pulled from the bulletin and not yet accepted, newest last.
+    /// Author-side only: a reader never sees these.
+    #[serde(default)]
+    pub pending_comments: Vec<ZineComment>,
     /// Local mute. No wire effect — the zine is still held and still counted.
     #[serde(default)]
     pub muted: bool,
@@ -186,7 +339,25 @@ pub struct ZineFile {
 pub struct ZinesState {
     #[serde(default)]
     pub zines: Vec<ZineFile>,
+    /// Sealed blobs this vault holds the bytes of, oldest first. Bounded by
+    /// [`BLOBS_CAP`] and [`BLOB_BYTES_CAP`].
+    #[serde(default)]
+    pub blobs: Vec<HeldBlob>,
+    /// The highest bulletin `seq` this vault has processed. The drain is
+    /// resumable across restarts because of this: a member that was offline for
+    /// a week reads the lane from where it stopped rather than from the start.
+    #[serde(default)]
+    pub bulletin_seq: i64,
+    /// How many blobs the caps evicted since the caller last asked.
+    ///
+    /// Not persisted: it is a fact about this session's drains rather than about
+    /// the corpus, and a count that survived a restart would report an eviction
+    /// that happened in another life. A drop is a real loss of bytes, so it is
+    /// counted here and reported by the drain instead of passing silently.
+    #[serde(skip)]
+    pub dropped_since_read: usize,
 }
+
 
 /// Decode sidecar bytes; `None` (never saved) decodes to the empty default.
 /// A corrupt sidecar is an error, not silent data loss.
@@ -229,6 +400,10 @@ pub struct ZineSummary {
     pub updated_ms: u64,
     pub revision: u64,
     pub comments: usize,
+    /// Comments pulled and not yet accepted. Author-side only: it is the count
+    /// the writer needs to see, and a reader never has any.
+    #[serde(default)]
+    pub pending: usize,
     /// A short plain-text taste of the body, for the list row.
     pub preview: String,
     pub authored: bool,
@@ -295,10 +470,11 @@ fn preview_of(body: &str) -> String {
 /// Whether a comment body is worth merging: an empty one is not a comment.
 ///
 /// Sanitised on the way in, the same as an article body, so a merged thread
-/// cannot carry markup the reader's sanitizer would strip anyway. Phase 3 wires
-/// the route that calls this; until then only the unit tests do.
-#[allow(dead_code)]
-fn normalize_comment_body(raw: &str) -> String {
+/// cannot carry markup the reader's sanitizer would strip anyway. Public because
+/// the composer applies the same rule before sealing: a commenter should not be
+/// able to send a body the author's ingest would have to change, or the hash the
+/// thread names would not be the bytes that were written.
+pub fn normalize_comment_body(raw: &str) -> String {
     crate::reads::sanitize_rich_text(raw)
 }
 
@@ -415,6 +591,7 @@ impl ZinesState {
                 updated_ms: z.updated_ms,
                 revision: z.descriptor.revision,
                 comments: z.descriptor.comments.len(),
+                pending: z.pending_comments.len(),
                 preview: preview_of(&z.descriptor.body),
                 authored: z.authored,
                 muted: z.muted,
@@ -502,18 +679,7 @@ impl ZinesState {
             }
             // The old head becomes history before the new one replaces it, so
             // the chain is always readable and an undo has somewhere to go.
-            let superseded = ZineRevision {
-                revision: file.descriptor.revision,
-                hash: content_hash(&file.descriptor),
-                title: file.descriptor.title.clone(),
-                body: file.descriptor.body.clone(),
-                sections: file.descriptor.sections.clone(),
-                replaced_ms: now_ms,
-            };
-            file.history.insert(0, superseded);
-            file.history.truncate(HISTORY_CAP);
-            file.descriptor.prev_hash = content_hash(&file.descriptor);
-            file.descriptor.revision += 1;
+            advance(file, now_ms);
             file.descriptor.title = title;
             file.descriptor.sections = sections;
             file.descriptor.body = body;
@@ -548,6 +714,9 @@ impl ZinesState {
             authored: true,
             read_key: Some(mint_read_key()),
             unreadable: false,
+            head_blob: String::new(),
+            expected_blob: String::new(),
+            pending_comments: Vec::new(),
             muted: false,
             updated_ms: now_ms,
         });
@@ -630,6 +799,27 @@ impl ZinesState {
         Ok(())
     }
 
+    /// Open a new revision without changing the text.
+    ///
+    /// What accepting a comment needs. The thread lives inside the descriptor,
+    /// so a merge *is* a document change, and a change that kept its revision
+    /// number would be refused by roughly half its readers: two heads at the
+    /// same number are ordered by content hash, and a merge has no claim to the
+    /// greater one. So a merge is a revision like any other edit, and the author
+    /// republishes it through the same path.
+    ///
+    /// Answers with the new revision number, which is what the caller publishes.
+    pub fn bump_revision(&mut self, zine_id: &str, now_ms: u64) -> Result<u64, String> {
+        let file = self
+            .get_mut(zine_id)
+            .ok_or_else(|| "no post with that id is held".to_string())?;
+        if !file.authored {
+            return Err("only the pen name that wrote a zine can publish it".to_string());
+        }
+        advance(file, now_ms);
+        Ok(file.descriptor.revision)
+    }
+
     /// Set the local mute flag. `false` when there is no such zine.
     pub fn set_muted(&mut self, zine_id: &str, muted: bool, now_ms: u64) -> bool {
         let Some(file) = self.get_mut(zine_id) else {
@@ -654,21 +844,699 @@ impl ZinesState {
         self.zines.retain(|z| z.descriptor.zine_id != zine_id);
         self.zines.len() != before
     }
+
+    // ---------------------------------------------------------------- blobs
+    //
+    // The pool is what makes "held, not discarded" true. Nothing here opens a
+    // blob — this module holds no keys and does no crypto — so a blob arrives
+    // already classified by the caller, and the only decisions made here are
+    // whether it is new and whether the caps have to evict something.
+
+    /// Whether this vault holds a blob's bytes, by address.
+    pub fn holds_blob(&self, hash: &str) -> bool {
+        !hash.is_empty() && self.blobs.iter().any(|b| b.hash == hash)
+    }
+
+    /// The bytes of a held blob.
+    ///
+    /// Test-only: production paths that need the bytes already have them (the
+    /// drain holds the slice it is placing, and the re-post sweep takes them
+    /// straight off the pool), so this exists to let a test assert that what a
+    /// blob went in as is what it comes back out as.
+    #[cfg(test)]
+    pub fn blob_body(&self, hash: &str) -> Option<Vec<u8>> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let held = self.blobs.iter().find(|b| b.hash == hash)?;
+        STANDARD.decode(&held.body).ok()
+    }
+
+    /// Keep a sealed blob's bytes, reporting what it cost.
+    ///
+    /// Idempotent on the address: the same blob arrives on every drain, and a
+    /// re-post sends one this vault already has. The caps evict rather than
+    /// refuse — a drain that refused would lose the blob for good, because the
+    /// cursor moves on either way — so the caller is told how many went and can
+    /// say so instead of pretending nothing happened. Eviction takes superseded
+    /// revisions first and the newest last: a superseded revision's plaintext is
+    /// already in `history`, so its bytes are worth the least, while an
+    /// unopened blob may be the only copy of something a later key opens.
+    pub fn hold_blob(
+        &mut self,
+        hash: &str,
+        body: &[u8],
+        inserted_at: u64,
+        readable: bool,
+    ) -> BlobHeld {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        if hash.is_empty() || body.is_empty() {
+            return BlobHeld { added: false, dropped: 0 };
+        }
+        if self.holds_blob(hash) {
+            // Not a no-op: a re-post refreshes the relay's TTL, and a blob that
+            // was unreadable may have just been opened by a caller that learned
+            // the key. Readable only ever goes up.
+            if readable {
+                if let Some(b) = self.blobs.iter_mut().find(|b| b.hash == hash) {
+                    b.readable = true;
+                }
+            }
+            return BlobHeld { added: false, dropped: 0 };
+        }
+        self.blobs.push(HeldBlob {
+            hash: hash.to_string(),
+            body: STANDARD.encode(body),
+            inserted_at,
+            readable,
+        });
+        BlobHeld {
+            added: true,
+            dropped: self.trim_blobs(),
+        }
+    }
+
+    /// Drop blobs until both caps are met, oldest and least valuable first.
+    fn trim_blobs(&mut self) -> usize {
+        if self.blobs.len() <= BLOBS_CAP && self.blob_bytes() <= BLOB_BYTES_CAP {
+            return 0;
+        }
+        let ranks: Vec<u8> = self
+            .blobs
+            .iter()
+            .map(|b| self.blob_rank(&b.hash))
+            .collect();
+        let mut order: Vec<(u8, u64, usize)> = ranks
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (*r, self.blobs[i].inserted_at, i))
+            .collect();
+        order.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut doomed: Vec<usize> = Vec::new();
+        let mut count = self.blobs.len();
+        let mut bytes = self.blob_bytes();
+        for (_, _, i) in order {
+            if count <= BLOBS_CAP && bytes <= BLOB_BYTES_CAP {
+                break;
+            }
+            count -= 1;
+            bytes = bytes.saturating_sub(self.blobs[i].body.len());
+            doomed.push(i);
+        }
+        doomed.sort_unstable();
+        for i in doomed.iter().rev() {
+            self.blobs.remove(*i);
+        }
+        // Counted as well as returned: the cap is a real loss of held bytes, and
+        // the drain reports it rather than letting a corpus quietly shrink.
+        self.dropped_since_read += doomed.len();
+        doomed.len()
+    }
+
+    /// How many blobs the caps evicted since this was last taken, resetting it.
+    pub fn take_dropped(&mut self) -> usize {
+        std::mem::take(&mut self.dropped_since_read)
+    }
+
+    /// How much a blob is worth keeping: 0 superseded, 1 unknown or unopened,
+    /// 2 the head of a post.
+    fn blob_rank(&self, hash: &str) -> u8 {
+        for z in &self.zines {
+            if z.head_blob == hash {
+                return 2;
+            }
+            if z.history.iter().any(|r| r.blob_hash == hash) {
+                return 0;
+            }
+        }
+        1
+    }
+
+    /// The base64 size of every held blob: what the byte cap actually bounds,
+    /// because that is what the sidecar has to hold in memory and decrypt.
+    fn blob_bytes(&self) -> usize {
+        self.blobs.iter().map(|b| b.body.len()).sum()
+    }
+
+    /// Blobs due to be sent again: least recently published first, at most
+    /// `limit`, and only those the relay has not seen for `after_ms`.
+    ///
+    /// The relay refreshes a row's TTL when the same bytes are published again,
+    /// so a holder's sweep is what keeps a zine alive past the window without
+    /// anyone re-authoring it.
+    ///
+    /// The age filter is what makes the sweep affordable. The relay's window is
+    /// weeks, so re-posting on every poll would spend the member's whole publish
+    /// budget on traffic nobody needs; waiting until a blob is a fraction of the
+    /// way through the window keeps every held zine alive with one request per
+    /// blob per window instead of one per poll.
+    pub fn repost_due(&self, now_ms: u64, after_ms: u64, limit: usize) -> Vec<(String, Vec<u8>)> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let mut order: Vec<&HeldBlob> = self.blobs.iter().collect();
+        order.sort_by(|a, b| a.inserted_at.cmp(&b.inserted_at).then_with(|| a.hash.cmp(&b.hash)));
+        order
+            .into_iter()
+            .filter(|b| now_ms.saturating_sub(b.inserted_at) >= after_ms)
+            .take(limit)
+            .filter_map(|b| STANDARD.decode(&b.body).ok().map(|raw| (b.hash.clone(), raw)))
+            .collect()
+    }
+
+    /// Record that the relay accepted these bytes at `at_ms`, which moves the
+    /// blob to the back of the re-post queue.
+    pub fn note_published(&mut self, hash: &str, at_ms: u64) {
+        if let Some(b) = self.blobs.iter_mut().find(|b| b.hash == hash) {
+            b.inserted_at = at_ms;
+        }
+    }
+
+    /// Record the sealed blob a revision was published as.
+    ///
+    /// The publisher calls this after sealing and signing — this module holds no
+    /// keys and cannot seal — so that a grant can name an address, a re-post can
+    /// send bytes, and a reader that already has the blob can recognise it.
+    pub fn record_published(
+        &mut self,
+        zine_id: &str,
+        revision: u64,
+        hash: &str,
+        body: &[u8],
+        at_ms: u64,
+    ) -> Result<(), String> {
+        let file = self
+            .get_mut(zine_id)
+            .ok_or_else(|| "no post with that id is held".to_string())?;
+        if file.descriptor.revision == revision {
+            file.head_blob = hash.to_string();
+        } else if let Some(rev) = file
+            .history
+            .iter_mut()
+            .find(|r| r.revision == revision)
+        {
+            rev.blob_hash = hash.to_string();
+        }
+        self.hold_blob(hash, body, at_ms, true);
+        Ok(())
+    }
+
+    /// The address a grant should name for this post: the blob carrying its
+    /// head, when this vault has it.
+    pub fn head_blob(&self, zine_id: &str) -> String {
+        self.get(zine_id).map(|z| z.head_blob.clone()).unwrap_or_default()
+    }
+
+    /// A post's read key, decoded, when this vault holds one.
+    pub fn read_key(&self, zine_id: &str) -> Option<[u8; 32]> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let key = self.get(zine_id)?.read_key.as_deref()?;
+        STANDARD.decode(key).ok()?.try_into().ok()
+    }
+
+    /// Every read key this vault holds, with the post it opens.
+    ///
+    /// What a drain needs: a blob off the bulletin says nothing about which post
+    /// it belongs to, so the only way to place it is to try the keys, and this is
+    /// the set to try. A post whose key has not arrived is simply not in it.
+    pub fn read_keys(&self) -> Vec<(String, [u8; 32])> {
+        self.zines
+            .iter()
+            .filter_map(|z| {
+                self.read_key(&z.descriptor.zine_id)
+                    .map(|k| (z.descriptor.zine_id.clone(), k))
+            })
+            .collect()
+    }
+
+    /// Blobs held that this vault has not opened. The honest status line: they
+    /// are kept, they cost space, and a key may still make them readable.
+    pub fn unreadable_blobs(&self) -> usize {
+        self.blobs.iter().filter(|b| !b.readable).count()
+    }
+
+    // ------------------------------------------------------------- ingesting
+
+    /// Take a read key from a grant.
+    ///
+    /// Returns whether anything changed. A key for a post this vault has never
+    /// seen creates a placeholder rather than being dropped: the grant names the
+    /// post, the key, and the address of the newest blob the sender held, and
+    /// that blob may not have arrived yet. Until it does the post is
+    /// [`ZineFile::unreadable`], which is exactly what that flag means.
+    ///
+    /// Nothing is verified, by design: any holder may re-share a key, and a
+    /// grant can only confer read of a post the sender could already read.
+    pub fn apply_grant(&mut self, zine_id: &str, key: &[u8], latest_hash: &str, now_ms: u64) -> bool {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        if zine_id.is_empty() || key.len() != 32 {
+            return false;
+        }
+        let encoded = STANDARD.encode(key);
+        if let Some(file) = self.get_mut(zine_id) {
+            if file.read_key.is_none() {
+                file.read_key = Some(encoded);
+                return true;
+            }
+            // A second grant for a post already readable is the norm: every
+            // holder may re-share, so the same key arrives from several
+            // directions. Only a *newer* address is worth recording, because
+            // that is the one a later drain can open without trying keys.
+            if !latest_hash.is_empty()
+                && file.expected_blob != latest_hash
+                && file.head_blob != latest_hash
+            {
+                file.expected_blob = latest_hash.to_string();
+                return true;
+            }
+            return false;
+        }
+        if self.zines.len() >= ZINES_CAP {
+            return false;
+        }
+        self.zines.push(ZineFile {
+            descriptor: ZineDescriptor {
+                zine_id: zine_id.to_string(),
+                // Unknown until the blob arrives: an empty pen name and a
+                // revision of zero are what "not opened yet" looks like.
+                pen_id: String::new(),
+                pen_name: String::new(),
+                title: String::new(),
+                sections: Vec::new(),
+                created_ms: now_ms,
+                revision: 0,
+                prev_hash: String::new(),
+                body: String::new(),
+                comments: Vec::new(),
+            },
+            history: Vec::new(),
+            authored: false,
+            read_key: Some(encoded),
+            unreadable: true,
+            head_blob: String::new(),
+            expected_blob: latest_hash.to_string(),
+            pending_comments: Vec::new(),
+            muted: false,
+            updated_ms: now_ms,
+        });
+        true
+    }
+
+    /// Take a signed revision out of the bulletin.
+    ///
+    /// The signature is checked *here* rather than by the caller, because this
+    /// is the one place a revision is admitted and a caller that forgot to check
+    /// would let any reader forge an edit: every reader holds the read key, so
+    /// the signature is the only thing that makes a revision the author's.
+    ///
+    /// The key that opened the blob is passed in so a post this vault has never
+    /// seen can be created from what the blob says, rather than from a grant
+    /// that may not have arrived.
+    pub fn ingest_blob(
+        &mut self,
+        blob: &ZineBlob,
+        hash: &str,
+        body: &[u8],
+        key: [u8; 32],
+        now_ms: u64,
+    ) -> Result<Ingest, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        if blob.v != BLOB_VERSION {
+            return Err(format!("blob version {} is not understood", blob.v));
+        }
+        let signature = STANDARD
+            .decode(&blob.signature)
+            .map_err(|_| "the blob's signature is not base64".to_string())?;
+        if !hush_core::verify_pen_signature(&blob.sign_pk, &blob.signed_bytes(), &signature) {
+            return Err("the blob is not signed by the pen name it claims".to_string());
+        }
+        let descriptor = validate_descriptor(&blob.descriptor, now_ms)?;
+        let id = descriptor.zine_id.clone();
+        let existing = self.get(&id).map(|z| {
+            (
+                z.descriptor.revision,
+                z.head_blob.clone(),
+                content_hash(&z.descriptor),
+            )
+        });
+        let Some((head_revision, head_blob, head_content)) = existing else {
+            if self.zines.len() >= ZINES_CAP {
+                return Err(format!("at most {ZINES_CAP} zines are held"));
+            }
+            self.hold_blob(hash, body, now_ms, true);
+            self.zines.push(ZineFile {
+                descriptor,
+                history: Vec::new(),
+                authored: false,
+                read_key: Some(STANDARD.encode(key)),
+                unreadable: false,
+                head_blob: hash.to_string(),
+                expected_blob: String::new(),
+                pending_comments: Vec::new(),
+                muted: false,
+                updated_ms: now_ms,
+            });
+            return Ok(Ingest::NewPost);
+        };
+
+        if hash == head_blob {
+            // Our own head coming back around the lane, or a blob this vault
+            // already has. The bytes are still worth holding: that is what a
+            // re-post sends.
+            self.hold_blob(hash, body, now_ms, true);
+            return Ok(Ingest::Duplicate);
+        }
+        if self
+            .get(&id)
+            .is_some_and(|z| z.history.iter().any(|r| r.blob_hash == hash))
+        {
+            // A superseded revision this vault already has: the bytes are worth
+            // keeping for a re-post, the record is already here.
+            self.hold_blob(hash, body, now_ms, true);
+            return Ok(Ingest::Duplicate);
+        }
+        let file = self.get_mut(&id).expect("checked above");
+        if !file.descriptor.pen_id.is_empty() && file.descriptor.pen_id != descriptor.pen_id {
+            return Err("that post id belongs to another pen name".to_string());
+        }
+        let newer = match descriptor.revision.cmp(&head_revision) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            // Two devices, one post, the same revision number: the author has
+            // forked. Nothing can order them by time — both are signed and
+            // honest — so the greater content hash wins. Arbitrary, but
+            // deterministic, which is what makes two readers agree.
+            std::cmp::Ordering::Equal => {
+                let incoming = content_hash(&descriptor);
+                incoming > head_content
+            }
+        };
+        if !newer {
+            // An older revision is kept, not discarded: it is the undo history
+            // and it answers "is this blob older than what I have?".
+            let already = file
+                .history
+                .iter()
+                .any(|r| r.revision == descriptor.revision);
+            if !already && descriptor.revision > 0 {
+                file.history.insert(
+                    0,
+                    ZineRevision {
+                        revision: descriptor.revision,
+                        hash: content_hash(&descriptor),
+                        blob_hash: hash.to_string(),
+                        title: descriptor.title.clone(),
+                        body: descriptor.body.clone(),
+                        sections: descriptor.sections.clone(),
+                        replaced_ms: now_ms,
+                    },
+                );
+                file.history.truncate(HISTORY_CAP);
+            }
+            self.hold_blob(hash, body, now_ms, true);
+            return Ok(Ingest::Superseded);
+        }
+        // A placeholder — a key that arrived before its blob — is filled, not
+        // superseded: there is no revision to keep as history and nothing was
+        // known about the post to lose.
+        let placeholder = file.descriptor.revision == 0;
+        if !placeholder {
+            let superseded = ZineRevision {
+                revision: file.descriptor.revision,
+                hash: head_content,
+                blob_hash: head_blob,
+                title: file.descriptor.title.clone(),
+                body: file.descriptor.body.clone(),
+                sections: file.descriptor.sections.clone(),
+                replaced_ms: now_ms,
+            };
+            // A vault cloned onto two devices can hold two revisions under one
+            // number. Whichever loses is worth keeping once, not twice.
+            if !file
+                .history
+                .iter()
+                .any(|r| r.revision == superseded.revision)
+            {
+                file.history.insert(0, superseded);
+            }
+            file.history.truncate(HISTORY_CAP);
+        }
+        file.descriptor = descriptor;
+        file.head_blob = hash.to_string();
+        file.expected_blob = String::new();
+        file.unreadable = false;
+        file.updated_ms = now_ms;
+        self.hold_blob(hash, body, now_ms, true);
+        Ok(if placeholder {
+            Ingest::NewPost
+        } else {
+            Ingest::Advanced
+        })
+    }
+
+    /// Hold a comment for a post this vault wrote. Not merged: the author
+    /// decides, and an unaccepted comment is never in the thread.
+    ///
+    /// Idempotent on the blob's address, because the drain runs every few
+    /// seconds and a pile that grows on each pass is a pile nobody can read.
+    /// `Ok(false)` means the comment was already here, which is the common case.
+    pub fn pull_comment(
+        &mut self,
+        comment: &ZineCommentBlob,
+        hash: &str,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        if comment.v != BLOB_VERSION {
+            return Err(format!("comment version {} is not understood", comment.v));
+        }
+        let body = normalize_comment_body(&comment.body);
+        if body.trim().is_empty() {
+            return Err("an empty comment is not kept".to_string());
+        }
+        let file = self
+            .get_mut(&comment.zine_id)
+            .ok_or_else(|| "no post with that id is held".to_string())?;
+        if !file.authored {
+            return Err("only the pen name that wrote a post takes its comments".to_string());
+        }
+        if file
+            .descriptor
+            .comments
+            .iter()
+            .chain(file.pending_comments.iter())
+            .any(|c| c.hash == hash)
+        {
+            return Ok(false);
+        }
+        if file.pending_comments.len() >= PENDING_CAP {
+            return Err(format!("at most {PENDING_CAP} comments wait to be read"));
+        }
+        file.pending_comments.push(ZineComment {
+            hash: hash.to_string(),
+            author: comment.author.trim().to_string(),
+            body,
+            created_ms: clamp_ms(comment.created_ms, now_ms),
+            merged_ms: 0,
+        });
+        file.pending_comments
+            .sort_by(|a, b| a.created_ms.cmp(&b.created_ms).then_with(|| a.hash.cmp(&b.hash)));
+        file.updated_ms = now_ms;
+        Ok(true)
+    }
+
+    /// Accept a comment that was pulled: merge it into the thread and open a
+    /// revision to publish it in.
+    ///
+    /// The thread lives inside the descriptor, so accepting one *is* a document
+    /// change, and a change that kept its revision number would be refused by
+    /// roughly half its readers: two heads at the same number are ordered by
+    /// content hash, and a merge has no claim to the greater one. So a merge
+    /// advances the revision like any edit, and the caller publishes it with the
+    /// same call an edit uses.
+    ///
+    /// The bump happens *before* the merge, which is what keeps the chain honest:
+    /// the superseded revision is then the one that was actually published, so a
+    /// reader holding it computes the same hash this vault records as its
+    /// predecessor. Answers with the revision now in force, which the caller
+    /// publishes. Accepting a comment already merged is a no-op and does not open
+    /// a second revision.
+    pub fn accept_comment(&mut self, zine_id: &str, hash: &str, now_ms: u64) -> Result<u64, String> {
+        // Everything that can refuse is checked before anything moves: a comment
+        // that cannot be merged must not leave a revision behind.
+        let comment = {
+            let file = self
+                .get_mut(zine_id)
+                .ok_or_else(|| "no post with that id is held".to_string())?;
+            if !file.authored {
+                return Err("only the pen name that wrote a post merges its comments".to_string());
+            }
+            if file.descriptor.comments.iter().any(|c| c.hash == hash) {
+                return Ok(file.descriptor.revision);
+            }
+            let Some(at) = file.pending_comments.iter().position(|c| c.hash == hash) else {
+                return Err("no comment with that hash is waiting".to_string());
+            };
+            if file.descriptor.comments.len() >= COMMENTS_CAP {
+                return Err(format!("at most {COMMENTS_CAP} comments are kept"));
+            }
+            file.pending_comments.remove(at)
+        };
+        let revision = self.bump_revision(zine_id, now_ms)?;
+        self.merge_comment(zine_id, comment, now_ms)?;
+        Ok(revision)
+    }
+
+    /// Refuse a comment that was pulled: drop it from the pile.
+    ///
+    /// Not a retraction of anything published — nothing was published — and
+    /// `true` only says one was waiting.
+    pub fn discard_comment(&mut self, zine_id: &str, hash: &str) -> bool {
+        let Some(file) = self.get_mut(zine_id) else {
+            return false;
+        };
+        let before = file.pending_comments.len();
+        file.pending_comments.retain(|c| c.hash != hash);
+        file.pending_comments.len() != before
+    }
 }
 
-/// The content hash of a descriptor's canonical bytes.
+/// What a drain learned from one blob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ingest {
+    /// A post this vault had never seen.
+    NewPost,
+    /// A revision newer than the head: it is the head now.
+    Advanced,
+    /// An older revision than the head, kept in history.
+    Superseded,
+    /// A blob this vault already had.
+    Duplicate,
+}
+
+/// What holding a blob cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobHeld {
+    /// False when this vault already held that address.
+    pub added: bool,
+    /// How many older blobs the caps evicted to make room.
+    pub dropped: usize,
+}
+
+/// Normalise a descriptor that arrived from the wire.
 ///
-/// Canonical means the serialized form with the hash-bearing fields it does not
-/// cover taken out, so a hash can be computed before `prev_hash` is set. Phase 2
-/// signs over this same form, which is why it is one function here rather than
-/// inlined at the two call sites that need it.
-pub fn content_hash(descriptor: &ZineDescriptor) -> String {
+/// A received descriptor is not trusted: the signature proves *who* wrote it,
+/// not that it is sane, and the author may be running a hostile build. So every
+/// field goes through the same boundary the local write path uses — sanitized
+/// HTML, normalized sections, a clamped clock, a capped thread — and the
+/// identity fields are required rather than defaulted.
+fn validate_descriptor(raw: &ZineDescriptor, now_ms: u64) -> Result<ZineDescriptor, String> {
+    if raw.zine_id.trim().is_empty() {
+        return Err("a blob without a post id is refused".to_string());
+    }
+    if raw.pen_id.trim().is_empty() {
+        return Err("a blob without a pen name is refused".to_string());
+    }
+    if raw.revision == 0 {
+        return Err("a revision chain starts at 1".to_string());
+    }
+    let body = crate::reads::sanitize_rich_text(&raw.body);
+    if body.len() > BODY_SOFT_CAP {
+        return Err(format!(
+            "the article is over the {} KiB cap",
+            BODY_SOFT_CAP / 1024
+        ));
+    }
+    let mut comments: Vec<ZineComment> = raw
+        .comments
+        .iter()
+        .filter(|c| !c.hash.is_empty())
+        .take(COMMENTS_CAP)
+        .map(|c| ZineComment {
+            hash: c.hash.clone(),
+            author: c.author.trim().to_string(),
+            body: normalize_comment_body(&c.body),
+            created_ms: clamp_ms(c.created_ms, now_ms),
+            merged_ms: 0,
+        })
+        .filter(|c| !c.body.trim().is_empty())
+        .collect();
+    comments.sort_by(|a, b| a.created_ms.cmp(&b.created_ms).then_with(|| a.hash.cmp(&b.hash)));
+    Ok(ZineDescriptor {
+        zine_id: raw.zine_id.trim().to_string(),
+        pen_id: raw.pen_id.trim().to_string(),
+        pen_name: raw.pen_name.trim().to_string(),
+        title: raw.title.trim().to_string(),
+        sections: normalize_sections(&raw.sections),
+        created_ms: clamp_ms(raw.created_ms, now_ms),
+        revision: raw.revision,
+        prev_hash: raw.prev_hash.clone(),
+        body,
+        comments,
+    })
+}
+
+/// Move the current head into history and open the next revision.
+///
+/// The one place a revision advances, because two callers need it: an edit (new
+/// text) and a comment merge (same text, longer thread). Both keep the old head
+/// — it is the undo history, and it answers "is this blob older than what I
+/// have?" — and both chain the new revision to what the old one hashed to. Two
+/// copies of that would be two chances to get the chain wrong.
+///
+/// The caller mutates the text after this, so `prev_hash` is set before the
+/// descriptor changes: it names the revision being replaced, not the one being
+/// written.
+fn advance(file: &mut ZineFile, now_ms: u64) {
+    let head_content = content_hash(&file.descriptor);
+    // A vault cloned onto two devices can already hold a revision under this
+    // number. Whichever loses is worth keeping once, not twice.
+    if !file
+        .history
+        .iter()
+        .any(|r| r.revision == file.descriptor.revision)
+    {
+        let superseded = ZineRevision {
+            revision: file.descriptor.revision,
+            hash: head_content.clone(),
+            blob_hash: file.head_blob.clone(),
+            title: file.descriptor.title.clone(),
+            body: file.descriptor.body.clone(),
+            sections: file.descriptor.sections.clone(),
+            replaced_ms: now_ms,
+        };
+        file.history.insert(0, superseded);
+        file.history.truncate(HISTORY_CAP);
+    }
+    file.descriptor.prev_hash = head_content;
+    file.descriptor.revision += 1;
+    file.updated_ms = now_ms;
+}
+
+/// The bytes a revision is hashed and signed over.
+///
+/// Canonical means the serialized form with the one field it cannot cover taken
+/// out: `prev_hash`. Clearing it is what lets a hash be computed before the
+/// revision is chained, and what lets a signature be made by a layer that does
+/// not know the chain. One function, because a hash and a signature over
+/// *nearly* the same bytes is a bug waiting to happen.
+pub fn canonical_bytes(descriptor: &ZineDescriptor) -> Vec<u8> {
     let canonical = ZineDescriptor {
         prev_hash: String::new(),
         ..descriptor.clone()
     };
-    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
-    hex::encode(hush_core::sha256(&bytes))
+    serde_json::to_vec(&canonical).unwrap_or_default()
+}
+
+/// The content hash of a descriptor's canonical bytes.
+///
+/// This is derived from the *plaintext*, so only someone holding the read key
+/// can compute it — which is what it is for: the revision chain, where both
+/// ends hold the key. The relay's address for a blob is the hash of its sealed
+/// bytes instead ([`blob_hash`]), because a holder that cannot open a blob can
+/// still hash it, and a grant has to be matchable by one.
+pub fn content_hash(descriptor: &ZineDescriptor) -> String {
+    hex::encode(hush_core::sha256(&canonical_bytes(descriptor)))
+}
+
+/// The address of a sealed blob: SHA-256 of the bytes as they travel.
+pub fn blob_hash(body: &[u8]) -> String {
+    hex::encode(hush_core::sha256(body))
 }
 
 #[cfg(test)]
@@ -712,6 +1580,57 @@ mod zine_store_tests {
         let mut s = ZinesState::default();
         create(&mut s, PEN, "ada", draft("First", "<p>hello</p>"), NOW);
         s
+    }
+
+    /// A real Ed25519 pen name for the tests that publish a blob. Fixed, so a
+    /// failure is reproducible, and a real keypair, because a signature that was
+    /// never really made proves nothing about the check.
+    const SIGN_SK: [u8; 32] = [7u8; 32];
+
+    fn sign_pk() -> String {
+        use ed25519_dalek::SigningKey;
+        hex::encode(SigningKey::from_bytes(&SIGN_SK).verifying_key().to_bytes())
+    }
+
+    fn signature_over(bytes: &[u8]) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use ed25519_dalek::Signer;
+        let sig = ed25519_dalek::SigningKey::from_bytes(&SIGN_SK).sign(bytes);
+        STANDARD.encode(sig.to_bytes())
+    }
+
+    /// A descriptor as it would arrive from the wire, at revision `rev`.
+    fn descriptor(id: &str, rev: u64, body: &str) -> ZineDescriptor {
+        ZineDescriptor {
+            zine_id: id.to_string(),
+            pen_id: PEN.to_string(),
+            pen_name: "ada".to_string(),
+            title: format!("Revision {rev}"),
+            sections: vec!["Notes".to_string()],
+            created_ms: NOW,
+            revision: rev,
+            prev_hash: String::new(),
+            body: body.to_string(),
+            comments: Vec::new(),
+        }
+    }
+
+    /// Sign and seal a descriptor the way the publisher does, returning the
+    /// envelope and the bytes a reader would hash.
+    fn sealed(d: ZineDescriptor) -> (ZineBlob, Vec<u8>, [u8; 32]) {
+        let key = [3u8; 32];
+        let signature = signature_over(&canonical_bytes(&d));
+        let blob = ZineBlob::new(d, sign_pk(), signature);
+        let plain = serde_json::to_vec(&blob).unwrap();
+        let body = hush_core::seal_symmetric(&key, &plain).unwrap();
+        (blob, body, key)
+    }
+
+    /// Ingest a revision the way the drain does.
+    fn ingest(s: &mut ZinesState, d: ZineDescriptor, now: u64) -> Result<Ingest, String> {
+        let (blob, body, key) = sealed(d);
+        let hash = blob_hash(&body);
+        s.ingest_blob(&blob, &hash, &body, key, now)
     }
 
     /// The id of the only post in `s`.
@@ -785,6 +1704,9 @@ mod zine_store_tests {
             authored: false,
             read_key: None,
             unreadable: true,
+            head_blob: String::new(),
+            expected_blob: String::new(),
+            pending_comments: Vec::new(),
             muted: false,
             updated_ms: NOW,
         }
@@ -1350,5 +2272,455 @@ mod zine_store_tests {
         assert_eq!(z.descriptor.zine_id, "bb22", "the address did not move");
         assert!(z.read_key.is_none(), "a held post still has no key");
         assert!(!s.migrate(), "nothing left to do");
+    }
+
+    // ------------------------------------------------------------- blobs
+
+    #[test]
+    fn a_held_blob_is_kept_by_address_and_a_second_copy_changes_nothing() {
+        let mut s = ZinesState::default();
+        let first = s.hold_blob("aa", b"one", 10, false);
+        assert!(first.added && first.dropped == 0);
+        assert!(s.holds_blob("aa"));
+        assert_eq!(s.blob_body("aa").unwrap(), b"one");
+        assert_eq!(s.unreadable_blobs(), 1);
+
+        // The same address again: the drain sees it every few seconds, and a
+        // re-post sends one this vault already has.
+        let again = s.hold_blob("aa", b"one", 20, false);
+        assert!(!again.added, "the address was already held");
+        assert_eq!(s.blobs.len(), 1, "not a second copy");
+        assert_eq!(s.blobs[0].inserted_at, 10, "and not a new clock");
+
+        // A blob that is opened later only ever goes from unreadable to read.
+        s.hold_blob("aa", b"one", 10, true);
+        assert_eq!(s.unreadable_blobs(), 0);
+
+        assert!(!s.hold_blob("", b"x", 10, false).added, "no address, no blob");
+        assert!(!s.hold_blob("bb", b"", 10, false).added, "no bytes, no blob");
+    }
+
+    #[test]
+    fn the_blob_caps_evict_superseded_revisions_before_the_head() {
+        // A pool has to be bounded, and eviction is not free: a superseded
+        // revision's plaintext is already in `history`, while the head is what a
+        // reader needs and what a re-post keeps alive.
+        let mut s = with_zine();
+        let id = the_id(&s);
+        s.get_mut(&id).unwrap().head_blob = "head".to_string();
+        s.hold_blob("head", b"head", 500, true);
+        s.hold_blob("old", b"old", 100, true);
+        s.get_mut(&id).unwrap().history.push(ZineRevision {
+            revision: 1,
+            hash: "h1".into(),
+            blob_hash: "old".into(),
+            title: String::new(),
+            body: String::new(),
+            sections: Vec::new(),
+            replaced_ms: NOW,
+        });
+
+        // Fill the pool past the count cap and force one eviction.
+        for i in 0..BLOBS_CAP {
+            s.hold_blob(&format!("filler-{i}"), b"x", 200 + i as u64, false);
+        }
+        assert!(s.blobs.len() <= BLOBS_CAP, "the cap is enforced");
+        assert!(s.holds_blob("head"), "the head survives");
+        assert!(!s.holds_blob("old"), "the superseded revision went first");
+    }
+
+    #[test]
+    fn a_repost_batch_is_oldest_first_and_a_publish_moves_a_blob_to_the_back() {
+        let mut s = ZinesState::default();
+        s.hold_blob("a", b"a", NOW - 30, true);
+        s.hold_blob("b", b"b", NOW - 50, true);
+        s.hold_blob("c", b"c", NOW - 40, true);
+        // Nothing is due until a blob has been on the relay for the interval.
+        assert!(
+            s.repost_due(NOW, 100, 2).is_empty(),
+            "a fresh corpus is not re-posted"
+        );
+        let batch: Vec<String> = s
+            .repost_due(NOW, 20, 2)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(batch, vec!["b", "c"], "the oldest go first");
+        s.note_published("b", NOW);
+        let batch: Vec<String> = s
+            .repost_due(NOW, 20, 1)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(batch, vec!["c"], "a re-posted blob goes to the back");
+        assert_eq!(s.blob_body("b").unwrap(), b"b", "the bytes come back whole");
+    }
+
+    #[test]
+    fn every_read_key_is_listed_with_the_post_it_opens() {
+        // What a drain has to try against a blob that says nothing about itself.
+        let mut s = with_zine();
+        let id = the_id(&s);
+        let keys = s.read_keys();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, id);
+        assert_eq!(Some(keys[0].1), s.read_key(&id));
+        // A post with no key is not in the set, rather than a zero key that
+        // would silently fail to open anything.
+        s.zines[0].read_key = None;
+        assert!(s.read_keys().is_empty());
+    }
+
+    #[test]
+    fn accepting_a_comment_opens_a_revision_chained_to_the_published_one() {
+        // A merge changes the descriptor, and a change that kept its revision
+        // number would be refused by whichever readers hold the greater hash.
+        let mut s = with_zine();
+        let id = the_id(&s);
+        // What readers hold: revision 1 with no comments. Its hash is the chain
+        // link, and it is computable by anyone holding the read key.
+        let published_hash = content_hash(&s.get(&id).unwrap().descriptor);
+        let blob = ZineCommentBlob::new(id.clone(), "bob".into(), "<p>nice</p>".into(), NOW);
+        assert!(s.pull_comment(&blob, "c1", NOW).unwrap());
+        assert!(
+            s.get(&id).unwrap().descriptor.comments.is_empty(),
+            "a pulled comment is not merged"
+        );
+
+        assert_eq!(s.accept_comment(&id, "c1", NOW + 5).unwrap(), 2);
+        let file = s.get(&id).unwrap();
+        assert_eq!(file.descriptor.comments.len(), 1, "the merge is in the head");
+        assert_eq!(
+            file.descriptor.prev_hash, published_hash,
+            "the new revision is chained to the one that was published"
+        );
+        assert_eq!(
+            file.history[0].hash, published_hash,
+            "history records the published revision, not the merge"
+        );
+        assert!(file.pending_comments.is_empty(), "it left the pile");
+
+        // Accepting the same comment again does not open a second revision.
+        assert_eq!(s.accept_comment(&id, "c1", NOW + 6).unwrap(), 2);
+        assert_eq!(s.get(&id).unwrap().descriptor.revision, 2);
+    }
+
+    #[test]
+    fn a_comment_that_cannot_be_merged_leaves_no_revision_behind() {
+        let mut s = with_zine();
+        let id = the_id(&s);
+        assert!(s.accept_comment(&id, "nope", NOW).is_err());
+        assert_eq!(
+            s.get(&id).unwrap().descriptor.revision,
+            1,
+            "a refused accept is not an edit"
+        );
+    }
+
+    #[test]
+    fn a_holder_cannot_publish_someone_elses_post() {
+        let mut s = ZinesState::default();
+        let (blob, body, key) = sealed(descriptor("z1", 1, "<p>theirs</p>"));
+        let hash = blob_hash(&body);
+        s.ingest_blob(&blob, &hash, &body, key, NOW).unwrap();
+        assert!(s.bump_revision("z1", NOW).is_err(), "read is not write");
+    }
+
+    // --------------------------------------------------------- ingesting
+
+    #[test]
+    fn a_grant_for_an_unknown_post_waits_for_the_blob_and_then_opens_it() {
+        // The common shape: the key arrives over a session before the blob
+        // arrives over the bulletin, so the post exists as a placeholder rather
+        // than not at all.
+        let mut s = ZinesState::default();
+        let key = [3u8; 32];
+        let (blob, body, _) = sealed(descriptor("z1", 1, "<p>hello</p>"));
+        let hash = blob_hash(&body);
+
+        assert!(s.apply_grant("z1", &key, &hash, NOW));
+        let z = s.get("z1").unwrap();
+        assert!(z.unreadable, "the key is here, the article is not");
+        assert_eq!(z.expected_blob, hash, "the grant named the blob to open");
+        assert_eq!(z.descriptor.revision, 0, "nothing is known about it yet");
+        assert!(!s.apply_grant("z1", &key, &hash, NOW), "the second is a no-op");
+        assert!(!s.apply_grant("z1", &[0u8; 7], &hash, NOW), "a short key is not a key");
+        assert!(!s.apply_grant("", &key, &hash, NOW), "an id is needed");
+
+        assert_eq!(s.ingest_blob(&blob, &hash, &body, key, NOW).unwrap(), Ingest::NewPost);
+        let z = s.get("z1").unwrap();
+        assert!(!z.unreadable, "opened");
+        assert!(!z.authored, "held, not written here");
+        assert_eq!(z.descriptor.title, "Revision 1");
+        assert_eq!(z.head_blob, hash);
+        assert_eq!(z.expected_blob, "", "nothing left to wait for");
+        assert_eq!(s.read_key("z1").unwrap(), key);
+    }
+
+    #[test]
+    fn an_unsigned_or_foreign_revision_is_refused() {
+        // The read key is shared with every reader, so a signature is the only
+        // thing that makes a revision the author's. This is the check that has
+        // to hold, and it holds in the store rather than in a caller.
+        let mut s = ZinesState::default();
+        let key = [3u8; 32];
+        let d = descriptor("z1", 1, "<p>hello</p>");
+
+        let unsigned = ZineBlob {
+            v: BLOB_VERSION,
+            sign_pk: sign_pk(),
+            signature: String::new(),
+            descriptor: d.clone(),
+        };
+        let err = s.ingest_blob(&unsigned, "h", b"x", key, NOW).unwrap_err();
+        assert!(err.contains("not signed"), "{err}");
+
+        // A body edited after it was signed: the signature is over the bytes
+        // that were signed, so the edit is what fails the check.
+        let mut edited = d.clone();
+        edited.title = "Tampered".into();
+        let forged = ZineBlob::new(edited, sign_pk(), signature_over(&canonical_bytes(&d)));
+        let err = s.ingest_blob(&forged, "h", b"x", key, NOW).unwrap_err();
+        assert!(err.contains("not signed"), "{err}");
+
+        // A signature that is real, but by someone else.
+        let other = ZineBlob::new(
+            d.clone(),
+            hex::encode([9u8; 32]),
+            signature_over(&canonical_bytes(&d)),
+        );
+        assert!(s.ingest_blob(&other, "h", b"x", key, NOW).is_err());
+
+        // An envelope version this build does not understand is refused rather
+        // than guessed at.
+        let mut future = ZineBlob::new(d.clone(), sign_pk(), signature_over(&canonical_bytes(&d)));
+        future.v = BLOB_VERSION + 1;
+        assert!(s.ingest_blob(&future, "h", b"x", key, NOW).is_err());
+
+        assert!(s.zines.is_empty(), "nothing was admitted");
+    }
+
+    #[test]
+    fn a_descriptor_off_the_wire_is_validated_before_it_is_kept() {
+        let mut s = ZinesState::default();
+        let key = [3u8; 32];
+
+        // A body with a script tag is sanitized, not stored as it arrived: the
+        // UI renders this HTML.
+        let mut hostile = descriptor("z1", 1, "<p>ok</p><script>alert(1)</script>");
+        hostile.sections = vec!["  Notes  ".into(), "notes".into(), "".into()];
+        hostile.created_ms = NOW + 10 * 24 * 60 * 60 * 1000;
+        let (blob, body, _) = sealed(hostile);
+        let hash = blob_hash(&body);
+        assert_eq!(s.ingest_blob(&blob, &hash, &body, key, NOW).unwrap(), Ingest::NewPost);
+        let z = s.get("z1").unwrap();
+        assert!(!z.descriptor.body.contains("script"), "{}", z.descriptor.body);
+        assert_eq!(z.descriptor.sections, vec!["notes"], "one section, normalized");
+        assert_eq!(z.descriptor.created_ms, NOW, "a future clock is pulled back");
+
+        // A blob with no pen name, and one with no revision, are refused.
+        let mut anon = descriptor("z2", 1, "<p>x</p>");
+        anon.pen_id = "  ".into();
+        assert!(ingest(&mut s, anon, NOW).is_err());
+        let mut zero = descriptor("z3", 0, "<p>x</p>");
+        zero.revision = 0;
+        assert!(ingest(&mut s, zero, NOW).is_err());
+    }
+
+    #[test]
+    fn a_newer_revision_becomes_the_head_and_the_old_one_goes_to_history() {
+        let mut s = ZinesState::default();
+        let key = [3u8; 32];
+        let (b1, body1, _) = sealed(descriptor("z1", 1, "<p>first</p>"));
+        let h1 = blob_hash(&body1);
+        assert_eq!(s.ingest_blob(&b1, &h1, &body1, key, NOW).unwrap(), Ingest::NewPost);
+
+        // The same bytes again: the drain runs on a timer.
+        assert_eq!(s.ingest_blob(&b1, &h1, &body1, key, NOW).unwrap(), Ingest::Duplicate);
+        assert_eq!(s.get("z1").unwrap().descriptor.revision, 1);
+
+        let (b2, body2, _) = sealed(descriptor("z1", 2, "<p>second</p>"));
+        let h2 = blob_hash(&body2);
+        assert_eq!(s.ingest_blob(&b2, &h2, &body2, key, NOW).unwrap(), Ingest::Advanced);
+        let z = s.get("z1").unwrap();
+        assert_eq!(z.descriptor.revision, 2);
+        assert_eq!(z.descriptor.body, "<p>second</p>");
+        assert_eq!(z.head_blob, h2);
+        assert_eq!(z.history.len(), 1, "the old head is the undo history");
+        assert_eq!(z.history[0].revision, 1);
+        assert_eq!(z.history[0].blob_hash, h1, "and it remembers which blob it was");
+
+        // An older revision arriving late is kept, and the head does not move.
+        let (b3, body3, _) = sealed(descriptor("z1", 3, "<p>third</p>"));
+        let h3 = blob_hash(&body3);
+        assert_eq!(s.ingest_blob(&b3, &h3, &body3, key, NOW).unwrap(), Ingest::Advanced);
+        let (old, old_body, _) = sealed(descriptor("z1", 1, "<p>first</p>"));
+        let old_hash = blob_hash(&old_body);
+        assert_eq!(
+            s.ingest_blob(&old, &old_hash, &old_body, key, NOW).unwrap(),
+            Ingest::Superseded
+        );
+        assert_eq!(s.get("z1").unwrap().descriptor.revision, 3, "the head stands");
+        assert!(s.holds_blob(&old_hash), "and the older bytes are still held");
+    }
+
+    #[test]
+    fn two_revisions_under_one_number_resolve_the_same_way_everywhere() {
+        // A vault cloned onto two devices can publish the same revision twice,
+        // and both are honestly signed. Nothing can order them by time, so the
+        // rule is deterministic instead: the greater content hash wins. The
+        // property that matters is not *which* wins but that two readers agree,
+        // so this asserts convergence rather than picking a winner — which also
+        // keeps it honest about the descriptor being normalized on the way in.
+        let key = [3u8; 32];
+        let a = descriptor("z1", 1, "<p>aaaa</p>");
+        let b = descriptor("z1", 1, "<p>bbbb</p>");
+        let (blob_a, body_a, _) = sealed(a);
+        let (blob_b, body_b, _) = sealed(b);
+        let hash_a = blob_hash(&body_a);
+        let hash_b = blob_hash(&body_b);
+
+        let mut one = ZinesState::default();
+        assert_eq!(
+            one.ingest_blob(&blob_a, &hash_a, &body_a, key, NOW).unwrap(),
+            Ingest::NewPost
+        );
+        let second = one.ingest_blob(&blob_b, &hash_b, &body_b, key, NOW).unwrap();
+        assert_ne!(second, Ingest::NewPost, "the same revision is not a new post");
+
+        let mut two = ZinesState::default();
+        assert_eq!(
+            two.ingest_blob(&blob_b, &hash_b, &body_b, key, NOW).unwrap(),
+            Ingest::NewPost
+        );
+        assert_ne!(
+            two.ingest_blob(&blob_a, &hash_a, &body_a, key, NOW).unwrap(),
+            Ingest::NewPost
+        );
+
+        let head_one = &one.get("z1").unwrap().descriptor;
+        let head_two = &two.get("z1").unwrap().descriptor;
+        assert_eq!(head_one.body, head_two.body, "the two vaults agree");
+        assert_eq!(head_one.revision, head_two.revision);
+        assert_eq!(head_one.title, head_two.title);
+        // And the revision that lost is kept as history in both, not thrown away.
+        assert_eq!(one.get("z1").unwrap().history.len(), 1);
+        assert_eq!(two.get("z1").unwrap().history.len(), 1);
+    }
+
+    #[test]
+    fn a_post_id_cannot_be_revised_by_another_pen_name() {
+        let mut s = ZinesState::default();
+        let key = [3u8; 32];
+        let (b1, body1, _) = sealed(descriptor("z1", 1, "<p>mine</p>"));
+        let h1 = blob_hash(&body1);
+        s.ingest_blob(&b1, &h1, &body1, key, NOW).unwrap();
+
+        let mut stolen = descriptor("z1", 2, "<p>not mine</p>");
+        stolen.pen_id = "pen-eve".into();
+        let (b2, body2, _) = sealed(stolen);
+        let h2 = blob_hash(&body2);
+        let err = s.ingest_blob(&b2, &h2, &body2, key, NOW).unwrap_err();
+        assert!(err.contains("another pen name"), "{err}");
+        assert_eq!(s.get("z1").unwrap().descriptor.body, "<p>mine</p>");
+    }
+
+    // ---------------------------------------------------------- comments
+
+    #[test]
+    fn a_pulled_comment_waits_to_be_accepted_and_is_merged_only_then() {
+        let mut s = with_zine();
+        let id = the_id(&s);
+        let blob = ZineCommentBlob::new(id.clone(), "bob".into(), "<p>nice one</p>".into(), NOW - 1000);
+
+        assert!(s.pull_comment(&blob, "c1", NOW).unwrap());
+        assert!(!s.pull_comment(&blob, "c1", NOW).unwrap(), "idempotent on the address");
+        let z = s.get(&id).unwrap();
+        assert_eq!(z.pending_comments.len(), 1);
+        assert_eq!(z.pending_comments[0].merged_ms, 0, "not merged yet");
+        assert!(z.descriptor.comments.is_empty(), "and not in the thread");
+
+        assert!(s.accept_comment(&id, "c1", NOW).is_ok());
+        let z = s.get(&id).unwrap();
+        assert!(z.pending_comments.is_empty(), "accepted, so no longer waiting");
+        assert_eq!(z.descriptor.comments.len(), 1);
+        assert_eq!(z.descriptor.comments[0].body, "<p>nice one</p>");
+        assert_eq!(z.descriptor.comments[0].merged_ms, NOW);
+        assert_eq!(
+            s.accept_comment(&id, "c1", NOW).unwrap(),
+            2,
+            "accepting again is a no-op, not a second revision"
+        );
+        let z = s.get(&id).unwrap();
+        assert_eq!(z.descriptor.comments.len(), 1, "the comment is not duplicated");
+        assert_eq!(z.descriptor.revision, 2);
+        assert!(
+            s.accept_comment(&id, "never-pulled", NOW).is_err(),
+            "a hash that was never pulled is refused"
+        );
+
+        // A discarded comment is dropped, and that is not a retraction of
+        // anything: nothing was ever published.
+        assert!(s.pull_comment(&blob, "c2", NOW).unwrap());
+        assert!(s.discard_comment(&id, "c2"));
+        assert!(!s.discard_comment(&id, "c2"));
+        assert!(s.get(&id).unwrap().pending_comments.is_empty());
+    }
+
+    #[test]
+    fn a_comment_is_only_held_for_a_post_this_vault_wrote() {
+        // A reader that pulled a comment would be holding something it can
+        // neither merge nor republish: the thread lives in the author's
+        // descriptor and only the author can sign a revision of it.
+        let mut s = ZinesState::default();
+        let key = [3u8; 32];
+        let (blob, body, _) = sealed(descriptor("z1", 1, "<p>theirs</p>"));
+        let hash = blob_hash(&body);
+        s.ingest_blob(&blob, &hash, &body, key, NOW).unwrap();
+
+        let comment = ZineCommentBlob::new("z1".into(), "bob".into(), "<p>hi</p>".into(), NOW);
+        let err = s.pull_comment(&comment, "c1", NOW).unwrap_err();
+        assert!(err.contains("takes its comments"), "{err}");
+        assert!(s.get("z1").unwrap().pending_comments.is_empty());
+
+        // An empty body, and a comment for a post this vault has never seen.
+        let empty = ZineCommentBlob::new("z1".into(), "bob".into(), "  ".into(), NOW);
+        assert!(s.pull_comment(&empty, "c2", NOW).is_err());
+        let stray = ZineCommentBlob::new("nope".into(), "bob".into(), "<p>hi</p>".into(), NOW);
+        assert!(s.pull_comment(&stray, "c3", NOW).is_err());
+    }
+
+    #[test]
+    fn a_published_revision_records_the_address_a_grant_names() {
+        let mut s = with_zine();
+        let id = the_id(&s);
+        assert_eq!(s.head_blob(&id), "", "nothing published yet");
+        s.record_published(&id, 1, "hh", b"bytes", NOW).unwrap();
+        assert_eq!(s.head_blob(&id), "hh");
+        assert!(s.holds_blob("hh"), "the bytes are held for a re-post");
+        assert_eq!(s.blob_body("hh").unwrap(), b"bytes");
+        assert!(s.record_published("nope", 1, "hh", b"bytes", NOW).is_err());
+    }
+
+    #[test]
+    fn the_whole_pool_survives_a_round_trip_through_the_sidecar() {
+        let mut s = with_zine();
+        let id = the_id(&s);
+        let (blob, body, key) = sealed(descriptor("held", 2, "<p>theirs</p>"));
+        let hash = blob_hash(&body);
+        s.apply_grant("held", &key, &hash, NOW);
+        s.ingest_blob(&blob, &hash, &body, key, NOW).unwrap();
+        s.record_published(&id, 1, "own", b"own bytes", NOW).unwrap();
+        s.bulletin_seq = 42;
+        s.hold_blob("unopened", b"sealed", NOW, false);
+
+        let back = decode(Some(&s.encode().unwrap())).unwrap();
+        assert_eq!(back.bulletin_seq, 42, "the drain resumes where it stopped");
+        assert_eq!(back.get(&id).unwrap().head_blob, "own");
+        assert_eq!(back.get("held").unwrap().head_blob, hash);
+        assert_eq!(back.read_key("held").unwrap(), key, "the key came through");
+        assert_eq!(back.blobs.len(), 3);
+        assert_eq!(back.unreadable_blobs(), 1);
+        assert_eq!(back.blob_body("unopened").unwrap(), b"sealed");
     }
 }

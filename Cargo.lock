@@ -4446,6 +4446,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "ed25519-dalek",
  "ego-tree",
  "feed-rs",
  "futures-util",

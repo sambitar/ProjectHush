@@ -93,6 +93,17 @@ it is stated in full. Full design: [`docs/tasks/zines.md`](tasks/zines.md) (Task
 | Corpus size | Every member downloads every blob | Bandwidth, not privacy; text-only keeps totals in low MBs; the per-member rate limit is the throttle |
 | At rest | Nothing in plaintext | `zines.enc` sealed under the vault master key; locked vault = unreadable; the editor runs from local assets only |
 
+**As built (2026-10-13), and what the built form adds to the table above:**
+
+| Surface | What it may see | Rule |
+|---|---|---|
+| Publish credential | A publish and a drain use the **same** credential (the read token of a queue the member owns), so a publish does not spend or reveal a delivery slot | Narrower than the design note: the operator learns *some* member published, not which slot was written to |
+| Re-post | The sweep tells the relay a member **holds** a blob it re-sends, about once a week per blob | Accepted, as above — and it is the only availability path, because relays never talk |
+| Grant | A `ZineGrant` rides the existing 1:1 session, so it is sealed by the session the two members already have | Nothing new; the relay sees a normal message |
+| Comment blob | Sealed to the pen name's **public** key, so it is anonymous to everyone including the relay — and **any holder can keep re-posting it** | A refused comment is not a retraction: it is never merged, and the blob stays on the lane sealed to the author alone until it ages out |
+| Acceptance | A merge is a revision, so accepting a comment **republishes** the post | The thread is public to every reader once accepted; a pending comment is visible only to the author |
+| Held bytes | Bounded (1024 blobs, 32 MiB), evicting superseded revisions first, with the drop reported in the daemon log | A holder under pressure loses bytes; the alternative (unbounded growth) is worse, and the cap is stated rather than silent |
+
 **Rejected surfaces, recorded so they are not re-proposed:** a **public IPFS/DHT** layer (announces
 your IP *and* your interest in that exact content to the swarm — a direct break of "the relay cannot
 learn who reads what"); a **private swarm in v1** (a second network stack for a text-only feature);
@@ -101,7 +112,9 @@ sections live inside the encrypted article instead).
 
 **Honest limits for user-facing copy:** publishing reveals your member slot to the relay operator
 (not to other members); a zine you hold can be seen to be held if someone re-posts it; read access,
-once granted, is not revocable; and every member holds a copy of what they have received — zines are
+once granted, is not revocable and spreads transitively, because any holder may hand the key on;
+a comment is sealed to a pen name rather than sent to an inbox, so the author can refuse to merge it
+but cannot take it off the lane; and every member holds a copy of what they have received — zines are
 not "leaves nothing behind."
 
 ## Implications already decided

@@ -39,7 +39,31 @@ pub struct InboxResult {
     /// a paper whose hub is gone has no rendezvous, so the convener inherits it.
     /// Reported here because only `recv` sees the membership change.
     pub departed: Vec<(String, String)>,
+    /// Read keys for zines, handed over by contacts during this poll.
+    ///
+    /// Kept out of `messages` for the same reason as `papers`: a grant is not a
+    /// chat message. The daemon applies each to its zines sidecar and then sweeps
+    /// the bulletin for blobs that have just become readable, which is the
+    /// epidemic's second half.
+    pub zine_grants: Vec<ReceivedZineGrant>,
     pub warnings: Vec<String>,
+}
+
+/// A zine read key received from a contact.
+///
+/// Authority-free by design: any holder of a key may re-share it, so there is
+/// nothing to verify and nothing here records who vouched for what. The sender
+/// is carried for diagnostics only.
+#[derive(Debug, Clone)]
+pub struct ReceivedZineGrant {
+    pub from_account: String,
+    pub from_nick: String,
+    /// The post this key opens. One grant, one post.
+    pub zine_id: String,
+    /// The symmetric read key.
+    pub key: Vec<u8>,
+    /// Content hash of the newest revision the sender held.
+    pub latest_hash: String,
 }
 
 /// A paper payload received from a peer.

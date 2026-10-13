@@ -258,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Control payloads are handled inside `recv` and never
                     // surface as inbox items.
                     MessagePayload::QueueGrant { .. }
+                    | MessagePayload::ZineGrant { .. }
                     | MessagePayload::ConclaveInvite { .. }
                     | MessagePayload::ConclaveAccept { .. }
                     | MessagePayload::ConclaveDecline { .. }

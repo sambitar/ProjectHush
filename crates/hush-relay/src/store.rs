@@ -62,6 +62,21 @@ impl Store {
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_drops_created ON drops(created_at);
+            -- The bulletin: one flat, append-only log of opaque blobs addressed
+            -- to nobody. There is deliberately no queue column and no foreign
+            -- key — the relay authorizes the publisher and then forgets which
+            -- member that was, and burning a member's queue must not delete the
+            -- corpus. `hash` is the content hash of the stored bytes: the relay
+            -- can hash them anyway, so it costs no leak and makes a re-post
+            -- idempotent instead of a second copy of the same blob.
+            CREATE TABLE IF NOT EXISTS bulletin (
+                seq INTEGER PRIMARY KEY,
+                hash TEXT NOT NULL,
+                body BLOB NOT NULL,
+                inserted_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_bulletin_hash ON bulletin(hash);
+            CREATE INDEX IF NOT EXISTS idx_bulletin_inserted ON bulletin(inserted_at);
             ",
         )
         .map_err(|_| RelayError::Internal)?;
@@ -430,11 +445,20 @@ impl Store {
     fn purge_expired(&self) -> Result<(), RelayError> {
         let ttl = self.config.blob_ttl.as_secs() as i64;
         let cutoff = Self::now_secs() as i64 - ttl;
+        // The bulletin has its own, longer TTL: it is the corpus, not a drained
+        // inbox, so one window cannot serve both.
+        let bulletin_cutoff =
+            Self::now_secs() as i64 - self.config.bulletin_ttl.as_secs() as i64;
         let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
         conn.execute("DELETE FROM blobs WHERE created_at < ?1", params![cutoff])
             .map_err(|_| RelayError::Internal)?;
         conn.execute("DELETE FROM drops WHERE created_at < ?1", params![cutoff])
             .map_err(|_| RelayError::Internal)?;
+        conn.execute(
+            "DELETE FROM bulletin WHERE inserted_at < ?1",
+            params![bulletin_cutoff],
+        )
+        .map_err(|_| RelayError::Internal)?;
         Ok(())
     }
 
@@ -488,6 +512,91 @@ impl Store {
             .map_err(|_| RelayError::Internal)?;
         Ok(())
     }
+
+    /// Append an opaque blob to the bulletin, or refresh it when those exact
+    /// bytes are already there.
+    ///
+    /// Authorized with the queue's **read** token, the private half of the
+    /// credential pair. The delivery token is public — it travels in invites —
+    /// so accepting it here would let anyone holding an invite publish as that
+    /// member and spend their rate budget. The queue is bound on the first
+    /// publish (`authorize_read_or_create`), which is what lets a member publish
+    /// before anyone has ever delivered to them, and it stamps no presence:
+    /// publishing a zine is not a heartbeat.
+    ///
+    /// A re-post is idempotent on the content hash. Every holder's daemon runs
+    /// the same re-post sweep against the same blobs, so without this the lane
+    /// would grow one copy per holder per sweep; a duplicate refreshes the row's
+    /// TTL instead, which is the sweep's purpose.
+    pub fn put_bulletin(
+        &self,
+        queue_id: &str,
+        read_token: &str,
+        body: &[u8],
+    ) -> Result<i64, RelayError> {
+        if body.len() > self.config.bulletin_max_blob_bytes {
+            return Err(RelayError::TooLarge);
+        }
+        self.authorize_read_or_create(queue_id, read_token)?;
+        self.check_rate(&format!("bulletin:{queue_id}"))?;
+        self.purge_expired()?;
+
+        let hash = hex::encode(Sha256::digest(body));
+        let now = Self::now_secs() as i64;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        // A re-post keeps its original seq: it is the same blob, and moving it
+        // to the end would hand every drainer a second copy of what it has.
+        conn.execute(
+            "INSERT INTO bulletin (hash, body, inserted_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(hash) DO UPDATE SET inserted_at = ?3",
+            params![hash, body, now],
+        )
+        .map_err(|_| RelayError::Internal)?;
+        conn.query_row(
+            "SELECT seq FROM bulletin WHERE hash = ?1",
+            params![hash],
+            |row| row.get(0),
+        )
+        .map_err(|_| RelayError::Internal)
+    }
+
+    /// Drain the bulletin: every blob after `since`, oldest first.
+    ///
+    /// Authorized with the read token, like the publish. Everyone drains the
+    /// same lane, so what a member drains says nothing about what they read —
+    /// the reason the bulletin is not a queue per reader.
+    ///
+    /// Not rate-limited: the publish limit is what keeps a member from filling
+    /// the lane, and a drain is a read the HTTP layer can throttle like any
+    /// other. Counting drains against the same budget would make a poll tick
+    /// compete with a publish.
+    pub fn list_bulletin(
+        &self,
+        queue_id: &str,
+        read_token: &str,
+        since: i64,
+    ) -> Result<Vec<BulletinBlob>, RelayError> {
+        self.authorize_read_or_create(queue_id, read_token)?;
+        self.purge_expired()?;
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let mut stmt = conn
+            .prepare("SELECT seq, body, inserted_at FROM bulletin WHERE seq > ?1 ORDER BY seq")
+            .map_err(|_| RelayError::Internal)?;
+        let rows = stmt
+            .query_map(params![since], |row| {
+                Ok(BulletinBlob {
+                    seq: row.get(0)?,
+                    body: row.get(1)?,
+                    inserted_at: row.get(2)?,
+                })
+            })
+            .map_err(|_| RelayError::Internal)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|_| RelayError::Internal)?);
+        }
+        Ok(out)
+    }
 }
 
 /// A drop id is exactly 32 lowercase hex characters — the hex of a 16-byte
@@ -511,4 +620,16 @@ struct QueueRow {
 pub struct BlobMeta {
     pub id: String,
     pub created_at: i64,
+}
+
+/// One blob as it comes off the bulletin.
+///
+/// Carries no publisher: the row it came from has no such column. `seq` is the
+/// drain cursor — a client stores the highest it has processed and asks for
+/// everything after it next time.
+#[derive(Clone, Debug)]
+pub struct BulletinBlob {
+    pub seq: i64,
+    pub body: Vec<u8>,
+    pub inserted_at: i64,
 }

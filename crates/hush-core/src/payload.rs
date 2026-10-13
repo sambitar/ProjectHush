@@ -331,6 +331,32 @@ pub enum MessagePayload {
     /// Sent only by the paper's hub, and only to the peer that offered: the
     /// topology is a star, so a peer never answers another peer.
     PaperAnswer { paper_id: String, sdp: String },
+    /// A zine's read key, handed to one recipient over their existing session.
+    ///
+    /// This is the key epidemic in one payload: delivery of a zine is broadcast
+    /// on the bulletin, but readability is passed hand to hand, because there is
+    /// no "all members" key to encrypt a post to a stranger with. The recipient
+    /// learns a post exists and can then find its blob on the bulletin by trying
+    /// the key.
+    ///
+    /// Authority-free on receipt, unlike `QueueGrant`: any holder of a read key
+    /// may re-share it to their own contacts, and a grant confers read, never
+    /// write. So there is nothing to verify and no signature — the only trust is
+    /// that the session itself is authenticated to a known contact, and the
+    /// worst a forged grant can do is hand over a key the sender already holds.
+    /// One grant covers one post, which is the price of a key per post.
+    ZineGrant {
+        /// The post's id, not the pen name: a grant names the one post it opens.
+        zine_id: String,
+        /// The post's symmetric read key, so the recipient can open its blob
+        /// without trial decryption.
+        #[serde(with = "b64_bytes")]
+        key: Vec<u8>,
+        /// The content hash of the newest revision the sender holds, so the
+        /// recipient can pick that blob out of the lane without opening the
+        /// chain from the start.
+        latest_hash: String,
+    },
     /// A payload whose tag this build does not know.
     ///
     /// Decoded rather than rejected so a peer running a newer build can send
@@ -340,7 +366,6 @@ pub enum MessagePayload {
     #[serde(other)]
     Unknown,
 }
-
 mod b64_bytes {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{Deserialize, Deserializer, Serializer};
@@ -405,6 +430,24 @@ mod tests {
             }],
         };
         assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    /// A zine grant carries key bytes, which must survive the base64 hop as
+    /// bytes and must not be readable in the encoded form.
+    #[test]
+    fn a_zine_grant_round_trips_with_its_key() {
+        let p = MessagePayload::ZineGrant {
+            zine_id: "3f2a".into(),
+            key: vec![0u8, 1, 2, 250, 255],
+            latest_hash: "ab12".into(),
+        };
+        let encoded = p.encode().unwrap();
+        assert_eq!(MessagePayload::decode(&encoded).unwrap(), p);
+        let as_text = String::from_utf8(encoded).unwrap();
+        assert!(
+            !as_text.contains("[0,1,2"),
+            "the key is base64, not a JSON byte array: {as_text}"
+        );
     }
 
     #[test]

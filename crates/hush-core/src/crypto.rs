@@ -65,6 +65,24 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
+/// Seal bytes under a 32-byte symmetric key, as a zine's read key is.
+///
+/// The same construction as [`encrypt`], named for the one thing outside this
+/// crate that uses it: a zine's body is sealed under the post's read key and
+/// published as an opaque blob, so a reader needs to seal and open *bytes*
+/// without ever handling the vault's master key. Kept as a thin wrapper rather
+/// than a re-export so the two callers' intents stay readable — one derives from
+/// a passphrase, the other is handed a key by a grant.
+pub fn seal_symmetric(key: &[u8; MASTER_KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+    encrypt(key, plaintext)
+}
+
+/// Open bytes sealed by [`seal_symmetric`]. A wrong key is an error, never a
+/// partial plaintext.
+pub fn open_symmetric(key: &[u8; MASTER_KEY_LEN], packed: &[u8]) -> Result<Vec<u8>, Error> {
+    decrypt(key, packed)
+}
+
 /// Context string mixed into the queue delivery token.
 ///
 /// A domain separator: the same read token must never produce a value that
@@ -89,6 +107,27 @@ const QUEUE_DELIVERY_CONTEXT: &[u8] = b"hush-queue-delivery-v1";
 /// there is no second credential to register or rotate.
 pub fn queue_delivery_token(read_token: &str) -> String {
     hex::encode(hmac_sha256(read_token.as_bytes(), QUEUE_DELIVERY_CONTEXT))
+}
+
+/// Context string mixed into the bulletin queue id.
+const BULLETIN_QUEUE_CONTEXT: &[u8] = b"hush-bulletin-queue-v1";
+
+/// The queue a member publishes to the bulletin under.
+///
+/// Derived from the device's own read token and never published, so the relay
+/// cannot link a member's bulletin credential to the inbox it already knows.
+///
+/// It exists because the bulletin has to authorize a publisher somehow, and the
+/// obvious choice — publishing under the inbox queue id — is the one that does
+/// not work: a relay binds an unclaimed queue to whichever credential reaches
+/// it first, and every contact holds the inbox id *and* its delivery token from
+/// the invite. A contact could therefore publish once with the delivery token,
+/// bind the queue to a hash the owner's read token cannot reproduce, and lock
+/// the owner out of their own bulletin credential. An id nobody else can derive
+/// closes that: only the read token's holder can compute it, so the owner is
+/// always the first and only claimant.
+pub fn bulletin_queue_id(read_token: &str) -> String {
+    hex::encode(hmac_sha256(read_token.as_bytes(), BULLETIN_QUEUE_CONTEXT))
 }
 
 /// Domain separators for a per-contact queue's two credentials.
@@ -243,6 +282,34 @@ mod tests {
         assert_ne!(
             queue_delivery_token("a different read token"),
             delivery,
+            "different read tokens must not collide"
+        );
+    }
+
+    /// The bulletin queue id is an address only its holder can compute, and it
+    /// must not be confused with the other two values derived from the same read
+    /// token — the relay stores the inbox queue id, so a shared value would let
+    /// it link a member's bulletin credential to their inbox.
+    #[test]
+    fn the_bulletin_queue_id_is_its_own_value() {
+        let read = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let bulletin = bulletin_queue_id(read);
+        assert_eq!(bulletin.len(), 64, "hex of a 32-byte MAC");
+        assert_eq!(
+            bulletin_queue_id(read),
+            bulletin,
+            "derivation must be deterministic"
+        );
+        assert_ne!(bulletin, read);
+        assert_ne!(bulletin, queue_delivery_token(read));
+        assert_ne!(
+            bulletin,
+            contact_queue_id(read, "an-account-id"),
+            "the domain separator must keep the derivations independent"
+        );
+        assert_ne!(
+            bulletin_queue_id("a different read token"),
+            bulletin,
             "different read tokens must not collide"
         );
     }

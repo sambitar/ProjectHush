@@ -312,6 +312,38 @@ enum Work {
         name: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Zines: the pen name's seal keypair, secret half included.
+    ///
+    /// Handed out of the worker because opening a comment is a *policy* step —
+    /// "is this blob mine, and for which post?" — and that policy lives with the
+    /// zines sidecar, which is in the route layer. The key never leaves the
+    /// process and is never logged.
+    ZineSealKey {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Zines: sign bytes as the current pen name.
+    ZineSign {
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Zines: publish one sealed blob to this member's bulletin.
+    BulletinPut {
+        body: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Zines: drain this member's bulletin after `since`, oldest first.
+    BulletinList {
+        since: i64,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Zines: hand one contact a post's read key.
+    ZineGrantSend {
+        to: String,
+        zine_id: String,
+        key: Vec<u8>,
+        latest_hash: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// Torrents pane: load the encrypted sidecar state (None when never saved).
     TorrentsStateGet {
         reply: oneshot::Sender<WorkResult>,
@@ -564,6 +596,16 @@ pub enum WorkResult {
     SecretRemoved,
     /// The zines pen name this vault publishes under; `None` before one exists.
     PenName(Option<PenNameDto>),
+    /// The pen name's seal keypair, secret half included; `None` before one
+    /// exists. Only ever held in memory by the caller that asked for it.
+    ZineSealKey(Option<hush_core::DropKeyPair>),
+    /// A pen-name signature; `None` when there is no pen name to sign with, so
+    /// nothing is ever published unsigned under a byline that does not exist.
+    ZineSignature(Option<Vec<u8>>),
+    /// The seq the relay assigned to a published blob.
+    BulletinSeq(i64),
+    /// Blobs drained from the bulletin, oldest first.
+    Bulletin(Vec<hush_core::BulletinBlob>),
     /// The record id of the saved draft.
     DraftSaved(String),
     Blob(Vec<u8>),
@@ -1161,6 +1203,61 @@ impl AccountWorker {
                                     };
                                     match outcome {
                                         Ok(pen) => WorkResult::PenName(Some(pen.into())),
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::ZineSealKey { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::ZineSealKey(a.pen_name_seal_keypair()),
+                            };
+                            (reply, result)
+                        }
+                        Work::ZineSign { bytes, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::ZineSignature(a.pen_name_sign(&bytes)),
+                            };
+                            (reply, result)
+                        }
+                        Work::BulletinPut { body, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.publish_bulletin(&body).await {
+                                    Ok(seq) => WorkResult::BulletinSeq(seq),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::BulletinList { since, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.drain_bulletin(since).await {
+                                    Ok(blobs) => WorkResult::Bulletin(blobs),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::ZineGrantSend {
+                            to,
+                            zine_id,
+                            key,
+                            latest_hash,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a
+                                        .send_zine_grant(&to, &zine_id, &key, &latest_hash)
+                                        .await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
                                         Err(e) => WorkResult::Err(e.to_string()),
                                     }
                                 }
@@ -1895,6 +1992,48 @@ impl AccountWorker {
     pub async fn set_pen_name(&self, name: &str) -> WorkResult {
         self.call(|reply| Work::PenNameSet {
             name: name.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// The pen name's seal keypair, for opening what is sealed to it.
+    ///
+    /// The secret half crosses the channel because the *policy* that needs it —
+    /// which comment belongs to which post — lives with the zines sidecar. It
+    /// stays in this process, is never logged, and is dropped by the caller.
+    pub async fn zine_seal_key(&self) -> WorkResult {
+        self.call(|reply| Work::ZineSealKey { reply }).await
+    }
+
+    /// Sign bytes as the current pen name.
+    pub async fn zine_sign(&self, bytes: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::ZineSign { bytes, reply }).await
+    }
+
+    /// Publish one sealed blob to this member's bulletin.
+    pub async fn bulletin_put(&self, body: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::BulletinPut { body, reply }).await
+    }
+
+    /// Drain this member's bulletin after `since`, oldest first.
+    pub async fn bulletin_list(&self, since: i64) -> WorkResult {
+        self.call(|reply| Work::BulletinList { since, reply }).await
+    }
+
+    /// Hand one contact a post's read key.
+    pub async fn zine_grant_send(
+        &self,
+        to: &str,
+        zine_id: &str,
+        key: Vec<u8>,
+        latest_hash: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::ZineGrantSend {
+            to: to.to_string(),
+            zine_id: zine_id.to_string(),
+            key,
+            latest_hash: latest_hash.to_string(),
             reply,
         })
         .await

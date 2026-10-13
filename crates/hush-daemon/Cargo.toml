@@ -51,3 +51,6 @@ hush-relay = { path = "../hush-relay" }
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+# A real Ed25519 keypair for the zine store tests: a signature that was not
+# really made proves nothing, so the fixture signs rather than stands in.
+ed25519-dalek = { version = "2", features = ["rand_core"] }

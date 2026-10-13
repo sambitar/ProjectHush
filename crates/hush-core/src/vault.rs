@@ -469,6 +469,37 @@ impl Vault {
         Some(public_pen_name(&file.current))
     }
 
+    /// The current pen name's seal keypair, for opening what is sealed to it.
+    ///
+    /// The seal public half is published with every zine, so anyone can seal a
+    /// comment to it; only this vault holds the private half that opens one.
+    /// `None` when there is no pen name — a caller cannot address an identity
+    /// that does not exist, and should not silently create one.
+    pub fn pen_name_seal_keypair(&self) -> Option<crate::drop::DropKeyPair> {
+        let file = self.read_pen_names().ok()??;
+        let sk: [u8; 32] = hex::decode(&file.current.seal_sk_hex).ok()?.try_into().ok()?;
+        let pk: [u8; 32] = hex::decode(&file.current.seal_pk_hex).ok()?.try_into().ok()?;
+        Some(crate::drop::DropKeyPair { sk, pk })
+    }
+
+    /// Sign `msg` as the current pen name.
+    ///
+    /// Provenance, not secrecy. The signature travels *inside* the sealed blob,
+    /// so it is checked by a reader rather than by anyone who merely holds the
+    /// bytes — a signing key in the clear would be a stable pseudonym for its
+    /// author, and the bulletin is meant to be one flat opaque log. What it buys
+    /// is the property the read key cannot: every reader holds that key, so
+    /// without a signature any reader could forge an edit. `None` when there is
+    /// no pen name, so nothing is ever published unsigned under a byline that
+    /// does not exist.
+    pub fn pen_name_sign(&self, msg: &[u8]) -> Option<Vec<u8>> {
+        use ed25519_dalek::Signer;
+        let file = self.read_pen_names().ok()??;
+        let sk: [u8; 32] = hex::decode(&file.current.sign_sk_hex).ok()?.try_into().ok()?;
+        let signing = SigningKey::from_bytes(&sk);
+        Some(signing.sign(msg).to_bytes().to_vec())
+    }
+
     /// Mint a pen name. A second call is refused rather than silently absorbed,
     /// like the drop key: a pen name is an identity, and quietly reusing one
     /// when the caller expected a new one is the kind of thing that ends up
@@ -621,6 +652,30 @@ pub struct PenName {
     pub name: String,
     /// The signing public key, hex. Provenance, published with a blob.
     pub sign_pk: String,
+}
+
+/// Check a pen name's signature over the bytes it was made for.
+///
+/// Free rather than a method because the verifier is not the signer: a reader
+/// checks a blob against the signing key that travelled inside it, and holds no
+/// pen name of its own in the case that matters. False for anything malformed —
+/// a bad hex key, a short signature, a wrong length — because a blob that cannot
+/// be checked is a blob that is not verified.
+pub fn verify_pen_signature(sign_pk_hex: &str, message: &[u8], signature: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Ok(pk) = hex::decode(sign_pk_hex) else {
+        return false;
+    };
+    let Ok(pk) = <[u8; 32]>::try_from(pk.as_slice()) else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
+        return false;
+    };
+    let Ok(sig) = Signature::from_slice(signature) else {
+        return false;
+    };
+    vk.verify(message, &sig).is_ok()
 }
 
 /// Plaintext bytes per encrypted chunk for [`Vault::put_blob_stream`]. Large
@@ -987,6 +1042,40 @@ mod tests {
         assert!(!hay.contains("Ada Lovelace"), "the display name is not plaintext");
         assert!(!hay.contains(&pen.id), "the address is not plaintext");
         assert!(!hay.contains(&pen.sign_pk), "the signing key is not plaintext");
+    }
+
+    /// The pen name's secret halves are what the daemon needs to open a comment
+    /// sealed to the byline and to sign a published blob. They must come from
+    /// the stored entry, must not exist before a pen name does, and must be the
+    /// halves of the keys the world sees.
+    #[test]
+    fn the_pen_name_secrets_are_the_halves_of_its_public_keys() {
+        let d = scratch("pen-name-secrets");
+        let vault = Vault::create(&d, "pw").unwrap();
+        assert!(vault.pen_name_seal_keypair().is_none(), "no pen name yet");
+        assert!(vault.pen_name_sign(b"x").is_none(), "nothing to sign with yet");
+
+        let pen = vault.create_pen_name("Ada").unwrap();
+        let seal = vault.pen_name_seal_keypair().unwrap();
+        assert_eq!(hex::encode(seal.pk), pen.id, "the seal public half is the address");
+
+        // A comment sealed to the published key opens with the stored secret.
+        let sealed = crate::drop::seal_bytes_to_key(b"<p>hello</p>", &seal.pk).unwrap();
+        let opened = crate::drop::open_bytes_with_key(&sealed, &seal).unwrap();
+        assert_eq!(opened, b"<p>hello</p>");
+
+        // And a signature verifies under the published signing key, and only
+        // over the bytes it was made for.
+        let sig = vault.pen_name_sign(b"a blob").unwrap();
+        assert!(verify_pen_signature(&pen.sign_pk, b"a blob", &sig));
+        assert!(
+            !verify_pen_signature(&pen.sign_pk, b"another blob", &sig),
+            "a signature is over the bytes it was made for"
+        );
+        // Malformed material is a refusal, not a panic.
+        assert!(!verify_pen_signature("not-hex", b"a blob", &sig));
+        assert!(!verify_pen_signature(&pen.sign_pk, b"a blob", b"short"));
+        assert!(!verify_pen_signature(&pen.sign_pk, b"a blob", &[]));
     }
 
     #[test]

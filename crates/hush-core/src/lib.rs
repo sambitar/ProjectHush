@@ -31,8 +31,8 @@ pub use config::{
 pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
 pub use drop::{
     decode_drop_pk, decode_drop_sk, drop_keypair, encode_drop_pk, encode_drop_sk,
-    open_with_key, rendezvous_id, seal_to_key, is_drop_container, DropAttachment, DropKeyPair,
-    DropPackage, MAX_DROP_BYTES,
+    open_bytes_with_key, open_with_key, rendezvous_id, seal_bytes_to_key, seal_to_key,
+    is_drop_container, DropAttachment, DropKeyPair, DropPackage, MAX_DROP_BYTES,
 };
 pub use device::{DeviceKeys, DEVICE_ID};
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
@@ -45,7 +45,9 @@ pub use invite::InvitePayload;
 pub use mail::{
     format_address, normalize_handle, normalize_vault_name, DEFAULT_VAULT_NAME, MAX_HANDLE_LEN,
 };
-pub use message::{InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper};
+pub use message::{
+    InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper, ReceivedZineGrant,
+};
 pub use payload::{
     ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeState,
     MailAttachment, DEFAULT_PAPER_TITLE, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS,
@@ -53,9 +55,9 @@ pub use payload::{
 pub use prekey::{OneTimePreKey, PreKeyRecord};
 pub use relay_client::{
     is_v3_onion_host, normalize_relay_base, normalize_relay_base_with, validate_onion_relay,
-    validate_socks_proxy, HttpPolicy, RelayClient,
+    validate_socks_proxy, BulletinBlob, HttpPolicy, RelayClient,
 };
-pub use vault::{BlobId, DropDrainKey, IdentityPub, PenName, Vault};
+pub use vault::{verify_pen_signature, BlobId, DropDrainKey, IdentityPub, PenName, Vault};
 
 /// Queue credential derivation, shared by the client and the relay.
 ///
@@ -64,6 +66,14 @@ pub use vault::{BlobId, DropDrainKey, IdentityPub, PenName, Vault};
 /// the rest of `crypto` handles key material and has no business being public.
 pub use crypto::queue_delivery_token;
 
+/// The queue id a member publishes to the bulletin under.
+///
+/// Client-side only — the relay never derives it, it just stores the queue the
+/// member binds — but re-exported beside the credential derivation because it is
+/// the same kind of value: an address computed from a secret the relay never
+/// sees.
+pub use crypto::bulletin_queue_id;
+
 /// Content addressing: the hash a zine blob is named by, and the one its
 /// revision chain links through.
 ///
@@ -71,3 +81,11 @@ pub use crypto::queue_delivery_token;
 /// two implementations can disagree about is not an address. The rest of
 /// `crypto` handles key material and stays private.
 pub use crypto::sha256;
+
+/// Sealing and opening a zine blob under its post's read key.
+///
+/// A zine's read key is a bare 32-byte symmetric key that travels in a grant,
+/// not the vault's master key, so the daemon needs to seal and open bytes
+/// without a passphrase in sight. The rest of `crypto` stays private for the
+/// same reason as above.
+pub use crypto::{open_symmetric, seal_symmetric};

@@ -228,49 +228,75 @@ Relay view of a paper delta is unchanged from any other message: an opaque ciphe
 a queue and dropped after its TTL. The relay cannot tell a paper update from a chat message, and
 there is no paper object, membership, or history on it.
 
-### Zines (2026-10-12, design not built)
+### Zines (2026-10-12 design, built 2026-10-13)
 
-Members-only long-form publishing. Every member has a **zine** — their own blog of articles with a
-comments section — readable by **all members**, not only contacts. It is the **one place the relay
-gains a new ability**: a **bulletin**, a generic opaque append-only broadcast lane. Everything else
-reuses existing primitives. Full design: [`docs/tasks/zines.md`](tasks/zines.md) (Task **21**).
+Members-only long-form publishing. A **pen name** holds any number of **posts** — each its own
+article with its own read key and revision chain — readable by **all members**, not only contacts. It
+is the **one place the relay gains a new ability**: a **bulletin**, a generic opaque append-only
+broadcast lane. Everything else reuses existing primitives. Full design:
+[`docs/tasks/zines.md`](tasks/zines.md) (Task **21**).
 
-- **Bulletin.** `PUT /b` appends an opaque blob to a flat log; `GET /b?since={seq}` drains it. A
-  member authorizes with the credential for a queue they own — the **delivery** credential to
-  publish, the **read** credential to drain, reusing the existing split. The stored row carries **no
-  queue id**, so the log is not an author index, and every member drains the same lane, so a drain
-  reveals no readership. Its own cap (256 KiB) and TTL (30 days), and a per-member rate limit. It is
-  **per relay**: relays never talk to each other (see *Many relays* below), so cross-relay reach is
-  holders re-posting to their own relay's bulletin — no federation, no relay-to-relay path.
+- **Bulletin.** `PUT /b/{queue_id}` appends an opaque blob to a flat log; `GET /b/{queue_id}?since={seq}`
+  drains it. Both are authorized with the **read** token of a queue the member owns — the same
+  credential a drain needs — so the publish path is the one every member already uses and no
+  *delivery* slot is spent on it (and the delivery token, which travels in invites, cannot publish at
+  all). The queue id in the path is **derived** from the vault's identity rather than being the inbox
+  id: the relay self-binds an unclaimed queue to whichever credential reaches it first, and an inbox
+  id plus its delivery token both travel in an invite, so publishing under the inbox id would let a
+  contact claim the member's bulletin credential on their behalf. The stored row is
+  `(seq, hash, body, inserted_at)` and carries **no
+  queue id**, so the log is not an author index; every member drains the same lane, so a drain
+  reveals no readership. Per-blob cap 256 KiB, TTL 30 days, and a per-member rate limit on publish
+  (drains are not rate-limited: a read is not what fills the lane). Content-addressed: a **re-post
+  keeps its original `seq`** and only moves `inserted_at`, so refreshing the window does not hand
+  every drainer a second copy. It is **per relay** — relays never talk to each other (see *Many
+  relays* below), so cross-relay reach is holders re-posting to their own relay's bulletin, with no
+  federation and no relay-to-relay path.
 - **Delivery is broadcast; readability is epidemic.** There is no all-members key and no member list
-  to encrypt to, so the bulletin carries **ciphertext**. An article is sealed under the zine's
+  to encrypt to, so the bulletin carries **ciphertext**. An article is sealed under the post's
   symmetric **read key**; the author hands that key to a contact as `MessagePayload::ZineGrant` over
-  their existing 1:1 session, and **any holder** may re-share the same key to *their* contacts. A
-  member may therefore hold an unreadable blob until a key reaches them. This is the price of
-  members-only E2EE on a broadcast lane.
+  their existing 1:1 session, and **any holder** may re-share the same key to *their* contacts, so
+  reach grows one session at a time from whoever can already read. A member may therefore hold an
+  **unreadable** blob until a key reaches them; those blobs are held, never dropped, and a retry
+  sweep runs on every poll so a key that arrives after its blob still opens it (and a blob that
+  arrives after its key is opened on the drain). This is the price of members-only E2EE on a
+  broadcast lane.
 - **Wire payload.** One new variant, `ZineGrant { zine_id, key, latest_hash }` — read keys are the
-  only zine thing that rides the sessions; articles and comments ride the bulletin. `zine_id` is the
-  pen name's public key. Receiving it is authority-free (any holder may re-share); it grants read,
-  never write. `Unknown` (shared with Paper) keeps a zine-unaware build interoperable.
-- **Article blob.** Opaque to the relay, content-addressed by hash. Plaintext descriptor: pen name,
-  title, **sections (tags)**, author-declared `created_ms` (clamped on ingest), `revision`,
-  `prev_hash` (an edit chain), body, and the merged comment thread. Authorship is the pen name's
-  **signature** (verifiable without the read key); integrity is **AEAD**. Sections live inside the
-  descriptor, so the relay never sees a tag and there is **no relay-side category registry**.
-- **Comments.** Sealed to the pen name's **public** key and published to the bulletin, so no session
-  to the author is needed to write one. The author drains, trial-decrypts, keeps what opens, merges
-  the accepted ones, and republishes. Moderation is entirely author-side; an unmerged comment simply
-  ages out with the window.
-- **Identity.** A zine belongs to a **pen name** — a vault keypair isolated from messaging keys, so a
-  messaging pubkey never appears in a zine and a pen name never appears on the relay. One zine per
-  pen name in v1.
-- **At rest.** `zines.enc` in the vault holds my zines, held zines, the **read keys I hold**, and the
-  local section index; it is ciphertext when locked. Browsing is a local facet — no follows, no
-  ranking, no relay knowledge.
+  only zine thing that rides the sessions; articles and comments ride the bulletin. Receiving it is
+  authority-free (any holder may re-share); it grants read, never write. `latest_hash` is the address
+  of the newest blob the sender held, which lets a recipient match it by hashing bytes rather than
+  opening everything. `Unknown` (shared with Paper) keeps a zine-unaware build interoperable.
+- **Article blob.** `ZineBlob { v, sign_pk, signature, descriptor }`, sealed under the read key, so
+  the relay sees only ciphertext. Authorship is the pen name's **signature** over the descriptor's
+  canonical bytes (verifiable *without* the read key, which is what lets a holder check provenance);
+  integrity is **AEAD**. The descriptor carries `zine_id` (minted per post, so it is an address and
+  not an identity), `pen_id` (the pen name's seal public key, stable across everything that name
+  writes), `pen_name` (the byline), title, **sections (tags)**, author-declared `created_ms` (clamped
+  on ingest), `revision`, `prev_hash` (an edit chain), body, and the merged comment thread. Sections
+  live inside the encrypted descriptor, so the relay never sees a tag and there is **no relay-side
+  category registry**.
+- **Comments.** `ZineCommentBlob { v, zine_id, author, body, created_ms }`, sealed to the pen name's
+  **public** key (an anonymous sealed box) and published to the bulletin, so no session to the author
+  is needed to write one. The author drains, trial-decrypts, keeps what opens as a **pending** pile,
+  and merges the accepted ones. A merge is a **revision**, because the thread lives in the descriptor,
+  so accepting a comment republishes the post and that republish is what makes the comment visible to
+  everyone else. A refusal is not a retraction: the comment was never published, and the blob stays on
+  the lane (sealed to the author alone) until it ages out. Moderation is entirely author-side.
+- **Availability is the holders.** Every holder re-posts what it holds once the relay has not seen it
+  for a week (a quarter of the 30-day window), a couple of blobs per poll to stay inside the publish
+  rate limit. That is what keeps a zine in the window with its author offline — and there is no other
+  path, since relays do not talk.
+- **At rest.** `zines.enc` in the vault holds my posts, held posts, the **read keys I hold**, the held
+  blob bytes, and the local section index; it is ciphertext when locked. Held bytes are bounded
+  (1024 blobs, 32 MiB); going over evicts superseded revisions first and reports the drop in the
+  daemon's log rather than letting the corpus shrink silently. Browsing is a local facet — no follows,
+  no ranking, no relay knowledge.
 
 Relay view of a bulletin blob is an opaque ciphertext blob with a size and a time. The relay learns
 that **some** member published at a time (it must authorize the publish) and nothing else; it cannot
-tell a zine from a comment, and the pen name, title, sections, and body never appear in its storage.
+tell an article from a comment, and the pen name, title, sections, and body never appear in its
+storage.
+
 
 ## What the relay HTTP API looks like (shape)
 
@@ -281,7 +307,7 @@ tell a zine from a comment, and the pen name, title, sections, and body never ap
 - `PUT /k/{account_id}` — publish this account's prekey record (authz: the record's own signature)
 - `GET /k/{account_id}` — take the record, consuming one one-time prekey
 - `PUT /drop/{id}`, `GET /drop/{id}` — outsider delivery containers, keyed by a random capability id
-- `PUT /b`, `GET /b?since={seq}` — the **bulletin** broadcast lane (opaque blobs; publish authorized by a member credential; the stored row carries no author)
+- `PUT /b/{queue_id}`, `GET /b/{queue_id}?since={seq}` — the **bulletin** broadcast lane (opaque blobs; publish and drain both authorized by the read token of a queue the member owns; the stored row carries no author, and a re-post keeps its seq)
 - No search, no profiles, no public keys directory, and no device directory (`/d/…` is gone)
 
 A drop container is `HSHD`-magic and one of two versions (2026-10-08): **v1** is sealed under a PIN

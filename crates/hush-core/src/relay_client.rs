@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -24,6 +25,31 @@ struct ListResponse {
 #[derive(Debug, Deserialize)]
 struct BlobMeta {
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BulletinListResponse {
+    blobs: Vec<BulletinEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BulletinEntry {
+    seq: i64,
+    /// Base64, because the JSON body carries ciphertext.
+    body: String,
+    inserted_at: i64,
+}
+
+/// One blob off the bulletin, with the cursor that follows it.
+///
+/// The relay keeps no publisher beside it, so there is nothing here that says
+/// who wrote it — the blob is ciphertext and the seq is only a place in a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulletinBlob {
+    /// The drain cursor: a client stores the highest it has processed.
+    pub seq: i64,
+    pub body: Vec<u8>,
+    pub inserted_at: i64,
 }
 
 /// Environment override for a SOCKS proxy placed in front of every relay
@@ -394,6 +420,90 @@ impl RelayClient {
             return Err(Error::Relay(format!("delete failed: {}", res.status())));
         }
         Ok(())
+    }
+
+    /// Publish one opaque blob to the bulletin, answering with its seq.
+    ///
+    /// `queue_id` is the member's **bulletin** queue — the value
+    /// [`crate::bulletin_queue_id`] derives from their read token, never the
+    /// inbox id. The relay uses it to authorize and to rate-limit per member,
+    /// and stores nothing about it beside the blob. Re-publishing the same bytes
+    /// is idempotent on the relay: the seq comes back unchanged and the row's
+    /// TTL is refreshed, which is what makes a holder's re-post sweep affordable.
+    pub async fn put_bulletin(
+        &self,
+        queue_id: &str,
+        token: &str,
+        body: &[u8],
+    ) -> Result<i64, Error> {
+        #[derive(Deserialize)]
+        struct PutResponse {
+            seq: i64,
+        }
+        let res = self
+            .http
+            .put(format!("{}/b/{}", self.base, queue_id))
+            .header("authorization", Self::auth(token))
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!(
+                "bulletin put failed: {}",
+                res.status()
+            )));
+        }
+        let parsed: PutResponse = res.json().await.map_err(|e| Error::Relay(e.to_string()))?;
+        Ok(parsed.seq)
+    }
+
+    /// Drain the bulletin: everything after `since`, oldest first.
+    ///
+    /// A queue the relay does not know reads as empty rather than an error, the
+    /// same way [`Self::list_optional`] treats a missing or burned queue: a
+    /// member who has never published has no bulletin queue yet, and an empty
+    /// lane is not a failure.
+    pub async fn list_bulletin(
+        &self,
+        queue_id: &str,
+        token: &str,
+        since: i64,
+    ) -> Result<Vec<BulletinBlob>, Error> {
+        let res = self
+            .http
+            .get(format!("{}/b/{}?since={}", self.base, queue_id, since))
+            .header("authorization", Self::auth(token))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND
+            || res.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Ok(Vec::new());
+        }
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!(
+                "bulletin drain failed: {}",
+                res.status()
+            )));
+        }
+        let parsed: BulletinListResponse =
+            res.json().await.map_err(|e| Error::Relay(e.to_string()))?;
+        let mut out = Vec::with_capacity(parsed.blobs.len());
+        for blob in parsed.blobs {
+            // A relay that answers with something that is not base64 is a relay
+            // that cannot be trusted with the lane, not a corrupt local state.
+            let body = B64
+                .decode(blob.body.as_bytes())
+                .map_err(|_| Error::Relay("bulletin body is not base64".into()))?;
+            out.push(BulletinBlob {
+                seq: blob.seq,
+                body,
+                inserted_at: blob.inserted_at,
+            });
+        }
+        Ok(out)
     }
 
     /// Park a sealed drop under its rendezvous id.

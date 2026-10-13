@@ -20,7 +20,7 @@ use crate::error::Error;
 use crate::invite::InvitePayload;
 use crate::message::{InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper};
 use crate::payload::{MailAttachment, MessagePayload, PaperDescriptor, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS};
-use crate::relay_client::{normalize_relay_base, validate_onion_relay, RelayClient};
+use crate::relay_client::{normalize_relay_base, validate_onion_relay, BulletinBlob, RelayClient};
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
     process_contact_bundle, protocol_address, protocol_name_from_identity, sign_queue_grant,
@@ -1082,6 +1082,19 @@ impl Account {
     /// published under this byline changes its address.
     pub fn rename_pen_name(&mut self, name: &str) -> Result<crate::PenName, Error> {
         self.vault.rename_pen_name(name)
+    }
+
+    /// The pen name's seal keypair, for opening what is sealed to it.
+    ///
+    /// A comment is sealed to the pen name's *public* seal key, so only this
+    /// vault can open one addressed to it. `None` when there is no pen name.
+    pub fn pen_name_seal_keypair(&self) -> Option<crate::DropKeyPair> {
+        self.vault.pen_name_seal_keypair()
+    }
+
+    /// Sign bytes as the pen name, for provenance on a published blob.
+    pub fn pen_name_sign(&self, msg: &[u8]) -> Option<Vec<u8>> {
+        self.vault.pen_name_sign(msg)
     }
 
     /// Drain every drop slot this account still holds a key for.
@@ -2716,6 +2729,70 @@ impl Account {
         )
     }
 
+    /// Publish one opaque blob to this member's bulletin, answering with its
+    /// `seq`.
+    ///
+    /// The queue is derived from the **read** token rather than from the inbox
+    /// id, so no contact — who holds the inbox id and its delivery token from
+    /// the invite — can bind or poison it; see
+    /// [`bulletin_queue_id`](crate::bulletin_queue_id). Re-publishing the same
+    /// bytes is idempotent and refreshes the row's TTL, which is what makes a
+    /// holder's re-post sweep affordable.
+    pub async fn publish_bulletin(&self, body: &[u8]) -> Result<i64, Error> {
+        let relay = self.relay_client()?;
+        relay
+            .put_bulletin(
+                &crate::bulletin_queue_id(self.device.read_token()),
+                self.device.read_token(),
+                body,
+            )
+            .await
+    }
+
+    /// Drain this member's bulletin: everything after `since`, oldest first.
+    ///
+    /// A member that has never published has no bulletin queue yet, and an empty
+    /// lane is not a failure — the relay answers an unknown queue as empty.
+    pub async fn drain_bulletin(&self, since: i64) -> Result<Vec<BulletinBlob>, Error> {
+        let relay = self.relay_client()?;
+        relay
+            .list_bulletin(
+                &crate::bulletin_queue_id(self.device.read_token()),
+                self.device.read_token(),
+                since,
+            )
+            .await
+    }
+
+    /// Hand one contact a post's read key.
+    ///
+    /// Store-and-forward rather than live-only, like mail: a key is durable and
+    /// the reader may simply be away, so refusing to send one because the
+    /// recipient is offline would leave a zine unreadable for no reason.
+    ///
+    /// Authority-free by design: any holder of a key may re-share it, so there is
+    /// nothing to verify and no signature. The session is already authenticated
+    /// to a known contact, and the worst a forged grant can do is hand over a key
+    /// the sender already held.
+    pub async fn send_zine_grant(
+        &mut self,
+        nickname: &str,
+        zine_id: &str,
+        key: &[u8],
+        latest_hash: &str,
+    ) -> Result<(), Error> {
+        self.send_payload_inner(
+            nickname,
+            MessagePayload::ZineGrant {
+                zine_id: zine_id.to_string(),
+                key: key.to_vec(),
+                latest_hash: latest_hash.to_string(),
+            },
+            false,
+        )
+        .await
+    }
+
     /// Whether this device's relay inbox was replaced when the vault was opened.
     ///
     /// True once, for a vault written before the read/delivery credential split,
@@ -2759,6 +2836,7 @@ impl Account {
 
         let mut out = Vec::new();
         let mut papers = Vec::new();
+        let mut zine_grants = Vec::new();
         let mut warnings = Vec::new();
         let mut dirty = false;
         // Who was joined before this poll, so a trustee that joins during it can
@@ -2838,6 +2916,30 @@ impl Account {
                 let nick = self
                     .contact_nick_for_protocol(&from_account)
                     .unwrap_or_else(|| short_name(&from_account));
+
+                // A zine grant: a contact hands over the read key of one post.
+                // It is not a chat message and is never surfaced as one; the
+                // daemon applies it to its zines sidecar and then sweeps the
+                // bulletin for blobs that have just become readable. Nothing is
+                // verified, by design — any holder may re-share a key they hold,
+                // and a grant can only confer read of a post the sender could
+                // already read.
+                if let MessagePayload::ZineGrant {
+                    zine_id,
+                    key,
+                    latest_hash,
+                } = &payload
+                {
+                    zine_grants.push(crate::message::ReceivedZineGrant {
+                        from_account: from_account.clone(),
+                        from_nick: nick.clone(),
+                        zine_id: zine_id.clone(),
+                        key: key.clone(),
+                        latest_hash: latest_hash.clone(),
+                    });
+                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    continue;
+                }
 
                 // Conclave control payloads. Membership is consensual, so an
                 // invite, accept, decline, leave, update or end changes local
@@ -2982,7 +3084,10 @@ impl Account {
                     | MessagePayload::ConclaveDecline { .. }
                     | MessagePayload::ConclaveLeave { .. }
                     | MessagePayload::ConclaveUpdate { .. }
-                    | MessagePayload::ConclaveEnd { .. } => {
+                    | MessagePayload::ConclaveEnd { .. }
+                    // Handed over above, into `zine_grants`: a read key is not
+                    // a chat message and must never be rendered as one.
+                    | MessagePayload::ZineGrant { .. } => {
                         unreachable!("control payload handled above")
                     }
                     // A paper payload is not a chat message, so it must not
@@ -3093,6 +3198,7 @@ impl Account {
             papers,
             joined,
             departed,
+            zine_grants,
             warnings,
         })
     }

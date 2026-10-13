@@ -276,9 +276,9 @@ fn api_router(state: Arc<App>) -> Router {
             get(paper_presence).post(paper_publish_presence),
         )
         .route("/api/paper/{conclave_id}/hub/rehome", post(paper_rehome))
-        // Zines (Task 21, Phase 1 — local only). The literal `pen-name` segment
-        // is matched ahead of the `{zine_id}` parameter, and cannot collide with
-        // a real zine: an id is a 32-byte pen-name key in hex.
+        // Zines (Task 21). The literal `pen-name` segment is matched ahead of
+        // the `{zine_id}` parameter, and cannot collide with a real zine: an id
+        // is a minted uuid.
         .route("/api/zines", get(zines_index).post(zines_write))
         .route("/api/zines/pen-name", get(zines_pen_name).post(zines_set_pen_name))
         .route("/api/zines/sections", get(zines_sections))
@@ -287,6 +287,18 @@ fn api_router(state: Arc<App>) -> Router {
             get(zines_get).delete(zines_forget),
         )
         .route("/api/zines/{zine_id}/mute", post(zines_mute))
+        // The key epidemic, sender side: hand this post's read key to a contact.
+        .route("/api/zines/{zine_id}/grant", post(zines_grant))
+        // Comments go the other way: sealed to the author's pen-name key.
+        .route("/api/zines/{zine_id}/comment", post(zines_comment))
+        .route(
+            "/api/zines/{zine_id}/accept-comment",
+            post(zines_accept_comment),
+        )
+        .route(
+            "/api/zines/{zine_id}/discard-comment",
+            post(zines_discard_comment),
+        )
         .route("/api/torrents/state", get(torrents_state))
         .route("/api/torrents/key", post(torrents_set_key))
         .route("/api/torrents/test", post(torrents_test_key))
@@ -1801,6 +1813,15 @@ async fn recv(
             ),
         }
     }
+    // The zines bulletin lane is drained on the same poll as the inbox: it is
+    // the same relay, the same unlocked account and the same sidecar, and a
+    // second timer would only be a second thing racing to write `zines.enc`. A
+    // failure is logged and swallowed — the poll's job is the mailbox, and a
+    // zine that could not be synced is still held and still on the lane for the
+    // next pass.
+    if let Err((_, Json(err))) = zines_sync(&state, &inbox.zine_grants).await {
+        eprintln!("hush-daemon: zines sync failed: {}", err.error);
+    }
     Ok(Json(RecvResponse {
         messages: inbox.messages.into_iter().filter_map(to_dto).collect(),
         warnings: inbox.warnings,
@@ -1890,6 +1911,7 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         // Control payloads are handled inside `recv` and never surface as inbox
         // items.
         MessagePayload::QueueGrant { .. }
+        | MessagePayload::ZineGrant { .. }
         | MessagePayload::ConclaveInvite { .. }
         | MessagePayload::ConclaveAccept { .. }
         | MessagePayload::ConclaveDecline { .. }
@@ -3020,23 +3042,34 @@ const PAPER_NOT_FOUND: (&str, StatusCode) = ("no paper in this conclave", Status
 // Zines (Task 21, Phase 1)
 // ---------------------------------------------------------------------------
 //
-// Local and offline: authoring, storing, and reading a zine in this vault. The
-// bulletin, the key epidemic, and comments arriving from other members are
-// later phases; the routes below are the ones that need no network. Every route
+// Local, plus the wire: authoring, storing, reading and publishing a zine, and
+// the bulletin lane that carries revisions, read keys and comments. Every route
 // goes through the worker, so a locked vault answers 401 without any of these
 // types being touched.
+//
+// The split is the same one the papers use: the worker owns the wire and the
+// keys, this layer owns the sidecar and the policy. So the seal key crosses the
+// channel — "is this blob mine, and for which post?" is a question about the
+// sidecar — and the store itself never does crypto.
 
-/// The whole zines pane in one response: the index, the section facet, and the
-/// pen name. Three round trips to paint one screen would be three chances to
-/// render a pane that disagrees with itself.
+/// The whole zines pane in one response: the index, the section facet, the pen
+/// name, and the state of the blob pool. Four round trips to paint one screen
+/// would be four chances to render a pane that disagrees with itself.
 #[derive(serde::Serialize)]
 struct ZinesView {
     zines: Vec<zine_store::ZineSummary>,
     sections: Vec<ZineSectionView>,
     pen_name: Option<PenNameDto>,
+    /// Blobs this vault holds, opened or not. Held bytes are what a re-post
+    /// sweep sends, so this is the corpus this vault is keeping alive.
+    held_blobs: usize,
+    /// Of those, the ones no key has opened yet. Shown rather than hidden: they
+    /// cost space, they are kept on purpose, and a key may still arrive.
+    unreadable_blobs: usize,
 }
 
-/// The answer to a write: the index the UI renders, plus which post was written.
+/// The answer to a write: the index the UI renders, plus which post was written
+/// and whether the relay took it.
 ///
 /// A create mints the post's id, so the caller cannot know it in advance — and
 /// without it the UI would publish a second post and then open nothing, or
@@ -3046,6 +3079,12 @@ struct ZinesView {
 struct ZineWriteView {
     zine_id: String,
     revision: u64,
+    /// Whether the sealed blob reached the relay. `false` is not a lost write:
+    /// the bytes are held and the re-post sweep will send them again, which is
+    /// why the article is still stored and still returned.
+    published: bool,
+    /// Why the publish failed, when it did. Empty on success.
+    publish_error: String,
     #[serde(flatten)]
     view: ZinesView,
 }
@@ -3150,6 +3189,8 @@ fn zines_view(
             .map(|(name, count)| ZineSectionView { name, count })
             .collect(),
         pen_name,
+        held_blobs: state.blobs.len(),
+        unreadable_blobs: state.unreadable_blobs(),
     }
 }
 
@@ -3230,10 +3271,23 @@ async fn zines_write(
     let (zine_id, revision) = parsed
         .write(&pen_name.id, &pen_name.name, draft, paper_now_ms())
         .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    // The write is already durable before the wire is touched: a relay that is
+    // unreachable, or that refuses, must not cost the author the article. The
+    // blob is held either way, and the re-post sweep is what sends it later.
+    let (published, publish_error) = match zines_publish(&state, &mut parsed, &zine_id, revision).await
+    {
+        Ok(_) => (true, String::new()),
+        Err(e) => {
+            eprintln!("hush-daemon: publishing zine {zine_id} rev {revision} failed: {e}");
+            (false, e)
+        }
+    };
     zines_persist(&state, &parsed).await?;
     Ok(Json(ZineWriteView {
         zine_id,
         revision,
+        published,
+        publish_error,
         view: zines_view(&parsed, None, None, Some(pen_name)),
     }))
 }
@@ -3274,6 +3328,543 @@ async fn zines_forget(
     zines_persist(&state, &parsed).await?;
     let pen_name = zines_pen_name_dto(&state).await?;
     Ok(Json(zines_view(&parsed, None, None, pen_name)))
+}
+
+// ------------------------------------------------------------ the bulletin
+//
+// The wire half of zines. Delivery is broadcast: a sealed blob goes onto the
+// relay's bulletin lane, which carries no author, no tag and no pen name, and
+// every member drains the whole lane. Readability is epidemic: the read key
+// travels hand to hand over the 1:1 sessions (`ZineGrant`), because there is no
+// "all members" key to encrypt a post to a stranger with. Comments go the other
+// way, sealed to the author's pen-name public key, so a commenter needs no
+// session with the author to write one.
+
+/// How many held blobs one pass re-posts.
+///
+/// The relay rate-limits a member to 60 bulletin publishes a minute, and the
+/// daemon polls every few seconds, so a couple per pass stays well inside the
+/// budget even when a corpus comes due all at once.
+const ZINES_REPOST_PER_PASS: usize = 2;
+
+/// How long a held blob may go unrefreshed before the sweep sends it again.
+///
+/// The relay's window is 30 days, so a quarter of it is the slack: a member that
+/// was offline for a week still has a fortnight before anything this vault holds
+/// could expire. Re-posting every poll instead would spend the member's whole
+/// publish budget on traffic nobody needs.
+const ZINES_REPOST_AFTER_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Seal, sign and publish one revision, and record the address it went out as.
+///
+/// The bytes on the wire are the blob — descriptor, signer, signature — sealed
+/// under the post's read key, so the relay sees only ciphertext. Authorship is
+/// the signature over the *canonical plaintext*, not over the sealed form, which
+/// is what lets a holder verify who wrote a blob without holding the read key;
+/// integrity is the AEAD's job.
+///
+/// A publish that fails is not a lost write. The blob is held either way and the
+/// sweep sends it again, which is why the caller records the revision first and
+/// treats the relay's answer as a status rather than a precondition.
+async fn zines_publish(
+    state: &App,
+    parsed: &mut zine_store::ZinesState,
+    zine_id: &str,
+    revision: u64,
+) -> Result<i64, String> {
+    let Some(key) = parsed.read_key(zine_id) else {
+        return Err("this post has no read key, so nothing can be published for it".to_string());
+    };
+    let Some(descriptor) = parsed.get(zine_id).map(|z| z.descriptor.clone()) else {
+        return Err("no post with that id is held".to_string());
+    };
+    let Some(pen_name) = zines_pen_name_dto(state)
+        .await
+        .map_err(|(_, Json(err))| err.error)?
+    else {
+        return Err("choose a pen name before publishing".to_string());
+    };
+    // The signature is over the canonical bytes of the descriptor *as the store
+    // holds it*, so a reader's verification and this signature agree on the same
+    // bytes rather than on two nearly-identical serializations.
+    let mut blob = zine_store::ZineBlob::new(descriptor, pen_name.sign_pk, String::new());
+    let signature = match state.worker.zine_sign(blob.signed_bytes()).await {
+        WorkResult::ZineSignature(Some(sig)) => sig,
+        WorkResult::ZineSignature(None) => return Err("no pen name to sign with".to_string()),
+        WorkResult::Err(msg) => return Err(msg),
+        _ => return Err("unexpected worker response".to_string()),
+    };
+    blob.signature = STANDARD.encode(&signature);
+    let plaintext =
+        serde_json::to_vec(&blob).map_err(|e| format!("blob could not be encoded: {e}"))?;
+    let sealed = hush_core::seal_symmetric(&key, &plaintext)
+        .map_err(|e| format!("blob could not be sealed: {e}"))?;
+    let hash = zine_store::blob_hash(&sealed);
+    // Recorded before the relay is asked: the address is what a grant names and
+    // what a re-post sends, and it is a fact about the bytes rather than about
+    // the relay's answer.
+    parsed.record_published(zine_id, revision, &hash, &sealed, paper_now_ms())?;
+    match state.worker.bulletin_put(sealed).await {
+        WorkResult::BulletinSeq(seq) => Ok(seq),
+        WorkResult::Err(msg) => Err(msg),
+        _ => Err("unexpected worker response".to_string()),
+    }
+}
+
+/// Take one blob off the drain and place it.
+///
+/// The dedup guard is the drain's, not the placement's: see [`zines_place`] for
+/// why the two are apart.
+async fn zines_absorb(
+    parsed: &mut zine_store::ZinesState,
+    seal: Option<&hush_core::DropKeyPair>,
+    body: &[u8],
+    at_ms: u64,
+    now_ms: u64,
+) -> bool {
+    let hash = zine_store::blob_hash(body);
+    if parsed.holds_blob(&hash) {
+        return false;
+    }
+    zines_place(parsed, seal, &hash, body, at_ms, now_ms).await
+}
+
+/// Open a blob's bytes against the keys this vault holds and file what it says.
+///
+/// A blob is opaque, so this is trial decryption and the order matters: a read
+/// key this vault holds first (an article), then the pen name's own seal key (a
+/// comment addressed to it). A comment never opens with a read key, so trying
+/// keys in this order keeps a lane full of other people's comments from being
+/// trial-decrypted against every zine key. Nothing that opens neither is
+/// dropped: it is held unreadable, because a key may still arrive and because
+/// holding it is what keeps it in the relay's window for the readers who can.
+///
+/// Separate from the drain's dedup guard because the retry sweep exists to
+/// revisit a blob that is *held and unopened*, which a "do I already have this"
+/// check would skip — and a held blob that still opens to nothing must answer
+/// "nothing changed", or every poll would rewrite the sidecar.
+///
+/// Answers whether anything about the corpus changed.
+async fn zines_place(
+    parsed: &mut zine_store::ZinesState,
+    seal: Option<&hush_core::DropKeyPair>,
+    hash: &str,
+    body: &[u8],
+    at_ms: u64,
+    now_ms: u64,
+) -> bool {
+    // 1. An article, sealed under a post's read key.
+    if let Some((key, plaintext)) = zines_open_with_a_read_key(parsed, hash, body) {
+        let Ok(blob) = serde_json::from_slice::<zine_store::ZineBlob>(&plaintext) else {
+            // Opened with a key this vault holds, but not a zine envelope. Kept
+            // rather than dropped: it is sealed to us, so a later build may know
+            // what it is.
+            eprintln!("hush-daemon: zine blob {hash} is not a zine envelope");
+            parsed.hold_blob(hash, body, at_ms, false);
+            return true;
+        };
+        return match parsed.ingest_blob(&blob, hash, body, key, now_ms) {
+            Ok(_) => true,
+            Err(e) => {
+                // It opened, so it was sealed for a post this vault can read,
+                // which makes the signature or the chain what failed. Not held:
+                // a re-post would hand every other member a revision none of
+                // them can trust.
+                eprintln!("hush-daemon: zine blob {hash} refused: {e}");
+                false
+            }
+        };
+    }
+    // 2. A comment, sealed to this vault's pen name rather than to a session.
+    if let Some(pair) = seal {
+        if let Ok(plaintext) = hush_core::open_bytes_with_key(body, pair) {
+            match serde_json::from_slice::<zine_store::ZineCommentBlob>(&plaintext) {
+                // Held either way: a comment that cannot be filed — for a post
+                // this vault has forgotten, or past the pile's cap — is still a
+                // blob worth keeping in the lane, and the reason is logged
+                // rather than swallowed.
+                Ok(comment) => {
+                    if let Err(e) = parsed.pull_comment(&comment, hash, now_ms) {
+                        eprintln!("hush-daemon: comment {hash} could not be filed: {e}");
+                    }
+                    parsed.hold_blob(hash, body, at_ms, true);
+                    return true;
+                }
+                Err(e) => {
+                    eprintln!("hush-daemon: blob {hash} opened as the pen name but is not a comment: {e}");
+                    parsed.hold_blob(hash, body, at_ms, true);
+                    return true;
+                }
+            }
+        }
+    }
+    // 3. Nothing this vault holds opens it. Held unreadable, never discarded.
+    //    A blob already held unreadable is a no-op, so the retry sweep can run
+    //    this on every pass without reporting a change it did not make.
+    let held = parsed.hold_blob(hash, body, at_ms, false);
+    held.added || held.dropped > 0
+}
+
+/// The read key that opens a blob, and the plaintext it opened to.
+///
+/// A grant names the address of the newest blob the sender held, so a blob that
+/// matches one is opened with that one key rather than with every key in turn —
+/// which is the point of putting a hash in the grant, and the common case for a
+/// reader that has just been handed a post.
+fn zines_open_with_a_read_key(
+    parsed: &zine_store::ZinesState,
+    hash: &str,
+    body: &[u8],
+) -> Option<([u8; 32], Vec<u8>)> {
+    for file in &parsed.zines {
+        if file.expected_blob == hash {
+            if let Some(key) = parsed.read_key(&file.descriptor.zine_id) {
+                if let Ok(plain) = hush_core::open_symmetric(&key, body) {
+                    return Some((key, plain));
+                }
+            }
+        }
+    }
+    for (_, key) in parsed.read_keys() {
+        if let Ok(plain) = hush_core::open_symmetric(&key, body) {
+            return Some((key, plain));
+        }
+    }
+    None
+}
+
+/// Try every blob this vault holds unopened against the keys it now holds.
+///
+/// The second half of the epidemic, and a sweep rather than a hook because the
+/// two halves arrive in either order: a grant can land before its blob (the post
+/// exists as a placeholder until the bytes turn up) or after it (the blob was
+/// held unreadable until the key arrived). Both end here.
+async fn zines_retry_unreadable(
+    parsed: &mut zine_store::ZinesState,
+    seal: Option<&hush_core::DropKeyPair>,
+    now_ms: u64,
+) -> bool {
+    let pending: Vec<(String, Vec<u8>)> = parsed
+        .blobs
+        .iter()
+        .filter(|b| !b.readable)
+        .filter_map(|b| {
+            STANDARD
+                .decode(&b.body)
+                .ok()
+                .map(|raw| (b.hash.clone(), raw))
+        })
+        .collect();
+    let mut changed = false;
+    for (hash, body) in pending {
+        // The relay's own inserted_at is not kept beside the bytes here, so the
+        // local clock stands in: it only drives the re-post interval.
+        if zines_place(parsed, seal, &hash, &body, now_ms, now_ms).await {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// One pass of the bulletin lane: take the keys, drain, place, retry, re-post.
+///
+/// Runs on the poll rather than on a timer of its own: it is the same relay, the
+/// same unlocked account and the same sidecar, and a second timer would only be a
+/// second thing racing to write `zines.enc`. The cost is that the lane moves
+/// while the app is polling and stands still when it is not — a daemon with no UI
+/// attached does not sweep, which is the same shape the papers already have.
+async fn zines_sync(
+    state: &Arc<App>,
+    grants: &[hush_core::ReceivedZineGrant],
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let mut parsed = zines_sidecar(state).await?;
+    let now = paper_now_ms();
+    let mut changed = false;
+
+    // 1. Keys first. A grant may be the only reason a blob already held is
+    //    readable, and the retry below runs against the keys this vault holds
+    //    *now*, so applying them before the drain means one pass is enough.
+    for grant in grants {
+        if parsed.apply_grant(&grant.zine_id, &grant.key, &grant.latest_hash, now) {
+            changed = true;
+        }
+    }
+
+    // 2. The pen name's seal key, for comments. Absent when this vault has no pen
+    //    name, in which case nothing can be sealed to it and there is nothing to
+    //    try.
+    let seal = match state.worker.zine_seal_key().await {
+        WorkResult::ZineSealKey(pair) => pair,
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+
+    // 3. Drain from where the last pass stopped. The cursor is persisted, so a
+    //    member that was away for a week reads the lane from where it stopped
+    //    rather than from the start.
+    let blobs = match state.worker.bulletin_list(parsed.bulletin_seq).await {
+        WorkResult::Bulletin(blobs) => blobs,
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+    for blob in &blobs {
+        parsed.bulletin_seq = parsed.bulletin_seq.max(blob.seq);
+        // The relay stamps `inserted_at` in seconds; everything on this side is
+        // milliseconds, and a mixed unit would make every drained blob look
+        // overdue for a re-post the moment it arrived.
+        let at_ms = blob.inserted_at.max(0) as u64 * 1000;
+        changed |= zines_absorb(&mut parsed, seal.as_ref(), &blob.body, at_ms, now).await;
+    }
+
+    // 4. Blobs that arrived before their key did.
+    changed |= zines_retry_unreadable(&mut parsed, seal.as_ref(), now).await;
+
+    // 5. Re-post what this vault holds that the relay has not seen for a while,
+    //    which is what keeps a zine in the window with its author gone. Done
+    //    last so a drain that filled the pool is already accounted for, and the
+    //    timestamps are persisted so a restart does not send the same batch
+    //    again.
+    for (hash, body) in parsed.repost_due(now, ZINES_REPOST_AFTER_MS, ZINES_REPOST_PER_PASS) {
+        match state.worker.bulletin_put(body).await {
+            WorkResult::BulletinSeq(_) => {
+                parsed.note_published(&hash, now);
+                changed = true;
+            }
+            WorkResult::Err(msg) => {
+                eprintln!("hush-daemon: zine re-post of {hash} failed: {msg}")
+            }
+            _ => eprintln!("hush-daemon: zine re-post of {hash} got an unexpected answer"),
+        }
+    }
+
+    if changed {
+        zines_persist(state, &parsed).await?;
+    }
+    // A cap that evicted something is a loss the member should hear about, in
+    // the log rather than in a count nobody reads: the honest statement is which
+    // cap and how much, and the answer is the same one the store's docs give.
+    let dropped = parsed.take_dropped();
+    if dropped > 0 {
+        eprintln!(
+            "hush-daemon: dropped {dropped} held zine blob(s) to stay inside the caps \
+             ({} blobs, {} bytes); superseded revisions go first",
+            zine_store::BLOBS_CAP,
+            zine_store::BLOB_BYTES_CAP
+        );
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct ZineGrantBody {
+    /// The contact's nickname, the same handle every other route takes.
+    contact: String,
+}
+
+/// Hand one contact this post's read key (the key epidemic, sender side).
+///
+/// Any holder may share, not just the author: that is what makes readability
+/// spread to members the author has no session with. There is nothing to
+/// authorize and nothing to sign, because a grant can only confer read of a post
+/// the sender could already read — so the refusal here is about *having* the key,
+/// not about being entitled to pass it on.
+async fn zines_grant(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+    Json(body): Json<ZineGrantBody>,
+) -> Result<Json<ZinesView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let parsed = zines_sidecar(&state).await?;
+    let Some(key) = parsed.read_key(&zine_id) else {
+        // Either the post is not held or no key for it has arrived. Both mean
+        // the same thing to the caller: there is nothing here to hand over.
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "this vault has no read key for that post, so it cannot be shared".to_string(),
+            }),
+        ));
+    };
+    let latest_hash = parsed.head_blob(&zine_id);
+    let contact = body.contact.trim();
+    if contact.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "a grant needs a contact to send it to".to_string(),
+            }),
+        ));
+    }
+    match state
+        .worker
+        .zine_grant_send(contact, &zine_id, key.to_vec(), &latest_hash)
+        .await
+    {
+        WorkResult::Ok => {}
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    }
+    let pen_name = zines_pen_name_dto(&state).await?;
+    Ok(Json(zines_view(&parsed, None, None, pen_name)))
+}
+
+#[derive(serde::Deserialize)]
+struct ZineCommentBody {
+    #[serde(default)]
+    body: String,
+}
+
+/// Write a comment: seal it to the author's pen-name public key and publish it.
+///
+/// No session with the author is needed, which is the whole reason a comment is
+/// sealed to a key rather than sent to an inbox: the pen name is a public key
+/// that travels in the article's descriptor. What the commenter writes is
+/// sanitized here with the same rule the author applies on ingest, so the body
+/// that gets hashed is the body that will be read.
+///
+/// The commenter keeps its own blob. That is not vanity: every holder is part of
+/// the availability story, and a commenter is a holder.
+async fn zines_comment(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+    Json(body): Json<ZineCommentBody>,
+) -> Result<Json<ZineWriteView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = zines_sidecar(&state).await?;
+    let Some(file) = parsed.get(&zine_id) else {
+        return Err(zine_not_held(&zine_id));
+    };
+    let pen_id = file.descriptor.pen_id.clone();
+    let revision = file.descriptor.revision;
+    let Some(pen_pk) = hex::decode(&pen_id).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+        // A post with no usable pen-name key is one whose author cannot be
+        // addressed at all. Refused with the reason rather than published into
+        // the void.
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: "that post names no pen name to seal a comment to".to_string(),
+            }),
+        ));
+    };
+    let text = zine_store::normalize_comment_body(&body.body);
+    if text.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "an empty comment is not worth publishing".to_string(),
+            }),
+        ));
+    }
+    // The byline is this vault's own pen name when it has one, so a reader knows
+    // who is talking; a commenter without one is anonymous rather than refused,
+    // because a pen name is a deliberate act and a comment is not the place to
+    // demand one.
+    let byline = zines_pen_name_dto(&state)
+        .await?
+        .map(|p| p.name)
+        .unwrap_or_default();
+    let comment = zine_store::ZineCommentBlob::new(zine_id.clone(), byline, text, paper_now_ms());
+    let plaintext =
+        serde_json::to_vec(&comment).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: e.to_string() })))?;
+    let sealed = hush_core::seal_bytes_to_key(&plaintext, &pen_pk).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("the comment could not be sealed: {e}"),
+            }),
+        )
+    })?;
+    let hash = zine_store::blob_hash(&sealed);
+    let (published, publish_error) = match state.worker.bulletin_put(sealed.clone()).await {
+        WorkResult::BulletinSeq(_) => (true, String::new()),
+        WorkResult::Err(msg) => {
+            eprintln!("hush-daemon: publishing a comment on {zine_id} failed: {msg}");
+            (false, msg)
+        }
+        _ => (false, "unexpected worker response".to_string()),
+    };
+    // Held as readable: this vault wrote it, so it knows what it is, and holding
+    // it is what lets the commenter's own sweep keep it alive.
+    parsed.hold_blob(&hash, &sealed, paper_now_ms(), true);
+    zines_persist(&state, &parsed).await?;
+    let pen_name = zines_pen_name_dto(&state).await?;
+    Ok(Json(ZineWriteView {
+        zine_id,
+        revision,
+        published,
+        publish_error,
+        view: zines_view(&parsed, None, None, pen_name),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct ZineCommentRefBody {
+    comment_hash: String,
+}
+
+/// Accept a pulled comment: merge it, then republish the post it belongs to.
+///
+/// The thread lives inside the descriptor, so the merge is a revision — and the
+/// republish is not optional, because until it happens nobody else can see the
+/// comment. Author-side only by construction: only the pen name that wrote a post
+/// can sign a revision of it.
+async fn zines_accept_comment(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+    Json(body): Json<ZineCommentRefBody>,
+) -> Result<Json<ZineWriteView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = zines_sidecar(&state).await?;
+    let revision = parsed
+        .accept_comment(&zine_id, &body.comment_hash, paper_now_ms())
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    let (published, publish_error) = match zines_publish(&state, &mut parsed, &zine_id, revision).await
+    {
+        Ok(_) => (true, String::new()),
+        Err(e) => {
+            eprintln!("hush-daemon: republishing {zine_id} after a merge failed: {e}");
+            (false, e)
+        }
+    };
+    zines_persist(&state, &parsed).await?;
+    let pen_name = zines_pen_name_dto(&state).await?;
+    Ok(Json(ZineWriteView {
+        zine_id,
+        revision,
+        published,
+        publish_error,
+        view: zines_view(&parsed, None, None, pen_name),
+    }))
+}
+
+/// Refuse a pulled comment: drop it from the pile.
+///
+/// Not a retraction, because nothing was ever published: the comment is sealed to
+/// this vault alone and a refusal is simply never merged and never republished.
+/// The blob itself stays on the lane until it ages out, and any other holder
+/// keeps re-posting it — which is the honest limit of author-side moderation.
+async fn zines_discard_comment(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+    Json(body): Json<ZineCommentRefBody>,
+) -> Result<Json<ZineView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = zines_sidecar(&state).await?;
+    if !parsed.discard_comment(&zine_id, &body.comment_hash) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "no comment with that hash is waiting".to_string(),
+            }),
+        ));
+    }
+    zines_persist(&state, &parsed).await?;
+    let zine = parsed
+        .get(&zine_id)
+        .ok_or_else(|| zine_not_held(&zine_id))?
+        .clone();
+    Ok(Json(ZineView { zine }))
 }
 
 /// The pen name this vault publishes under.
@@ -7085,4 +7676,365 @@ async fn a_zine_survives_a_restart() {
         .unwrap()
         .contains("still here"));
 }
+}
+
+/// Zines over the wire, with two daemons and a real relay.
+///
+/// The bulletin lane is the one part of zines that exists only on the wire, so
+/// a stub would test nothing: what has to hold is that two vaults converge
+/// through the relay, that a blob nobody can open yet is held rather than
+/// dropped, and that the relay's own database holds no plaintext. The contact
+/// dance is real too (invite and accept, both ways) because a grant rides a 1:1
+/// session and a session needs the recipient's queue, which is in their invite.
+#[cfg(test)]
+mod zines_bulletin_tests {
+    use super::*;
+    use crate::notes_api_tests::{build_app, request};
+    use hush_relay::RelayConfig;
+    use tempfile::{NamedTempFile, TempDir};
+
+    /// A real relay, on a real port, with its own database on disk.
+    async fn relay_on_a_port() -> (String, NamedTempFile) {
+        let db = NamedTempFile::new().unwrap();
+        let app =
+            hush_relay::router(db.path().to_str().unwrap(), RelayConfig::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), db)
+    }
+
+    /// One member: a vault, its worker, and the routes over them.
+    struct Member {
+        /// Held only so the vault directory outlives the test.
+        _dir: TempDir,
+        app: Arc<App>,
+    }
+
+    impl Member {
+        async fn new(relay: &str) -> Self {
+            let dir = TempDir::new().unwrap();
+            hush_core::Account::create(dir.path(), "pw", relay)
+                .await
+                .unwrap();
+            let worker = AccountWorker::spawn();
+            assert!(matches!(
+                worker.unlock(&dir.path().to_path_buf(), "pw").await,
+                WorkResult::Ok
+            ));
+            let app = build_app(dir.path(), worker, true);
+            Self { _dir: dir, app }
+        }
+
+        async fn post(&self, uri: &str, body: Option<&str>) -> (StatusCode, serde_json::Value) {
+            request(&api_router(self.app.clone()), "POST", uri, body).await
+        }
+
+        async fn get(&self, uri: &str) -> (StatusCode, serde_json::Value) {
+            request(&api_router(self.app.clone()), "GET", uri, None).await
+        }
+
+        /// Poll, the way the UI does: the bulletin drain rides on it.
+        async fn poll(&self) -> serde_json::Value {
+            let (status, view) = self.post("/api/recv", None).await;
+            assert_eq!(status, StatusCode::OK, "recv failed: {view}");
+            view
+        }
+    }
+
+    /// Make two members contacts of each other.
+    ///
+    /// Both directions, because a session needs the *recipient's* queue and the
+    /// only place it travels is their invite.
+    async fn connect(a: &Member, b: &Member, a_nick: &str, b_nick: &str) {
+        for (me, other, nick) in [(a, b, b_nick), (b, a, a_nick)] {
+            let (status, invite) = other.post("/api/invite", None).await;
+            assert_eq!(status, StatusCode::OK, "{invite}");
+            let body = serde_json::json!({
+                "nickname": nick,
+                "invite": invite["invite"].as_str().unwrap(),
+            })
+            .to_string();
+            let (status, err) = me.post("/api/contacts/add", Some(&body)).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        }
+    }
+
+    /// Two members on one relay, each holding the other's invite.
+    async fn pair() -> (String, NamedTempFile, Member, Member) {
+        let (relay, db) = relay_on_a_port().await;
+        let a = Member::new(&relay).await;
+        let b = Member::new(&relay).await;
+        connect(&a, &b, "ada", "bo").await;
+        (relay, db, a, b)
+    }
+
+    /// A raw byte scan, so the claim covers the whole file: a marker in a freed
+    /// page or a WAL frame is still plaintext on the relay's disk.
+    fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[tokio::test]
+    async fn a_published_zine_reaches_a_reader_unreadable_and_the_relay_holds_no_plaintext() {
+        let (_, relay_db, a, b) = pair().await;
+
+        a.post("/api/zines/pen-name", Some(r#"{"name":"BYLINE-MARKER"}"#))
+            .await;
+        let (status, created) = a
+            .post(
+                "/api/zines",
+                Some(
+                    r#"{"title":"TITLE-MARKER","sections":["SECTION-MARKER"],"body":"<p>BODY-MARKER</p>"}"#,
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["published"], true, "the relay took the blob: {created}");
+        assert_eq!(created["publish_error"], "", "{created}");
+
+        // The reader has no key, so the blob is held and counted rather than
+        // dropped or rendered as an empty post.
+        b.poll().await;
+        let (_, index) = b.get("/api/zines").await;
+        assert_eq!(
+            index["zines"].as_array().unwrap().len(),
+            0,
+            "an unopenable blob is not a post yet: {index}"
+        );
+        assert_eq!(index["held_blobs"], 1, "{index}");
+        assert_eq!(index["unreadable_blobs"], 1, "{index}");
+
+        // Nothing readable reached the relay, anywhere in its database file.
+        let bytes = std::fs::read(relay_db.path()).unwrap();
+        for marker in [
+            "BYLINE-MARKER",
+            "TITLE-MARKER",
+            "SECTION-MARKER",
+            "BODY-MARKER",
+        ] {
+            assert!(
+                !holds(&bytes, marker.as_bytes()),
+                "{marker} is on the relay's disk"
+            );
+        }
+
+        // A second poll does not hold a second copy, and the cursor did not
+        // rewind: the lane is read from where it stopped.
+        b.poll().await;
+        let (_, again) = b.get("/api/zines").await;
+        assert_eq!(again["held_blobs"], 1, "the blob is not duplicated");
+    }
+
+    #[tokio::test]
+    async fn a_grant_makes_a_held_blob_readable_and_a_comment_comes_back_merged() {
+        // The relay's database is bound to a name, not to `_`: dropping the
+        // `NamedTempFile` deletes the file, and SQLite would then be writing to
+        // an unlinked inode.
+        let (_relay, _relay_db, a, b) = pair().await;
+
+        a.post("/api/zines/pen-name", Some(r#"{"name":"ada"}"#)).await;
+        let (_, created) = a
+            .post(
+                "/api/zines",
+                Some(r#"{"title":"On relays","sections":["rust"],"body":"<p>hello</p>"}"#),
+            )
+            .await;
+        let id = created["zine_id"].as_str().unwrap().to_string();
+
+        // The reader drains before the key arrives.
+        b.poll().await;
+        assert_eq!(b.get("/api/zines").await.1["unreadable_blobs"], 1);
+
+        // The author hands the key over their session.
+        let (status, granted) = a
+            .post(&format!("/api/zines/{id}/grant"), Some(r#"{"contact":"bo"}"#))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{granted}");
+
+        // The next poll takes the key and re-tries the blob already held, which
+        // is the second half of the epidemic.
+        b.poll().await;
+        let (status, index) = b.get("/api/zines").await;
+        assert_eq!(status, StatusCode::OK, "{index}");
+        assert_eq!(index["zines"].as_array().unwrap().len(), 1, "{index}");
+        assert_eq!(index["zines"][0]["title"], "On relays");
+        assert_eq!(index["zines"][0]["unreadable"], false);
+        assert_eq!(index["unreadable_blobs"], 0, "the held blob is readable now");
+        assert_eq!(index["zines"][0]["sections"][0], "rust");
+
+        // The reader comments: sealed to the author's pen-name key, published to
+        // the lane, and kept by the commenter as a holder.
+        let (status, comment) = b
+            .post(
+                &format!("/api/zines/{id}/comment"),
+                Some(r#"{"body":"<p>nice one</p>"}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{comment}");
+        assert_eq!(comment["published"], true, "{comment}");
+
+        // The author pulls it. It waits: a comment is merged by the author, not
+        // by arriving.
+        a.poll().await;
+        let (_, one) = a.get(&format!("/api/zines/{id}")).await;
+        let pending = one["zine"]["pending_comments"].as_array().unwrap();
+        assert_eq!(pending.len(), 1, "{one}");
+        assert_eq!(pending[0]["body"], "<p>nice one</p>");
+        assert_eq!(
+            one["zine"]["descriptor"]["comments"].as_array().unwrap().len(),
+            0,
+            "pulled is not merged: {one}"
+        );
+        let hash = pending[0]["hash"].as_str().unwrap().to_string();
+
+        // Accepting it is a revision — the thread lives in the descriptor, so a
+        // merge that kept its revision number would be refused by half its
+        // readers — and the republish is what makes it visible.
+        let body = serde_json::json!({ "comment_hash": hash }).to_string();
+        let (status, accepted) = a
+            .post(&format!("/api/zines/{id}/accept-comment"), Some(&body))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        assert_eq!(accepted["revision"], 2, "a merge opens a revision");
+        assert_eq!(accepted["published"], true, "{accepted}");
+        assert!(
+            accepted["zines"][0]["pending"] == 0,
+            "the pile is empty once merged: {accepted}"
+        );
+
+        // The reader drains the republished revision and sees the thread.
+        b.poll().await;
+        let (_, seen) = b.get(&format!("/api/zines/{id}")).await;
+        assert_eq!(seen["zine"]["descriptor"]["revision"], 2, "{seen}");
+        let thread = seen["zine"]["descriptor"]["comments"].as_array().unwrap();
+        assert_eq!(thread.len(), 1, "{seen}");
+        assert_eq!(thread[0]["body"], "<p>nice one</p>");
+        assert_eq!(thread[0]["author"], "", "the commenter had no pen name");
+
+        // A refusal is the author's other option, and it is not a retraction:
+        // the comment was never published.
+        let (status, refused) = b
+            .post(
+                &format!("/api/zines/{id}/comment"),
+                Some(r#"{"body":"<p>spam</p>"}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{refused}");
+        a.poll().await;
+        let (_, one) = a.get(&format!("/api/zines/{id}")).await;
+        let spam = one["zine"]["pending_comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["body"] == "<p>spam</p>")
+            .expect("the second comment arrived")
+            .clone();
+        let body = serde_json::json!({ "comment_hash": spam["hash"] }).to_string();
+        let (status, after) = a
+            .post(&format!("/api/zines/{id}/discard-comment"), Some(&body))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(
+            after["zine"]["pending_comments"].as_array().unwrap().len(),
+            0,
+            "the refusal took it out of the pile"
+        );
+        assert_eq!(
+            after["zine"]["descriptor"]["comments"].as_array().unwrap().len(),
+            1,
+            "and it is not in the thread"
+        );
+        assert_eq!(after["zine"]["descriptor"]["revision"], 2, "a refusal is not an edit");
+    }
+
+    #[tokio::test]
+    async fn a_holder_re_shares_a_key_it_was_given() {
+        // The epidemic's point: C has no session with A, and reads the post
+        // because B — a reader, not the author — passed the key on. All three are
+        // on one relay, because the bulletin is per-relay: reach across relays is
+        // the re-post sweep, not a relay-to-relay path.
+        let (relay, _relay_db, a, b) = pair().await;
+        let c = Member::new(&relay).await;
+        connect(&b, &c, "bo", "cy").await;
+
+        a.post("/api/zines/pen-name", Some(r#"{"name":"ada"}"#)).await;
+        let (_, created) = a
+            .post(
+                "/api/zines",
+                Some(r#"{"title":"On gossip","body":"<p>spread it</p>"}"#),
+            )
+            .await;
+        let id = created["zine_id"].as_str().unwrap().to_string();
+
+        // B reads it the ordinary way: drain, grant, drain.
+        b.poll().await;
+        a.post(&format!("/api/zines/{id}/grant"), Some(r#"{"contact":"bo"}"#))
+            .await;
+        b.poll().await;
+        assert_eq!(b.get("/api/zines").await.1["zines"][0]["title"], "On gossip");
+
+        // B re-shares to C, who has never spoken to A.
+        let (status, shared) = b
+            .post(&format!("/api/zines/{id}/grant"), Some(r#"{"contact":"cy"}"#))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{shared}");
+
+        // C drains the same lane and opens the blob with the key it was handed.
+        // The key alone would be useless without the blob, and the blob alone
+        // useless without the key: both arrive on C's own schedule.
+        c.poll().await;
+        let (_, index) = c.get("/api/zines").await;
+        assert_eq!(index["zines"].as_array().unwrap().len(), 1, "{index}");
+        assert_eq!(index["zines"][0]["title"], "On gossip");
+        assert_eq!(index["zines"][0]["authored"], false, "C is a reader, not the author");
+
+        // A post this vault holds no key for cannot be passed on: the refusal is
+        // about having the key, not about being entitled to share it.
+        let (status, refused) = c
+            .post("/api/zines/no-such-post/grant", Some(r#"{"contact":"bo"}"#))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("read key"),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zine_route_that_needs_the_wire_fails_with_a_reason_rather_than_a_lost_write() {
+        // No relay reachable: the write still lands locally, and the caller is
+        // told the publish did not. The bytes are held, so the re-post sweep is
+        // what sends them later.
+        let dir = TempDir::new().unwrap();
+        let app = crate::notes_api_tests::unlocked_app(dir.path()).await;
+        let router = api_router(app);
+        request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"ada"}"#),
+        )
+        .await;
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"title":"Offline","body":"<p>held</p>"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["published"], false, "the relay is unreachable");
+        assert!(
+            !created["publish_error"].as_str().unwrap().is_empty(),
+            "and the reason is given: {created}"
+        );
+        assert_eq!(
+            created["zines"][0]["title"], "Offline",
+            "the article is stored either way"
+        );
+        assert_eq!(created["zines"][0]["revision"], 1);
+    }
 }
