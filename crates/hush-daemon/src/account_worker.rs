@@ -3,7 +3,7 @@ use std::thread;
 
 use hush_core::{
     Account, ChatRecord, ConclaveRecord, InboxResult, MessagePayload, PaperDescriptor,
-    PendingInvite,
+    PendingInvite, VoiceDescriptor,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -257,6 +257,16 @@ enum Work {
     SendPaperHub {
         conclave_id: String,
         paper: PaperDescriptor,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Fan one voice control payload out to a conclave's trustees (Task 23).
+    ///
+    /// One variant rather than five: the voice payloads differ only in their
+    /// fields, the account's typed senders are the real authority surface, and
+    /// the arm matches on which payload it is carrying.
+    SendVoice {
+        conclave_id: String,
+        payload: MessagePayload,
         reply: oneshot::Sender<WorkResult>,
     },
     /// Deliver one DataChannel signalling payload to a single trustee.
@@ -1188,6 +1198,68 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::SendVoice {
+                            conclave_id,
+                            payload,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match payload {
+                                    MessagePayload::VoiceOpen { session } => match a
+                                        .send_conclave_voice_open(&conclave_id, session)
+                                        .await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    },
+                                    MessagePayload::VoiceOffer { session_id, sdp } => match a
+                                        .send_conclave_voice_offer(&conclave_id, &session_id, &sdp)
+                                        .await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    },
+                                    MessagePayload::VoiceAnswer { session_id, sdp } => match a
+                                        .send_conclave_voice_answer(&conclave_id, &session_id, &sdp)
+                                        .await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    },
+                                    MessagePayload::VoiceMute {
+                                        session_id,
+                                        who,
+                                        muted,
+                                    } => match a
+                                        .send_conclave_voice_mute(
+                                            &conclave_id,
+                                            &session_id,
+                                            &who,
+                                            muted,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    },
+                                    MessagePayload::VoiceLeave { session_id, who } => match a
+                                        .send_conclave_voice_leave(&conclave_id, &session_id, &who)
+                                        .await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    },
+                                    // The caller only ever hands this a voice
+                                    // payload; anything else is a bug, and a
+                                    // refusal beats fanning it out.
+                                    other => WorkResult::Err(format!(
+                                        "not a voice payload: {other:?}"
+                                    )),
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::ReadsStatePut { bytes, reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
@@ -2066,6 +2138,95 @@ impl AccountWorker {
     pub async fn reads_state_put(&self, bytes: Vec<u8>) -> WorkResult {
         self.call(|reply| Work::ReadsStatePut { bytes, reply })
             .await
+    }
+
+    /// Open a voice room: announce the session to the conclave's trustees.
+    pub async fn send_voice_open(
+        &self,
+        conclave_id: &str,
+        session: VoiceDescriptor,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendVoice {
+            conclave_id: conclave_id.to_string(),
+            payload: MessagePayload::VoiceOpen { session },
+            reply,
+        })
+        .await
+    }
+
+    /// Fan a WebRTC offer out to the conclave's trustees.
+    pub async fn send_voice_offer(
+        &self,
+        conclave_id: &str,
+        session_id: &str,
+        sdp: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendVoice {
+            conclave_id: conclave_id.to_string(),
+            payload: MessagePayload::VoiceOffer {
+                session_id: session_id.to_string(),
+                sdp: sdp.to_string(),
+            },
+            reply,
+        })
+        .await
+    }
+
+    /// Fan a WebRTC answer out to the conclave's trustees.
+    pub async fn send_voice_answer(
+        &self,
+        conclave_id: &str,
+        session_id: &str,
+        sdp: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendVoice {
+            conclave_id: conclave_id.to_string(),
+            payload: MessagePayload::VoiceAnswer {
+                session_id: session_id.to_string(),
+                sdp: sdp.to_string(),
+            },
+            reply,
+        })
+        .await
+    }
+
+    /// Fan a mute flag out to the conclave's trustees.
+    pub async fn send_voice_mute(
+        &self,
+        conclave_id: &str,
+        session_id: &str,
+        who: &str,
+        muted: bool,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendVoice {
+            conclave_id: conclave_id.to_string(),
+            payload: MessagePayload::VoiceMute {
+                session_id: session_id.to_string(),
+                who: who.to_string(),
+                muted,
+            },
+            reply,
+        })
+        .await
+    }
+
+    /// Fan a leave out to the conclave's trustees. The opener's leave is the
+    /// room's end on every peer.
+    pub async fn send_voice_leave(
+        &self,
+        conclave_id: &str,
+        session_id: &str,
+        who: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendVoice {
+            conclave_id: conclave_id.to_string(),
+            payload: MessagePayload::VoiceLeave {
+                session_id: session_id.to_string(),
+                who: who.to_string(),
+            },
+            reply,
+        })
+        .await
     }
 
     /// The zines pen name this vault publishes under, if it has one yet.

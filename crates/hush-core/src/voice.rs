@@ -85,6 +85,24 @@ impl VoiceManager {
         self.sessions.get(conclave_id)
     }
 
+    /// Every live room. Order is unspecified (map order); callers that show a
+    /// list sort by what they already have (`started_ms`).
+    pub fn rooms(&self) -> Vec<&VoiceSession> {
+        self.sessions.values().collect()
+    }
+
+    /// The conclave a session id belongs to, if a live room is running it.
+    ///
+    /// The wire payloads after `VoiceOpen` carry only the `session_id`, so
+    /// applying one needs this lookup to find the conclave the room's
+    /// authority checks are against.
+    pub fn conclave_of(&self, session_id: &str) -> Option<&str> {
+        self.sessions
+            .values()
+            .find(|s| s.session.session_id == session_id)
+            .map(|s| s.session.conclave_id.as_str())
+    }
+
     /// Open a voice room in a conclave.
     ///
     /// `sender` must be a joined trustee of `conclave`; the conclave must not
@@ -210,6 +228,14 @@ impl VoiceManager {
     /// whether there was one to end.
     pub fn end_conclave(&mut self, conclave_id: &str) -> bool {
         self.sessions.remove(conclave_id).is_some()
+    }
+
+    /// End every live room — what locking the vault calls.
+    ///
+    /// A voice session is live-only, so a lock is the end of it; there is
+    /// nothing to save because there is nothing on disk to save to.
+    pub fn clear(&mut self) {
+        self.sessions.clear();
     }
 }
 
@@ -410,6 +436,16 @@ mod tests {
         assert!(!f.manager.end_conclave(CONCLAVE_ID));
     }
 
+    /// Locking the vault ends every room: a live-only session cannot survive
+    /// its keys going away.
+    #[test]
+    fn a_lock_ends_every_room() {
+        let mut f = fixture(&[]);
+        assert_eq!(open(&mut f, "aa", "v-1").unwrap(), VoiceEffect::Opened);
+        f.manager.clear();
+        assert!(f.manager.session(CONCLAVE_ID).is_none());
+    }
+
     /// A room that ended is not a zombie: the next open is a new session.
     #[test]
     fn a_new_room_can_open_after_one_ends() {
@@ -430,5 +466,18 @@ mod tests {
             f.manager.join(&f.conclave, "bb", "v-old"),
             Err(Error::VoiceNoSession)
         ));
+    }
+
+    /// `conclave_of` resolves the live session id — the lookup the late
+    /// payloads (offer/answer/mute/leave carry only the id) are applied
+    /// through — and does not resolve a dead one.
+    #[test]
+    fn a_session_id_resolves_to_its_conclave() {
+        let mut f = fixture(&[]);
+        assert_eq!(f.manager.conclave_of("v-1"), None);
+        assert_eq!(open(&mut f, "aa", "v-1").unwrap(), VoiceEffect::Opened);
+        assert_eq!(f.manager.conclave_of("v-1"), Some(CONCLAVE_ID));
+        f.manager.end_conclave(CONCLAVE_ID);
+        assert_eq!(f.manager.conclave_of("v-1"), None);
     }
 }
