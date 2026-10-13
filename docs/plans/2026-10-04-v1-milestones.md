@@ -688,8 +688,10 @@ Nostr egress until the switch is on. Sanitized-only UI (reuses the reads sanitiz
 
 **Status:** **Phase Q** — spec drafted **2026-10-13**; all forks resolved the same day, with the
 decisions **delegated to agent judgment** ("do all by your judgement, I will evaluate later") and
-the reasoning recorded in the task doc's Section 3 **for the user's review**. **Planning only** —
-Phase 1 is not approved.
+the reasoning recorded in the task doc's Section 3 **for the user's review**. **Phase 1 (signaling
+plumbing, no media) approved and landed 2026-10-13** on `feature/conclave-voice-phase1` —
+acceptance scripted as `scripts/voice-dogfood.sh`. Phase 2 (real audio) and the Phase 0 engine
+spike remain open; Phase 2 awaits approval.
 
 **Goal:** Trustees in a live conclave can **talk** — end-to-end encrypted, peer-to-peer, no Hush
 server carries media, nothing recorded, a locked vault ends the session. The third conclave surface

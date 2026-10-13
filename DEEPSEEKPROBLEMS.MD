@@ -13,6 +13,60 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-13 — Conclave voice Phase 1 verification (branch `feature/conclave-voice-phase1`)
+
+### The voice-dogfood script asserted a mute semantics that does not exist — `FIXED`
+
+Attempted: the Phase 1 acceptance script (`scripts/voice-dogfood.sh`) asserted that a joiner's mic
+reads `muted: true` on the receiver's roster "until the answer confirms it".
+
+Symptom: the first run failed at exactly that assertion. Alice's roster showed Bob unmuted the
+moment his offer landed:
+
+```
+FAIL: alice should see bob's mic unconfirmed until his answer: <id-a>:false <id-b>:false
+```
+
+The "muted until confirmed by answer" state was invented while writing the script. The code has one
+consistent rule: an inbound `VoiceOffer` is applied as a `join` (the receiver's `voice_apply_inbound`
+reuses `VoiceManager::join`), and `join` adds the sender unmuted; `VoiceMute` is documented as
+advisory only ("silence is the truth and this is the label") and moves only by an explicit payload.
+The answer's role is the handshake, not a mic label. The script was fixed to match the code, which
+is the correct direction — the code's rule is simpler and matches the payload docs.
+
+Lesson: when scripting acceptance checks, derive the expected DTO values from the implementation's
+own semantics, not from a stricter design remembered mid-sentence. If the stricter design is wanted
+(a "peer not yet handshake-confirmed" state), it is a Phase 2 decision to make deliberately, with
+the UI for it, not a dogfood assertion smuggled in.
+
+### Dogfood assertions matched nicknames against a roster of account ids — `FIXED`
+
+Attempted: match roster strings containing `"bob:true"` / `"alice:false"`.
+
+Symptom: the assertion never matched even though the JSON payload held exactly the right state
+(`"muted": true` for Bob), because `joined[].account` carries account ids (hex), never nicknames.
+Made this mistake twice in the same script; the first fix (the answer step) did not fix the class
+(the mute step), which cost a third run.
+
+Resolution: all roster assertions now compare against ids read from the view itself — the opener's
+id from the `opener` field, joiner order from insertion — with the nickname placed only in comments.
+
+Lesson: same class, twice in one file, is a prompt to grep the whole file for the pattern before
+re-running, not to patch the one assertion that failed.
+
+### Script bug: `if find …` tests find's exit status, not whether it matched — `FIXED`
+
+Attempted: `if find "$VA" "$VB" -type f -name '*voice*'; then fail …` as a "no voice files on
+disk" check.
+
+Symptom: vacuous — `find` exits 0 whether or not it matched anything, so the branch could never
+fire and the assertion proved nothing (a passed-without-exercising check, in the log's own
+vocabulary).
+
+Resolution: capture the output (`VOICE_FILES=$(find … || true)`) and test `-z` on it.
+
+---
+
 ## 2026-10-13 — `pgrep -f` and `pkill -f` matched the shell running them, again
 
 ### A self-matching `pgrep` reported a finished build as still running — `OPEN` (recurrence)

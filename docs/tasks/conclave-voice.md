@@ -2,9 +2,13 @@
 
 **Status:** Spec drafted 2026-10-13; **all forks resolved the same day — the user delegated the
 decisions** ("do all by your judgement, I will evaluate later"), so they were resolved by **agent
-judgment under delegation**, with the reasoning recorded in Section 3 for that review. **Planning
-only** — no implementation code until a phase is explicitly approved. The one decision still to be
-made *with evidence* is the media-engine spike (Phase 0/2); every other fork is closed.
+judgment under delegation**, with the reasoning recorded in Section 3 for that review.
+**Phase 1 approved and landed 2026-10-13** (`feature/conclave-voice-phase1`): payloads, state
+machine, fan-out, `/api/voice/*`, UI pill, and the scripted two-daemon acceptance
+(`scripts/voice-dogfood.sh`) — signaling only, stub SDP, no media. Phase 0's two open items
+(`THREAT_MODEL.md` addendum, engine spike) are still open, and Phase 2 (real audio) awaits
+approval. The one decision still to be made *with evidence* is the media-engine spike (Phase
+0/2); every other fork is closed.
 
 **Index:** New **Task 23** in
 [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md) (Phase **Q**). It
@@ -284,17 +288,31 @@ Socket-first, thin-UI, the Paper route pattern (`account_worker.rs` owns the vau
       backend per §2 #5 if the front-runner wins. A pivot is logged in
       [`DEEPSEEKPROBLEMS.MD`](../../DEEPSEEKPROBLEMS.MD).
 
-### Phase 1 — Signaling plumbing (no media; awaits explicit approval)
+### Phase 1 — Signaling plumbing (no media) — LANDED 2026-10-13
 
-- [ ] `Voice*` payload variants + `voice.rs` state machine in `hush-core` (open/join/leave rules,
-      opener authority, cap, timeouts).
-- [ ] `/api/voice/*` endpoints; UI chrome: voice pill, open/join/leave, cap refusals.
-- [ ] Two daemons exchange open/offer/answer/mute/leave and reach terminal states with **fake**
+Approved 2026-10-13 (user: "Approved — start Phase 1"), built on
+`feature/conclave-voice-phase1`.
+
+- [x] `Voice*` payload variants + `voice.rs` state machine in `hush-core` (open/join/leave rules,
+      opener authority, cap, timeouts) — 12 in-file tests.
+- [x] `/api/voice/*` endpoints; UI chrome: voice pill, open/join/leave, cap refusals — the pill
+      derives purely from the room state (`voicePill.ts`, 6 tests) and the daemon words the
+      refusals (`voice_err` maps the manager's stable messages).
+- [x] Two daemons exchange open/offer/answer/mute/leave and reach terminal states with **fake**
       peer connections (no audio yet).
 
-**Verify:** `./scripts/run-two-ui.sh` — A opens a voice room in a conclave; B joins, mutes, and
-leaves; the room ends cleanly (auto-end at <2 and opener end both exercised); a non-trustee or a
-locked vault sees nothing (401/404 contract); `cargo test -p hush-core -p hush-daemon`.
+**Verify:** `./scripts/voice-dogfood.sh` (2026-10-13, the `run-two-ui.sh` pattern scripted
+headlessly, the paper-dogfood skeleton) — A opens a voice room in a conclave over a real relay; B
+sees it as joinable, joins (offer-as-join), both rosters agree on two live speakers; B mutes and A
+sees it; B leaves and the room auto-ends for A (<2); a re-open is ended by the **opener's** own
+leave for B; no voice file exists in either vault (the live plane is memory-only). Locked-vault
+401 and nonexistent-conclave 404 are pinned in `voice_api_tests`. Full `cargo test --workspace`
+and the UI suite (`tsc --noEmit`, 65 tests) green at the close of the slice.
+
+**Note from the dogfood (2026-10-13):** the mute flag is advisory and never flips by handshake —
+an inbound `VoiceOffer` adds the joiner unmuted, the same `join` the joiner applies for themselves;
+the answer closes the handshake only. A "handshake-unconfirmed" roster state is a deliberate
+Phase 2 decision, not an accident to introduce; see `DEEPSEEKPROBLEMS.MD` (2026-10-13).
 
 ### Phase 2 — Real audio, two trustees (the spike promoted)
 
