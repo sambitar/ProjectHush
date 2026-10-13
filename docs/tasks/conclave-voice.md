@@ -93,8 +93,8 @@ Step 1 (prove it, or pivot and log it in [`DEEPSEEKPROBLEMS.MD`](../../DEEPSEEKP
 | 1 | **Primitive / consent** | A **voice room** per conclave, **explicitly joined** per trustee — not a ring. Join is the consent act; a mic is louder than a message, so there is no passive joining |
 | 2 | **Topology** | **Full mesh** of peer connections among joined trustees; no hub, no succession; hub-star and SFU deferred behind the cap |
 | 3 | **Cap** | **8 joined speakers** as the starting ceiling; joining at the cap **refuses with a reason** (the `notes_store` pattern); the dogfood measures and may move it |
-| 4 | **Media engine** | **One spike, both stacks, one decision for the whole voice plane** (Task 17 Phase 2 included). `webrtc-rs` reuse is the front-runner; the outcome amends member-calls §6 in place, whichever way it goes; a pivot is logged in `DEEPSEEKPROBLEMS.MD` |
-| 5 | **Capture backend** (if `webrtc-rs` wins) | **`pipewire-rs` first** — it keeps `PrivateDevices=true` (socket access, not `/dev/snd`), matching the posture the distro docs already prefer; `cpal`/ALSA is the documented fallback |
+| 4 | **Media engine** | **Resolved 2026-10-13 by spike** (`crates/voice-spike`): **`webrtc-rs` reuse wins** — the daemon's own `webrtc` 0.21 stack carried 3 s of Opus RTP over loopback losslessly (150/150 packets, byte-exact against a codec-only reference, encode 157 µs / decode 28 µs per 20 ms frame). Amends member-calls §6 in place; the bespoke glue (capture → resample → Opus → RTP) is measured, not estimated. A pivot is no longer pending |
+| 5 | **Capture backend** (with `webrtc-rs`) | **`pipewire-rs` first** — it keeps `PrivateDevices=true` (socket access, not `/dev/snd`), matching the posture the distro docs already prefer; `cpal`/ALSA is the documented fallback **and is now probe-proven on real hardware** (spike `--capture`: the default device recorded 2 s to WAV, 44.1 kHz F32 stereo, on a live PipeWire host). The pipewire-rs probe itself is Phase 2's first step |
 | 6 | **Authority** | Any joined trustee may **open**; the **opener** may end the session for all; leaving is always per-trustee; the session **auto-ends when fewer than two remain**; `ConclaveEnd` ends any session. No convener gate on opening — membership is already the convener's |
 | 7 | **Crypto** | **DTLS-SRTP** with SDP fingerprints authenticated by the Signal session (Task 17 §3's argument, unchanged). **No SFrame in v1** — its attacker class (a compromised media hop) does not exist in a P2P mesh; the recorded revisit trigger is any relayed/BYO-transport mode ever shipping |
 | 8 | **Mute and indicators** | Local VAD (your own level meter) only in v1. Remote **mute flags** ride one new low-frequency `VoiceMute` control payload over the existing fan-out — a user action, not a stream, so relay cadence is fine. **No remote speaking indicators** in v1 |
@@ -283,10 +283,13 @@ Socket-first, thin-UI, the Paper route pattern (`account_worker.rs` owns the vau
 
 - [x] Section 2 forks resolved and recorded (2026-10-13, delegated — Section 3 holds the reasoning
       for review).
-- [ ] `THREAT_MODEL.md` addendum (Section 5).
-- [ ] **Engine spike decision made once** (§2 #4): `webrtc-rs` reuse vs `webrtcbin`; capture
-      backend per §2 #5 if the front-runner wins. A pivot is logged in
-      [`DEEPSEEKPROBLEMS.MD`](../../DEEPSEEKPROBLEMS.MD).
+- [x] `THREAT_MODEL.md` addendum (Section 5) — landed 2026-10-13 on
+      `feature/conclave-voice-phase1`.
+- [x] **Engine spike decision made once** (§2 #4) — resolved **2026-10-13**: `webrtc-rs` reuse,
+      proven by `crates/voice-spike` (Opus-over-SRTP losslessly on loopback with the daemon's own
+      stack; see §2 #4 for the numbers). No pivot, so nothing to log in
+      [`DEEPSEEKPROBLEMS.MD`](../../DEEPSEEKPROBLEMS.MD) beyond the spike's own findings; the
+      §2 #5 capture probe is Phase 2's first step.
 
 ### Phase 1 — Signaling plumbing (no media) — LANDED 2026-10-13
 
@@ -315,6 +318,10 @@ the answer closes the handshake only. A "handshake-unconfirmed" roster state is 
 Phase 2 decision, not an accident to introduce; see `DEEPSEEKPROBLEMS.MD` (2026-10-13).
 
 ### Phase 2 — Real audio, two trustees (the spike promoted)
+
+**Unblocked 2026-10-13** — the engine spike (§2 #4) resolved in favour of the daemon's own
+`webrtc` stack; the capture backend probe (§2 #5) is the first step of this phase.
+
 
 - [ ] Engine per Phase 0's decision: capture (`pipewire-rs` per §2 #5), Opus, RTP/DTLS, jitter,
       playout — in the daemon.

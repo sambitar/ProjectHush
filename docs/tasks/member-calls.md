@@ -199,6 +199,15 @@ pub enum CallMedia { Audio, AudioVideo }
 
 **Decision: GStreamer `webrtcbin` for the client media engine.** Rationale, against the project's "no homemade crypto / use audited components / minimize custom security-sensitive code" stance: `webrtcbin` supplies capture, Opus, RTP, ICE, DTLS-SRTP, TURN, jitter buffering and sinks as one **audited, widely deployed** stack, so we write the least security-critical glue. The alternative, `webrtc-rs`, keeps the transport in memory-safe Rust but leaves us assembling capture → resample → Opus → RTP/SRTP and the reverse ourselves — more bespoke, more places to get wrong.
 
+**Amended in place 2026-10-13 — the shared spike went the other way.** Task **23**'s spec
+re-opened this decision for the whole voice plane, and the spike (`crates/voice-spike`, evidence in
+[`conclave-voice.md`](conclave-voice.md) §2 #4) resolved it for **`webrtc-rs` reuse**: the daemon
+had shipped a working `webrtc` 0.21 plane with the Paper (`paper_data.rs`), and the bespoke glue
+proved cheap and measurable — Opus RTP over the daemon's own stack was byte-exact on loopback at
+157 µs encode / 28 µs decode per 20 ms frame. One WebRTC stack in the daemon beats shipping
+GStreamer beside it. This section's original `webrtcbin` rationale is kept for the record; the
+capture-backend fork (PipeWire first, `cpal`/ALSA fallback) lives in Task 23 §2 #5.
+
 Cost and mitigation: GStreamer is a large C dependency with a plugin ecosystem, which is a real attack-surface and supply-chain concern for a privacy app. Mitigations, enforced in Phase 2: **pin the plugin set** (no plugin autoload from environment paths; ignore `GST_PLUGIN_PATH`), ship only the plugins the call path needs, and document the exact package list in `DISTRO_READINESS.md`. If dependency weight is judged disqualifying, `webrtc-rs` is the documented fallback. **Phase 2 begins with a spike** that proves capture + a real two-way call before the rest of the feature commits to the choice.
 
 ---

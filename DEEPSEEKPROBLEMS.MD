@@ -67,6 +67,58 @@ Resolution: capture the output (`VOICE_FILES=$(find … || true)`) and test `-z`
 
 ---
 
+## 2026-10-13 — Voice engine spike (`crates/voice-spike`, Task 23 §2 #4)
+
+### The facade's answer SDP is incomplete unless both peers register the codec registry — `FIXED`
+
+Attempted: two `webrtc` 0.21 (the facade over `rtc`) peer connections on loopback; the receiver
+built with no `with_media_engine`.
+
+Symptom: `set_remote_description` refused the answer with `ErrSessionDescriptionMissingIceUfrag`,
+and the dumped answer SDP showed the degenerate shape — `m=audio 0 … 0` (PCMU only, no Opus) and
+**no `ice-ufrag`/`ice-pwd` lines at all**, though candidates were present.
+
+Resolution: build the answerer with the same `MediaEngine::default()` + `register_default_codecs()`
+as the offerer. The SDP then carries `m=audio … 111` with credentials, and the loopback proof goes
+150/150 byte-exact. The other necessary piece was waiting for gathering complete before reading
+`local_description()` — without it the offer goes out with no candidates and the same ufrag error
+surfaces on the receiver's `set_remote_description`.
+
+Lesson: the new `webrtc` facade keeps its media engine per connection and gives empty registries by
+default; both halves of a handshake need the codec registry, and non-trickle signalling needs the
+gather-complete wait on BOTH descriptions, not just the offer. The `paper_data.rs` pattern already
+did the wait for its offers; the answer side needs it too.
+
+### `pgrep -a a b` does not do what it reads like — `FIXED`
+
+Attempted: `pgrep -a pipewire pulseaudio` to check for sound servers.
+
+Symptom: reported nothing, and I concluded "no PipeWire session running". Later in the same
+session, `pgrep -c pipewire` alone found **3 processes** — a full PipeWire session was up the whole
+time. The two-argument form does not search two patterns; the second word was silently not a
+pattern, and the first pattern's match was lost to whatever the combined invocation did.
+
+Resolution: one pattern per call (`pgrep -a pipewire; pgrep -a pulseaudio`), or `pgrep -a 'pipewire|pulseaudio'`. The §2 #5 capture-backend probe was scoped on the wrong premise because of this.
+
+Lesson: the cost of a bad negative here was under-probing (skipping the pipewire-rs capture probe
+that was feasible all along), not a wrong product result — but a check that silently answers
+"absent" is the classic shape this log exists for.
+
+### Smaller build frictions in the same slice — `FIXED`
+
+- Opus 1.4 fails to compile with only `OPUS_BUILD`/`HAVE_LRINT*`: `stack_alloc.h` demands one of
+  `VAR_ARRAYS`/`USE_ALLOCA`/`NONTHREADSAFE_PSEUDOSTACK`. `VAR_ARRAYS` is the Linux norm.
+- `cpal` 0.15's host methods (`default_input_device`, `build_input_stream`, `play`) live on the
+  `traits::{HostTrait, DeviceTrait, StreamTrait}` traits — importing the crate is not enough.
+  There is no `alsa` feature to enable (the Linux backend is a non-optional dependency); inventing
+  one fails version selection.
+- `hound::WavWriter::finalize` consumes `self` — an `Arc<Mutex<WavWriter>>` shared with the capture
+  callback needs `Arc::try_unwrap` after the stream is dropped, not a `lock()`.
+- The first loopback proof lost exactly one packet (149/150): the first `write_sample` raced the
+  ICE pair opening. A 150 ms settle after `Connected` makes it 150/150 byte-exact.
+
+---
+
 ## 2026-10-13 — `pgrep -f` and `pkill -f` matched the shell running them, again
 
 ### A self-matching `pgrep` reported a finished build as still running — `OPEN` (recurrence)

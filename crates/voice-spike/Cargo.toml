@@ -1,0 +1,23 @@
+[package]
+name = "voice-spike"
+version = "0.1.0"
+edition = "2021"
+
+# The engine spike for Task 23 Phase 0/2 (docs/tasks/conclave-voice.md §2 #4):
+# prove `webrtc-rs` reuse can carry Opus audio end-to-end with the daemon's own
+# stack, or pivot to GStreamer `webrtcbin` and log it. Throwaway evidence, not a
+# product crate; it never ships and its vendored Opus is spike-only.
+[dependencies]
+webrtc = "0.21.1"
+# The codec/transceiver parameter types the facade leaves in its underlying
+# crate, and the Sample struct rtc-media owns.
+rtc = "0.21.1"
+rtc-media = "0.21.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+async-trait = "0.1"
+bytes = "1"
+cpal = "0.15"
+hound = "3.5"
+
+[build-dependencies]
+cc = "1"

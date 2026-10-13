@@ -712,8 +712,9 @@ local VAD plus remote **mute flags** (`VoiceMute` control payload), no remote sp
 no chat notice and no persistence in v1; the signaling plumbing lands **once, in this task**, with
 Task **17** Phase 1 as a consumer; the ~4 s poll is accepted for dogfood.
 
-**The one decision left to evidence:** the engine spike (task doc Phase 0/2) — every other fork is
-closed.
+**The one decision left to evidence:** the engine spike — **resolved 2026-10-13** by
+`crates/voice-spike` (`webrtc-rs` reuse wins; see the task doc §2 #4). Phase 1 is landed; the
+capture-backend probe is Phase 2's first step.
 
 **Depends on:** conclave fan-out (done), **5h** presence (done), **5c** encrypted store (done),
 the Paper's landed DataPlane patterns (`paper_data.rs`, `stun_url`, tolerant decode — all done).

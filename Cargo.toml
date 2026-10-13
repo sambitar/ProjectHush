@@ -6,6 +6,7 @@ members = [
   "crates/hush-daemon",
   "crates/hush-wallet",
   "crates/hush-articles",
+  "crates/voice-spike",
   "apps/hush-tauri/src-tauri",
 ]
 resolver = "2"
