@@ -5000,6 +5000,48 @@ export class App {
   }
 
   /**
+   * Start a revision from the rail's write button.
+   *
+   * The rail holds the index, and a summary carries a preview rather than the
+   * article, so the body has to come from somewhere else: the open detail when
+   * it is the caller's own zine, and a fetch when it is not. Seeding an empty
+   * body here is not a neutral default — the title and sections are pre-filled
+   * from the existing zine, so an empty editor reads as "the body is gone",
+   * and publishing it would blank an article that was already written.
+   *
+   * A failed fetch therefore does not open a draft at all: a refusal the author
+   * can act on beats an editor that looks ready and would destroy the article.
+   */
+  private async zinesStartOwnDraft(): Promise<void> {
+    const own = this.zinesOwn();
+    if (!own) {
+      this.zinesStartDraft(null, "", "", "");
+      return;
+    }
+    let body: string | null = null;
+    const open = this.zinesDetail?.zine.descriptor;
+    if (open && open.zine_id === own.zine_id) {
+      body = open.body;
+    } else {
+      try {
+        const detail = await api.zinesGet(own.zine_id);
+        if (detail) body = detail.zine.descriptor.body;
+      } catch (e) {
+        if (this.rail === "zines") {
+          this.announce(
+            e instanceof AppError
+              ? e.message
+              : "Couldn't read that zine back to revise it.",
+          );
+        }
+        return;
+      }
+    }
+    if (body === null || this.rail !== "zines") return;
+    this.zinesStartDraft(own.zine_id, own.title, own.sections.join(", "), body);
+  }
+
+  /**
    * Publish the draft as a new revision.
    *
    * The editor's document is read *before* the button is disabled, because
@@ -5058,6 +5100,13 @@ export class App {
     try {
       const view = await api.zinesMute(zineId, muted);
       if (view) this.zinesView = view;
+      // The reading pane renders from the detail, which was fetched before the
+      // toggle, so it is patched from the daemon's answer. Re-fetching would
+      // work too, and would flicker the article for a flag with no wire effect.
+      const open = this.zinesDetail?.zine;
+      if (open && open.descriptor.zine_id === zineId) {
+        open.muted = view?.zines.find((z) => z.zine_id === zineId)?.muted ?? muted;
+      }
     } catch (e) {
       this.announce(e instanceof AppError ? e.message : "Couldn't change that.");
     }
@@ -5094,6 +5143,12 @@ export class App {
       if (view) this.zinesView = view;
       this.zinesPenNameOpen = false;
       this.zinesPenNameError = null;
+      // A rename moves the byline on every zine this pen name wrote, and the
+      // reading pane is rendering one of them from a detail fetched before the
+      // rename. A held zine keeps its author's byline, so only an authored one
+      // is patched.
+      const open = this.zinesDetail?.zine;
+      if (open?.authored) open.descriptor.pen_name = name;
     } catch (e) {
       this.zinesPenNameError =
         e instanceof AppError ? e.message : "Couldn't set that pen name.";
@@ -5164,8 +5219,7 @@ export class App {
       write.type = "button";
       write.className = "btn-primary pressable zines-write";
       write.textContent = own ? "Write a new revision" : "Write a zine";
-      write.onclick = () =>
-        this.zinesStartDraft(own?.zine_id ?? null, own?.title ?? "", own?.sections.join(", ") ?? "", "");
+      write.onclick = () => void this.zinesStartOwnDraft();
       col.appendChild(write);
     }
 

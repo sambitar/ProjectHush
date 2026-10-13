@@ -103,6 +103,72 @@ Lesson: an in-place editor inside a render-on-demand UI needs an explicit change
 UI. Re-rendering on every keystroke would have been the other option, and it would have thrown away
 the cursor.
 
+### The rail's write button opened a blank editor over an existing article — `FIXED`
+
+Attempted: press "Write a new revision" in the rail, then publish.
+
+Symptom: the title and sections were pre-filled from the existing zine, the editor was empty, and
+Publish was enabled the moment a character was typed. Publishing would have replaced the head
+revision with a blank article. The old body survives in `history`, but the head is what a reader
+opens.
+
+Root cause: the rail button seeded `""` for the body, because the rail holds the index and a
+`ZineSummary` carries a `preview`, not the article. The title and sections *were* seeded, so the
+editor read as "the body is gone" rather than "write a new one". The article's own revise button
+seeded correctly from the detail, so the two paths disagreed — which is why clicking the one in the
+reading pane looked fine.
+
+Resolution: `zinesStartOwnDraft()` seeds from the open detail when it is the caller's own zine, and
+fetches it otherwise. A failed fetch announces and opens no draft at all: an editor that looks ready
+and would destroy the article is worse than a refusal. Verified live both ways — the rail button and
+the article button now seed the same body, bold run included.
+
+Lesson: two entry points to one destructive action must be tested as two paths. Only one of them was
+wrong, and the one that worked is the one that got exercised first.
+
+### The reading pane kept rendering a stale detail after mute and rename — `FIXED`
+
+Attempted: mute the open zine, then rename the pen name, watching the article.
+
+Symptom: the daemon recorded both changes, but the article's Mute button kept its old label after
+the toggle, so a second click repeated the same request instead of reversing it.
+
+Root cause: `renderZineArticle` renders from `zinesDetail`, which is fetched by `zinesOpen` and never
+refreshed. `zinesMute` and `zinesSetPenName` store the returned **index**, which the list and the
+facets read, but the detail was left as it was.
+
+Resolution: both handlers patch the open detail from the daemon's answer — the mute flag from the
+returned index, the byline only when the detail is authored, since a rename does not move a held
+zine's byline. Verified live: Mute toggles to Unmute and back with the row gaining and losing
+`muted-row`, and a rename round trip moves the byline in both the article and the rail without a
+refetch.
+
+### A probe read the mute label before the re-render and looked like a second bug — `OPEN` (tooling)
+
+Attempted: drive the mute toggle from one CDP script with fixed 800 ms waits.
+
+Symptom: the label appeared to lag one click behind. A second, longer-waited probe showed the
+sequence was correct, and the earlier reading was a race: the daemon was slow under a failing drop
+drain loop (`429 Too Many Requests` in its log), so the response had not arrived inside the wait.
+
+Resolution: not a repo problem. Re-probed with a poll-until-condition loop instead of a fixed sleep,
+which is what the first probe should have done.
+
+Lesson: a fixed sleep in a probe is an assumption about latency. Poll for the condition being
+asserted, or the probe reports the harness's timing as a product defect.
+
+### The forget path cannot be exercised in Phase 1 — `OPEN` (by design, not a defect)
+
+Attempted: open the forget confirmation on the demo zine.
+
+Symptom: no Forget button. `renderZineArticle` only offers it when `!authored`, so the modal is
+unreachable for a zine this vault wrote — and in Phase 1 every zine is authored, because held zines
+need Phase 2's bulletin.
+
+Resolution: none needed. The route is covered by `zines_round_trip_a_create_an_edit_a_mute_and_a_forget`
+and a live check that a zine this vault does not hold is 404 with a reason, but the **modal** has no
+end-to-end evidence. Recorded rather than claimed.
+
 ---
 
 ## 2026-10-12 — Zines spec (design, docs-only)
