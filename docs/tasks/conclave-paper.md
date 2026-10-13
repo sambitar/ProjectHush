@@ -249,14 +249,15 @@ copy of the paper their vault already held, exactly as they keep conclave messag
 
 ### Phase 0 — Spec and threat model (this document)
 - [x] Decisions in Section 2 resolved and recorded (2026-10-12).
-- [ ] `THREAT_MODEL.md` addendum (Section 6) when implementation starts.
+- [x] `THREAT_MODEL.md` addendum (Section 6) when implementation starts — landed 2026-10-12 with Task 8.
 
-### Phase 1 — Paper core, offline (daemon + editor, no network)
-- [ ] `paper_store.rs` sidecar: descriptor + doc snapshot + update log, caps (doc ~256 KiB soft cap, snapshot ~512 KiB; refuse with a reason, the notes pattern), round-trip + corruption tests.
-- [ ] `yrs` doc owned by the daemon; `/api/paper/*` endpoints; lock = 401 everywhere.
-- [ ] Webview: Paper affordance in the conclave view (tab beside chat), ProseMirror editor bound through a local Yjs bridge; toolbar (bold/italic/underline, lists, headings); author colour is the local user's.
+### Phase 1 — Paper core, offline (daemon + editor, no network) — landed 2026-10-12
+- [x] `paper_store.rs` sidecar: descriptor + doc snapshot + update log, caps (doc ~256 KiB soft cap, snapshot ~512 KiB; refuse with a reason, the notes pattern), round-trip + corruption tests.
+- [x] `yrs` doc owned by the daemon; `/api/paper/*` endpoints; lock = 401 everywhere.
+- [x] Webview: Paper affordance in the conclave view (tab beside chat), ProseMirror editor bound through a local Yjs bridge; toolbar (bold/italic/underline, lists, headings); author colour is the local user's.
 
-**Verify:** create + edit a paper in one vault; restart the app — the document survives; lock the vault — every paper route 401s and `papers.enc` on disk is ciphertext; `cargo test -p hush-daemon`.
+**Verify:** create + edit a paper in one vault; restart the app — the document survives; lock the vault — every paper route 401s and `papers.enc` on disk is ciphertext; `cargo test -p hush-daemon`. Verified 2026-10-12 — see the Task 5 dogfood record in
+[`docs/plans/2026-10-12-conclave-paper.md`](../plans/2026-10-12-conclave-paper.md).
 
 ### Phase 2 — Wire fan-out (relay cadence end-to-end)
 - [x] Payload variants + tolerant unknown-tag decode (shared change with Task 17 Phase 1) — landed 2026-10-12; the shared change is done, so Task 17 Phase 1 no longer brings it.
@@ -265,26 +266,26 @@ copy of the paper their vault already held, exactly as they keep conclave messag
 
 **Verify:** `./scripts/paper-dogfood.sh` — three daemons and a real relay: Alice creates the paper; Bob converges on her edit; Bob's edit reaches Alice with both documents byte-identical; Carol joins late and the hub's snapshot catches her up; `relay.db`, all three vaults, and every other file on disk hold no paper plaintext. Verified 2026-10-12. This is a daemon-level dogfood, not a pass in the webview — see the Task 4 note in the milestone plan for the limits.
 
-### Phase 3 — DataChannel liveness
-- [ ] Spike first: prove `webrtc-rs` DataChannel between two daemons over a LAN before the rest commits (offer/answer/ICE as `MessagePayload` variants).
-- [ ] Hub = creator; peers open one DataChannel each; updates + presence ride it when up.
-- [ ] Automatic per-peer path selection (fast when the channel is up, relay otherwise) with the live/degraded badge.
+### Phase 3 — DataChannel liveness — landed 2026-10-12
+- [x] Spike first: prove `webrtc-rs` DataChannel between two daemons over a LAN before the rest commits (offer/answer/ICE as `MessagePayload` variants). Proved over loopback with no STUN server; a real LAN run is still open (the code does not depend on the answer, because the relay fans out underneath in every case).
+- [x] Hub = creator; peers open one DataChannel each; updates + presence ride it when up. The hub re-broadcasts what it receives, because the fast path is a star while the relay fan-out is a mesh.
+- [x] Automatic per-peer path selection (fast when the channel is up, relay otherwise) with the live/degraded badge. `Sent::UseRelay` is a normal answer rather than an error, so the relay stays the guarantee.
 
-**Verify:** two daemons on a LAN converge sub-second; kill the hub's channel — peers degrade to relay cadence and keep merging; hub returns — liveness resumes with no user action.
+**Verify:** two daemons on a LAN converge sub-second; kill the hub's channel — peers degrade to relay cadence and keep merging; hub returns — liveness resumes with no user action. Sub-second convergence is proven on loopback (957 µs for one update against the relay's 1–3 s); the LAN half and a real symmetric NAT remain open, with degradation reached by simulating unreachability.
 
-### Phase 4 — Presence, succession, hardening
-- [ ] Author colours + named live cursors (ProseMirror decorations fed by DataChannel awareness); cursor presence is DataChannel-only in v1 (nothing over the relay).
-- [ ] Hub succession: creator leaves/kicked → convener-authoritative `PaperHub` (default: the convener); explicit re-home route for the convener.
-- [ ] Lock/suspend mid-editing: local delta queue flushes on unlock; a locked **hub** degrades peers cleanly. Caps enforced with reasons.
+### Phase 4 — Presence, succession, hardening — landed 2026-10-12
+- [x] Author colours + named live cursors (ProseMirror decorations fed by DataChannel awareness); cursor presence is DataChannel-only in v1 (nothing over the relay). The label is resolved on receipt from the sender's account id against the receiver's own roster, so a caret cannot be labelled after someone else.
+- [x] Hub succession: creator leaves/kicked → convener-authoritative `PaperHub` (default: the convener); explicit re-home route for the convener. The authority rule lives in `hush-core`, so there is no second copy of the roster to drift.
+- [x] Lock/suspend mid-editing: local delta queue flushes on unlock; a locked **hub** degrades peers cleanly. Caps enforced with reasons. This one was a real gap: `closePaper()` claimed to flush and did not, and `lock()` called the API first, so an edit inside the 400 ms window was lost twice over.
 
-**Verify:** three-way edit with distinct colours/cursors; kick the creator mid-session — the convener becomes hub and liveness resumes; lock the hub — peers degrade; a locked editor's queued edits land on unlock and merge cleanly.
+**Verify:** three-way edit with distinct colours/cursors; kick the creator mid-session — the convener becomes hub and liveness resumes; lock the hub — peers degrade; a locked editor's queued edits land on unlock and merge cleanly. Verified 2026-10-12 by `./scripts/paper-dogfood.sh` (23 checks), which drives the daemon API with the editor's own bytes rather than typing in a window.
 
-### Phase 5 — Polish
-- [ ] Toolbar completeness check against the v1 scope; empty state ("Start the paper"); read-only rendering after `ConclaveEnd`.
-- [ ] Error states (NAT-limited, hub gone, caps) with actionable copy.
-- [ ] `DISTRO_READINESS.md` updates: `yrs` + `webrtc-rs` dependencies, STUN config surface, sandbox notes (no new devices; SCTP egress).
+### Phase 5 — Polish — landed 2026-10-12
+- [x] Toolbar completeness check against the v1 scope; empty state ("Start the paper"); read-only rendering after `ConclaveEnd`.
+- [x] Error states (NAT-limited, hub gone, caps) with actionable copy.
+- [x] `DISTRO_READINESS.md` updates: `yrs` + `webrtc-rs` dependencies, STUN config surface, sandbox notes (no new devices; SCTP egress).
 
-**Verify:** full three-daemon dogfood session, including an ended conclave rendering read-only papers in every vault.
+**Verify:** full three-daemon dogfood session, including an ended conclave rendering read-only papers in every vault. Verified 2026-10-12. `cargo deny` / `cargo audit` were **not** run — neither tool is installed in this environment; adding them to CI is separate work.
 
 ---
 
