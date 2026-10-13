@@ -798,6 +798,29 @@
   box-shadow: var(--shadow-1);
 }
 
+/* Conclave voice pill (Task 23) — sits under the Chat | Paper tabs. */
+.voice-bar {
+  display: flex;
+  gap: var(--space-1);
+  align-items: center;
+  padding: var(--space-1) 0;
+}
+
+.voice-pill {
+  border: none;
+  background: var(--surface-2);
+  border-radius: var(--radius-pill);
+  padding: var(--space-2) var(--space-3);
+}
+
+.voice-action {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: var(--radius-pill);
+  padding: var(--space-2);
+}
+
 /* Mail rail */
 .mail-thread-list {
   display: flex;

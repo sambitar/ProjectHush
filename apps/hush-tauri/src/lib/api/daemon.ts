@@ -28,6 +28,8 @@ import type {
   WalletNetworkMode,
   WalletSendDto,
   WalletStateDto,
+  VoiceStateDto,
+  VoiceViewDto,
   ZineDraftDto,
   ZinesViewDto,
   ZinesWriteDto,
@@ -422,6 +424,28 @@ export const api = {
     request<null>(`/api/paper/${encodeURIComponent(conclaveId)}/presence`, {
       method: "POST",
       body: JSON.stringify({ frame }),
+    }),
+  // --- Conclave voice (Task 23). The room state is in-memory on the daemon:
+  // a restart or a lock is a leave, and 404 means no room is open. ---
+  voiceState: () => request<VoiceStateDto>("/api/voice/state"),
+  voiceGet: (conclaveId: string) =>
+    request<VoiceViewDto>(`/api/voice/${encodeURIComponent(conclaveId)}`),
+  voiceOpen: (conclaveId: string) =>
+    request<VoiceViewDto>(`/api/voice/${encodeURIComponent(conclaveId)}/open`, {
+      method: "POST",
+    }),
+  voiceJoin: (conclaveId: string) =>
+    request<VoiceViewDto>(`/api/voice/${encodeURIComponent(conclaveId)}/join`, {
+      method: "POST",
+    }),
+  voiceLeave: (conclaveId: string) =>
+    request<VoiceViewDto>(`/api/voice/${encodeURIComponent(conclaveId)}/leave`, {
+      method: "POST",
+    }),
+  voiceMute: (conclaveId: string, muted: boolean) =>
+    request<VoiceViewDto>(`/api/voice/${encodeURIComponent(conclaveId)}/mute`, {
+      method: "POST",
+      body: JSON.stringify({ muted }),
     }),
   // --- Torrents (TorBox-powered client). The API key lives in the vault
   // sidecar and is never sent back; the daemon does all TorBox traffic. ---

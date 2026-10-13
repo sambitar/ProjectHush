@@ -419,6 +419,39 @@ export interface PaperPresenceDto {
   peers: PaperPresencePeerDto[];
 }
 
+// --- Conclave voice (Task 23) -----------------------------------------------
+// `GET`/`POST /api/voice/*` — the conclave's live voice room. Phase 1 is the
+// signaling plumbing; the room state is real, the handshakes are stubs.
+
+/** One trustee in a voice room. `muted` is advisory: capture stopped before
+ * the flag was sent, so silence is the truth and this is the label. */
+export interface VoiceMemberDto {
+  account: string;
+  muted: boolean;
+}
+
+/**
+ * One conclave's voice room.
+ *
+ * `joined: []` with `i_am_in: false` is also the shape a successful leave
+ * returns when the leave *ended* the room: the action succeeded and there is
+ * nothing left to show.
+ */
+export interface VoiceViewDto {
+  session_id: string;
+  conclave_id: string;
+  opener: string;
+  started_ms: number;
+  /** Joined trustees in join order; the opener is first. */
+  joined: VoiceMemberDto[];
+  i_am_in: boolean;
+}
+
+/** `GET /api/voice/state` — every live room, keyed by conclave id. */
+export interface VoiceStateDto {
+  rooms: VoiceViewDto[];
+}
+
 // --- Torrents (TorBox-powered client) ------------------------------------------
 
 /** Where a queued item's data came from. */
