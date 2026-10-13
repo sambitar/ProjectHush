@@ -975,3 +975,144 @@ async fn a_trustee_cannot_re_home_a_paper() {    let (relay, _relay_dir) = spawn
         Err(Error::NotConclaveConvener)
     ));
 }
+
+// --- Voice (Task 23) ---
+
+fn voice_session(conclave_id: &str, opener: &str, session_id: &str) -> hush_core::VoiceDescriptor {
+    hush_core::VoiceDescriptor {
+        session_id: session_id.into(),
+        conclave_id: conclave_id.into(),
+        opener: opener.into(),
+        started_ms: 1_000,
+    }
+}
+
+/// The authority rule for opening, checked where the roster is in hand: the
+/// sender must be the opener the descriptor names *and* a joined trustee. A
+/// voice room is announced, not asked for — joining is the consent — so a
+/// forged open must not even surface as room state on the peers.
+#[tokio::test]
+async fn a_voice_open_reaches_a_joined_trustee_as_voice_not_chat() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Standup", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    alice
+        .send_conclave_voice_open(
+            &conclave.id,
+            voice_session(&conclave.id, &alice.protocol_name(), "v-1"),
+        )
+        .await
+        .unwrap();
+
+    let inbox = bob.recv().await.unwrap();
+    assert!(inbox.messages.is_empty(), "a voice open is not a chat message");
+    assert_eq!(inbox.voices.len(), 1, "the open is routed as voice");
+    match &inbox.voices[0].payload {
+        MessagePayload::VoiceOpen { session } => {
+            assert_eq!(session.session_id, "v-1");
+            assert_eq!(session.opener, alice.protocol_name());
+        }
+        other => panic!("expected a voice open, got {other:?}"),
+    }
+    // Consumed on delivery: the next poll does not see it again.
+    let again = bob.recv().await.unwrap();
+    assert!(again.voices.is_empty());
+}
+
+/// The open's opener must be the sender: a trustee announcing a room in
+/// someone else's name is dropped and consumed, never surfaced.
+#[tokio::test]
+async fn a_voice_open_forging_the_opener_is_dropped() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Standup", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    // Alice names *bob* as the opener of a room she sends.
+    alice
+        .send_conclave_voice_open(
+            &conclave.id,
+            voice_session(&conclave.id, &bob.protocol_name(), "v-1"),
+        )
+        .await
+        .unwrap();
+
+    let inbox = bob.recv().await.unwrap();
+    assert!(inbox.voices.is_empty(), "a forged open is not room state");
+    assert!(inbox.messages.is_empty());
+}
+
+/// You can only mute or leave as yourself: a `who` that is not the sender is
+/// dropped at the same place the roster is in hand.
+#[tokio::test]
+async fn a_voice_mute_for_someone_else_is_dropped() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Standup", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+
+    alice
+        .send_conclave_voice_mute(&conclave.id, "v-1", &bob.protocol_name(), true)
+        .await
+        .unwrap();
+
+    let inbox = bob.recv().await.unwrap();
+    assert!(inbox.voices.is_empty(), "a mute in someone else's name is dropped");
+    assert!(inbox.messages.is_empty());
+}
+
+/// Voice follows the conclave's lifecycle: once it has ended, sending is
+/// refused exactly as a conclave message is.
+#[tokio::test]
+async fn voice_senders_refuse_once_the_conclave_has_ended() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let conclave = alice
+        .create_conclave("Standup", &["bob".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    alice.recv().await.unwrap();
+    alice.end_conclave(&conclave.id).await.unwrap();
+    bob.recv().await.unwrap();
+
+    assert!(matches!(
+        alice
+            .send_conclave_voice_open(
+                &conclave.id,
+                voice_session(&conclave.id, &alice.protocol_name(), "v-1")
+            )
+            .await,
+        Err(Error::ConclaveEnded)
+    ));
+}

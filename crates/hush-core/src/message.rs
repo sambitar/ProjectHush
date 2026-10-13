@@ -25,6 +25,13 @@ pub struct InboxResult {
     /// message and must never be rendered as one, and the document itself is
     /// the daemon's business (`paper_store`), not the chat log's.
     pub papers: Vec<ReceivedPaper>,
+    /// Voice payloads from conclave trustees (Task 23), for the caller to
+    /// apply to its voice manager.
+    ///
+    /// Kept out of `messages` for the same reason as `papers`: a voice payload
+    /// is not a chat message. The manager is in-memory — a voice session is
+    /// live-only — so these are applied and then gone.
+    pub voices: Vec<ReceivedVoice>,
     /// Conclave ids that gained a joined trustee during this poll.
     ///
     /// The paper hub needs this: a trustee that joined after the paper existed
@@ -75,6 +82,23 @@ pub struct ReceivedZineGrant {
 #[derive(Debug, Clone)]
 pub struct ReceivedPaper {
     /// The sending account's id, for the creator/convener checks.
+    pub from_account: String,
+    /// The sender's nickname, for diagnostics.
+    pub from_nick: String,
+    pub payload: crate::payload::MessagePayload,
+}
+
+/// A voice payload received from a conclave trustee (Task 23).
+///
+/// Kept out of `messages` for the same reason as `papers` and `zine_grants`:
+/// a voice payload is not a chat message and must never render as one. The
+/// daemon applies each to its in-memory voice manager — the session itself is
+/// live-only and stores nothing — so this channel carries the room's truth and
+/// the SDP of its handshakes, already authority-checked for identity by
+/// `recv`.
+#[derive(Debug, Clone)]
+pub struct ReceivedVoice {
+    /// The sending account's id, for the authority checks.
     pub from_account: String,
     /// The sender's nickname, for diagnostics.
     pub from_nick: String,
