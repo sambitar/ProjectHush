@@ -13,6 +13,272 @@ Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fi
 
 ---
 
+## 2026-10-13 — Zines: the bulletin lane, key epidemic and comments (Phases 2 and 3)
+
+Trigger: "ok i thought you are done .. lets continute with all the phases". The design is in
+`docs/tasks/zines.md` (sections 4 and 5). Entries below are the problems hit wiring the wire.
+
+### The grant/comment UI was never driven in a live browser — `OPEN`
+
+Attempted: verify Phases 3 and 4 in the running app the way the front page was verified on
+2026-10-13 (Vite on 5173 against a real daemon, driven over CDP).
+
+Symptom: not attempted. The flow needs **two daemons, two vaults, and a relay** running at once to
+exercise a grant, and the browser harness in this session had no such pair standing. What was verified
+instead is the daemon-level integration test (`zines_bulletin_tests`) over the same wire, plus the
+composition rules as unit tests, plus `tsc --noEmit` and `npm run build`.
+
+Resolution needed: start a relay, two daemons with separate data roots, grant A → B → C, then drive the
+UI. Until then, treat the *paint* of the share dialog, the comment composer, the pending pile, the
+byline filter chip, and the corpus note as unverified. The logic behind them is tested; the wiring
+between the DOM and the routes is not. Lesson: an integration test proves the wire, not the button —
+"the daemon does this" and "the user can do this" are two different claims and only the first is
+evidenced here.
+
+### The protocol doc described the bulletin's publish credential wrongly — `FIXED`
+
+Attempted: bring `docs/PROTOCOL.md` up to the built wire, which had been marked "design not built".
+
+Symptom: the design note said publish authorizes with the **delivery** credential and drain with the
+**read** credential, reusing the queue split. `Store::put_bulletin` calls
+`authorize_read_or_create(queue_id, read_token)`, and `crates/hush-relay/tests/bulletin.rs`
+(`a_publish_needs_the_private_credential`) pins it: the read token publishes, and the delivery token —
+the one that travels in invites — is refused with `401`. A second detail the note did not have: the
+queue id in the path is **derived** (`hush_core::bulletin_queue_id`), not the inbox id, because the
+relay self-binds an unclaimed queue to the first credential and an inbox id plus its delivery token
+both travel in invites.
+
+Resolution: `PROTOCOL.md` and `THREAT_MODEL.md` now state the built form, and
+`docs/tasks/zines.md` lists both corrections at the end of Phase 5 so the older text is not trusted
+over the code. Lesson: a design doc that says "not built" is a hypothesis about the wire; correcting it
+is part of building, and a doc that disagrees with the code is worse than no doc at all.
+
+### The retry sweep was a no-op: `zines_absorb` refused every blob it already held — `FIXED`
+
+Attempted: verify the key epidemic end to end in `zines_bulletin_tests`. Test 2 drains the
+bulletin as B (blob held, unreadable), then A sends a `ZineGrant` over the session, then B polls
+again and is expected to open the blob it is already holding.
+
+Symptom: after the grant, the post appeared in B's index with an empty title and empty sections:
+
+```
+assertion `left == right` failed
+  left: String("")
+ right: "On relays"
+```
+
+`unreadable_blobs` had gone from 1 to 0 and the blob was flagged readable, so the *key* had
+landed; what had not landed was the *plaintext*. `zines_retry_unreadable` called `zines_absorb`
+for each held-unreadable blob, and `zines_absorb` began with `if parsed.holds_blob(&hash) {
+return false }` — the drain's dedup guard. The retry sweep exists precisely to revisit a blob that
+is held and unopened, so that guard made every retry a no-op. The post stayed a placeholder:
+`apply_grant` had created a `ZineFile` with an empty pen name and revision 0, and nothing ever
+filled it in.
+
+Resolution: split the placement from the guard. `zines_place` does the trial decryption and
+filing; `zines_absorb` is now `if holds_blob { false } else { zines_place(...) }`, and the retry
+sweep calls `zines_place` directly. Also made step 3 (`held unreadable, never discarded`) report
+the real outcome from `hold_blob`'s `BlobHeld` instead of a hardcoded `true`, so a blob that is
+already held and still opens to nothing answers "nothing changed" rather than making every poll
+rewrite `zines.enc`. Lesson: a dedup guard belongs to the caller that needs dedup, not to the
+function both callers share — putting it in the shared function silently disabled the one caller
+whose job was to revisit what was already stored.
+
+### Two integration tests dropped the relay's temp database while SQLite held it open — `FIXED`
+
+Attempted: run the three-daemon bulletin tests, each of which starts a real relay on a port with
+`relay_on_a_port()` returning `(url, NamedTempFile, Member, Member)`.
+
+Symptom: every relay write in tests 2 and 3 answered `500 Internal Server Error`
+(`bulletin put failed: 500`, `recv failed: delete failed: 500`), while test 1 passed. Patching
+every `map_err(|_| RelayError::Internal)` in `hush-relay/src/store.rs` to print the underlying
+error gave the actual cause:
+
+```
+DBG relay: attempt to write a readonly database
+```
+
+The tests destructured the tuple in the wrong order — `let (_relay_db, _, a, b) = pair().await;`
+bound the *URL string* to `_relay_db` and the `NamedTempFile` to `_`, so the temp file was dropped
+at the binding and deleted, and SQLite kept writing to an unlinked inode. The `500` was a
+plausible-looking symptom pointing at the new bulletin SQL, which was not at fault.
+
+Resolution: bind the file — `let (_relay, _relay_db, a, b) = pair().await;` — and the debug
+`eprintln!`s were reverted (restored from a pre-patch copy of `store.rs`). Lesson: `_name` still
+binds and `_` drops; when a handle's lifetime is load-bearing, the placeholder must be named. Also:
+`RelayError::Internal` swallowing the SQLite message cost several build-test cycles — a log line
+at the conversion point would have made this a one-run diagnosis.
+
+### `hush-cli` did not know the new payload tag — `FIXED`
+
+Attempted: build the workspace after adding `MessagePayload::ZineGrant`.
+
+Symptom: `error[E0004]: non-exhaustive patterns: ZineGrant { .. } not covered` in
+`crates/hush-cli/src/main.rs`, in the `recv` printing match. The core crate compiled, so the break
+was only visible from a workspace build.
+
+Resolution: added the variant to the group of control payloads the CLI never prints, with a comment
+saying why. Lesson: a new `MessagePayload` variant is a workspace-wide change; `cargo build
+--workspace` is the check, not `-p hush-core`.
+
+### A tie-break test asserted the wrong winner — `FIXED`
+
+Attempted: test the rule that resolves two honest revisions under one revision number (a vault
+cloned onto two devices): the greater content hash wins. The test picked its winner with
+`content_hash(&a) > content_hash(&b)` on the descriptors it had built.
+
+Symptom: `assertion left == right failed: the lesser hash does not displace the head — left:
+Advanced, right: Superseded`. The store compares hashes of the *validated* descriptors, and
+validation normalizes sections and clamps the clock, so it hashes different bytes than the test
+did. Hashing is not order-preserving, so the two disagreed about which descriptor had the greater
+hash.
+
+Resolution: the test now asserts the property that actually matters — ingest both orders, assert
+both vaults land on the same head and both keep the loser as history — instead of picking a winner
+outside the code under test. Lesson: when the code normalizes its input before hashing it, a test
+that hashes the raw input is testing its own copy of the rule.
+
+---
+
+
+
+## 2026-10-13 — Zines: the front page (two columns, corpus on the page)
+
+Trigger: "i imagine zines home page to be like a newspaper first page and showing categories on
+homepage instead of pane ... the pane is only control stuff". The reshape is described in
+`docs/tasks/zines.md` (Phase 4 reshape note). The entries below are the problems hit doing it: two
+are real defects in the new code, three are the verification harness reading a page that had not
+finished loading, and one is an agreed design rule I had not implemented.
+
+### The pending front-page scroll was consumed by the story page — `FIXED`
+
+Attempted: carry the reader's place on the front page across a story, the same way the chat pane
+carries its scroll position (`pendingChatScroll`).
+
+Symptom: the browser check reported `{"left":149,"back":0}` — the position was captured and then
+lost. Cause: the restore hook in `render()` looked for `.zines-page` and consumed the pending value
+on the *next* render, which is the story's own render, because a story is rendered inside a
+`.zines-page` too. The value was cleared before the reader ever came back.
+
+Resolution: only the front page consumes it — the hook also requires `.zines-masthead` inside the
+page. Re-verified: `{"left":149,"back":149}` at a 420px viewport, so the page really scrolled.
+Lesson: a "pending" value applied by a generic render hook needs the hook to know *which* render
+consumes it; matching on a container class shared by both states is not enough.
+
+### The lead was the newest story, muted or not — `FIXED`
+
+Attempted: build the front page from the agreed design, where Q4 settled "the lead is the newest
+**unmuted** post".
+
+Symptom: none in the code — `stories[0]` looks obviously right. It surfaced when the browser check
+muted the story the page was leading with: the muted story stayed the lead, so muting ("stop this
+zine competing for attention") did not move the page's loudest element. The rule had been agreed and
+then not implemented, and no test or type could have caught it.
+
+Resolution: `leadOf()` in `lib/zinesPage.ts` picks the newest unmuted story, falling back to the
+newest when every story is muted, with unit tests for both. Verified end to end: muting the lead
+hands it to the next unmuted story and unmuting gives it back.
+
+### Group ordering contradicted its own comment — `FIXED`
+
+Attempted: file a story carrying several sections under one heading, chosen by the section strip's
+order so a double-tagged story cannot be printed twice and cannot move depending on the order the
+author typed its tags.
+
+Symptom: the test failed with `actual: [{ name: 'systems' }]` against `expected: [{ name: 'rust' }]`.
+The code used `story.sections.find((s) => order.includes(s))` — the author's tag order — while the
+comment above it promised the strip's order.
+
+Resolution: `order.find((s) => story.sections.includes(s))`. Caught only because the rule was in the
+pure module with a test; the same code inline in a render function would have shipped. Lesson: the
+comment was the correct specification and the code disagreed with it — worth reading the comment as
+a spec when writing the test.
+
+### The harness clicked the rail before the app had painted it — `WORKED AROUND` (harness, not the app)
+
+Attempted: drive the new front page over CDP, starting by pressing the `Zines` rail button.
+
+Symptom: the whole run reported an empty pane — `paneText: ""`, no masthead, and every check failing
+— with no exception anywhere. The app was still on Chats: `document.body.innerText.length > 50` was
+satisfied by the unlock screen, the rail button did not exist yet, and the click helper returned
+`false` into a script that never checked it.
+
+Resolution: wait for the rail button itself before clicking, and assert the click returned `true`.
+Lesson: a click helper that returns a boolean needs its caller to assert it; "the element was not
+there yet" and "the feature is broken" look identical otherwise.
+
+### The reader paints before the story arrives — `WORKED AROUND` (harness, not the app)
+
+Attempted: assert the story's headline and body after clicking a headline on the front page.
+
+Symptom: `{"back":"← Front page","title":null,"body":""}` — the reader and its way back were there,
+the article was not, because `renderZinesReader` paints an "Opening…" placeholder while the detail is
+in flight. Reading it at that moment is not a defect, but it is a false failure.
+
+Resolution: wait for `.zine-article h1` rather than for `.zines-reader`. The same trap appeared twice
+more: waiting for the masthead instead of the index (the masthead paints first), and clicking
+"Unmute" on a story that was already muted, where the button read "Unmute" *before* the click and the
+way back was therefore read from a view the daemon had not updated yet. Fixed by waiting for the
+state the click should produce (the button flipping back to "Mute"), not for the button's label.
+
+### The daemon's zines index takes seconds — `OPEN`
+
+Observed: `GET /api/zines` answered in 3.4s on `peer-a` (a 1.7GB vault), and the UI shows an empty
+pane until it lands — the masthead paints immediately, the pen name and the strip wait for the view.
+Not a defect in this slice (the request is unchanged), and not something the front page made worse,
+but it is the reason a cold open of the rail looks empty for a beat. Worth measuring against a large
+corpus before Phase 4's browsing work leans on it further.
+
+### The Write-a-post pill was 11px wider than its own pane — `FIXED`
+
+Trigger: "fix button of write a post". Attempted: measure the button against the column it lives in
+rather than eyeball the screenshot.
+
+Symptom: `.zines-pane` reported `clientWidth 231` but `scrollWidth 255`, and the button's right edge
+sat 11px past the pane's right edge, so the pill was clipped and the pane scrolled sideways. Cause:
+`.btn-primary` sets `width: 100%`, and `.zines-pane` is a padding-less flex column, so 100% was the
+*whole* pane width and the button's own `0 12px 12px` margins were added on top of it. Pre-existing,
+not introduced by the front-page reshape — the button lived in the old `.zines-nav`, also a
+padding-less flex column, so it had been clipped since Phase 1.
+
+Resolution: `.zines-write { width: auto }`, which as a stretched flex item resolves to the pane's
+content width *minus* the margins — the same fix `.trusts-add` and `.conclaves-new` already carry
+for the same reason. Verified: `clientWidth 231 / scrollWidth 231`, no sideways scroll, button 207px
+at a 12px inset, flush with the pen card and the view controls above it, and a real mouse click at
+its centre still mounts the editor.
+
+Lesson: the 33-assertion browser suite for the front page passed while the pane was visibly broken,
+because every assertion looked at the page and none looked at whether the pane's own controls fit
+the column. Measuring `scrollWidth` against `clientWidth` is a one-line check that catches the whole
+class; the suite now carries it (40 checks) and it was confirmed sensitive by re-injecting
+`width: 100%` at runtime, which reproduces `sideways: true` and `zines-write:11px`. Scanning the other
+ten rails the same way found no second instance; `Reads` shows a phantom 8px sideways scroll from
+the scrollbar gutter, with no descendant painting past the edge, and is left alone as cosmetic and
+out of this slice's scope.
+
+### The same button silently wiped a draft that was still being written — `FIXED`
+
+Found while checking what else the button does. The pane is rendered in every Zines state, so
+`Write a post` sat there while a draft was open and its handler (`zinesStartNewPost`) starts an
+*empty* draft. Symptom, driven through the live UI: typed `"A draft I am still writing"` plus a
+paragraph, pressed the pane button, and read back `{"title":"","body":"\n"}` — the text was gone with
+no confirmation and nothing to undo.
+
+Resolution: the button is rendered only when `!this.zinesEditing`, the way the Notes pane hides
+`New note` while its editor is open (`if (!this.notesEditorOpen)`). The draft page already carries
+`Publish` and `Discard`, so the pane has nothing to add mid-draft. Verified through the live UI with
+a reload against the new source: front page offers the button and it fits, the draft holds what was
+typed, the pane hides the button while drafting, `Publish` is still enabled, discarding brings the
+button back with the front page, and pressing it again opens a genuinely clean draft.
+
+Lesson: the first pass fixed what was reported (a clipped pill) and stopped there; the destructive
+path was one click away and only showed up by asking what else the control does in each state it is
+rendered in. A control that starts fresh work should be checked in every state where it is visible,
+not just the state the report named.
+
+---
+
+
 ## 2026-10-13 — Zines: many posts per pen name
 
 Trigger: "Currently zine only allow one post?!" — a correct observation. Phase 1 had made the pen

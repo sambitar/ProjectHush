@@ -314,8 +314,9 @@ not "leaves nothing behind."
       index plus the id it wrote, because a create's id is the daemon's to choose.
 - [x] ProseMirror editor + toolbar (no CRDT), rendered from local assets.
       `apps/hush-tauri/src/lib/proseSchema.ts` (shared with Paper), `apps/hush-tauri/src/lib/zineStore.ts`,
-      the Zines pane in `apps/hush-tauri/src/app.ts` (Rail button, three-column view, pen-name modal,
-      forget confirmation), `apps/hush-tauri/src/styles/app.css`.
+      the Zines pane in `apps/hush-tauri/src/app.ts` (Rail button, the front page and its
+      controls pane, pen-name modal, forget confirmation), `apps/hush-tauri/src/styles/app.css`,
+      `apps/hush-tauri/src/lib/zinesPage.ts`.
 
 **Verify:** author a zine with sections, restart — it survives; lock — every route 401s and `zines.enc`
 on disk is ciphertext; `cargo test -p hush-daemon`.
@@ -340,22 +341,58 @@ history entries while the second stayed at rev 1. The scratch posts were forgott
 the vault with the migrated original only. Problems hit are logged in
 [`DEEPSEEKPROBLEMS.MD`](../../DEEPSEEKPROBLEMS.MD) (2026-10-13 section).
 
+**Verified 2026-10-13** for the front page, in the real UI (Vite on 5173 against the daemon on 9876,
+vault `peer-a`, driven over CDP): 33 assertions, all passing. The masthead and its dateline render,
+the strip reads `All 2 / politics 1`, the lead is set at 40px in the serif face while the body stays
+in the interface font, the remaining story is filed under `politics`, and the pane's text contains no
+headline at all — the pane is controls. Clicking a headline opens the story with `← Front page` and
+the body; coming back restores the front page's scroll position (149px out, 149px back, at a 420px
+viewport so the page really scrolled). Picking a section drops the group headings and leaves only
+that section's stories; `Mine only` narrows the page *and* the strip counts together. Muting the lead
+from its own page hands the lead to the next unmuted story, prints the muted one as a muted card
+under `Unsorted`, and the pane's `Muted posts` switch hides and restores it; unmuting gives the lead
+back. Edge checks: the draft editor keeps a real height in the new container, `Discard` returns to
+the front page, and at the app's 760px minimum width the page does not overflow and the card grid
+collapses to one column. `npm test`: 26 passed (10 new, for `lib/zinesPage.ts`); `npx tsc --noEmit`
+and `npm run build`: clean.
+
 ### Phase 2 — Bulletin lane (broadcast delivery)
-- [ ] Relay: `PUT /b` / `GET /b`, storage without an author column, cap, TTL, per-member rate limit; relay tests (unauthorized publish fails; TTL drops; a drain is not attributable).
-- [ ] Daemon: publish a signed sealed blob; drain the lane; content-addressed dedup; signature + AEAD verification.
-- [ ] Unreadable blobs are held, not discarded.
+- [x] Relay: `PUT /b` / `GET /b`, storage without an author column, cap, TTL, per-member rate limit; relay tests (unauthorized publish fails; TTL drops; a drain is not attributable).
+- [x] Daemon: publish a signed sealed blob; drain the lane; content-addressed dedup; signature + AEAD verification.
+- [x] Unreadable blobs are held, not discarded.
 
 **Verify:** two daemons and a real relay: A publishes; B drains the blob (still unreadable); `relay.db` holds no pen name, title, tag, or body plaintext.
 
+**Verified 2026-10-13** by `zines_bulletin_tests::a_published_zine_reaches_a_reader_unreadable_and_the_relay_holds_no_plaintext`
+(`cargo test -p hush-daemon`), which runs a real relay on a port with two daemons and two vaults. A
+publishes `TITLE-MARKER` / `SECTION-MARKER` / `BODY-MARKER` under `BYLINE-MARKER`; B polls and the
+index holds **no post** but `held_blobs: 1`, `unreadable_blobs: 1` — an unopenable blob is not
+rendered as an empty article. The relay's own database file is then read bytewise and none of the four
+markers appears anywhere in it. A second poll does not duplicate the blob, and the cursor did not
+rewind. The relay's own suite (`crates/hush-relay/tests/bulletin.rs`) covers the lane directly:
+publish and drain authorize on the read token, an unauthorized publish is refused, the blob cap and
+the TTL drop, the stored row carries no author, and a re-post keeps its `seq`.
+
 ### Phase 3 — Key epidemic + comments
-- [ ] `ZineGrant` send/receive; a holder re-shares to their contacts; the retry-unreadable sweep classifies newly readable blobs.
-- [ ] Comments: seal to the pen-name public key, publish, pull, trial-decrypt, merge, republish.
+- [x] `ZineGrant` send/receive; a holder re-shares to their contacts; the retry-unreadable sweep classifies newly readable blobs.
+- [x] Comments: seal to the pen-name public key, publish, pull, trial-decrypt, merge, republish.
 
 **Verify:** A publishes; grants B; B reads; B re-shares to C who has no session with A; C reads; C comments; A merges it and B/C see the merged thread.
 
+**Verified 2026-10-13** by `a_grant_makes_a_held_blob_readable_and_a_comment_comes_back_merged` and
+`a_holder_re_shares_a_key_it_was_given`. The first: A publishes; B drains and holds it unreadable; A
+grants over the session; B's *next poll* re-tries the blob it already holds and the post opens
+(readable, titled, sectioned) with `unreadable_blobs` back to 0. B comments; the comment is sealed to
+A's pen name, published, and `published: true` is reported. A polls and the comment waits in
+`pending_comments` — pulled but **not** merged. Accepting it opens revision 2 and republishes; B
+drains and sees the merged thread at revision 2 with the commenter's byline. A second comment is then
+refused and drops out of the pile. The second test walks the re-share: A publishes, grants B, B
+**re-shares to C** (a member C has no session with A for), and C reads the post — which is the
+epidemic proper, and the only path by which readability reaches beyond the author's own contacts.
+
 ### Phase 4 — Browsing
-- [ ] Local index: all / by section / by pen name; newest-first with clamped timestamps; local mute.
-- [ ] Unreadable-blob indicator and empty states; honest copy from Section 7.
+- [x] Local index: all / by section / by pen name; newest-first with clamped timestamps; local mute.
+- [x] Unreadable-blob indicator and empty states; honest copy from Section 7.
 
 **Verify:** a corpus of several zines browses by section and pen name; a muted pen name disappears locally with no wire effect.
 
@@ -364,12 +401,96 @@ the local mute, and the unreadable/empty states all landed with Phase 1 — `Zin
 both filters and the pane renders the facets. What Phase 4 still owes is the pen-name filter in the
 UI and a corpus to browse, so the boxes stay unticked.
 
+**Landed (2026-10-13) — the pen-name filter, the corpus note, and the honest copy.** The byline is a
+control on both a card and a story: clicking it narrows the front page to everything signed by that
+byline, and the page carries the active filter as a chip with its own way out (`renderZinesPenFilter`).
+The rule lives in `lib/zinesPage.ts` (`byByline`) with unit tests, and it is deliberately **whole-name
+and case-insensitive** rather than the daemon's substring `pen` query — a reader clicking "ada" is
+asking for ada, not for everyone whose name contains it. The filter is applied to the corpus this vault
+already holds, so the strip's counts and the page's stories still come from one payload. The corpus note
+(`renderZinesCorpusNote`) prints the held/unopened blob counts only when there is something unopened to
+report, and says why those bytes are kept rather than dropped.
+
+**Verified 2026-10-13** for the filter rules: `npm test` — 30 passed, including the four new byline
+cases (case-insensitive, whole-name, null-is-no-filter, and an unopened story matching the
+`unknown byline` its card prints). `npx tsc --noEmit` and `npm run build`: clean. Not verified: the
+filter clicked in a live browser against a corpus of several bylines, which needs the running app —
+the composition rules are unit-tested and the paint is one `filter` call, but that is not the same
+evidence and is stated as such here.
+
+
+**Reshape (2026-10-13) — the corpus is a front page, the pane is controls.** The three-column pane
+(nav / list / main) made the pane a second, worse copy of the page beside it: the same corpus indexed
+twice, once as facets and once as rows. It is now two columns.
+
+- **The page** (`renderZinesFront`) is a newspaper front page: a masthead (`Zines` and the reader's
+  own date — generic on purpose, because the page carries other people's zines as much as this
+  vault's), the corpus's own sections as a clickable strip, one lead story, then the rest of the
+  corpus under section headings, with unsectioned stories under `Unsorted` last.
+- **The lead** is the newest story the reader has not muted (`leadOf`), so muting the lead hands the
+  front page to the next unmuted story rather than leaving a headline the reader asked to stop seeing.
+  A page of nothing but muted stories still leads with the newest: a page needs a headline.
+- **The strip counts** are derived from the stories the page would actually show (`sectionCounts`),
+  not from the daemon's whole-corpus facet, so a view control that hides stories never leaves a strip
+  entry promising something that is not there.
+- **The pane** holds only what a reader *does*: the pen-name card, `Write a post`, and two view
+  switches, `Mine only` and `Muted posts`. The section facet is gone from it.
+- **`Write a post` disappears while a draft is open** (`!zinesEditing`), the way the Notes pane hides
+  `New note` while its editor is open. The handler starts an *empty* draft, so leaving it visible
+  mid-draft made it a silent discard of whatever was typed; the draft page's own `Publish` and
+  `Discard` are the only ways out of a draft.
+- **The pane's controls fit the column.** `.zines-pane` is a padding-less flex column, so a
+  `btn-primary` (which is `width: 100%`) plus its own side margins is wider than the pane; the write
+  button therefore carries `width: auto`, like `.trusts-add` and `.conclaves-new`. A control that
+  overshoots its pane clips the pill and gives the pane a sideways scroll.
+- **A story** opens on its own page with `← Front page` above it, and coming back lands where the
+  reader left the page (`pendingZinesScroll`, applied by the front page's own render — a story is
+  also a `.zines-page`, so consuming the position there would drop it).
+- The composition rules (strip order, grouping, the lead) live in `lib/zinesPage.ts` with unit tests,
+  because they are rules rather than markup.
+
+Phase 4's remaining box is ticked above: the byline filter landed 2026-10-13.
+
 ### Phase 5 — Retention, hardening, docs
-- [ ] Holder **re-post sweep** (rate-limited, signature-verified) keeps held zines in the window; per-zine and total caps surface reasons.
-- [ ] `DISTRO_READINESS.md` (bulletin storage growth on the relay; no new client egress), `THREAT_MODEL.md`, `PROTOCOL.md`.
+- [x] Holder **re-post sweep** (rate-limited, signature-verified) keeps held zines in the window; per-zine and total caps surface reasons.
+- [x] `DISTRO_READINESS.md` (bulletin storage growth on the relay; no new client egress), `THREAT_MODEL.md`, `PROTOCOL.md`.
 - [ ] Optional later: Nostr **export** (sign a NIP-23 event with the pen name; publish over Tor) — the reshaped Task 11.
 
 **Verify:** a zine survives the window on a holder's re-post with the author offline; full dogfood with no plaintext on disk; export produces a verifiable NIP-23 event.
+
+**Landed (2026-10-13).** The sweep runs at the end of every bulletin pass (`zines_sync`, step 5):
+`ZinesState::repost_due` selects held blobs the relay has not seen for `ZINES_REPOST_AFTER_MS`
+(7 days, a quarter of the 30-day window) and `ZINES_REPOST_PER_PASS` (2) of them are re-published,
+because the relay's publish limit is 60 a minute and the daemon polls every few seconds. The
+timestamps are persisted, so a restart does not re-send the same batch, and the relay keeps a re-post's
+original `seq`, so a refresh does not hand every drainer a second copy. The caps now surface: the
+store counts what `trim_blobs` evicted (`dropped_since_read`) and the drain reports it in the daemon's
+log with both cap figures and which blobs go first, rather than letting a corpus shrink silently.
+`THREAT_MODEL.md`, `PROTOCOL.md`, and `DISTRO_READINESS.md` are updated to the built wire, including
+the two corrections the build forced (listed at the end of this phase).
+
+**Not verified:** a zine actually surviving the 30-day window on a holder's re-post with the author
+offline — that is a 30-day clock, so what is verified is the selection rule (`repost_due` unit-tested
+against `NOW`-relative timestamps) and that the pass re-publishes what it selects. Also not verified:
+the live UI dogfood (A → B → C in the running app), because it needs two daemons, a relay, and a
+browser; the daemon-level integration tests cover the same wire, and the gap is stated rather than
+implied.
+
+**Two design notes the build corrected** (the docs are updated to the built form, and the corrections
+are recorded here so the earlier text is not trusted over the code):
+
+- **The bulletin authorizes publish with the read token, not the delivery token.** The design note had
+  publish on the delivery credential and drain on the read credential, reusing the queue split. The
+  code (`Store::put_bulletin` → `authorize_read_or_create`) uses the **read** token for both. That is
+  the narrower choice in one respect and the simpler one in another: a publish no longer spends or
+  reveals a delivery slot, and the credential a member publishes with is the one every member already
+  uses to drain, so a publish and a drain are not distinguishable by credential alone.
+- **A re-post keeps its `seq`.** The lane is content-addressed (`hash` is `UNIQUE`, the insert is an
+  upsert that only moves `inserted_at`), so refreshing a blob's window does not move it to the end of
+  the log. Without that, every drainer would receive a second copy of every re-posted blob and dedup
+  would be the client's problem on every poll rather than the relay's on insert.
+
+
 
 ---
 

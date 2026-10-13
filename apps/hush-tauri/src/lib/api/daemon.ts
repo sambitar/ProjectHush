@@ -607,4 +607,31 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ name }),
     }),
+  // --- The wire: a grant hands the read key to one contact over the session
+  // that already exists, and a comment is sealed to the author's pen name and
+  // published to the bulletin lane. Both are queued by the worker, so a
+  // `published: false` answer is a status rather than a lost write. ---
+  /** Hand one contact this post's read key. Any holder may share. */
+  zinesGrant: (zineId: string, contact: string) =>
+    request<ZinesViewDto>(`/api/zines/${encodeURIComponent(zineId)}/grant`, {
+      method: "POST",
+      body: JSON.stringify({ contact }),
+    }),
+  zinesComment: (zineId: string, body: string) =>
+    request<ZinesWriteDto>(`/api/zines/${encodeURIComponent(zineId)}/comment`, {
+      method: "POST",
+      body: JSON.stringify({ body }),
+    }),
+  /** Merge a pulled comment. This is a revision, and it republishes the post. */
+  zinesAcceptComment: (zineId: string, commentHash: string) =>
+    request<ZinesWriteDto>(
+      `/api/zines/${encodeURIComponent(zineId)}/accept-comment`,
+      { method: "POST", body: JSON.stringify({ comment_hash: commentHash }) },
+    ),
+  /** Refuse a pulled comment. Not a retraction: it was never published. */
+  zinesDiscardComment: (zineId: string, commentHash: string) =>
+    request<ZineViewDto>(
+      `/api/zines/${encodeURIComponent(zineId)}/discard-comment`,
+      { method: "POST", body: JSON.stringify({ comment_hash: commentHash }) },
+    ),
 };

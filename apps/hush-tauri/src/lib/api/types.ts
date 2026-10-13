@@ -604,6 +604,9 @@ export interface ZineSummaryDto {
   /** Monotonic per zine, from 1. */
   revision: number;
   comments: number;
+  /** Comments pulled and not yet accepted. Author-side only: the writer needs
+   *  to see the pile, and a reader never has one. */
+  pending: number;
   /** A short plain-text taste of the body, for the list row. */
   preview: string;
   /** Whether this vault is the author. Only the author's pen name can publish
@@ -625,6 +628,17 @@ export interface ZineCommentDto {
   created_ms: number;
   /** When this vault merged it: a local fact, never published. */
   merged_ms: number;
+}
+
+/** A comment pulled from the lane and waiting for the author's decision.
+ *
+ *  Same shape as a merged one minus `merged_ms`: it is not in the thread, and
+ *  accepting it is what puts it there. */
+export interface ZinePendingCommentDto {
+  hash: string;
+  author: string;
+  body: string;
+  created_ms: number;
 }
 
 /** A superseded revision, kept so a mistake can be undone. */
@@ -665,6 +679,8 @@ export interface ZineFileDto {
   authored: boolean;
   read_key: string | null;
   unreadable: boolean;
+  /** Pulled comments waiting for this vault's decision. Author-side only. */
+  pending_comments: ZinePendingCommentDto[];
   muted: boolean;
   updated_ms: number;
 }
@@ -694,6 +710,12 @@ export interface ZinesViewDto {
   /** Absent until a byline has been chosen: publishing before then is refused
    *  with a reason rather than minting one silently. */
   pen_name: PenNameDto | null;
+  /** Sealed blobs this vault holds the bytes of, opened or not. These are what
+   *  the re-post sweep keeps alive on the relay. */
+  held_blobs: number;
+  /** Of those, the ones no key has opened yet. Held on purpose, and a key may
+   *  still arrive. */
+  unreadable_blobs: number;
 }
 
 /** `GET /api/zines/{id}` */
@@ -717,4 +739,9 @@ export interface ZineDraftDto {
 export interface ZinesWriteDto extends ZinesViewDto {
   zine_id: string;
   revision: number;
+  /** Whether the sealed blob reached the relay. `false` is not a lost write:
+   *  the bytes are held and the re-post sweep sends them again. */
+  published: boolean;
+  /** Why the publish failed, when it did. Empty on success. */
+  publish_error: string;
 }

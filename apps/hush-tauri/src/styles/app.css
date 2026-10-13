@@ -3963,12 +3963,13 @@ button.library-item-main {
 
 /* ---------------------------------------------------------------------------
    Zines: a member's own publication, and the ones they hold.
-   The same three-column shape as Reads (nav, list, main), because the model is
-   the same one: a pull-only corpus with a facet, and an article on the right.
+   Two columns rather than the three Reads uses. The corpus is not a list beside
+   a reader, it is a front page: the page carries every story, its sections and
+   the reader, and the pane keeps only the things a reader does.
    --------------------------------------------------------------------------- */
 
-.zines-nav {
-  width: 220px;
+.zines-pane {
+  width: 232px;
   flex-shrink: 0;
   border-right: 1px solid var(--border);
   background: var(--surface);
@@ -4015,149 +4016,319 @@ button.library-item-main {
   margin-top: var(--space-2);
 }
 
+/* `btn-primary` is `width: 100%`, and this pane is a flex column with no
+   padding, so 100% is the full pane width and the button's own 12px margins
+   then push it 11px past the pane's edge: the pill was clipped and the pane
+   scrolled sideways. Stretched as a flex item, the width excludes the margins —
+   the same fix `.trusts-add` and `.conclaves-new` carry for the same reason. */
 .zines-write {
+  width: auto;
   margin: 0 var(--space-3) var(--space-3);
 }
 
-.zines-facet {
+/* The view controls: the pane's other job. Ruled off from the identity card and
+   the write button above, because these change what the page shows rather than
+   what the vault holds. */
+.zines-controls {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 0 var(--space-2);
+  gap: var(--space-2);
+  margin: 0 var(--space-3) var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
 }
 
-.zines-facet-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border: none;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-dim);
-  text-align: left;
-  cursor: pointer;
-}
-
-.zines-facet-row:hover {
-  background: var(--surface-2);
-}
-
-.zines-facet-row.active {
-  background: var(--surface-2);
-  color: var(--text);
+.zines-controls-head {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
   font-weight: 600;
 }
 
-.zines-list {
-  width: 320px;
-  flex-shrink: 0;
-  border-right: 1px solid var(--border);
-  background: var(--surface);
-  display: flex;
-  flex-direction: column;
+.zines-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.zines-toggle input {
+  accent-color: var(--accent);
+}
+
+/* --- The front page ------------------------------------------------------- */
+
+.zines-page {
+  flex: 1;
+  min-width: 0;
   overflow-y: auto;
-  min-height: 0;
-  padding: 0 var(--space-2) var(--space-4);
+  padding: var(--space-5) var(--space-6) var(--space-7);
+  background: var(--background);
 }
 
-.zines-status {
-  padding: var(--space-3) var(--space-3) 0;
+/* A masthead is the page naming itself, not a header over a list: serif, wide
+   letterspacing, and the double rule that separates the name from the contents
+   under it. The name is deliberately generic — this page carries other people's
+   zines as much as this vault's, so it is a newsstand, not one pen name's paper.
+   The date is the reader's own day, in their own locale. */
+.zines-masthead {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding-bottom: var(--space-3);
+  border-bottom: 3px double var(--border);
+  text-align: center;
 }
 
-.zines-retry {
-  margin: var(--space-3) var(--space-3) 0;
+.zines-masthead-name {
+  margin: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 44px;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
-.zines-row {
+.zines-masthead-date {
+  margin: var(--space-1) 0 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+}
+
+/* The section strip: the corpus's own categories, printed on the page. It was
+   in the pane before, which made the pane a second index of the same corpus. */
+.zines-sections {
+  max-width: 1080px;
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.zines-section-btn {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: var(--space-1) var(--space-2);
+  cursor: pointer;
+}
+
+.zines-section-btn:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.zines-section-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.zines-section-count {
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--text-faint);
+}
+
+.zines-section-btn.active .zines-section-count {
+  color: var(--accent-strong);
+}
+
+/* The lead: the one story the page prints big. Centred, serif, and ruled off
+   from the sections under it. */
+.zines-lead {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: var(--space-5) 0 var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.zine-card {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-  padding: var(--space-3);
-  border-radius: var(--radius-md);
 }
 
-.zines-row:hover {
-  background: var(--surface-2);
-}
-
-.zines-row.open {
-  background: var(--surface-2);
-}
-
-/* A muted zine is still held and still listed; it just stops competing for
-   attention with the ones the reader has not seen. */
-.zines-row.muted-row {
-  opacity: 0.6;
-}
-
-.zines-row-top {
-  display: flex;
-  align-items: baseline;
+.zine-card.lead {
+  align-items: center;
+  text-align: center;
   gap: var(--space-2);
 }
 
-.zines-row-title {
-  flex: 1;
+.zine-card-kicker {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-dim);
+}
+
+.zine-card-mine {
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+/* Headlines are the one place in this app that is set in serif: it is what a
+   front page is, and it is confined to the cards so the rest of the app keeps
+   the interface font it shares with every other pane. */
+.zine-card-title {
   border: none;
   background: transparent;
   color: var(--text);
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1.25;
   text-align: left;
-  line-height: 1.35;
   padding: 0;
   cursor: pointer;
 }
 
-.zines-row-mine {
-  flex-shrink: 0;
-  color: var(--accent-strong);
-  font-weight: 600;
-}
-
-.zines-row-preview {
-  margin: 0;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  line-height: 1.4;
-}
-
-.zines-row-meta {
-  line-height: 1.4;
-}
-
-.zines-main {
-  flex: 1;
-  overflow-y: auto;
-  min-width: 0;
-  padding: var(--space-5) var(--space-6);
-  background: var(--background);
-}
-
-.zines-empty {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-3);
-  color: var(--text-dim);
+.zine-card.lead .zine-card-title {
+  font-size: 40px;
+  line-height: 1.1;
   text-align: center;
 }
 
-.zines-empty svg {
-  width: 40px;
-  height: 40px;
-  opacity: 0.5;
+.zine-card-title:hover {
+  color: var(--accent-strong);
+}
+
+.zine-card-preview {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.zine-card.lead .zine-card-preview {
+  font-size: 16px;
+  max-width: 68ch;
+  -webkit-line-clamp: 4;
+}
+
+.zine-card-meta {
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* The byline is a control on both the card and the article: clicking it is how
+   a reader narrows the page to everything signed by that name. It carries no
+   chrome of its own — it reads as the byline text it replaced — and only shows
+   itself as interactive under the pointer or the keyboard. */
+.zine-byline {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 2px;
+}
+
+.zine-byline:hover {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+
+.zine-byline:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* A muted story is still held and still printed; it just stops competing for
+   attention with the ones the reader has not seen. */
+.zine-card.muted-card {
+  opacity: 0.6;
+}
+
+/* Everything under the lead, in the strip's order, with the unsectioned last. */
+.zines-groups {
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.zines-group {
+  padding-top: var(--space-5);
+}
+
+/* A section heading is a label, not a headline: small, spaced, and ruled. */
+.zines-group-head {
+  margin: 0 0 var(--space-3);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-dim);
+}
+
+/* Cards flow into as many columns as the window allows: a front page is a grid
+   of columns, not one stack of rows. */
+.zines-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--space-5);
+  align-items: start;
+}
+
+/* A note in place of stories: loading, an error, or nothing to show. Sized for
+   reading rather than for the pane it sits in, because it can also sit inside a
+   story, where the width is the article's measure. */
+.zines-note {
+  margin: var(--space-4) 0 0;
+  max-width: 68ch;
+  line-height: 1.5;
+}
+
+.zines-retry {
+  margin: var(--space-3) 0 0;
+}
+
+/* --- One story ------------------------------------------------------------ */
+
+/* The reader's measure lives here rather than on the article, because the way
+   back sits inside it and has to line up with the story's first line. */
+.zines-reader {
+  max-width: 720px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.zines-back {
+  align-self: flex-start;
 }
 
 /* --- The article ---------------------------------------------------------- */
 
 .zine-article {
-  max-width: 720px;
-  margin: 0 auto;
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
@@ -4287,6 +4458,103 @@ button.library-item-main {
 
 .zine-comment-body {
   white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+/* The author's queue: comments that are not in the thread yet, so the row is
+   marked as pending and carries the two decisions. */
+.zine-comment.pending {
+  border: 1px solid var(--accent);
+  background: var(--surface-2);
+}
+
+.zine-pending,
+.zine-comment-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.zine-pending h2,
+.zine-comment-form h2 {
+  margin: 0;
+}
+
+.zine-pending-actions {
+  display: flex;
+  gap: var(--space-2);
+  padding-top: var(--space-1);
+}
+
+.zine-pending-actions .btn-primary,
+.zine-pending-actions .btn-secondary {
+  width: auto;
+}
+
+.zine-comment-input {
+  width: 100%;
+  min-height: 76px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.zine-comment-input:focus {
+  outline: none;
+  border-color: var(--accent-strong);
+}
+
+.zine-comment-send {
+  align-self: flex-start;
+  width: auto;
+}
+
+.zine-error {
+  color: var(--danger);
+}
+
+/* The active byline filter, on the page it narrows. It sits between the strip
+   and the stories because that is what it is: a second narrowing of the page,
+   with its own way out. */
+.zines-pen-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: var(--space-1) 0;
+}
+
+.zines-pen-chip {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--accent-strong);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.zines-pen-chip:hover {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* The corpus status line: quiet, and only there when there is something to say
+   about blobs this vault is holding unopened. */
+.zines-corpus-note {
+  max-width: 1080px;
+  margin: 0 auto var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-left: 2px solid var(--accent);
   line-height: 1.5;
 }
 

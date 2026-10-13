@@ -18,6 +18,7 @@ import type {
   WalletNetworkMode,
   WalletStateDto,
   WalletTokenDto,
+  ZinePendingCommentDto,
   ZineSummaryDto,
   ZineViewDto,
   ZinesViewDto,
@@ -209,6 +210,14 @@ import {
   zineEditorHtml,
   zineEditorIsDirty,
 } from "./lib/zineStore";
+import type { ZinesSectionCount } from "./lib/zinesPage";
+import {
+  byByline,
+  bylineOf,
+  groupBySection,
+  leadOf,
+  sectionCounts,
+} from "./lib/zinesPage";
 import {
   dropById,
   verifiedCount,
@@ -435,6 +444,23 @@ function paperReadOnlyReason(
     return "You are no longer a trustee of this conclave, so the paper is read-only.";
   }
   return null;
+}
+
+/**
+ * The Zines masthead's date line: the day the page is being read, in the
+ * reader's own locale.
+ *
+ * `undefined` rather than a fixed locale on purpose — a date line that reads
+ * like a wire dateline to a reader in Nebraska and like a foreign stamp to a
+ * reader in Osaka is worse than no dateline at all.
+ */
+function zinesDateLine(now: Date = new Date()): string {
+  return now.toLocaleDateString(undefined, {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
 }
 
 export class App {
@@ -687,9 +713,9 @@ export class App {
   /**
    * The Zines pane's state.
    *
-   * Phase 1 is local and offline: this vault authors one zine under its pen
-   * name and holds whatever else it has been given. Everything the pane needs
-   * to paint — the index, the section facet, the pen name — arrives in one
+   * Phase 1 is local and offline: this vault authors zines under its pen name
+   * and holds whatever else it has been given. Everything the pane needs to
+   * paint — the corpus, its sections, the pen name — arrives in one
    * `ZinesViewDto`, because three round trips would be three chances to render
    * a pane that disagrees with itself.
    */
@@ -698,6 +724,35 @@ export class App {
   private zinesError: string | null = null;
   /** The active section filter, or null for the whole corpus. */
   private zinesSection: string | null = null;
+  /**
+   * The active byline filter, or null for every byline.
+   *
+   * Applied to the corpus this vault already holds rather than asked of the
+   * daemon's `pen` query, because the front page and its strip are both derived
+   * from that corpus: a filter that came back as a second, differently-ordered
+   * list is a page that can disagree with its own counts.
+   *
+   * A byline is not an identity — it is free text, and two pen names may share
+   * one — so this narrows to "everything signed by this byline", which is what a
+   * reader clicking a byline means. The honest copy says byline, not author.
+   */
+  private zinesPen: string | null = null;
+  /**
+   * The pane's two view controls.
+   *
+   * Both are display decisions, not corpus changes: `Mine only` narrows the
+   * page to what this vault's pen name wrote, and `Show muted` decides whether
+   * muted stories appear at all. They live in the pane because that is what the
+   * pane is for — the corpus itself is on the front page.
+   */
+  private zinesMineOnly = false;
+  private zinesShowMuted = true;
+  /**
+   * Where the front page was scrolled when a story was opened, so coming back
+   * lands the reader where they left rather than at the masthead. Captured on
+   * the way in, applied after the pane has layout, cleared once used.
+   */
+  private pendingZinesScroll: number | null = null;
   /** The zine open in the reading pane. */
   private zinesOpenId: string | null = null;
   private zinesDetail: ZineViewDto | null = null;
@@ -732,6 +787,34 @@ export class App {
   private zinesPenNameDraft = "";
   private zinesPenNameError: string | null = null;
   private zinesForgetId: string | null = null;
+  /**
+   * The share dialog: which post's read key is being handed out, and to whom.
+   *
+   * The contact is held here rather than read back out of the picker for the
+   * same reason the draft's fields are: a re-render rebuilds the control.
+   */
+  private zinesShareId: string | null = null;
+  private zinesShareContact = "";
+  private zinesShareBusy = false;
+  private zinesShareError: string | null = null;
+  /**
+   * The comment being written on the open story.
+   *
+   * Outside the DOM for the same reason: the pane re-renders on a poll, and a
+   * half-typed comment must not go with it.
+   */
+  private zinesCommentDraft = "";
+  private zinesCommentBusy = false;
+  private zinesCommentError: string | null = null;
+  /** Which pending comment is mid-accept or mid-discard, so its row can say so. */
+  private zinesCommentBusyHash: string | null = null;
+  /**
+   * The stable host for the comment box, built once per open story and
+   * re-parented into the fresh article on every re-render — the same doctrine
+   * as the draft editor's host, because a poll repaints the page under the
+   * reader and a half-typed comment must not go with it.
+   */
+  private zinesCommentHost: HTMLTextAreaElement | null = null;
   private conclaveCreateOpen = false;
   /**
    * The in-progress create-conclave form.
@@ -1361,10 +1444,19 @@ export class App {
     this.zinesDetail = null;
     this.zinesOpenId = null;
     this.zinesSection = null;
+    this.zinesPen = null;
+    this.zinesMineOnly = false;
+    this.zinesShowMuted = true;
+    this.pendingZinesScroll = null;
     this.zinesError = null;
     this.zinesDetailError = null;
     this.zinesPenNameOpen = false;
     this.zinesForgetId = null;
+    this.zinesShareId = null;
+    this.zinesShareContact = "";
+    this.zinesShareError = null;
+    this.zinesCommentDraft = "";
+    this.zinesCommentError = null;
     clearReadsStore();
     clearNotesStore();
     clearTorrentsStore();
@@ -1467,9 +1559,8 @@ export class App {
     } else if (this.rail === "conclaves") {
       shell.appendChild(this.renderConclaves());
     } else if (this.rail === "zines") {
-      shell.appendChild(this.renderZinesNav());
-      shell.appendChild(this.renderZinesList());
-      shell.appendChild(this.renderZinesMain());
+      shell.appendChild(this.renderZinesPane());
+      shell.appendChild(this.renderZinesPage());
     } else if (this.rail === "reads") {
       shell.appendChild(this.renderReadsNav());
       shell.appendChild(this.renderReadsList());
@@ -1514,6 +1605,20 @@ export class App {
         liveMsgs.scrollTop = Math.min(pending.top, liveMsgs.scrollHeight);
       }
     }
+    // The front page scrolls like any long page, so a story opened from halfway
+    // down it puts the reader back at that point on the way out — the same
+    // carry-across as the thread pane above, and for the same reason. Only the
+    // front page consumes it: a story is also a `.zines-page`, and consuming
+    // the position there would throw it away before the reader came back.
+    const liveZines = this.root.querySelector<HTMLElement>(".zines-page");
+    if (
+      liveZines &&
+      this.pendingZinesScroll !== null &&
+      liveZines.querySelector(".zines-masthead")
+    ) {
+      liveZines.scrollTop = Math.min(this.pendingZinesScroll, liveZines.scrollHeight);
+      this.pendingZinesScroll = null;
+    }
     if (this.paletteOpen) this.root.appendChild(this.renderPalette());
     if (this.addFriendOpen) this.root.appendChild(this.renderAddFriend());
     if (this.readsAddOpen) this.root.appendChild(this.renderReadsAddModal());
@@ -1529,6 +1634,7 @@ export class App {
     if (this.notesViewingId) this.root.appendChild(this.renderNoteViewModal());
     if (this.zinesPenNameOpen) this.root.appendChild(this.renderZinesPenNameModal());
     if (this.zinesForgetId) this.root.appendChild(this.renderZinesForgetModal());
+    if (this.zinesShareId) this.root.appendChild(this.renderZinesShareModal());
     if (this.pendingUpdate) this.root.appendChild(this.renderUpdatePrompt());
   }
 
@@ -4934,11 +5040,68 @@ export class App {
     if (this.rail === "zines") this.render();
   }
 
-  /** The corpus as the list shows it, narrowed by the active section. */
+  /**
+   * The corpus after the pane's view controls and the byline filter, before the
+   * section filter.
+   *
+   * This is what the section strip counts and what the page is built from, so
+   * the two can never disagree: a control that hides stories hides them from
+   * the strip as well.
+   */
+  private zinesHeld(): ZineSummaryDto[] {
+    let held = this.zinesView?.zines ?? [];
+    if (this.zinesMineOnly) held = this.zinesMine();
+    if (!this.zinesShowMuted) held = held.filter((z) => !z.muted);
+    return byByline(held, this.zinesPen);
+  }
+
+  /** The front page's stories: the held corpus, narrowed by the active section. */
   private zinesFiltered(): ZineSummaryDto[] {
-    const all = this.zinesView?.zines ?? [];
+    const held = this.zinesHeld();
     const section = this.zinesSection;
-    return section ? all.filter((z) => z.sections.includes(section)) : all;
+    return section ? held.filter((z) => z.sections.includes(section)) : held;
+  }
+
+  /** The section strip, in the order the page files its stories under it. */
+  private zinesSections(): ZinesSectionCount[] {
+    return sectionCounts(this.zinesHeld());
+  }
+
+  /**
+   * Flip a front-page view control.
+   *
+   * A control that empties the section the page is filtered to would leave the
+   * reader on a blank page with no way to tell why, so the filter falls back to
+   * the whole corpus when the section stops being one the strip lists.
+   */
+  private zinesSetView(mineOnly: boolean, showMuted: boolean): void {
+    this.zinesMineOnly = mineOnly;
+    this.zinesShowMuted = showMuted;
+    const section = this.zinesSection;
+    if (section && !this.zinesSections().some((s) => s.name === section)) {
+      this.zinesSection = null;
+    }
+    this.pendingZinesScroll = null;
+    this.render();
+  }
+
+  /**
+   * Narrow the page to one byline, or clear it.
+   *
+   * Reached from a byline on a story or a card, which is the only place a reader
+   * can learn a byline they did not already know. It clears the section filter
+   * rather than stacking with it: the two are different narrowings of the same
+   * page, and a page silently filtered twice is a page that looks empty for no
+   * visible reason.
+   */
+  private zinesFilterByByline(pen: string | null): void {
+    this.zinesPen = pen;
+    if (pen) this.zinesSection = null;
+    this.zinesOpenId = null;
+    this.zinesDetail = null;
+    this.zinesDetailError = null;
+    this.pendingZinesScroll = null;
+    this.render();
   }
 
   /** Every post this vault's pen name wrote, newest first. */
@@ -4946,12 +5109,22 @@ export class App {
     return (this.zinesView?.zines ?? []).filter((z) => z.authored);
   }
 
-  /** Open a zine in the reading pane. */
+  /** Open a story on its own page. */
   private async zinesOpen(zineId: string): Promise<void> {
     if (this.zinesEditing) this.zinesDiscardDraft();
+    // Opening a story leaves the front page, so remember where it was: the
+    // reader coming back should land where they were reading, not at the top.
+    const front = this.root.querySelector<HTMLElement>(".zines-page");
+    if (front && !this.zinesOpenId) this.pendingZinesScroll = front.scrollTop;
     this.zinesOpenId = zineId;
     this.zinesDetail = null;
     this.zinesDetailError = null;
+    // A comment belongs to the story it was typed on, so opening another story
+    // starts a fresh box rather than carrying the text across.
+    this.zinesCommentHost = null;
+    this.zinesCommentDraft = "";
+    this.zinesCommentError = null;
+    this.zinesCommentBusyHash = null;
     this.render();
     try {
       const detail = await api.zinesGet(zineId);
@@ -5132,6 +5305,155 @@ export class App {
     if (this.rail === "zines") this.render();
   }
 
+  /**
+   * Hand the open post's read key to one contact.
+   *
+   * The dialog's own state is cleared first, so a failure reports into the
+   * announcement line rather than leaving a modal open over a story whose
+   * reading position the reader has already moved past.
+   */
+  private async zinesShare(): Promise<void> {
+    const zineId = this.zinesShareId;
+    const contact = this.zinesShareContact;
+    if (!zineId) return;
+    if (!contact) {
+      this.zinesShareError = "Choose a contact to send it to.";
+      this.render();
+      return;
+    }
+    this.zinesShareBusy = true;
+    this.zinesShareError = null;
+    this.render();
+    try {
+      const view = await api.zinesGrant(zineId, contact);
+      if (view) this.zinesView = view;
+      this.zinesShareId = null;
+      this.zinesShareContact = "";
+      this.announce(
+        `Key sent to ${displayNick(contact)}. They will read this post on their next poll.`,
+      );
+    } catch (e) {
+      this.zinesShareError =
+        e instanceof AppError ? e.message : "Couldn't send that key.";
+    }
+    this.zinesShareBusy = false;
+    if (this.rail === "zines") this.render();
+  }
+
+  /**
+   * Publish a comment on the open post.
+   *
+   * The comment is sealed to the author's pen name and goes to the lane, not to
+   * the author's inbox, so this needs no session with them — and the answer's
+   * `published` flag is reported honestly rather than assumed, because a relay
+   * that refused the put is a comment that only exists in this vault.
+   */
+  private async zinesPostComment(): Promise<void> {
+    const zineId = this.zinesOpenId;
+    if (!zineId || this.zinesCommentBusy) return;
+    const text = this.zinesCommentDraft.trim();
+    if (!text) {
+      this.zinesCommentError = "An empty comment is not worth publishing.";
+      this.render();
+      return;
+    }
+    this.zinesCommentBusy = true;
+    this.zinesCommentError = null;
+    this.render();
+    try {
+      const view = await api.zinesComment(zineId, text);
+      if (view) this.zinesView = view;
+      // The box is a stable host that outlives this render, so clearing the
+      // draft is not enough: the textarea still holds the text that was just
+      // published, and leaving it there invites a double post.
+      this.zinesCommentDraft = "";
+      if (this.zinesCommentHost) this.zinesCommentHost.value = "";
+      this.announce(
+        view?.published === false
+          ? "Comment kept in your vault. The relay refused it just now; your vault will re-post it."
+          : "Comment published to the lane. The author sees it once they poll.",
+      );
+    } catch (e) {
+      this.zinesCommentError =
+        e instanceof AppError ? e.message : "Couldn't publish that comment.";
+    }
+    this.zinesCommentBusy = false;
+    if (this.rail === "zines") this.render();
+  }
+
+  /**
+   * Merge one pulled comment, then republish the post.
+   *
+   * Both halves matter and both are reported: a merge that did not republish is
+   * a comment only this vault can see, and the re-post sweep will try again.
+   */
+  private async zinesAcceptComment(hash: string): Promise<void> {
+    const zineId = this.zinesOpenId;
+    if (!zineId || this.zinesCommentBusyHash) return;
+    this.zinesCommentBusyHash = hash;
+    this.render();
+    try {
+      const view = await api.zinesAcceptComment(zineId, hash);
+      if (view) this.zinesView = view;
+      this.announce(
+        view?.published === false
+          ? "Merged into revision " +
+              (view?.revision ?? 0) +
+              ", but the republish failed: " +
+              (view?.publish_error || "the relay refused it") +
+              ". Your vault will send it again."
+          : `Merged into revision ${view?.revision ?? 0} and republished.`,
+      );
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't merge that comment.",
+      );
+    }
+    this.zinesCommentBusyHash = null;
+    await this.zinesRefreshDetail(zineId);
+  }
+
+  /** Drop a pulled comment from the pile. Not a retraction: it was never out. */
+  private async zinesDiscardComment(hash: string): Promise<void> {
+    const zineId = this.zinesOpenId;
+    if (!zineId || this.zinesCommentBusyHash) return;
+    this.zinesCommentBusyHash = hash;
+    this.render();
+    try {
+      const detail = await api.zinesDiscardComment(zineId, hash);
+      // The pile is inside the zine, so the detail is patched from the answer
+      // rather than re-fetched: this changes nothing about the article.
+      if (detail && this.zinesOpenId === zineId) this.zinesDetail = detail;
+      this.announce("Comment dropped. It was never merged, so nothing is retracted.");
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't drop that comment.",
+      );
+    }
+    this.zinesCommentBusyHash = null;
+    if (this.rail === "zines") this.render();
+  }
+
+  /**
+   * Re-read the open story.
+   *
+   * A merge changes the descriptor — a new revision, a longer thread — and the
+   * detail on screen was fetched before it, so it is refetched rather than
+   * patched field by field.
+   */
+  private async zinesRefreshDetail(zineId: string): Promise<void> {
+    try {
+      const detail = await api.zinesGet(zineId);
+      if (this.zinesOpenId === zineId) this.zinesDetail = detail;
+    } catch (e) {
+      if (this.zinesOpenId === zineId) {
+        this.zinesDetailError =
+          e instanceof AppError ? e.message : "Couldn't open that zine.";
+      }
+    }
+    if (this.rail === "zines") this.render();
+  }
+
   private async zinesSavePenName(): Promise<void> {
     const name = this.zinesPenNameDraft.trim();
     if (!name) {
@@ -5158,12 +5480,16 @@ export class App {
   }
 
   /**
-   * The left column: who this vault publishes as, what it can write, and the
-   * section facet.
+   * The left column: identity and controls, never the corpus.
+   *
+   * The corpus used to be here as well — a section facet and a list of stories
+   * — which made the pane a second, worse copy of the page beside it. What is
+   * left is what a reader *does*: who they publish as, writing, and the two
+   * switches over what the front page shows.
    */
-  private renderZinesNav(): HTMLElement {
+  private renderZinesPane(): HTMLElement {
     const col = document.createElement("div");
-    col.className = "zines-nav";
+    col.className = "zines-pane";
 
     const head = document.createElement("div");
     head.className = "conv-list-header";
@@ -5214,7 +5540,10 @@ export class App {
     }
     col.appendChild(card);
 
-    if (penName) {
+    // Hidden while a draft is open, the way the Notes pane hides "New note": the
+    // button starts an empty draft, so pressing it mid-draft silently threw away
+    // whatever was typed. The draft page carries its own Publish and Discard.
+    if (penName && !this.zinesEditing) {
       const write = document.createElement("button");
       write.type = "button";
       write.className = "btn-primary pressable zines-write";
@@ -5223,172 +5552,397 @@ export class App {
       col.appendChild(write);
     }
 
-    const list = document.createElement("div");
-    list.className = "zines-facet";
-    const total = this.zinesView?.zines.length ?? 0;
-    list.appendChild(
-      this.zinesFacetRow("All", null, total, this.zinesSection === null),
+    const controls = document.createElement("div");
+    controls.className = "zines-controls";
+    const controlsHead = document.createElement("h2");
+    controlsHead.className = "zines-controls-head text-12 muted";
+    controlsHead.textContent = "Show";
+    controls.appendChild(controlsHead);
+    controls.appendChild(
+      this.zinesToggle("Mine only", this.zinesMineOnly, (on) =>
+        this.zinesSetView(on, this.zinesShowMuted),
+      ),
     );
-    for (const s of this.zinesView?.sections ?? []) {
-      list.appendChild(
-        this.zinesFacetRow(s.name, s.name, s.count, this.zinesSection === s.name),
-      );
-    }
-    col.appendChild(list);
+    controls.appendChild(
+      this.zinesToggle("Muted posts", this.zinesShowMuted, (on) =>
+        this.zinesSetView(this.zinesMineOnly, on),
+      ),
+    );
+    col.appendChild(controls);
     return col;
   }
 
-  private zinesFacetRow(
+  /**
+   * One view control.
+   *
+   * A checkbox rather than a styled button: these are switches over what the
+   * page shows, not buttons that do something once, and the native control is
+   * the one that already says so — the same shape the Drops pane's toggles use.
+   */
+  private zinesToggle(
     label: string,
-    section: string | null,
-    count: number,
-    active: boolean,
+    on: boolean,
+    onToggle: (on: boolean) => void,
   ): HTMLElement {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = `zines-facet-row pressable${active ? " active" : ""}`;
-    const name = document.createElement("span");
-    name.className = "text-13";
-    name.textContent = label;
-    const n = document.createElement("span");
-    n.className = "zines-facet-count text-12 muted";
-    n.textContent = String(count);
-    btn.append(name, n);
-    btn.onclick = () => {
-      this.zinesSection = section;
-      this.render();
-    };
-    return btn;
+    const wrap = document.createElement("label");
+    wrap.className = "zines-toggle text-13";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = on;
+    cb.onchange = () => onToggle(cb.checked);
+    wrap.append(cb, document.createTextNode(label));
+    return wrap;
   }
 
-  /** The middle column: the corpus, newest first. */
-  private renderZinesList(): HTMLElement {
-    const col = document.createElement("div");
-    col.className = "zines-list";
+  /**
+   * The right column: the front page, one story, or the draft.
+   *
+   * This is where the corpus lives now. The pane beside it is controls.
+   */
+  private renderZinesPage(): HTMLElement {
+    const page = document.createElement("div");
+    page.className = "zines-page";
+    if (this.zinesEditing) return this.renderZinesDraft(page);
 
-    const head = document.createElement("div");
-    head.className = "conv-list-header";
-    const title = document.createElement("span");
-    title.className = "text-15 muted";
-    title.textContent = this.zinesSection ?? "All zines";
-    head.appendChild(title);
-    col.appendChild(head);
+    const id = this.zinesOpenId;
+    if (id) return this.renderZinesReader(page, id);
+    return this.renderZinesFront(page);
+  }
+
+  /**
+   * The front page.
+   *
+   * A masthead, the corpus's own sections as a strip, one lead story, then
+   * everything else under section headings. Browsing and reading are the same
+   * surface, so there is no second list to keep in step with this one.
+   */
+  private renderZinesFront(page: HTMLElement): HTMLElement {
+    page.appendChild(this.renderZinesMasthead());
+    const corpus = this.renderZinesCorpusNote();
+    if (corpus) page.appendChild(corpus);
 
     if (this.zinesError) {
       const err = document.createElement("p");
-      err.className = "zines-status muted text-13";
+      err.className = "zines-note muted text-13";
       err.textContent = this.zinesError;
-      col.appendChild(err);
+      page.appendChild(err);
       const retry = document.createElement("button");
       retry.type = "button";
       retry.className = "btn-secondary pressable zines-retry";
       retry.textContent = "Try again";
       retry.onclick = () => void this.zinesLoad();
-      col.appendChild(retry);
-      return col;
+      page.appendChild(retry);
+      return page;
     }
     if (this.zinesLoading && !this.zinesView) {
       const loading = document.createElement("p");
-      loading.className = "zines-status muted text-13";
+      loading.className = "zines-note muted text-13";
       loading.textContent = "Loading…";
-      col.appendChild(loading);
-      return col;
+      page.appendChild(loading);
+      return page;
     }
 
-    const rows = this.zinesFiltered();
-    if (!rows.length) {
+    // The strip comes from the held corpus, not from what survives the section
+    // filter, so an empty section still shows the way back to the whole page.
+    if (this.zinesHeld().length) page.appendChild(this.renderZinesSections());
+    const pen = this.zinesPen;
+    if (pen) page.appendChild(this.renderZinesPenFilter(pen));
+
+    const stories = this.zinesFiltered();
+    if (!stories.length) {
       const empty = document.createElement("p");
-      empty.className = "zines-status muted text-13";
-      empty.textContent = this.zinesSection
-        ? "Nothing in this section."
-        : "Nothing here yet. Write the first one, or wait for one to arrive.";
-      col.appendChild(empty);
-      return col;
+      empty.className = "zines-note muted text-13";
+      empty.textContent = this.zinesEmptyNote();
+      page.appendChild(empty);
+      return page;
     }
-    for (const z of rows) col.appendChild(this.renderZinesRow(z));
-    return col;
+
+    // The lead is the newest story the reader has not muted; the rest of the
+    // page is everything else, in the same newest-first order.
+    const lead = leadOf(stories);
+    if (!lead) return page; // Unreachable: an empty corpus returned above.
+    const rest = stories.filter((z) => z !== lead);
+    const leadBlock = document.createElement("section");
+    leadBlock.className = "zines-lead";
+    leadBlock.appendChild(this.renderZineCard(lead, true));
+    page.appendChild(leadBlock);
+
+    // With a section picked, the strip is the heading: grouping again would
+    // print a section name over a page that is already only that section.
+    if (this.zinesSection) {
+      page.appendChild(this.renderZinesGrid(rest));
+    } else {
+      page.appendChild(this.renderZinesGroups(rest));
+    }
+    return page;
   }
 
-  private renderZinesRow(z: ZineSummaryDto): HTMLElement {
-    const row = document.createElement("article");
-    row.className = `zines-row pressable${this.zinesOpenId === z.zine_id ? " open" : ""}${z.muted ? " muted-row" : ""}`;
+  /** Why the page is empty, told apart by which control emptied it. */
+  private zinesEmptyNote(): string {
+    if (this.zinesPen) return `Nothing here is signed by ${this.zinesPen}.`;
+    if (this.zinesSection) return `Nothing in ${this.zinesSection} yet.`;
+    if (this.zinesMineOnly) return "You haven't published anything yet.";
+    return "Nothing here yet. Write the first one, or wait for one to arrive.";
+  }
 
-    const top = document.createElement("div");
-    top.className = "zines-row-top";
+  /**
+   * The active byline filter, on the page it narrows.
+   *
+   * A filter a reader cannot see is a page that looks empty for no reason, and
+   * this one is set from a story's byline — a page away from where it lands. So
+   * it prints what it is and carries its own way out.
+   */
+  private renderZinesPenFilter(pen: string): HTMLElement {
+    const bar = document.createElement("div");
+    bar.className = "zines-pen-filter";
+    const label = document.createElement("span");
+    label.className = "text-13 muted";
+    label.textContent = "Everything signed by this byline:";
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "zines-pen-chip pressable";
+    chip.textContent = `${pen} ×`;
+    chip.title = "Show every byline again";
+    chip.onclick = () => this.zinesFilterByByline(null);
+    bar.append(label, chip);
+    return bar;
+  }
+
+  /**
+   * The masthead: the page's name and today's date.
+   *
+   * Deliberately not the pen name. This page carries other people's zines at
+   * least as much as this vault's, so it is a newsstand rather than one pen
+   * name's paper — a byline belongs on the story, not over the whole page.
+   */
+  private renderZinesMasthead(): HTMLElement {
+    const head = document.createElement("header");
+    head.className = "zines-masthead";
+    const name = document.createElement("h1");
+    name.className = "zines-masthead-name";
+    name.textContent = "Zines";
+    const date = document.createElement("p");
+    date.className = "zines-masthead-date";
+    date.textContent = zinesDateLine();
+    head.append(name, date);
+    return head;
+  }
+
+  /**
+   * What this vault is holding that no key has opened yet.
+   *
+   * Absent when there is nothing to say, because a status line that reads zero
+   * on a healthy vault is noise. When there is something, it is stated plainly:
+   * the bytes are kept on purpose rather than left as a mystery, they cost
+   * space, and holding them is what keeps a post in the relay's window for the
+   * readers who can open it.
+   */
+  private renderZinesCorpusNote(): HTMLElement | null {
+    const view = this.zinesView;
+    if (!view || !view.unreadable_blobs) return null;
+    const note = document.createElement("p");
+    note.className = "zines-corpus-note muted text-12";
+    const held = view.held_blobs;
+    note.textContent =
+      `Holding ${held} sealed blob${held === 1 ? "" : "s"}, ` +
+      `${view.unreadable_blobs} of which no key has opened yet. ` +
+      "They are kept rather than dropped: a key may still arrive, and holding them is what keeps a post available to the readers who can open it.";
+    return note;
+  }
+
+  /**
+   * The section strip: the corpus's categories, on the page rather than in the
+   * pane. Clicking one narrows the page to it; `All` clears the filter.
+   */
+  private renderZinesSections(): HTMLElement {
+    const strip = document.createElement("nav");
+    strip.className = "zines-sections";
+    strip.appendChild(this.zinesSectionBtn("All", null, this.zinesHeld().length));
+    for (const s of this.zinesSections()) {
+      strip.appendChild(this.zinesSectionBtn(s.name, s.name, s.count));
+    }
+    return strip;
+  }
+
+  private zinesSectionBtn(
+    label: string,
+    section: string | null,
+    count: number,
+  ): HTMLElement {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `zines-section-btn pressable${this.zinesSection === section ? " active" : ""}`;
+    const name = document.createElement("span");
+    name.textContent = label;
+    const n = document.createElement("span");
+    n.className = "zines-section-count";
+    n.textContent = String(count);
+    btn.append(name, n);
+    btn.onclick = () => {
+      this.zinesSection = section;
+      // A new filter is a new page: open it at the masthead rather than at
+      // wherever the last one happened to be scrolled to.
+      this.pendingZinesScroll = null;
+      this.render();
+    };
+    return btn;
+  }
+
+  /** Everything under the lead, filed by section, with the unsectioned last. */
+  private renderZinesGroups(stories: ZineSummaryDto[]): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "zines-groups";
+    const order = this.zinesSections().map((s) => s.name);
+    for (const group of groupBySection(stories, order)) {
+      const section = document.createElement("section");
+      section.className = "zines-group";
+      const head = document.createElement("h2");
+      head.className = "zines-group-head";
+      head.textContent = group.name ?? "Unsorted";
+      section.append(head, this.renderZinesGrid(group.stories));
+      wrap.appendChild(section);
+    }
+    return wrap;
+  }
+
+  /** A run of stories as cards. */
+  private renderZinesGrid(stories: ZineSummaryDto[]): HTMLElement {
+    const grid = document.createElement("div");
+    grid.className = "zines-grid";
+    for (const z of stories) grid.appendChild(this.renderZineCard(z, false));
+    return grid;
+  }
+
+  /**
+   * One story as the page shows it.
+   *
+   * The lead is the same content in a bigger treatment rather than a different
+   * shape, so there is one place that decides what a story says about itself:
+   * its section, whether it is yours, its headline, a taste of the body, and
+   * the byline line.
+   */
+  private renderZineCard(z: ZineSummaryDto, lead: boolean): HTMLElement {
+    const card = document.createElement("article");
+    card.className = `zine-card pressable${lead ? " lead" : ""}${z.muted ? " muted-card" : ""}`;
+
+    if (z.sections.length || z.authored) {
+      const kicker = document.createElement("div");
+      kicker.className = "zine-card-kicker";
+      if (z.sections.length) {
+        const section = document.createElement("span");
+        section.className = "zine-card-section";
+        section.textContent = z.sections[0];
+        kicker.appendChild(section);
+      }
+      if (z.authored) {
+        const mine = document.createElement("span");
+        mine.className = "zine-card-mine";
+        mine.textContent = "Yours";
+        kicker.appendChild(mine);
+      }
+      card.appendChild(kicker);
+    }
+
     const title = document.createElement("button");
     title.type = "button";
-    title.className = "zines-row-title text-15";
+    title.className = "zine-card-title";
     title.textContent = z.title || "Untitled";
     title.onclick = () => void this.zinesOpen(z.zine_id);
-    top.appendChild(title);
-    if (z.authored) {
-      const mine = document.createElement("span");
-      mine.className = "zines-row-mine text-12";
-      mine.textContent = "Yours";
-      top.appendChild(mine);
-    }
-    row.appendChild(top);
+    card.appendChild(title);
 
     if (z.preview) {
       const preview = document.createElement("p");
-      preview.className = "zines-row-preview text-13 muted";
+      preview.className = "zine-card-preview";
       preview.textContent = z.preview;
-      row.appendChild(preview);
+      card.appendChild(preview);
     }
 
     const meta = document.createElement("div");
-    meta.className = "zines-row-meta text-12 muted";
-    const bits: string[] = [z.pen_name || "unknown byline"];
-    if (z.sections.length) bits.push(z.sections.join(", "));
+    meta.className = "zine-card-meta";
+    // The byline is a control, not text: it is the only place a reader can learn
+    // a name they did not already know, so clicking it is how the page narrows
+    // to that byline. A story with no byline yet has nothing to click.
+    if (z.pen_name) {
+      const byline = document.createElement("button");
+      byline.type = "button";
+      byline.className = "zine-byline pressable";
+      byline.textContent = z.pen_name;
+      byline.title = `Everything signed by ${z.pen_name}`;
+      byline.onclick = () => this.zinesFilterByByline(z.pen_name);
+      meta.appendChild(byline);
+    }
+    const bits: string[] = [];
+    // A story whose blob has not been opened has no byline to click, but the
+    // line still has to say so rather than start with a separator.
+    if (!z.pen_name) bits.push(bylineOf(z));
     if (z.revision > 1) bits.push(`rev ${z.revision}`);
     if (z.comments) {
       bits.push(`${z.comments} comment${z.comments === 1 ? "" : "s"}`);
     }
+    if (z.pending) {
+      bits.push(`${z.pending} waiting for you`);
+    }
     bits.push(readsTimeAgo(Math.floor(z.updated_ms / 1000)));
     if (z.muted) bits.push("muted");
     if (z.unreadable) bits.push("unreadable");
-    meta.textContent = bits.join(" · ");
-    row.appendChild(meta);
-    return row;
+    if (bits.length) {
+      const rest = document.createElement("span");
+      rest.className = "zine-card-meta-rest";
+      rest.textContent = bits.join(" · ");
+      meta.appendChild(rest);
+    }
+    card.appendChild(meta);
+    return card;
   }
 
-  /** The right column: the article, the draft editor, or nothing. */
-  private renderZinesMain(): HTMLElement {
-    const main = document.createElement("div");
-    main.className = "zines-main";
-    if (this.zinesEditing) return this.renderZinesDraft(main);
+  /**
+   * One story on its own page, with the way back.
+   *
+   * The way back is on the page rather than in the pane because it belongs to
+   * the story: a reader who wants to browse again is reading, not operating
+   * something, and the pane is where operating happens.
+   */
+  private renderZinesReader(page: HTMLElement, id: string): HTMLElement {
+    const reader = document.createElement("div");
+    reader.className = "zines-reader";
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-secondary text-13 pressable zines-back";
+    back.textContent = "← Front page";
+    back.onclick = () => this.zinesBackToFront();
+    reader.appendChild(back);
 
-    const id = this.zinesOpenId;
-    if (!id) {
-      const empty = document.createElement("div");
-      empty.className = "zines-empty";
-      empty.appendChild(icon("zines"));
-      const p = document.createElement("p");
-      p.className = "muted text-15";
-      p.textContent = this.zinesView?.zines.length
-        ? "Pick something to read."
-        : "A zine is a page you publish under a pen name, stored encrypted in your vault.";
-      empty.appendChild(p);
-      main.appendChild(empty);
-      return main;
-    }
     if (this.zinesDetailError) {
       const err = document.createElement("p");
-      err.className = "zines-status muted text-13";
+      err.className = "zines-note muted text-13";
       err.textContent = this.zinesDetailError;
-      main.appendChild(err);
-      return main;
+      reader.appendChild(err);
+      page.appendChild(reader);
+      return page;
     }
     const detail = this.zinesDetail;
     if (!detail || detail.zine.descriptor.zine_id !== id) {
       const loading = document.createElement("p");
-      loading.className = "zines-status muted text-13";
+      loading.className = "zines-note muted text-13";
       loading.textContent = "Opening…";
-      main.appendChild(loading);
-      return main;
+      reader.appendChild(loading);
+      page.appendChild(reader);
+      return page;
     }
-    main.appendChild(this.renderZineArticle(detail));
-    return main;
+    reader.appendChild(this.renderZineArticle(detail));
+    page.appendChild(reader);
+    return page;
+  }
+
+  /** Back to the front page, where the reader left it. */
+  private zinesBackToFront(): void {
+    this.zinesOpenId = null;
+    this.zinesDetail = null;
+    this.zinesDetailError = null;
+    this.zinesCommentHost = null;
+    this.zinesCommentDraft = "";
+    this.zinesCommentError = null;
+    this.render();
   }
 
   private renderZineArticle(detail: ZineViewDto): HTMLElement {
@@ -5403,10 +5957,26 @@ export class App {
     h.textContent = descriptor.title || "Untitled";
     const byline = document.createElement("p");
     byline.className = "zine-article-byline text-13 muted";
-    const bits: string[] = [descriptor.pen_name || "unknown byline"];
+    const bits: string[] = [];
+    // The byline is the one control a reader can use to find the rest of what
+    // this name wrote, so on the article it is a button rather than text.
+    if (descriptor.pen_name) {
+      const who = document.createElement("button");
+      who.type = "button";
+      who.className = "zine-byline pressable";
+      who.textContent = descriptor.pen_name;
+      who.title = `Everything signed by ${descriptor.pen_name}`;
+      who.onclick = () => this.zinesFilterByByline(descriptor.pen_name);
+      byline.appendChild(who);
+    } else {
+      byline.textContent = "unknown byline";
+    }
     bits.push(readsTimeAgo(Math.floor(descriptor.created_ms / 1000)));
     if (descriptor.revision > 1) bits.push(`revision ${descriptor.revision}`);
-    byline.textContent = bits.join(" · ");
+    const rest = document.createElement("span");
+    rest.className = "zine-article-byline-rest";
+    rest.textContent = ` · ${bits.join(" · ")}`;
+    byline.appendChild(rest);
     head.append(h, byline);
 
     if (descriptor.sections.length) {
@@ -5421,6 +5991,9 @@ export class App {
           this.zinesSection = s;
           this.zinesOpenId = null;
           this.zinesDetail = null;
+          // Landing on the front page under a new filter: it starts at the
+          // masthead, not where this reader left the unfiltered page.
+          this.pendingZinesScroll = null;
           this.render();
         };
         tags.appendChild(tag);
@@ -5467,6 +6040,25 @@ export class App {
       : "Stop this zine being counted as new. It stays in your vault.";
     mute.onclick = () => void this.zinesToggleMute(descriptor.zine_id, !muted);
     actions.appendChild(mute);
+    // Any holder may share, not just the author: the key confers read of a post
+    // the sender could already read, so a member the author has no session with
+    // can still be reached through whoever does. Offered only when there is a
+    // key to hand over — an unreadable blob has none.
+    if (!unreadable && read_key) {
+      const share = document.createElement("button");
+      share.type = "button";
+      share.className = "btn-secondary pressable zine-share";
+      share.textContent = "Share with…";
+      share.title =
+        "Hand this post's read key to one of your contacts, over the session you already have. They can pass it on in turn.";
+      share.onclick = () => {
+        this.zinesShareId = descriptor.zine_id;
+        this.zinesShareContact = "";
+        this.zinesShareError = null;
+        this.render();
+      };
+      actions.appendChild(share);
+    }
     if (!authored) {
       const forget = document.createElement("button");
       forget.type = "button";
@@ -5484,7 +6076,7 @@ export class App {
 
     if (unreadable) {
       const held = document.createElement("p");
-      held.className = "zines-status muted text-13";
+      held.className = "zines-note muted text-13";
       held.textContent =
         "This zine is held but not openable yet: the blob arrived before the key that unlocks it. It will open by itself once the key does.";
       article.appendChild(held);
@@ -5492,7 +6084,7 @@ export class App {
     }
     if (!read_key && !authored) {
       const held = document.createElement("p");
-      held.className = "zines-status muted text-13";
+      held.className = "zines-note muted text-13";
       held.textContent = "This vault has no read key for this zine.";
       article.appendChild(held);
       return article;
@@ -5504,6 +6096,13 @@ export class App {
     // and a holder is not trusted to have sanitized it.
     body.innerHTML = bodyToDisplayHtml(descriptor.body);
     article.appendChild(body);
+
+    // The author's queue for this post, before the published thread: these are
+    // the only comments that are not in the article yet, and merging one is what
+    // puts it there.
+    if (authored && detail.zine.pending_comments.length) {
+      article.appendChild(this.renderZinePending(detail.zine.pending_comments));
+    }
 
     if (descriptor.comments.length) {
       const thread = document.createElement("section");
@@ -5526,6 +6125,10 @@ export class App {
       }
       article.appendChild(thread);
     }
+
+    // A comment is a reader's act, so the author does not get a box on their own
+    // post: what they do about a comment is accept or drop it, above.
+    if (!authored) article.appendChild(this.renderZineComposer());
 
     if (history.length) {
       const past = document.createElement("section");
@@ -5552,8 +6155,118 @@ export class App {
     return article;
   }
 
+  /**
+   * The comments waiting for this author's decision, one row each.
+   *
+   * The copy is deliberate about what a refusal is: dropping a comment here
+   * does not unsay it anywhere, because nothing was ever published. The blob is
+   * on the lane, sealed to this vault alone, and other holders keep re-posting
+   * it — which is the honest limit of author-side moderation.
+   */
+  private renderZinePending(comments: ZinePendingCommentDto[]): HTMLElement {
+    const pile = document.createElement("section");
+    pile.className = "zine-pending";
+    const h = document.createElement("h2");
+    h.className = "text-17";
+    h.textContent = `Waiting for you (${comments.length})`;
+    pile.appendChild(h);
+    const note = document.createElement("p");
+    note.className = "zines-note muted text-12";
+    note.textContent =
+      "Pulled from the lane and sealed to your pen name. Accepting one merges it and republishes this post; dropping one is not a retraction, because a refused comment was never published.";
+    pile.appendChild(note);
+
+    for (const c of comments) {
+      const row = document.createElement("div");
+      row.className = "zine-comment pending";
+      const meta = document.createElement("div");
+      meta.className = "zine-comment-meta text-12 muted";
+      meta.textContent = `${c.author || "unknown"} · ${readsTimeAgo(Math.floor(c.created_ms / 1000))}`;
+      const text = document.createElement("div");
+      text.className = "zine-comment-body text-13";
+      text.textContent = c.body;
+      row.append(meta, text);
+
+      const busy = this.zinesCommentBusyHash === c.hash;
+      const buttons = document.createElement("div");
+      buttons.className = "zine-pending-actions";
+      const accept = document.createElement("button");
+      accept.type = "button";
+      accept.className = "btn-primary pressable zine-accept-comment";
+      accept.textContent = busy ? "Merging…" : "Accept";
+      accept.title =
+        "Merge this comment into the thread and publish a new revision.";
+      accept.disabled = busy;
+      accept.onclick = () => void this.zinesAcceptComment(c.hash);
+      const drop = document.createElement("button");
+      drop.type = "button";
+      drop.className = "btn-secondary pressable zine-discard-comment";
+      drop.textContent = "Drop";
+      drop.title = "Never merge this comment. Nothing is published either way.";
+      drop.disabled = busy;
+      drop.onclick = () => void this.zinesDiscardComment(c.hash);
+      buttons.append(accept, drop);
+      row.appendChild(buttons);
+      pile.appendChild(row);
+    }
+    return pile;
+  }
+
+  /**
+   * The comment box on a story this vault only holds.
+   *
+   * No session with the author is needed: the pen name is a public key that
+   * travelled in the article, so the comment is sealed to it and published to
+   * the lane. The box is built once per open story and re-parented on every
+   * re-render — the same doctrine as the draft editor's host — so a poll cannot
+   * take away a half-typed comment or the caret in it.
+   */
+  private renderZineComposer(): HTMLElement {
+    const form = document.createElement("section");
+    form.className = "zine-comment-form";
+    const h = document.createElement("h2");
+    h.className = "text-17";
+    h.textContent = "Add a comment";
+    const hint = document.createElement("p");
+    hint.className = "zines-note muted text-12";
+    hint.textContent =
+      "Sealed to the author's pen name and published to the lane, so no session with them is needed. The author decides whether it joins the thread.";
+    form.append(h, hint);
+
+    if (!this.zinesCommentHost) {
+      const box = document.createElement("textarea");
+      box.className = "zine-comment-input";
+      box.rows = 3;
+      box.placeholder = "Write a comment…";
+      box.value = this.zinesCommentDraft;
+      box.oninput = () => {
+        this.zinesCommentDraft = box.value;
+      };
+      this.zinesCommentHost = box;
+    }
+    const box = this.zinesCommentHost;
+    box.disabled = this.zinesCommentBusy;
+    form.appendChild(box);
+
+    if (this.zinesCommentError) {
+      const err = document.createElement("p");
+      err.className = "zines-note zine-error text-12";
+      err.textContent = this.zinesCommentError;
+      form.appendChild(err);
+    }
+
+    const post = document.createElement("button");
+    post.type = "button";
+    post.className = "btn-primary pressable zine-comment-send";
+    post.textContent = this.zinesCommentBusy ? "Publishing…" : "Publish comment";
+    post.disabled = this.zinesCommentBusy;
+    post.onclick = () => void this.zinesPostComment();
+    form.appendChild(post);
+    return form;
+  }
+
   /** The draft form: title, sections, and the shared rich-text editor. */
-  private renderZinesDraft(main: HTMLElement): HTMLElement {
+  private renderZinesDraft(page: HTMLElement): HTMLElement {
     const form = document.createElement("div");
     form.className = "zine-draft";
 
@@ -5639,8 +6352,8 @@ export class App {
     };
     footer.append(publish, cancel);
     form.appendChild(footer);
-    main.appendChild(form);
-    return main;
+    page.appendChild(form);
+    return page;
   }
 
   private renderZinesPenNameModal(): HTMLElement {
@@ -5764,6 +6477,102 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.zinesForgetId = null;
+        this.render();
+      }
+    };
+    return back;
+  }
+
+  /**
+   * The share dialog: hand one contact this post's read key.
+   *
+   * The key travels over the session that already exists — the one thing in
+   * Zines that is not the bulletin lane — so it works for a contact this vault
+   * has a Signal session with, which is every contact in Trusts. What is being
+   * given is described plainly: read access to this post, which the recipient
+   * may pass on again.
+   */
+  private renderZinesShareModal(): HTMLElement {
+    const zineId = this.zinesShareId!;
+    const row = this.zinesView?.zines.find((z) => z.zine_id === zineId);
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal zine-share-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Share this zine");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Share this zine";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-2)";
+    p.textContent = `Send the read key for ${row?.title || "this zine"} to one contact. They will be able to read it and pass the key on in turn, and this is not a session with the author.`;
+    modal.append(h, p);
+
+    const field = document.createElement("div");
+    field.className = "zine-field";
+    const label = document.createElement("span");
+    label.className = "text-13";
+    label.textContent = "Contact";
+    const picker = new ContactPicker({
+      items: this.contacts.map((c) => ({
+        nickname: c.nickname,
+        label: c.mail_handle
+          ? `${displayNick(c.nickname)} (${this.contactAddress(c)})`
+          : displayNick(c.nickname),
+        keywords: c.nickname,
+      })),
+      value: this.zinesShareContact,
+      // Above the field, so the list cannot cover the Send button below it.
+      dropUp: true,
+      label: "Contact",
+      placeholder: "Type a name…",
+      emptyMessage: "No contacts yet. Add someone in Trusts first.",
+      noMatchMessage: "No contacts match that name.",
+      onChange: (nickname) => {
+        this.zinesShareContact = nickname;
+        this.zinesShareError = null;
+        send.disabled = false;
+      },
+    });
+    field.append(label, picker.element);
+    modal.appendChild(field);
+
+    if (this.zinesShareError) {
+      const err = document.createElement("p");
+      err.className = "zines-note zine-error text-13";
+      err.textContent = this.zinesShareError;
+      modal.appendChild(err);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.zinesShareId = null;
+      this.zinesShareError = null;
+      this.render();
+    };
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "btn-primary pressable";
+    send.textContent = this.zinesShareBusy ? "Sending…" : "Send key";
+    send.disabled = this.zinesShareBusy || !this.zinesShareContact;
+    send.onclick = () => void this.zinesShare();
+    actions.append(cancel, send);
+    modal.appendChild(actions);
+
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) {
+        this.zinesShareId = null;
+        this.zinesShareError = null;
         this.render();
       }
     };
