@@ -102,13 +102,14 @@ Living record. Reasons and rejected alternatives. Not a marketing doc.
 
 ### Public knowledge (later — after private capsule is real)
 
-- **Decision:** Optional **pseudonymous publishing** (Nostr-shaped **Articles**), not a Hush-hosted social graph or viral feed. Private chat stays on libsignal + blind queues; public work uses **pen names** isolated from messaging keys.
+- **Decision (reshaped 2026-10-12):** Members-only long-form is **native and encrypted** — **zines** (Task **21**), every member's blog of articles with comments, broadcast on a relay **bulletin** and readable by all members. It is a **newspaper**: no follows, no ranking, no relay-visible graph. Optional **Nostr export** (Task **11**) exists only to push a zine **beyond the membership** — reach is the one thing Nostr does that a members-only commons cannot. Pen names stay isolated from messaging keys.
+- **Relay change, stated:** zines add the first new relay ability since the founding constraint — a generic **broadcast bulletin** carrying opaque blobs (no names, no tags, no pen names). Detail: [`docs/tasks/zines.md`](tasks/zines.md), [`THREAT_MODEL.md`](THREAT_MODEL.md).
 - **Product arc (one pipeline, many surfaces):** Conversation (private) → publish idea → link evidence → local library → optional **project** index — without likes, trending, or our relay learning who follows whom.
-- **Feeds:** Follow-based and **explainable** (“included because…”), not engagement ML. “Editor’s picks” = curated pubkey lists in config, not ranking.
+- **Feeds:** zines are **pull-only** (read what you want from the local index; local mute is the only control). Any follow-based or **explainable** feed belongs to the **public/export** layer (Tasks **12–15**), not to zines — and is not engagement ML.
 - **Reputation (if any):** Structured links (supports / refutes / evidence), optional local “I changed my view” notes — **not** follower counts or upvotes as the primary signal.
-- **Storage:** Reading list, shelves, annotations, and graph edges live in the **encrypted local vault** (per person). Nostr cache is public-by-design; UI must say so.
-- **Rejected for this layer:** Global “For You” algorithm; Hush-operated follow graph; in-app crowdfunding; activist/“uncensored” positioning; first-party Nostr relay at launch.
-- **Detail:** Task **11** ([`docs/tasks/hush-articles.md`](tasks/hush-articles.md)); Tasks **12–15** backlog in [`docs/plans/knowledge-layer-roadmap.md`](plans/knowledge-layer-roadmap.md).
+- **Storage:** zines live in the encrypted vault (`zines.enc`); reading list, shelves, annotations, and graph edges live in the **encrypted local vault** (per person). An exported Nostr copy is public-by-design; UI must say so.
+- **Rejected for this layer:** A public IPFS/DHT (announces IP *and* content interest); a relay-side category registry; Global “For You” algorithm; Hush-operated follow graph; in-app crowdfunding; activist/“uncensored” positioning; first-party Nostr relay at launch.
+- **Detail:** Task **21** ([`docs/tasks/zines.md`](tasks/zines.md)); Task **11** export ([`docs/tasks/hush-articles.md`](tasks/hush-articles.md)); Tasks **12–15** backlog in [`docs/plans/knowledge-layer-roadmap.md`](plans/knowledge-layer-roadmap.md).
 
 ### Public positioning
 

@@ -1,0 +1,352 @@
+# Zines — members-only long-form publishing (planning only)
+
+**Status:** Spec resolved 2026-10-12 by grilling; **not implemented**. No code until a phase is
+explicitly approved.
+
+**Index:** New **Task 21** in [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md)
+(Phase **O**). **Reshapes Task 11** ([`hush-articles.md`](hush-articles.md)) — Nostr stops being the
+native shape and becomes an optional **export bridge**. Builds on Task **19**'s sidecar-store +
+fan-out spine ([`conclave-paper.md`](conclave-paper.md)); adds one relay ability.
+
+    10|**Goal:** Every member has a **zine** — their own blog of long-form articles with a comments
+section, readable by **all members** (not just contacts), end-to-end encrypted, with no server
+holding plaintext. Articles and comments are **broadcast** to a relay **bulletin** and held in every
+member's vault; readability propagates **holder-to-holder** over existing 1:1 sessions. Sections
+(tags) ride inside the encrypted article. Browsing is local and pull-only — a newspaper you read
+what you want from, with no follows and no algorithm.
+
+**Name:** **zines** (product name, lowercase in prose). An article is a zine; a tag is a **section**.
+
+**Non-goals (this task):** images/media (a later phase); public plaintext or the public IPFS DHT
+    20|(Section 1); a relay-side category registry (Section 1); follows/subscriptions (newspaper model);
+cross-relay federation (Section 4); Nostr as the native transport (now an export bridge); a
+Hush-operated Nostr relay.
+
+---
+
+## 1. Why not IPFS / a public DHT, and why not a relay category registry
+
+Two parts of the original idea were corrected before the design locked. Recording both, because
+they are the reason the architecture is shaped the way it is.
+
+**"Articles live on IPFS and vanish when nobody logs in" is not how IPFS GC works, and the public
+DHT is a metadata leak.**
+    30|
+- Blocks vanish when **no node anywhere pins or seeds them**. An author's login only re-provides
+  their *own* content; what keeps a zine alive is **readers pinning it**. Availability is a function
+  of the readers, not the author's uptime — so "people who do not log in lose their blog" is not a
+  mechanism IPFS gives you. Neglected zines die while popular ones outlive their authors.
+- Providing or fetching a CID announces your IP **and your interest in that exact content** to the
+  swarm. Every document in this repo treats "the relay cannot learn who reads what" as a v1
+  constraint ([`DESIGN.md`](../DESIGN.md), [`THREAT_MODEL.md`](../THREAT_MODEL.md)); a public DHT
+  breaks it on day one. A private swarm avoids the leak but is a second network stack (libp2p
+  bootstrap, a new egress surface in [`DISTRO_READINESS.md`](../DISTRO_READINESS.md)) that text-only
+  v1 does not need.
+
+    40|**"The relay holds the names of categories" is a relay directory, which the founding constraint
+forbids.** [`PROTOCOL.md`](../PROTOCOL.md): the relay sees ciphertext, size, time, slot ID, IP —
+never names, never a directory, never a social graph. A plaintext category registry makes the relay
+a public interest graph and is a typosquat magnet (free-form tags, first-writer-wins). Categories
+therefore live **inside the encrypted descriptor** with the article; a section exists wherever
+members hold posts carrying that tag, and browsing is a local facet. No registry, no cardinality
+cap, no relay knowledge.
+
+**What replaces both:** the relay's one new ability is a **generic broadcast lane** (the bulletin)
+carrying **opaque blobs** — no names, no tags, no pen names. Content addressing and "hold what you
+hold" live in the members' vaults, which is where the availability story actually is.
+
+    50|---
+
+## 2. Decisions locked (2026-10-12)
+
+| Decision | Choice |
+|---|---|
+| Audience | **Members-only**, end-to-end encrypted. Not public, not contacts-only |
+| Author identity | **Pen name** — a vault keypair isolated from messaging keys (the Task 11 doctrine); one zine per pen name; multiple pen names later |
+| Delivery | **Relay bulletin** — one new, generic, opaque, append-only **broadcast lane**. Any member may publish; any member drains. Content-blind, name-blind |
+| Readability | **Key epidemic** — the bulletin carries ciphertext encrypted to the zine's read key; read keys propagate holder-to-holder over existing 1:1 Signal sessions |
+| Read key | **One per zine**, not per article. One grant reads that zine forever after. No revocation; rotation is later |
+| Sections (tags) | **Inside the encrypted descriptor**; a local facet index. No relay registry |
+| Comments | Blobs encrypted to the pen name's **public** key, published to the same lane; the author pulls, merges accepted ones, republishes |
+| Edits | New blobs; a revision pointer in the descriptor; old revisions age out with the window and are pruned locally |
+| Browsing | **Newspaper model** — no follows, no subscriptions; the full local index (all / by section / by pen name), local mute per pen name |
+| Beyond Hush | Optional later **export** (Nostr NIP-23), reusing the pen-name keys — a button, not a second product |
+| Scope | **Text-only rich text** (Paper's toolbar: bold/italic/underline, lists, headings) |
+| Milestone | Task **21** / Phase **O** |
+
+**One correction to the "blog = single-author Paper" framing:** zines reuse Paper's **spine** — the
+sidecar-store pattern, the per-trustee fan-out, the payload codec, the tolerant decode — but **not
+its CRDT**. A zine article has exactly one writer (its pen name) and each comment is a separate
+signed blob merged by the author, so there is nothing to merge concurrently. The editor reuses
+Paper's **ProseMirror rendering** and toolbar but **not** `y-prosemirror`/`yrs`. That makes zines
+lighter than Paper, not heavier.
+
+---
+
+## 3. Architecture
+
+```mermaid
+flowchart LR
+  subgraph A["Member A (holds a pen name)"]
+    DA["hush-daemon A\nzines.enc + read keys"]
+  end
+  subgraph B["Member B"]
+    DB["hush-daemon B\nzines.enc"]
+  end
+  subgraph C["Member C"]
+    DC["hush-daemon C\nzines.enc"]
+  end
+  R["hush-relay"]
+  BU["bulletin\n(opaque append-only lane)"]
+
+  DA <-->|"PUT /b publish\nGET /b drain"| BU
+  DB <--> BU
+  DC <--> BU
+  DA <-.->|"ZineGrant: read key\n(1:1 Signal session)"| DB
+  DB <-.->|"re-share to contacts\n(key epidemic)"| DC
+  R --- BU
+```
+
+- **Bulletin (broadcast lane).** One new relay ability: an append-only log of **opaque blobs**,
+  addressed to nobody. A member publishes with their existing member credential; any member drains
+  it. The relay stores `(seq, body, inserted_at)` and **does not record which member published which
+  blob**. It is the first route not keyed to a specific queue or account, and it is the deliberate
+  exception to "the relay gains no new abilities" — Section 7 states exactly what it costs.
+- **Key epidemic (readability).** There is no "all members" key and no member list to encrypt to, so
+  the bulletin cannot carry readable articles to a stranger. Instead: **delivery is broadcast,
+  readability is epidemic.** An article is sealed under the zine's symmetric **read key**; the author
+  hands that key to a contact as a `ZineGrant` over their existing 1:1 session; **any holder** may
+  re-share the same key to *their* contacts. A member may therefore hold an unreadable blob until a
+  key reaches them, then a local "retry unreadable blobs against the new key" sweep classifies it.
+  This is the price of members-only E2EE on a broadcast lane; the alternative is public plaintext,
+  which is rejected.
+- **Comments.** A comment is sealed to the pen name's **public** key (no session to the author is
+  required to write one) and published to the same lane. The author drains, tries to open each
+  unclassified blob with the pen-name private key, keeps the ones that open, merges the accepted
+  ones into the article's comment thread, and republishes. **Moderation is entirely author-side**:
+  an unmerged comment is simply never republished and ages out with the window. The honest limit is
+  that a commenter cannot force publication — the same power a blog host always had.
+- **Vault.** `zines.enc` encrypted sidecar (the `notes_store`/`papers.enc` pattern): my own zines
+  (drafts, published revisions, the merged comment thread), **held** zines from others, the **read
+  keys I hold**, and the local section index. Read keys are secrets, so they are only ever at rest
+  encrypted here. Caps refuse with a reason (the house pattern).
+- **Editor.** ProseMirror in the webview with Paper's toolbar, rendered from local assets; a zine
+  body is text + marks. No CRDT, no `yrs`. The daemon owns state and wire (thin-UI doctrine).
+- **Browsing.** The daemon keeps a local index over everything held: filter by section, by pen name,
+  newest-first with author-declared `created_ms` **clamped** (a future timestamp is forgeable — the
+  old articles feed rule). No follows; local mute per pen name is the only feed control.
+
+---
+
+## 4. Wire format
+
+**Relay lane (new).** The bulletin carries opaque blobs. It is **not** a `MessagePayload` — it never
+touches a Signal session. Its shape is in Section 5.
+
+**Session payload (new).** One new `MessagePayload` variant carries read keys; it is the only zine
+thing that rides the 1:1 sessions.
+
+```rust
+pub enum MessagePayload {
+    // ... existing ...
+    // Task 21 — Zines:
+    /// A zine's read key, wrapped for one recipient over their existing session.
+    /// Doubles as the announcement: the recipient learns a zine exists and can
+    /// then find its blobs on the bulletin by trying the key.
+    ZineGrant { zine_id: String, key: Vec<u8>, latest_hash: String },
+    /// A tag this build does not know. Decoded, never sent. (Shared with Paper.)
+    Unknown,
+}
+```
+
+- **`ZineGrant`** is the key epidemic in one payload: `zine_id` is the pen name's public key (hex),
+  `key` is the symmetric read key (house `b64_bytes` codec), and `latest_hash` lets the recipient
+  identify the newest blob without trial decryption. Authority-free to *receive* (any holder may
+  re-share a key they hold); it grants read, never write.
+- **No article payload.** Articles and comments ride the bulletin, not the fan-out. This keeps the
+  Signal fan-out cost at zero for a zine that has many readers.
+- **`Unknown`** reuses the tolerant decode Paper landed 2026-10-12; a zine-aware build and a
+  Paper-only build interoperate.
+
+**Article blob (opaque to the relay).** Sealed under the read key; the plaintext descriptor is:
+
+```rust
+pub struct ZineDescriptor {
+    pub zine_id: String,      // pen name public key, hex
+    pub pen_name: String,     // display name chosen by the author
+    pub title: String,
+    pub sections: Vec<String>,// tags; exist only where members hold them
+    pub created_ms: u64,      // author-declared; clamped on ingest
+    pub revision: u64,        // monotonic per zine
+    pub prev_hash: String,    // previous revision's content hash (chain)
+    pub body: String,         // rich text (ProseMirror JSON or sanitized HTML)
+    pub comments: Vec<ZineComment>, // merged thread, author-curated
+}
+```
+
+- The blob is **content-addressed** by `hash(bytes)`; the hash is what `ZineGrant.latest_hash` and
+  `prev_hash` reference. Authorship is proven by the **pen name's signature** over the canonical
+  plaintext (a holder can verify provenance without holding the read key); integrity is **AEAD**, so
+  the relay cannot tamper undetected.
+- **Sections are inside the descriptor**, so the relay never sees a tag and the pen name never
+  appears on the wire. A section "exists" for a member once they hold a post carrying it.
+- **Edits** are a new blob with `revision + 1` and `prev_hash` pointing at the last; the newest
+  revision a member holds wins. Old revisions age out with the window and are pruned locally.
+
+**Comment blob (opaque to the relay).** Sealed to the pen name's **public** key (ECIES sealed box,
+the `hush-drop-v2` construction already in the tree). The author tries to open each unclassified
+blob; a failure is not an error, it is simply not theirs. A recipient tag (a truncated
+`H(ephemeral_pubkey ‖ pen_name_pubkey)`) is an **optimization** for a large corpus, not required in
+v1 — trial decryption is cheap at text scale.
+
+---
+
+## 5. Relay bulletin API (new)
+
+Reuses the existing queue authz primitives ([`crates/hush-relay/src/store.rs`](../../crates/hush-relay/src/store.rs)):
+a member proves membership with the credential for a queue they own.
+
+| Route | Auth | Behavior |
+|---|---|---|
+| `PUT /b` | member **delivery** credential (`{queue_id, delivery_token}` for a queue they own) | Append the opaque body to the bulletin log. Rate-limited per `queue_id`. **The stored row carries no queue id** |
+| `GET /b?since={seq}` | member **read** credential (`{queue_id, read_token}`) | Return blobs with `seq > since`, in order. Everyone drains the same lane, so a drain reveals no readership |
+
+- **Storage:** `bulletin(seq INTEGER PRIMARY KEY, body BLOB, inserted_at INTEGER)`. The relay's
+  transient knowledge of the publisher (it must authorize) is **not persisted** alongside the blob.
+- **Cap:** `bulletin_max_blob_bytes` = **256 KiB** (the text-only article cap; well under the
+  existing `max_blob_bytes` = 1 MiB).
+- **TTL:** its own `bulletin_ttl`, proposed **30 days** — longer than the chat `blob_ttl` (7 days)
+  because the bulletin is the corpus store, not a drained inbox. Survival past the window is the
+  holders' vaults plus the re-post sweep (Section 8, Phase 5).
+- **Rate limit:** per member credential, on top of the existing per-queue limits.
+- **Dedup (optional):** the relay may dedup by content hash and refresh the row's TTL on re-post —
+  it can hash the bytes anyway, so this adds no leak and saves storage.
+- **No new directory, no names, no tags, no pen names.** The bulletin is one flat opaque log.
+
+**Per-relay, not global.** Relays never talk to each other
+([`PROTOCOL.md`](../PROTOCOL.md#many-relays-clients-route-relays-never-talk-2026-10-09-design-not-built)),
+and a member holds slots on their **home** relay, so the bulletin is **per-relay**. "Eventually
+everybody has the same zines" across relays is the **holder re-post sweep** re-publishing to *their*
+relay's bulletin. No federation, no relay-to-relay path — the epidemic does the routing.
+
+---
+
+## 6. Daemon API (proposed)
+
+Socket-first, thin-UI, following the paper/notes pattern (`account_worker.rs` owns the Vault; routes
+in `main.rs`). All routes **401 when locked**.
+
+| Route | Body | Returns / notes |
+|---|---|---|
+| `GET /api/zines` | — | Local index: my zines + held zines; filters by `?section=` / `?pen=` |
+| `POST /api/zines` | `{pen_name, title, sections[], body}` | Create or edit; produces a new signed blob and publishes it |
+| `GET /api/zines/{zine_id}` | — | Article + merged comment thread (404 before it is held) |
+| `POST /api/zines/{zine_id}/comment` | `{body}` | Seal to the pen-name public key and publish to the bulletin |
+| `POST /api/zines/{zine_id}/accept-comment` | `{comment_hash}` | Merge one pulled comment into the thread; republish |
+| `POST /api/zines/{zine_id}/grant` | `{contact}` | Send `ZineGrant` over the 1:1 session (the key epidemic, author side) |
+| `POST /api/zines/{zine_id}/mute` | `{pen}` | Local mute; no wire effect |
+
+Bulletin drain, trial decryption, key re-sharing, and the re-post sweep are daemon-internal. The UI
+sees a local corpus and a **sync status** (drained up to seq N; N unreadable blobs pending a key).
+
+---
+
+## 7. Threat model delta
+
+Add to [`THREAT_MODEL.md`](../THREAT_MODEL.md) when implementing. This is the **first new relay
+ability since the founding constraint**, so it is stated in full.
+
+| New surface | What it may see | Rule |
+|---|---|---|
+| Bulletin lane | Opaque blob sizes, count, times; **not** which member published which blob in storage | Accepted. The relay stores a flat log with no author column |
+| Publish linkability | At publish time the relay **must** authorize, so it transiently learns **which member published a zine blob** (the Q3 cost) | **Accepted and documented** — narrower than what the operator already knows (payment identity). Drains reveal no readership (everyone drains everything). Optional Tor-path publish is the later fix |
+| Re-post linkability | A re-post tells the relay a member **holds** that zine | **Accepted** — in a converging commons (everyone holds everything) this is near-zero signal; it matters only for a zine you would rather not be seen holding. It is the price of author-independent availability |
+| Read keys | Held in `zines.enc`, encrypted at rest; a holder's grant grants **permanent** read of that zine | **No revocation**, like a kicked trustee keeping conclave messages. Rotation is a later concern |
+| Comments | The relay sees an opaque blob; only the pen name can open it | Accepted. A commenter's slot is linkable to the publish, same as an article |
+| Corpus size | Every member downloads every blob | Bandwidth, not privacy. Text-only keeps totals in low MBs; the per-member rate limit is the throttle |
+| At rest | Nothing in plaintext | `zines.enc` sealed under the vault master key; locked vault = unreadable; editor runs from local assets only |
+
+**Honest limits for user-facing copy:** publishing reveals your member slot to the relay operator
+(not to other members); a zine you hold can be seen to be held if someone re-posts it; read access,
+once granted, is not revocable; and every member holds a copy of what they have received — zines are
+not "leaves nothing behind."
+
+---
+
+## 8. Phases and acceptance criteria
+
+### Phase 0 — Spec and threat model (this document)
+- [x] Decisions in Section 2 resolved and recorded (2026-10-12).
+- [ ] `THREAT_MODEL.md` addendum (Section 7) and `PROTOCOL.md` bulletin subsection when implementation starts.
+
+### Phase 1 — Pen names, store, editor (offline, no network)
+- [ ] Pen-name keypair in the vault (isolated from messaging keys); backup manifest carries it.
+- [ ] `zines.enc` sidecar: descriptor + revision chain + merged comments + held zines + read keys; caps with reasons; round-trip and corruption tests.
+- [ ] `/api/zines/*` local routes; lock = 401 everywhere.
+- [ ] ProseMirror editor + toolbar (no CRDT), rendered from local assets.
+
+**Verify:** author a zine with sections, restart — it survives; lock — every route 401s and `zines.enc` on disk is ciphertext; `cargo test -p hush-daemon`.
+
+### Phase 2 — Bulletin lane (broadcast delivery)
+- [ ] Relay: `PUT /b` / `GET /b`, storage without an author column, cap, TTL, per-member rate limit; relay tests (unauthorized publish fails; TTL drops; a drain is not attributable).
+- [ ] Daemon: publish a signed sealed blob; drain the lane; content-addressed dedup; signature + AEAD verification.
+- [ ] Unreadable blobs are held, not discarded.
+
+**Verify:** two daemons and a real relay: A publishes; B drains the blob (still unreadable); `relay.db` holds no pen name, title, tag, or body plaintext.
+
+### Phase 3 — Key epidemic + comments
+- [ ] `ZineGrant` send/receive; a holder re-shares to their contacts; the retry-unreadable sweep classifies newly readable blobs.
+- [ ] Comments: seal to the pen-name public key, publish, pull, trial-decrypt, merge, republish.
+
+**Verify:** A publishes; grants B; B reads; B re-shares to C who has no session with A; C reads; C comments; A merges it and B/C see the merged thread.
+
+### Phase 4 — Browsing
+- [ ] Local index: all / by section / by pen name; newest-first with clamped timestamps; local mute.
+- [ ] Unreadable-blob indicator and empty states; honest copy from Section 7.
+
+**Verify:** a corpus of several zines browses by section and pen name; a muted pen name disappears locally with no wire effect.
+
+### Phase 5 — Retention, hardening, docs
+- [ ] Holder **re-post sweep** (rate-limited, signature-verified) keeps held zines in the window; per-zine and total caps surface reasons.
+- [ ] `DISTRO_READINESS.md` (bulletin storage growth on the relay; no new client egress), `THREAT_MODEL.md`, `PROTOCOL.md`.
+- [ ] Optional later: Nostr **export** (sign a NIP-23 event with the pen name; publish over Tor) — the reshaped Task 11.
+
+**Verify:** a zine survives the window on a holder's re-post with the author offline; full dogfood with no plaintext on disk; export produces a verifiable NIP-23 event.
+
+---
+
+## 9. Scheduling and dependencies
+
+- **Depends on:** Task **19**'s landed spine — the sidecar-store pattern, the per-trustee fan-out,
+  the payload codec, and the tolerant `Unknown` decode (all landed 2026-10-12); conclave fan-out
+  (done); **5c** encrypted store (done); **6** backup (must include `zines.enc` and pen-name keys).
+- **New relay work:** the bulletin lane (Phase 2) — the only server-side change.
+- **Independent of** **17**/**18** media work and of the postponed voice/video plane.
+- **Reshapes Task 11:** Nostr export becomes Phase 5's optional tail, not the native transport.
+- **Schedule after Paper Phase 5** (the remaining DataChannel wiring, presence, and docs), since
+  zines reuse that spine; the spec is written and locked in the meantime.
+
+---
+
+## 10. What not to build
+
+- A public IPFS/DHT layer, or a private swarm in v1 — Section 1.
+- A relay-side category registry or any relay-visible tag/pen-name index — Section 1.
+- Follows, subscriptions, or any ranking algorithm — the newspaper model is pull-only.
+- Images/media in v1 (their own later phase: EXIF strip, re-encode, hash-addressed media).
+- A CRDT for articles or comments — one writer per document.
+- Cross-relay bulletin federation — reach is the holder re-post sweep.
+- A first-party Nostr relay.
+
+---
+
+## 11. Open questions (not blocking Phase 1)
+
+| # | Topic |
+|---|---|
+| 1 | **Key rotation / revocation** — the one accepted gap. A "revoke and re-key" flow for a leaked read key is a later design |
+| 2 | **Read-key sealing vs. direct** — the grant currently carries the raw read key over the session; a wrapped form is a hardening step, not a v1 need |
+| 3 | **Comment spam** — per-member rate limit is the wall today; author-side mute of a pen name is local; a proof-of-work or per-zine allow-list is later |
+| 4 | **Corpus scale** — the full-index newspaper model is right for hundreds of zines; a paging/eviction story is needed if a commons grows to thousands |
+| 5 | **Body format** — ProseMirror JSON vs sanitized HTML on the wire; pick during Phase 1 and pin with test vectors |
+| 6 | **Relationship to reads/notes** — a zine body could reuse the `Reads` sanitizer; decide at Phase 1 to avoid two renderers |

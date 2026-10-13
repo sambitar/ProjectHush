@@ -2,6 +2,12 @@
 
 **Status:** Vision and backlog only — **not** v1 scope. Filters ChatGPT-style “Magazine / Ideas / Graph” proposals against [`DESIGN.md`](../DESIGN.md), [`THREAT_MODEL.md`](../THREAT_MODEL.md), and existing tasks (**11** Articles, **10** Confidential, **5** messaging).
 
+> **Reshaped 2026-10-12:** long-form publishing changed shape — the native members-only surface is
+> **zines** ([`zines.md`](../tasks/zines.md), Task **21**), with **Nostr as an optional export**
+> (Task **11**). The follow-based feed ideas below belong to the **public/export** layer, not to
+> zines, which is pull-only with no follows. Read every “Task 11” reference below as “the export
+> path”.
+
 **North star (Hush-aligned):**  
 *Private capsule for people who already care about privacy → optional **public pseudonymous** publishing → **argument and evidence** over popularity → **local** library and graph on the device → optional **projects** that link talk to work — without Hush becoming a host that reads DMs, a viral algorithm, or a Facebook-style group graph on our infrastructure.*
 

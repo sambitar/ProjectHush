@@ -1,6 +1,16 @@
 # Articles (Nostr pen names) — planning only
 
-**Status:** Not implemented. **Index:** Task **11** in [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md).
+> **Reshaped 2026-10-12 — this task is now the Nostr _export_ bridge, not the native shape.**
+> The native members-only long-form surface is **zines** ([`zines.md`](zines.md), Task **21** /
+> Phase **O**): a broadcast relay bulletin, pen-name identity, no public network, no follows.
+> Nostr keeps only the part it is uniquely good at — **reach beyond the membership** — as an
+> optional export of a zine as a NIP-23 event over Tor.
+> **Superseded below:** the feed engine, follows/mutes as a discovery mechanism, the relay pool as a
+> product surface, the phase-2 global stream, and the `crates/hush-articles/` product role (it is now
+> **export-only**). **Still relevant:** pen names, the NIP-23 event shape, media hardening, the Tor
+> (`arti`) egress, and the sanitizer/render rules.
+
+**Status:** Not implemented. **Index:** Task **11** in [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md) — **reshaped 2026-10-12** to an export bridge for **zines**.
 
 **Goal:** Long-form **pseudonymous publishing** inside Hush: pen names, Nostr-compatible articles, comments, and local social graph — **isolated** from 1:1 messaging identity and from `hush-relay`.
 

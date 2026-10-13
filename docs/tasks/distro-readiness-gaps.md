@@ -21,6 +21,6 @@
 | DR-15 | Received files may be opened/saved to **user Downloads** via browser (plaintext export) | Tauri uses native open/save | Task 5b.1 — **mitigated** (export is explicit user action) |
 | DR-16 | **Recovery / first-run backup** not implemented | — | Task 6 — **done** |
 | DR-17 | Chat history only in **UI memory** (not in data root encrypted store) | `chat.enc` + API | Task 5c.3 — **done** |
-| DR-18 | (Future) **Articles** will add **Nostr over Tor** as second outbound path | Task 11 | Document in network inventory when starting 11 |
+| DR-18 | (Future) **Zines → Nostr export** adds **Nostr over Tor** as a second outbound path (native zines use only the existing relay bulletin) | Task **11** (reshaped export bridge) | Document in network inventory when starting 11 |
 
 **Process:** Before implementing Tasks **1, 2, 5, 5c, 6, 7, 10**, read the distro checklist in the milestones file and check this table for conflicts.

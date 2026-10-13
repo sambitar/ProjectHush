@@ -15,7 +15,7 @@ Hush is **not** “another social network.” It is:
 
 1. **Private capsule (v1 center):** E2E 1:1 chat and files (Signal/libsignal), local encrypted vault, add-friends by QR/invite only — no phone directory, no global username search.
 2. **Dumb relay:** First-party VPS holds **ciphertext** on **rotating queue IDs**, not per-person inboxes. Relay may see size, time, slot ID, IP — **not** names or a social graph.
-3. **Optional later public layer:** Pseudonymous **Articles** on **Nostr** under **pen names** (keys separate from messaging), fetched via daemon over **Tor** — public by design, clearly labeled in UI.
+3. **Members-only commons (later):** **zines** — every member's own blog of long-form articles with a comments section, broadcast on a relay **bulletin** and readable by **all members**, E2EE, under **pen names** (keys separate from messaging). Optional **Nostr export** pushes a zine beyond the membership, over **Tor** — public by design, clearly labeled in UI.
 
 Positioning: **quiet ownership** — “your data on your machine; we cannot read it.” Calm capsule, **not** activist/“uncensored” hero marketing.
 
