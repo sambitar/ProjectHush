@@ -275,6 +275,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | MessagePayload::PaperHub { .. }
                     | MessagePayload::PaperOffer { .. }
                     | MessagePayload::PaperAnswer { .. }
+                    // Voice (Task 23) has no CLI surface: it is daemon- and
+                    // UI-only, and a CLI recv has nothing to print for it.
+                    | MessagePayload::VoiceOpen { .. }
+                    | MessagePayload::VoiceOffer { .. }
+                    | MessagePayload::VoiceAnswer { .. }
+                    | MessagePayload::VoiceMute { .. }
+                    | MessagePayload::VoiceLeave { .. }
                     | MessagePayload::Unknown => {}
                 }
             }

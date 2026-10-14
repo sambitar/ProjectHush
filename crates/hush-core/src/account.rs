@@ -18,8 +18,13 @@ use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_fi
 use crate::crypto::{decrypt, encrypt};
 use crate::error::Error;
 use crate::invite::InvitePayload;
-use crate::message::{InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper};
-use crate::payload::{MailAttachment, MessagePayload, PaperDescriptor, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS};
+use crate::message::{
+    InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper, ReceivedVoice,
+};
+use crate::payload::{
+    MailAttachment, MessagePayload, PaperDescriptor, VoiceDescriptor, MAX_INLINE_FILE_BYTES,
+    MAX_MAIL_ATTACHMENTS,
+};
 use crate::relay_client::{normalize_relay_base, validate_onion_relay, BulletinBlob, RelayClient};
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
@@ -686,6 +691,11 @@ impl Account {
     /// the onion address on file are left exactly as they were.
     pub async fn set_relay_clearnet(&mut self, url: &str) -> Result<(), Error> {
         self.state.relay = normalize_relay_base(url)?;
+        // The relay rides inside the invite payload, so a moved mailbox must
+        // drop the cached invite — otherwise "Copy my invite" keeps
+        // advertising the old address until the process restarts (the same
+        // rule `set_mail_handle` and `set_vault_name` follow).
+        self.state.invite_cache = None;
         self.save().await
     }
 
@@ -1621,18 +1631,20 @@ impl Account {
         Ok(())
     }
 
-    /// Fan one paper payload out to the conclave's joined trustees.
+    /// Fan one conclave control payload (paper or voice) out to the conclave's
+    /// joined trustees.
     ///
-    /// Papers ride the same 1:1 sessions as conclave messages: there is no
-    /// relay-side room and no group object, so this is one encrypted copy per
-    /// joined trustee. Unlike a message it is **not** written to the local chat
-    /// log — the document lives in the daemon's paper sidecar, and the sender's
-    /// own copy of an update is recorded there, not here.
+    /// These payloads ride the same 1:1 sessions as conclave messages: there
+    /// is no relay-side room and no group object, so this is one encrypted
+    /// copy per joined trustee. Unlike a message it is **not** written to the
+    /// local chat log — the state lives in the daemon (paper sidecar, voice
+    /// manager), and the sender's own copy is recorded there, not here.
     ///
-    /// A paper follows the conclave's lifecycle: once the conclave has ended
-    /// the document is read-only on every peer, so sending is refused exactly
-    /// as `send_conclave_message` refuses.
-    async fn fan_out_paper(
+    /// Everything riding this fan-out follows the conclave's lifecycle: once
+    /// the conclave has ended the paper is read-only on every peer and a voice
+    /// room is over, so sending is refused exactly as
+    /// `send_conclave_message` refuses.
+    async fn fan_out_conclave_payload(
         &mut self,
         conclave_id: &str,
         payload: MessagePayload,
@@ -1669,7 +1681,7 @@ impl Account {
         conclave_id: &str,
         paper: PaperDescriptor,
     ) -> Result<(), Error> {
-        self.fan_out_paper(conclave_id, MessagePayload::PaperState { paper })
+        self.fan_out_conclave_payload(conclave_id, MessagePayload::PaperState { paper })
             .await
     }
 
@@ -1696,7 +1708,7 @@ impl Account {
         if convener != me {
             return Err(Error::NotConclaveConvener);
         }
-        self.fan_out_paper(conclave_id, MessagePayload::PaperHub { paper })
+        self.fan_out_conclave_payload(conclave_id, MessagePayload::PaperHub { paper })
             .await
     }
 
@@ -1806,7 +1818,7 @@ impl Account {
         paper_id: &str,
         update: &[u8],
     ) -> Result<(), Error> {
-        self.fan_out_paper(
+        self.fan_out_conclave_payload(
             conclave_id,
             MessagePayload::PaperDelta {
                 paper_id: paper_id.to_string(),
@@ -1828,11 +1840,102 @@ impl Account {
         paper: PaperDescriptor,
         state: &[u8],
     ) -> Result<(), Error> {
-        self.fan_out_paper(
+        self.fan_out_conclave_payload(
             conclave_id,
             MessagePayload::PaperSnapshot {
                 paper,
                 state: state.to_vec(),
+            },
+        )
+        .await
+    }
+
+    /// Open a voice room: announce the session to every joined trustee.
+    ///
+    /// The room rules (one per conclave, joined-trustee opener, cap) are the
+    /// daemon's voice manager's to enforce on both sides; this is transport.
+    /// A receiver still checks identity — the opener named must be the sender
+    /// — in `recv`, where the roster is in hand.
+    pub async fn send_conclave_voice_open(
+        &mut self,
+        conclave_id: &str,
+        session: VoiceDescriptor,
+    ) -> Result<(), Error> {
+        self.fan_out_conclave_payload(conclave_id, MessagePayload::VoiceOpen { session })
+            .await
+    }
+
+    /// Send a WebRTC offer to every joined trustee: in a mesh there is no hub
+    /// to offer to, so a joining peer offers to each peer already in the room
+    /// and answers their replies.
+    pub async fn send_conclave_voice_offer(
+        &mut self,
+        conclave_id: &str,
+        session_id: &str,
+        sdp: &str,
+    ) -> Result<(), Error> {
+        self.fan_out_conclave_payload(
+            conclave_id,
+            MessagePayload::VoiceOffer {
+                session_id: session_id.to_string(),
+                sdp: sdp.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Send a WebRTC answer. Mesh topology: only the peers that were offered
+    /// apply one, so this still fans out to all and lets each receiver decide
+    /// by session state whether it answers this peer.
+    pub async fn send_conclave_voice_answer(
+        &mut self,
+        conclave_id: &str,
+        session_id: &str,
+        sdp: &str,
+    ) -> Result<(), Error> {
+        self.fan_out_conclave_payload(
+            conclave_id,
+            MessagePayload::VoiceAnswer {
+                session_id: session_id.to_string(),
+                sdp: sdp.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Send a mute flag. The sender stops capturing *before* calling this, so
+    /// silence is the truth and the flag is the label.
+    pub async fn send_conclave_voice_mute(
+        &mut self,
+        conclave_id: &str,
+        session_id: &str,
+        who: &str,
+        muted: bool,
+    ) -> Result<(), Error> {
+        self.fan_out_conclave_payload(
+            conclave_id,
+            MessagePayload::VoiceMute {
+                session_id: session_id.to_string(),
+                who: who.to_string(),
+                muted,
+            },
+        )
+        .await
+    }
+
+    /// Send a leave. The opener's leave is the end of the room on every peer;
+    /// anyone else's removes only them.
+    pub async fn send_conclave_voice_leave(
+        &mut self,
+        conclave_id: &str,
+        session_id: &str,
+        who: &str,
+    ) -> Result<(), Error> {
+        self.fan_out_conclave_payload(
+            conclave_id,
+            MessagePayload::VoiceLeave {
+                session_id: session_id.to_string(),
+                who: who.to_string(),
             },
         )
         .await
@@ -2855,6 +2958,7 @@ impl Account {
 
         let mut out = Vec::new();
         let mut papers = Vec::new();
+        let mut voices = Vec::new();
         let mut zine_grants = Vec::new();
         let mut warnings = Vec::new();
         let mut dirty = false;
@@ -3148,6 +3252,67 @@ impl Account {
                         dirty = true;
                         continue;
                     }
+                    // A voice payload is not a chat message (Task 23): it is
+                    // routed into `voices` for the daemon's voice manager and
+                    // consumed, exactly like a paper payload. Identity is
+                    // checked here rather than only in the manager because
+                    // this is where the conclave roster is in hand, and the
+                    // same treatment `PaperHub` gets applies: a claim in
+                    // someone else's name is consumed and dropped — it never
+                    // becomes room state, not even briefly.
+                    MessagePayload::VoiceOpen { session }
+                        if session.opener == from_account
+                            && self
+                                .chat_log
+                                .conclave(&session.conclave_id)
+                                .is_some_and(|c| {
+                                    c.joined().any(|t| t.account_id == from_account)
+                                }) =>
+                    {
+                        voices.push(ReceivedVoice {
+                            from_account: from_account.clone(),
+                            from_nick: nick.clone(),
+                            payload: payload.clone(),
+                        });
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        dirty = true;
+                        continue;
+                    }
+                    MessagePayload::VoiceMute { who, .. } | MessagePayload::VoiceLeave { who, .. }
+                        if *who == from_account =>
+                    {
+                        voices.push(ReceivedVoice {
+                            from_account: from_account.clone(),
+                            from_nick: nick.clone(),
+                            payload: payload.clone(),
+                        });
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        dirty = true;
+                        continue;
+                    }
+                    MessagePayload::VoiceOffer { .. } | MessagePayload::VoiceAnswer { .. } => {
+                        // Session-level traffic: the receiver's manager decides
+                        // whether the sender is a peer it is handshaking with.
+                        voices.push(ReceivedVoice {
+                            from_account: from_account.clone(),
+                            from_nick: nick.clone(),
+                            payload: payload.clone(),
+                        });
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        dirty = true;
+                        continue;
+                    }
+                    // A voice payload in someone else's name (a forged open, a
+                    // mute or leave for another trustee) or for a conclave this
+                    // vault has never joined is consumed and dropped — the
+                    // same treatment `Unknown` gets, for the same reason.
+                    MessagePayload::VoiceOpen { .. }
+                    | MessagePayload::VoiceMute { .. }
+                    | MessagePayload::VoiceLeave { .. } => {
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        dirty = true;
+                        continue;
+                    }
                     // A tag this build does not know, from one that does.
                     // Consumed and dropped: it can never be interpreted here,
                     // and leaving it would re-deliver it on every poll forever.
@@ -3215,6 +3380,7 @@ impl Account {
         Ok(InboxResult {
             messages: out,
             papers,
+            voices,
             joined,
             departed,
             zine_grants,
@@ -3676,6 +3842,28 @@ mod tests {
             Some("carol-granted-token")
         );
         assert!(contact.inbound_ready);
+    }
+
+    #[tokio::test]
+    async fn moving_the_relay_invalidates_the_cached_invite() {
+        let dir = scratch("relay-invite");
+        let mut account = Account::create(&dir, "pw", "http://127.0.0.1:1")
+            .await
+            .unwrap();
+        let first = account.invite().await.unwrap();
+
+        account
+            .set_relay_clearnet("http://127.0.0.1:2")
+            .await
+            .unwrap();
+        let second = account.invite().await.unwrap();
+
+        assert_ne!(
+            first, second,
+            "a cached invite must not survive a relay move: it advertises the old relay"
+        );
+        let decoded = crate::invite::InvitePayload::decode(&second).unwrap();
+        assert_eq!(decoded.relay, "http://127.0.0.1:2");
     }
 
     #[tokio::test]

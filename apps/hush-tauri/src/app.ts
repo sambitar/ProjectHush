@@ -206,6 +206,7 @@ import {
   paperHasFocus,
   paperSession,
 } from "./lib/paperStore";
+import { voicePill } from "./lib/voicePill";
 import {
   attachZineEditor,
   closeZineEditor,
@@ -3649,10 +3650,23 @@ export class App {
     syncSend();
 
     if (this.conclaveTab === "paper") {
-      pane.append(header, members, tabs, this.renderPaperSurface(conclave.id, me));
+      pane.append(
+        header,
+        members,
+        tabs,
+        this.renderVoiceBar(conclave.id, me),
+        this.renderPaperSurface(conclave.id, me),
+      );
       return pane;
     }
-    pane.append(header, members, tabs, scroll, composer);
+    pane.append(
+      header,
+      members,
+      tabs,
+      this.renderVoiceBar(conclave.id, me),
+      scroll,
+      composer,
+    );
     return pane;
   }
 
@@ -3693,6 +3707,74 @@ export class App {
       tabs.appendChild(b);
     }
     return tabs;
+  }
+
+  /**
+   * The voice pill row (Task 23, Phase 1): one pill that reads the conclave's
+   * live room and offers the next action — start it, join it, or (from
+   * inside) mute and leave.
+   *
+   * The room state is fetched here rather than through the global render
+   * cycle because it is live-only and cheap: a 404 is the start state, not an
+   * error. Every action re-fetches in place, and a refusal announces itself —
+   * the daemon's text names the cap or the ended conclave as it is.
+   */
+  private renderVoiceBar(conclaveId: string, me: string): HTMLElement {
+    const bar = document.createElement("div");
+    bar.className = "voice-bar";
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "pressable voice-pill";
+    const mute = document.createElement("button");
+    mute.type = "button";
+    mute.className = "pressable voice-action";
+    const leave = document.createElement("button");
+    leave.type = "button";
+    leave.className = "pressable voice-action";
+    leave.textContent = "Leave";
+    bar.append(pill, mute, leave);
+
+    const run = (p: Promise<unknown>, done: string): void => {
+      void p.then(() => {
+        this.announce(done);
+        refresh();
+      }).catch((e: unknown) => {
+        this.announce(e instanceof AppError ? e.message : "Voice action failed.");
+      });
+    };
+
+    const refresh = (): void => {
+      void api
+        .voiceGet(conclaveId)
+        .catch(() => null) // 404: no room is open — the start state
+        .then((view) => {
+          const s = voicePill(view, me);
+          pill.textContent = s.label;
+          pill.onclick = null;
+          mute.onclick = null;
+          leave.onclick = null;
+          mute.hidden = true;
+          leave.hidden = true;
+          if (s.action === "open") {
+            pill.onclick = () =>
+              run(api.voiceOpen(conclaveId), "Voice room opened. The conclave's trustees can join.");
+          } else if (s.action === "join") {
+            pill.onclick = () => run(api.voiceJoin(conclaveId), "You joined the voice room.");
+          } else {
+            mute.hidden = false;
+            leave.hidden = false;
+            mute.textContent = s.muted ? "Unmute" : "Mute";
+            mute.onclick = () =>
+              run(
+                api.voiceMute(conclaveId, !s.muted),
+                s.muted ? "Unmuted." : "Muted. Your capture is stopped.",
+              );
+            leave.onclick = () => run(api.voiceLeave(conclaveId), "You left the voice room.");
+          }
+        });
+    };
+    refresh();
+    return bar;
   }
 
   /**

@@ -204,6 +204,36 @@ relay_health() {
   [[ "$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 "${1%/}/health" 2>/dev/null)" == "200" ]]
 }
 
+# The relay a vault's config file carries (empty when the file is absent or
+# sets none). This is plaintext client config, not vault state, so it reads
+# without unlocking; the vault's own stored relay still wins at runtime, and
+# for existing vaults the two agree by construction (see DEEPSEEKPROBLEMS.MD).
+vault_config_relay() {
+  local cfg="$1/client-config.json"
+  [[ -f "$cfg" ]] || return 0
+  node -e '
+    try {
+      const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      if (typeof c.relay_url === "string") process.stdout.write(c.relay_url);
+    } catch {}
+  ' "$cfg" 2>/dev/null
+}
+
+# A loopback RELAY_URL with both vaults already present usually means "the
+# operator did not pass --relay", not "start a relay nobody will use": the
+# daemons read the relay stored in their vault, so a local one would come up
+# and carry no traffic. Follow the vaults instead.
+if [[ "$RELAY_IS_LOCAL" == 1 && -z "$RELAY_ARG" && -z "${HUSH_RELAY_URL:-}" ]] \
+     && [[ -d "$PEER_A" && -d "$PEER_B" ]]; then
+  STORED="$(vault_config_relay "$PEER_A")"
+  STORED_B="$(vault_config_relay "$PEER_B")"
+  if [[ -n "$STORED" && "$STORED" == "$STORED_B" ]] && ! relay_is_local "$STORED"; then
+    RELAY_URL="$STORED"
+    RELAY_IS_LOCAL=0
+    echo "Vaults point at $RELAY_URL (from client-config.json); no local relay."
+  fi
+fi
+
 if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
   if relay_ready; then
     echo "Local relay already up at $RELAY_URL"

@@ -3,13 +3,278 @@
 Running log of problems hit while implementing slices. Kept so the same dead ends are not
 re-explored and so unverified claims stay visible instead of being quietly dropped.
 
-**Convention:** append an entry when a problem is hit, not retroactively at the end of a
+**Convention:** append an entry when the problem is hit, not retroactively at the end of a
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
+
+## 2026-10-13 — Conclave voice Phase 2 two-peer test
+
+### Daemon playback was silent whenever the output device's default rate is not 48 kHz [FIXED]
+
+- Attempted: the VM peer joined the voice room; its 440 Hz tone arrived and
+  decoded at the host (`decoded_frames`/`played_frames` climbing), but the user
+  heard nothing.
+- Symptom: `wpctl status` showed the daemon holding only a capture stream —
+  no playback stream existed, yet `played_frames` kept climbing. The daemon log
+  said `hush-daemon: voice: no 48 kHz output device; playout is counted, not
+  audible`.
+- Cause: `voice_data.rs` only built the output stream when the device's
+  *default* output config was exactly 48 kHz. HDA analog defaults to 44.1 kHz,
+  so every run degraded to the counting playout ticker — counters lied while
+  the speakers got nothing.
+- Resolution: the plane now retries the output stream with 48 kHz requested
+  explicitly (`SupportedStreamConfig::new` at the wire rate; the audio server
+  resamples — the mix is already 48 kHz), logging the forced rate. Counting
+  fallback remains only for devices that fail both opens.
+  (`crates/hush-daemon/src/voice_data.rs`, voice tests green.)
+- Lesson: `played_frames` was never an audibility signal in Device mode either
+  (device callback) or in the fallback (ticker) — only PipeWire's stream table
+  (`wpctl status` Streams section) proves a real playback link exists.
+
+### Copy-my-invite served the old relay after the relay moved [FIXED]
+
+- Attempted: added the user's pasted invite to the VM peer; the blob carried
+  `"relay":"http://137.184.129.205:8790"` even though the vault had been moved to
+  `https://ban-therapeutic-daughter-organic.trycloudflare.com` via `relay set` hours earlier.
+- Symptom: `400: invite relay http://137.184.129.205:8790 does not match this vault relay
+  https://ban-therapeutic-daughter-organic.trycloudflare.com`. The user's "Copy my invite"
+  kept producing the stale blob across UI reopen and daemon restart.
+- Cause: `Account::invite` caches the minted invite in `state.invite_cache`, and
+  `set_mail_handle`/`set_vault_name` drop that cache on change, but `set_relay_clearnet`
+  did not — the relay rides inside the invite payload, so the cache advertised the old
+  address forever.
+- Resolution: `set_relay_clearnet` now sets `self.state.invite_cache = None`
+  (`crates/hush-core/src/account.rs`), with a regression test
+  `moving_the_relay_invalidates_the_cached_invite` (asserts a fresh `invite()` differs and
+  decodes with the new relay; green via `cargo test -p hush-core --lib`). Vault repaired in
+  place with `hush-cli relay set` on the fixed build, then the daemon was restarted so its
+  in-memory state could not clobber the cleared cache on its next `save()`.
+- Lesson: anything embedded in the invite payload must invalidate `invite_cache`; the cache
+  is a snapshot, not a view. Also: the daemon holds account state in memory — after editing
+  a vault out-of-band with the CLI, restart the daemon before trusting the result.
 
 Status tags: `FIXED` (resolved in-slice), `WORKED AROUND` (avoided, cause not fixed),
 `OPEN` (unresolved, needs a different environment or a later task), `NO LONGER APPLICABLE`
 (the configuration it described cannot occur any more).
+
+---
+
+## 2026-10-13 evening — trying the voice for real (same branch)
+
+### A stray `run-one-ui.sh` daemon held the `peer-a` vault lock and `run-two-ui.sh` failed to start — `FIXED`
+
+Attempted: the user ran `./scripts/run-two-ui.sh` to try the voice and it died at daemon start.
+
+Symptom: `another hush-daemon is already running on /home/sam/ProjectHush/instances/peer-a
+(Resource temporarily unavailable (os error 11))`. Cause: a daemon from an earlier
+`run-one-ui.sh` session (pid 699022, socket `/run/user/1000/hush-one/hush.sock`) was still
+alive and held the vault lock. Both demo scripts share `instances/peer-a`/`peer-b`, so each
+script's "is my daemon up" socket check can pass while *another* script's daemon holds the
+vault.
+
+Resolution: killed the stray; re-run works. Lesson: the vault lock is the only cross-script
+mutual exclusion, and the error names it well — when it fires, `pgrep -af hush-daemon` and kill
+the holder before re-running. The scripts cannot clean this up for each other safely.
+
+### `run-two-ui.sh` started a local relay that nothing used, next to a remote relay the vaults already point at — `FIXED`
+
+Attempted: the user runs the two-peer demo against the lab VPS relays (hakim: HTTPS quick
+tunnel + Tor onion, same box) and does not want a local relay.
+
+Symptom: with no `--relay` argument the script defaults to `http://127.0.0.1:8787` and starts a
+local relay — while both peer vaults store
+`https://ban-therapeutic-daughter-organic.trycloudflare.com` (set 2026-10-10) and the daemons
+use the **vault's** stored relay at runtime, so the local relay carried zero traffic and was
+pure confusion.
+
+Resolution: the script now, when no `--relay`/`HUSH_RELAY_URL` was given and both vaults exist,
+reads each vault's `client-config.json` `relay_url` (plaintext, no unlock) and adopts it when it
+is remote and identical for both vaults — no local relay is started, and the printed URLs match
+what the daemons will actually use. Explicit `--relay` still wins. Unverified end-to-end at
+write time (see next entry) — verify with `./scripts/run-two-ui.sh --dev` and look for
+"Vaults point at …".
+
+### My own verification kept re-killing the daemon's release build and mistook it for a recompile loop — `WORKED AROUND`
+
+Attempted: bounded (`timeout` 45–120 s) `--dev` runs of the script to verify the relay fix.
+
+Symptom: every run showed `Compiling hush-daemon` and got killed before finishing — five runs
+in a row looked like cargo refusing to cache. Root causes, all mine: (1) the script builds the
+daemon in **release even in `--dev`** (`PROFILE` defaults to release, for vault AEAD speed), and
+a release build of the ~1600-crate daemon tree under load average 3 takes longer than my
+timeouts; (2) killing a compile mid-flight leaves no fingerprint, so the next run starts the
+final crate over; (3) earlier direct `cargo build`s without the script's exported `PROTOC`
+flipped fingerprints the other way. Also `… | head -18` SIGPIPE-killed one run silently.
+
+Resolution: run the build to completion once, untimed, then test the script. Lesson: this
+script's dev mode is not a debug-mode run; never bound-timeout a script whose first action is a
+release build. Tooling-related, not a repo problem.
+
+---
+
+## 2026-10-13 — Conclave voice Phase 2 (real audio, branch `feature/conclave-voice-phase1`)
+
+### The `pipewire-rs` capture probe cannot run on this machine — `OPEN`
+
+Attempted: the spec (§2 #5) makes `pipewire-rs` the first capture backend, with the probe as
+Phase 2's first step. The probe needs `libpipewire-0.3-dev`, which is not installed.
+
+Symptom: `pkg-config --modversion libpipewire-0.3` → "Package libpipewire-0.3 was not found",
+and `sudo -n apt-get install libpipewire-0.3-dev` → "sudo: a password is required". No
+non-interactive way to install the dev headers here.
+
+Resolution: built capture/playout on the spec's documented fallback — `cpal`/ALSA against the
+host's PipeWire via the ALSA emulation, which the spike already probe-proved on this exact
+hardware (default device records; the daemon now also plays back and mixes). What remains to
+resolve it: a machine with the pipewire dev headers, a `pipewire-rs` input/output stream probe,
+and — if it works — swapping the capture source behind the same 48 kHz mono contract and
+restoring `PrivateDevices=true` in the shipped unit (socket access instead of `/dev/snd`).
+Recorded in `docs/tasks/conclave-voice.md` §2 #5 and Phase 4.
+
+Lesson: a "first choice, probe first" decision still needs a machine that can run the probe;
+the honest fallback path (documented in the spec) is what kept the slice unblocked.
+
+### The `VoiceAnswer` roster-join aborted the media handshake — `FIXED`
+
+Attempted: keep Phase 1's inbound pattern — apply every `Voice*` payload's roster effect with
+`.ok()?`, then do the media work.
+
+Symptom: the dogfood's audio assertion saw nothing for 20 s; both daemons logged zero voice
+lines. The handshake *looked* complete (rosters agreed on two speakers) because the roster side
+did land — on Bob's own side, locally, at his join. But Bob's recv of Alice's `VoiceAnswer`
+tried `mgr.join(...)` first, which refuses with `AlreadyConclaveTrustee` (he is already on his
+own roster), and the `?` returned `None` — so `accept_answer` never ran and the DTLS connection
+never got its remote description. The stats line proved it once added: `sent=957 decoded=956
+played=954 live=1` on Alice (audio flows!) while the assertion still failed — the script's own
+`sed -n 's/.../.../'` without the `p` flag printed nothing (second bug, fixed together).
+
+Resolution: the roster effect of `VoiceAnswer` is evidence, not authority — `AlreadyConclaveTrustee`
+proceeds to `accept_answer`; `VoiceOffer` keeps answering on a duplicate join but still refuses
+on a real authority failure. Re-run: audio crosses both ways (`decoded=64` / `decoded=11` and
+climbing) with mute and both leave paths still ending the room.
+
+Lesson: Phase 1's stub made the answer payload's *entire* job cosmetic, so an early-return on a
+benign refusal was invisible. When a stub is replaced by real behavior, every shortcut taken
+because "nothing real rides here yet" needs re-reading.
+
+### Dogfood stats assertion read `sed -n` output that was suppressed — `FIXED`
+
+Attempted: extract the `decoded=` counter with `sed -n 's/.*decoded=\([0-9]*\).*/\1/'`.
+
+Symptom: `decoded` was always empty (fell back to 0), so the assertion looped to its timeout
+even though the stats line plainly showed `decoded=956`.
+
+Resolution: `sed -n` suppresses the default print; the substitute needs the `p` flag:
+`s/.*decoded=\([0-9]*\).*/\1/p`.
+
+Lesson: `-n` + `s///` without `p` is the silent-output combo; test one iteration of the
+extraction before wrapping it in a wait loop.
+
+---
+
+## 2026-10-13 — Conclave voice Phase 1 verification (branch `feature/conclave-voice-phase1`)
+
+### The voice-dogfood script asserted a mute semantics that does not exist — `FIXED`
+
+Attempted: the Phase 1 acceptance script (`scripts/voice-dogfood.sh`) asserted that a joiner's mic
+reads `muted: true` on the receiver's roster "until the answer confirms it".
+
+Symptom: the first run failed at exactly that assertion. Alice's roster showed Bob unmuted the
+moment his offer landed:
+
+```
+FAIL: alice should see bob's mic unconfirmed until his answer: <id-a>:false <id-b>:false
+```
+
+The "muted until confirmed by answer" state was invented while writing the script. The code has one
+consistent rule: an inbound `VoiceOffer` is applied as a `join` (the receiver's `voice_apply_inbound`
+reuses `VoiceManager::join`), and `join` adds the sender unmuted; `VoiceMute` is documented as
+advisory only ("silence is the truth and this is the label") and moves only by an explicit payload.
+The answer's role is the handshake, not a mic label. The script was fixed to match the code, which
+is the correct direction — the code's rule is simpler and matches the payload docs.
+
+Lesson: when scripting acceptance checks, derive the expected DTO values from the implementation's
+own semantics, not from a stricter design remembered mid-sentence. If the stricter design is wanted
+(a "peer not yet handshake-confirmed" state), it is a Phase 2 decision to make deliberately, with
+the UI for it, not a dogfood assertion smuggled in.
+
+### Dogfood assertions matched nicknames against a roster of account ids — `FIXED`
+
+Attempted: match roster strings containing `"bob:true"` / `"alice:false"`.
+
+Symptom: the assertion never matched even though the JSON payload held exactly the right state
+(`"muted": true` for Bob), because `joined[].account` carries account ids (hex), never nicknames.
+Made this mistake twice in the same script; the first fix (the answer step) did not fix the class
+(the mute step), which cost a third run.
+
+Resolution: all roster assertions now compare against ids read from the view itself — the opener's
+id from the `opener` field, joiner order from insertion — with the nickname placed only in comments.
+
+Lesson: same class, twice in one file, is a prompt to grep the whole file for the pattern before
+re-running, not to patch the one assertion that failed.
+
+### Script bug: `if find …` tests find's exit status, not whether it matched — `FIXED`
+
+Attempted: `if find "$VA" "$VB" -type f -name '*voice*'; then fail …` as a "no voice files on
+disk" check.
+
+Symptom: vacuous — `find` exits 0 whether or not it matched anything, so the branch could never
+fire and the assertion proved nothing (a passed-without-exercising check, in the log's own
+vocabulary).
+
+Resolution: capture the output (`VOICE_FILES=$(find … || true)`) and test `-z` on it.
+
+---
+
+## 2026-10-13 — Voice engine spike (`crates/voice-spike`, Task 23 §2 #4)
+
+### The facade's answer SDP is incomplete unless both peers register the codec registry — `FIXED`
+
+Attempted: two `webrtc` 0.21 (the facade over `rtc`) peer connections on loopback; the receiver
+built with no `with_media_engine`.
+
+Symptom: `set_remote_description` refused the answer with `ErrSessionDescriptionMissingIceUfrag`,
+and the dumped answer SDP showed the degenerate shape — `m=audio 0 … 0` (PCMU only, no Opus) and
+**no `ice-ufrag`/`ice-pwd` lines at all**, though candidates were present.
+
+Resolution: build the answerer with the same `MediaEngine::default()` + `register_default_codecs()`
+as the offerer. The SDP then carries `m=audio … 111` with credentials, and the loopback proof goes
+150/150 byte-exact. The other necessary piece was waiting for gathering complete before reading
+`local_description()` — without it the offer goes out with no candidates and the same ufrag error
+surfaces on the receiver's `set_remote_description`.
+
+Lesson: the new `webrtc` facade keeps its media engine per connection and gives empty registries by
+default; both halves of a handshake need the codec registry, and non-trickle signalling needs the
+gather-complete wait on BOTH descriptions, not just the offer. The `paper_data.rs` pattern already
+did the wait for its offers; the answer side needs it too.
+
+### `pgrep -a a b` does not do what it reads like — `FIXED`
+
+Attempted: `pgrep -a pipewire pulseaudio` to check for sound servers.
+
+Symptom: reported nothing, and I concluded "no PipeWire session running". Later in the same
+session, `pgrep -c pipewire` alone found **3 processes** — a full PipeWire session was up the whole
+time. The two-argument form does not search two patterns; the second word was silently not a
+pattern, and the first pattern's match was lost to whatever the combined invocation did.
+
+Resolution: one pattern per call (`pgrep -a pipewire; pgrep -a pulseaudio`), or `pgrep -a 'pipewire|pulseaudio'`. The §2 #5 capture-backend probe was scoped on the wrong premise because of this.
+
+Lesson: the cost of a bad negative here was under-probing (skipping the pipewire-rs capture probe
+that was feasible all along), not a wrong product result — but a check that silently answers
+"absent" is the classic shape this log exists for.
+
+### Smaller build frictions in the same slice — `FIXED`
+
+- Opus 1.4 fails to compile with only `OPUS_BUILD`/`HAVE_LRINT*`: `stack_alloc.h` demands one of
+  `VAR_ARRAYS`/`USE_ALLOCA`/`NONTHREADSAFE_PSEUDOSTACK`. `VAR_ARRAYS` is the Linux norm.
+- `cpal` 0.15's host methods (`default_input_device`, `build_input_stream`, `play`) live on the
+  `traits::{HostTrait, DeviceTrait, StreamTrait}` traits — importing the crate is not enough.
+  There is no `alsa` feature to enable (the Linux backend is a non-optional dependency); inventing
+  one fails version selection.
+- `hound::WavWriter::finalize` consumes `self` — an `Arc<Mutex<WavWriter>>` shared with the capture
+  callback needs `Arc::try_unwrap` after the stream is dropped, not a `lock()`.
+- The first loopback proof lost exactly one packet (149/150): the first `write_sample` raced the
+  ICE pair opening. A 150 ms settle after `Connected` makes it 150/150 byte-exact.
 
 ---
 

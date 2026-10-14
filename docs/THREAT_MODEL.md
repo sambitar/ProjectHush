@@ -117,6 +117,25 @@ a comment is sealed to a pen name rather than sent to an inbox, so the author ca
 but cannot take it off the lane; and every member holds a copy of what they have received — zines are
 not "leaves nothing behind."
 
+## Conclave voice (group audio in a conclave, added 2026-10-13)
+
+A live, in-memory voice room per conclave among trustees, added 2026-10-13 (spec:
+[`docs/tasks/conclave-voice.md`](tasks/conclave-voice.md), Task **23**). Full mesh of direct
+peer connections; Phase 1 (signaling) landed, real audio behind the engine spike.
+
+| New surface | What it may see | Rule |
+|---|---|---|
+| Relay (control plane) | Same as today: ciphertext, size, time, queue id, IP. Voice signaling is ordinary fanned-out Signal ciphertext; the relay carries **no media** | **No change.** The `Voice*` payloads are indistinguishable from any other conclave fan-out |
+| Joined trustees | Every other joined trustee's IP and ICE candidates | **Accepted** — the mesh exposes the set, not one peer. A mic is louder than a message, which is why joining a room is an explicit consent act; the exposure is stated in copy |
+| STUN server | Querying IP + port, no party linkage | Self-hosted via the existing `ClientConfig::stun_url` (no default). Runbook: [`docs/ops/voice-stun-checklist.md`](ops/voice-stun-checklist.md) |
+| First-party relay (TURN) | — | **None** in v1; never first-party. A peer behind symmetric NAT gets a clear failure, not a relay |
+| Media on disk | Nothing | Never written, no temp files, no recording or transcription — ever ([`DESIGN.md`](DESIGN.md)); voice state is memory-only, so a restart or a lock ends the session |
+| Vault | Nothing new in v1 | No call-history rows, no chat notices for voice events; the session leaves no trace |
+
+**Honest limits for user-facing copy:** everyone in the room hears everyone (a room, not a dial
+tone); every joined trustee learns every other joined trustee's IP; the network can correlate media
+timing and size though never content; a locked or offline trustee is not in the session.
+
 ## Implications already decided
 
 - No phone/email directory, no global username search.
