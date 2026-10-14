@@ -798,7 +798,9 @@
   box-shadow: var(--shadow-1);
 }
 
-/* Conclave voice pill (Task 23) — sits under the Chat | Paper tabs. */
+/* Conclave voice controls — the on/off toggle sits in the conclave header's
+   action row (beside Invite / End / Leave); mute and leave stay in this slim
+   bar under the tabs while this vault is in the room. */
 .voice-bar {
   display: flex;
   gap: var(--space-1);
@@ -806,11 +808,49 @@
   padding: var(--space-1) 0;
 }
 
-.voice-pill {
-  border: none;
-  background: var(--surface-2);
-  border-radius: var(--radius-pill);
-  padding: var(--space-2) var(--space-3);
+/* The LED'd header buttons (Voice, Mic) are ordinary header pills (icon +
+   label, one line, same padding and height as their neighbors). The LED is
+   a badge pinned to the button's top corner, like a light on hardware:
+   green when live, and absent when off — an unlit LED is no light. */
+.voice-led-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+
+/* The button's own display would beat [hidden] (same as .trust-row and
+   .conclave-card below); restate it so the mic disappears when voice is off. */
+.voice-led-btn[hidden] {
+  display: none;
+}
+
+.voice-led-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.voice-led {
+  position: absolute;
+  top: -3px;
+  right: -1px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  visibility: hidden;
+}
+
+.voice-led-btn[data-led="green"] .voice-led {
+  visibility: visible;
+  background: var(--success-text);
+  box-shadow: 0 0 5px var(--success-text);
+}
+
+.voice-led-btn[data-led="amber"] .voice-led {
+  visibility: visible;
+  background: var(--warning-text);
+  box-shadow: 0 0 5px var(--warning-text);
 }
 
 .voice-action {
@@ -1663,6 +1703,31 @@
   width: auto;
 }
 
+/* The end-conclave choice card: three stacked, full-width choices, in the
+   order End and keep / End and delete / Cancel. Keep is green — it preserves;
+   delete is red — it destroys. */
+.conclave-end-choices {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.conclave-end-choices .btn-primary,
+.conclave-end-choices .btn-secondary {
+  width: 100%;
+}
+
+.conclave-end-keep {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+
+.conclave-end-delete {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
 /* Update prompt: the release notes, the progress bar, and the About controls */
 .update-notes {
   margin-top: var(--space-4);
@@ -1917,6 +1982,9 @@
 
 .conclave-end {
   width: auto;
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
 }
 
 .conclave-members {

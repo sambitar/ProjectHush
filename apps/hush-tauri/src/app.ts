@@ -504,6 +504,14 @@ export class App {
     atBottom: boolean;
     top: number;
   } | null = null;
+  /** Scroll state of the conclave chat pane from the render that is being
+   * replaced. Keyed by the conclave the old DOM was showing, for the same
+   * reason `chatScrollPos` is keyed by conversation. */
+  private conclaveScrollPos: {
+    conclaveId: string | null;
+    atBottom: boolean;
+    top: number;
+  } | null = null;
   /** The conversation the thread pane currently shows, for that keying. */
   private renderedNick: string | null = null;
   /** Where the freshly built thread pane should be scrolled once it is in the
@@ -517,6 +525,16 @@ export class App {
   /** Set when the window becomes visible again: the next thread paint opens
    * on the newest message, because returning to the window is a fresh read. */
   private bottomOnNextChatRender = false;
+  /** Where the freshly built conclave chat should be scrolled once it is in
+   * the document — same mechanism as `pendingChatScroll`, same reason: a
+   * detached element has no layout, so its scrollTop silently clamps. */
+  private pendingConclaveScroll:
+    | { conclaveId: string; mode: "bottom" }
+    | { conclaveId: string; mode: "restore"; top: number }
+    | null = null;
+  /** The conclave whose detail pane is currently in the document, for keying
+   * the scroll capture — the twin of `renderedNick` for chats. */
+  private renderedConclaveId: string | null = null;
   private pollTimer: number | null = null;
   private unlockedAt = 0;
   /** Relay-switch poller and last-seen state, so the pill repaints only on change. */
@@ -928,7 +946,6 @@ export class App {
    * carry over to the next conclave.
    */
   private conclaveEndId: string | null = null;
-  private conclaveEndConfirm = "";
 
   /**
    * The conclave the delete dialog is open for, and what the user has typed
@@ -1621,7 +1638,6 @@ export class App {
     this.conclaveInviteOpen = false;
     this.conclaveInviteTrustees = [];
     this.conclaveEndId = null;
-    this.conclaveEndConfirm = "";
     this.conclaveDeleteId = null;
     this.conclaveDeleteConfirm = "";
     this.unlockedAt = 0;
@@ -1642,6 +1658,21 @@ export class App {
           atBottom:
             prevMsgs.scrollHeight - prevMsgs.scrollTop - prevMsgs.clientHeight < 48,
           top: prevMsgs.scrollTop,
+        }
+      : null;
+    // Same carry for the conclave chat: was the reader pinned to the newest
+    // message, or away in history? Keyed by conclave, since the pane is
+    // rebuilt from scratch on every render.
+    const prevConclaveMsgs = this.root.querySelector<HTMLElement>(".conclave-messages");
+    this.conclaveScrollPos = prevConclaveMsgs
+      ? {
+          conclaveId: this.renderedConclaveId,
+          atBottom:
+            prevConclaveMsgs.scrollHeight -
+              prevConclaveMsgs.scrollTop -
+              prevConclaveMsgs.clientHeight <
+            48,
+          top: prevConclaveMsgs.scrollTop,
         }
       : null;
     // The IRC pane holds a live store subscription; tear it down before its
@@ -1707,6 +1738,7 @@ export class App {
     setTorrentsPaneOpen(this.rail === "torrents");
     setWalletPaneOpen(this.rail === "vault" && this.walletOpen);
     this.renderedNick = this.rail === "chats" ? this.selectedNick : null;
+    this.renderedConclaveId = this.rail === "conclaves" ? this.conclaveId : null;
     // Now that the thread pane is in the document and has layout, put the
     // reader where the conversation should open: the newest message, or their
     // place in the history of this same conversation.
@@ -1718,6 +1750,21 @@ export class App {
         liveMsgs.scrollTop = liveMsgs.scrollHeight;
       } else {
         liveMsgs.scrollTop = Math.min(pending.top, liveMsgs.scrollHeight);
+      }
+    }
+    // The conclave chat scrolls by the same contract, same reason: the intent
+    // was decided while the pane was detached and has only now got layout.
+    const liveConclaveMsgs = this.root.querySelector<HTMLElement>(".conclave-messages");
+    const conclavePending = this.pendingConclaveScroll;
+    this.pendingConclaveScroll = null;
+    if (liveConclaveMsgs && conclavePending) {
+      if (conclavePending.mode === "bottom") {
+        liveConclaveMsgs.scrollTop = liveConclaveMsgs.scrollHeight;
+      } else {
+        liveConclaveMsgs.scrollTop = Math.min(
+          conclavePending.top,
+          liveConclaveMsgs.scrollHeight,
+        );
       }
     }
     // The front page scrolls like any long page, so a story opened from halfway
@@ -3576,7 +3623,14 @@ export class App {
       group.appendChild(b);
       scroll.appendChild(group);
     }
-    scroll.scrollTop = scroll.scrollHeight;
+    // Decided while detached, applied after attachment (see render()): the
+    // reader pinned to the bottom — or opening fresh — rides the newest
+    // message; a reader away in history keeps their place.
+    const prev = this.conclaveScrollPos;
+    const pinned = !prev || (prev.conclaveId === conclave.id && prev.atBottom);
+    this.pendingConclaveScroll = pinned
+      ? { conclaveId: conclave.id, mode: "bottom" }
+      : { conclaveId: conclave.id, mode: "restore", top: prev.top };
 
     // Chat and Paper are the two surfaces of the same meeting; the pill swaps
     // between them without touching the header or the members row. Built before
@@ -3649,24 +3703,18 @@ export class App {
     composer.appendChild(inner);
     syncSend();
 
+    const voiceBar = conclave.ended
+      ? null // Read-only conclave: no voice room, no toggle in the header.
+      : this.renderVoiceControls(conclave.id, me, actions);
     if (this.conclaveTab === "paper") {
-      pane.append(
-        header,
-        members,
-        tabs,
-        this.renderVoiceBar(conclave.id, me),
-        this.renderPaperSurface(conclave.id, me),
-      );
+      pane.append(header, members, tabs);
+      if (voiceBar) pane.append(voiceBar);
+      pane.append(this.renderPaperSurface(conclave.id, me));
       return pane;
     }
-    pane.append(
-      header,
-      members,
-      tabs,
-      this.renderVoiceBar(conclave.id, me),
-      scroll,
-      composer,
-    );
+    pane.append(header, members, tabs);
+    if (voiceBar) pane.append(voiceBar);
+    pane.append(scroll, composer);
     return pane;
   }
 
@@ -3710,29 +3758,58 @@ export class App {
   }
 
   /**
-   * The voice pill row (Task 23, Phase 1): one pill that reads the conclave's
-   * live room and offers the next action — start it, join it, or (from
-   * inside) mute and leave.
+   * Voice controls for one conclave. Two header buttons — Voice (in/out of
+   * the room) and Mic (capture live/muted) — live in the conclave header's
+   * action row, beside Invite / End / Leave; the Leave button stays in a
+   * slim bar under the tabs, shown only while this vault is in the room.
    *
-   * The room state is fetched here rather than through the global render
-   * cycle because it is live-only and cheap: a 404 is the start state, not an
-   * error. Every action re-fetches in place, and a refusal announces itself —
-   * the daemon's text names the cap or the ended conclave as it is.
+   * One fetch of the room state drives everything, so the LEDs and the
+   * bar's visibility can never disagree. The room state is fetched here
+   * rather than through the global render cycle because it is live-only and
+   * cheap: a 404 is the start state, not an error. Every action re-fetches
+   * in place, and a refusal announces itself — the daemon's text names the
+   * cap or the ended conclave as it is.
    */
-  private renderVoiceBar(conclaveId: string, me: string): HTMLElement {
+  private renderVoiceControls(conclaveId: string, me: string, actions: HTMLElement): HTMLElement {
     const bar = document.createElement("div");
     bar.className = "voice-bar";
-    const pill = document.createElement("button");
-    pill.type = "button";
-    pill.className = "pressable voice-pill";
-    const mute = document.createElement("button");
-    mute.type = "button";
-    mute.className = "pressable voice-action";
+    // Two lights on the header, one per piece of hardware:
+    //   Voice — is this vault in the room at all.
+    //   Mic   — is this vault's capture live (only meaningful in the room).
+    // Both are ordinary header pills (icon + label, one line) with an LED
+    // badge pinned to the top corner — a light on the hardware, not a
+    // second row inside the button.
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "btn-secondary pressable voice-led-btn";
+    toggle.setAttribute("aria-label", "Toggle voice");
+    const micGlyph = icon("mic");
+    const toggleLabel = document.createElement("span");
+    toggleLabel.textContent = "Voice";
+    toggle.append(micGlyph, toggleLabel);
+    const roomLed = document.createElement("span");
+    roomLed.className = "voice-led";
+    toggle.appendChild(roomLed);
+
+    const micBtn = document.createElement("button");
+    micBtn.type = "button";
+    micBtn.className = "btn-secondary pressable voice-led-btn";
+    micBtn.setAttribute("aria-label", "Toggle microphone");
+    const micGlyph2 = icon("mic");
+    const micLabel = document.createElement("span");
+    micLabel.textContent = "Mic";
+    micBtn.append(micGlyph2, micLabel);
+    const micLed = document.createElement("span");
+    micLed.className = "voice-led";
+    micBtn.appendChild(micLed);
+    micBtn.hidden = true;
+
     const leave = document.createElement("button");
     leave.type = "button";
     leave.className = "pressable voice-action";
     leave.textContent = "Leave";
-    bar.append(pill, mute, leave);
+    bar.append(leave);
+    actions.prepend(micBtn, toggle);
 
     const run = (p: Promise<unknown>, done: string): void => {
       void p.then(() => {
@@ -3749,26 +3826,35 @@ export class App {
         .catch(() => null) // 404: no room is open — the start state
         .then((view) => {
           const s = voicePill(view, me);
-          pill.textContent = s.label;
-          pill.onclick = null;
-          mute.onclick = null;
+          toggle.onclick = null;
+          micBtn.onclick = null;
           leave.onclick = null;
-          mute.hidden = true;
           leave.hidden = true;
+          // The voice toggle is the one-button on/off: out of the room it
+          // joins (or opens), in it, it leaves. Dark means off, so an unlit
+          // badge is simply not shown.
+          toggle.dataset.led = s.led;
+          toggle.setAttribute("aria-pressed", String(s.inRoom));
+          toggle.replaceChildren(icon("mic"), toggleLabel, roomLed);
+          // The mic exists only while in the room; out of it the voice
+          // toggle is the single control that matters.
+          micBtn.hidden = !s.inRoom;
+          micBtn.dataset.led = s.micLed;
+          micBtn.setAttribute("aria-pressed", String(s.inRoom && !s.muted));
+          micBtn.replaceChildren(icon(s.muted ? "micOff" : "mic"), micLabel, micLed);
           if (s.action === "open") {
-            pill.onclick = () =>
+            toggle.onclick = () =>
               run(api.voiceOpen(conclaveId), "Voice room opened. The conclave's trustees can join.");
           } else if (s.action === "join") {
-            pill.onclick = () => run(api.voiceJoin(conclaveId), "You joined the voice room.");
+            toggle.onclick = () => run(api.voiceJoin(conclaveId), "You joined the voice room.");
           } else {
-            mute.hidden = false;
-            leave.hidden = false;
-            mute.textContent = s.muted ? "Unmute" : "Mute";
-            mute.onclick = () =>
+            toggle.onclick = () => run(api.voiceLeave(conclaveId), "You left the voice room.");
+            micBtn.onclick = () =>
               run(
                 api.voiceMute(conclaveId, !s.muted),
                 s.muted ? "Unmuted." : "Muted. Your capture is stopped.",
               );
+            leave.hidden = false;
             leave.onclick = () => run(api.voiceLeave(conclaveId), "You left the voice room.");
           }
         });
@@ -4205,23 +4291,23 @@ export class App {
   /** Open the end dialog for a conclave, always with an empty confirmation. */
   private openConclaveEnd(id: string): void {
     this.conclaveEndId = id;
-    this.conclaveEndConfirm = "";
     this.render();
   }
 
-  /** Close the end dialog and forget anything typed into it. */
+  /** Close the end dialog. */
   private closeConclaveEnd(): void {
     this.conclaveEndId = null;
-    this.conclaveEndConfirm = "";
   }
 
   /**
-   * The end-conclave dialog.
+   * The end-conclave dialog: three choices, one popup.
    *
-   * Mirrors the Trust delete dialog: a typed confirmation, focused on the field
-   * rather than the destructive button, so ending is never one click. The copy
-   * says plainly that this is local — the message log stays in the vault and no
-   * other member is notified, because membership is local-only.
+   * "End and keep" is the old ending — everyone is told, the conclave goes
+   * read-only, and the history stays in every vault. "End and delete" adds
+   * this vault's cleanup: after the ending goes out, this vault's record and
+   * its message log are deleted (the daemon only deletes an ended conclave,
+   * so the chain is end first, delete second). The other trustees keep their
+   * copies either way; files stay in the vault either way.
    */
   private renderConclaveEndModal(): HTMLElement {
     const id = this.conclaveEndId!;
@@ -4242,34 +4328,31 @@ export class App {
     p.className = "muted text-13";
     p.style.marginTop = "var(--space-3)";
     p.textContent =
-      "This ends the conclave for everyone. Its messages stay in every trustee's vault, so the history is kept rather than destroyed.";
-    const p2 = document.createElement("p");
-    p2.className = "muted text-13";
-    p2.style.marginTop = "var(--space-2)";
-    p2.textContent =
-      "Every joined trustee is told, and the conclave becomes read-only on their side too — no one can send in it after this.";
-    const note = document.createElement("p");
-    note.className = "faint text-12";
-    note.style.marginTop = "var(--space-2)";
-    note.textContent =
-      "Ending cannot be undone. As the convener you could also leave, which ends it the same way.";
+      "Every joined trustee is told, and the conclave becomes read-only on their side — no one can send in it after this. Ending cannot be undone.";
 
-    const label = document.createElement("label");
-    label.className = "trust-delete-field";
-    const labelText = document.createElement("span");
-    labelText.className = "text-13";
-    labelText.textContent = "Type END to confirm";
-    const input = document.createElement("input");
-    input.type = "text";
-    input.className = "input-field";
-    input.setAttribute("autocomplete", "off");
-    input.setAttribute("autocapitalize", "characters");
-    input.setAttribute("spellcheck", "false");
-    input.value = this.conclaveEndConfirm;
-    label.append(labelText, input);
+    const keep = document.createElement("p");
+    keep.className = "muted text-13";
+    keep.style.marginTop = "var(--space-2)";
+    keep.textContent =
+      "End and keep leaves the history here and in every trustee's vault.";
+    const del = document.createElement("p");
+    del.className = "muted text-13";
+    del.style.marginTop = "var(--space-2)";
+    del.textContent =
+      "End and delete also removes this vault's copy — messages included. The other trustees keep theirs, and files this conclave shared stay in your vault.";
 
     const row = document.createElement("div");
-    row.className = "modal-actions";
+    row.className = "modal-actions conclave-end-choices";
+    const keepBtn = document.createElement("button");
+    keepBtn.type = "button";
+    keepBtn.className = "btn-primary pressable conclave-end-keep";
+    keepBtn.textContent = "End and keep";
+    keepBtn.onclick = () => void this.endConclave(id);
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "btn-secondary pressable conclave-end-delete";
+    delBtn.textContent = "End and delete";
+    delBtn.onclick = () => void this.endAndDeleteConclave(id);
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn-secondary pressable";
@@ -4278,32 +4361,9 @@ export class App {
       this.closeConclaveEnd();
       this.render();
     };
-    const end = document.createElement("button");
-    end.type = "button";
-    end.className = "btn-primary pressable conclave-end-confirm";
-    end.style.background = "var(--danger)";
-    end.textContent = "End conclave";
-    // One rule, checked by the button, the Enter key, and the click handler, so
-    // there is no way to end a conclave without typing the word.
-    const confirmed = () => input.value.trim().toUpperCase() === "END";
-    const sync = () => {
-      this.conclaveEndConfirm = input.value;
-      end.disabled = !confirmed();
-    };
-    input.oninput = sync;
-    input.onkeydown = (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        if (confirmed()) void this.endConclave(id);
-      }
-    };
-    sync();
-    end.onclick = () => {
-      if (confirmed()) void this.endConclave(id);
-    };
 
-    row.append(cancel, end);
-    modal.append(h, p, p2, note, label, row);
+    row.append(keepBtn, delBtn, cancel);
+    modal.append(h, p, keep, del, row);
     back.appendChild(modal);
     back.onclick = (e) => {
       if (e.target === back) {
@@ -4311,10 +4371,40 @@ export class App {
         this.render();
       }
     };
-    // Focus the field, not the destructive button, so a stray Enter cannot end
-    // the conclave.
-    queueMicrotask(() => input.focus());
+    // Focus the common choice, not the destructive one, so a stray Enter
+    // cannot end the conclave.
+    queueMicrotask(() => keepBtn.focus());
     return back;
+  }
+
+  /**
+   * End the conclave for everyone, then delete this vault's copy. The delete
+   * is only legal after the end (the daemon refuses a live conclave), and if
+   * it fails the ending still stands — reload and say so rather than pretend.
+   */
+  private async endAndDeleteConclave(id: string): Promise<void> {
+    try {
+      await api.endConclave(id);
+      await api.deleteConclave(id);
+      this.closeConclaveEnd();
+      if (this.conclaveId === id) {
+        this.leavePaperTab();
+        this.conclaveId = null;
+      }
+      await this.reloadConclaves();
+      this.announce(
+        "Conclave ended and deleted. Files it shared stay in your vault.",
+      );
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError
+          ? e.message
+          : "Ended, but this vault's copy may remain — delete it from the ended conclave.",
+      );
+      await this.reloadConclaves();
+      this.render();
+    }
   }
 
   private async endConclave(id: string): Promise<void> {

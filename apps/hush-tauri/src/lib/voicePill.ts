@@ -17,6 +17,14 @@ export interface VoicePillState {
   muted: boolean;
   /** Joined trustees, this vault included when it is in. */
   count: number;
+  /**
+   * The room LED on the voice toggle: green while this vault is in the
+   * room, dark when out. The mic has its own light (`micLed`) because they
+   * are two different pieces of hardware with two different truths.
+   */
+  led: "green" | "off";
+  /** The mic LED: green while this vault's capture is live, dark when muted. */
+  micLed: "green" | "off";
 }
 
 export function voicePill(
@@ -33,6 +41,8 @@ export function voicePill(
       inRoom: false,
       muted: false,
       count: 0,
+      led: "off",
+      micLed: "off",
     };
   }
   const mine = room.joined.find((m) => m.account === me);
@@ -44,6 +54,8 @@ export function voicePill(
       inRoom: false,
       muted: false,
       count: n,
+      led: "off",
+      micLed: "off",
     };
   }
   if (mine.muted) {
@@ -53,6 +65,8 @@ export function voicePill(
       inRoom: true,
       muted: true,
       count: room.joined.length,
+      led: "green",
+      micLed: "off",
     };
   }
   return {
@@ -61,5 +75,7 @@ export function voicePill(
     inRoom: true,
     muted: false,
     count: room.joined.length,
+    led: "green",
+    micLed: "green",
   };
 }

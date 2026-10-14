@@ -12,6 +12,7 @@
   --on-accent: #ffffff;
   --success-soft: #e1f5ee;
   --success-text: #085041;
+  --success: #199d74;
   --warning-soft: #faeeda;
   --warning-text: #633806;
   --danger: #e24b4a;
@@ -49,6 +50,7 @@
   --on-accent: #16161d;
   --success-soft: #12362c;
   --success-text: #7fe0be;
+  --success: #2eb98c;
   --warning-soft: #3d3018;
   --warning-text: #f0d48a;
 }

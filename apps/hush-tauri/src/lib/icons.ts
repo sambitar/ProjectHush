@@ -78,6 +78,8 @@ import {
   Newspaper,
   Undo2,
   Redo2,
+  Mic,
+  MicOff,
   type IconNode,
 } from "lucide";
 
@@ -163,6 +165,8 @@ const ICONS = {
   zines: Newspaper,
   undo: Undo2,
   redo: Redo2,
+  mic: Mic,
+  micOff: MicOff,
 } satisfies Record<string, IconNode>;
 
 /**

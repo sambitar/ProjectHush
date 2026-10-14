@@ -20,13 +20,15 @@ function room(over: Partial<VoiceViewDto> = {}): VoiceViewDto {
   };
 }
 
-test("no room is a start-voice action", () => {
+test("no room is a start-voice action, both lights dark", () => {
   for (const state of [undefined, null]) {
     const pill = voicePill(state as VoiceViewDto | null | undefined, ME);
     assert.equal(pill.action, "open");
     assert.equal(pill.inRoom, false);
     assert.equal(pill.count, 0);
     assert.equal(pill.label, "Start voice");
+    assert.equal(pill.led, "off");
+    assert.equal(pill.micLed, "off");
   }
 });
 
@@ -36,6 +38,8 @@ test("a room this vault has not joined is a join action, with its size", () => {
   assert.equal(pill.inRoom, false);
   assert.equal(pill.count, 2);
   assert.match(pill.label, /2/);
+  assert.equal(pill.led, "off");
+  assert.equal(pill.micLed, "off");
 });
 
 test("a room this vault is in is live, with mute and leave available", () => {
@@ -43,6 +47,8 @@ test("a room this vault is in is live, with mute and leave available", () => {
   assert.equal(pill.action, "none");
   assert.equal(pill.inRoom, true);
   assert.equal(pill.muted, false);
+  assert.equal(pill.led, "green");
+  assert.equal(pill.micLed, "green");
 });
 
 test("my muted flag reads on the pill while i am in", () => {
@@ -50,12 +56,16 @@ test("my muted flag reads on the pill while i am in", () => {
   assert.equal(pill.inRoom, true);
   assert.equal(pill.muted, true);
   assert.match(pill.label, /muted/);
+  // The room is still live; only this vault's mic is dark.
+  assert.equal(pill.led, "green");
+  assert.equal(pill.micLed, "off");
 });
 
 test("another member's mute is not mine", () => {
   const pill = voicePill(room(), ME);
   assert.equal(pill.inRoom, true);
   assert.equal(pill.muted, false);
+  assert.equal(pill.micLed, "green");
 });
 
 test("an ended-by-leave view (empty room) is the start state again", () => {
@@ -63,4 +73,6 @@ test("an ended-by-leave view (empty room) is the start state again", () => {
   assert.equal(pill.action, "open");
   assert.equal(pill.inRoom, false);
   assert.equal(pill.count, 0);
+  assert.equal(pill.led, "off");
+  assert.equal(pill.micLed, "off");
 });

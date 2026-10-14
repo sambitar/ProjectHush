@@ -9,6 +9,29 @@ resolution, and the status.
 
 ## 2026-10-13 — Conclave voice Phase 2 two-peer test
 
+### Conclave chat never auto-scrolled to a new message [FIXED]
+
+- Context: flagged by the user during the two-peer voice test — messages
+  arrived but the reader had to scroll down manually.
+- Cause: `renderConclaveDetail` set `scroll.scrollTop = scroll.scrollHeight`
+  while the pane was still detached, and a detached element has no layout, so
+  the assignment silently clamped to zero on every render. The code comment
+  on `pendingChatScroll` documents exactly this trap for the chats pane; the
+  conclave pane never got the same treatment.
+- Resolution: same contract as chats. The previous pane's position is
+  captured at the top of `render()` (keyed by conclave via a new
+  `renderedConclaveId` mirror), `renderConclaveDetail` decides the intent
+  while detached — bottom when the reader was pinned (or opening fresh),
+  restore otherwise — and the pending intent is applied after attachment in
+  `render()`, next to the chats consume block. Verified live: pinned reader
+  rides to the newest message (`scrollTop + clientHeight === scrollHeight`
+  after a send), a reader parked in history stays put while a new message
+  lands (`scrollHeight` grew, `scrollTop` held).
+- Lesson: this is the third instance of the "author layout beats a UA default
+  / detached measurement" class (`.trust-row[hidden]`, `.conclave-card[hidden]`
+  precede it). Any pane that scrolls must decide intent detached and apply
+  attached — copy the chats pattern, not the one-liner.
+
 ### Daemon playback was silent whenever the output device's default rate is not 48 kHz [FIXED]
 
 - Attempted: the VM peer joined the voice room; its 440 Hz tone arrived and
