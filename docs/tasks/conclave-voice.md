@@ -5,10 +5,12 @@ decisions** ("do all by your judgement, I will evaluate later"), so they were re
 judgment under delegation**, with the reasoning recorded in Section 3 for that review.
 **Phase 1 approved and landed 2026-10-13** (`feature/conclave-voice-phase1`): payloads, state
 machine, fan-out, `/api/voice/*`, UI pill, and the scripted two-daemon acceptance
-(`scripts/voice-dogfood.sh`) — signaling only, stub SDP, no media. Phase 0's two open items
-(`THREAT_MODEL.md` addendum, engine spike) are still open, and Phase 2 (real audio) awaits
-approval. The one decision still to be made *with evidence* is the media-engine spike (Phase
-0/2); every other fork is closed.
+(`scripts/voice-dogfood.sh`) — signaling only, stub SDP, no media. **Phase 0's two items and
+Phase 2 (real audio, user-approved) landed the same day** on the same branch: the
+`THREAT_MODEL.md` addendum, the engine spike (§2 #4, `webrtc-rs` reuse wins), and the media
+plane itself — two trustees exchange real Opus audio in a conclave (`voice_data.rs`,
+`hush-audio`; `scripts/voice-dogfood.sh` asserts the audio crossing). Next: Phase 3 (the N-way
+mesh), which is where per-pair offers need a `to` field.
 
 **Index:** New **Task 23** in
 [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md) (Phase **Q**). It
@@ -94,7 +96,7 @@ Step 1 (prove it, or pivot and log it in [`DEEPSEEKPROBLEMS.MD`](../../DEEPSEEKP
 | 2 | **Topology** | **Full mesh** of peer connections among joined trustees; no hub, no succession; hub-star and SFU deferred behind the cap |
 | 3 | **Cap** | **8 joined speakers** as the starting ceiling; joining at the cap **refuses with a reason** (the `notes_store` pattern); the dogfood measures and may move it |
 | 4 | **Media engine** | **Resolved 2026-10-13 by spike** (`crates/voice-spike`): **`webrtc-rs` reuse wins** — the daemon's own `webrtc` 0.21 stack carried 3 s of Opus RTP over loopback losslessly (150/150 packets, byte-exact against a codec-only reference, encode 157 µs / decode 28 µs per 20 ms frame). Amends member-calls §6 in place; the bespoke glue (capture → resample → Opus → RTP) is measured, not estimated. A pivot is no longer pending |
-| 5 | **Capture backend** (with `webrtc-rs`) | **`pipewire-rs` first** — it keeps `PrivateDevices=true` (socket access, not `/dev/snd`), matching the posture the distro docs already prefer; `cpal`/ALSA is the documented fallback **and is now probe-proven on real hardware** (spike `--capture`: the default device recorded 2 s to WAV, 44.1 kHz F32 stereo, on a live PipeWire host). The pipewire-rs probe itself is Phase 2's first step |
+| 5 | **Capture backend** (with `webrtc-rs`) | **`pipewire-rs` first** — it keeps `PrivateDevices=true` (socket access, not `/dev/snd`), matching the posture the distro docs already prefer; `cpal`/ALSA is the documented fallback **and is now the shipped path** (spike `--capture` proved the default device on this host; Phase 2 ships capture + playout on it). The `pipewire-rs` probe could not run here — no dev headers, no sudo (`DEEPSEEKPROBLEMS.MD` 2026-10-13, `OPEN`) — so it moves to Phase 4's distro work; the capture contract (48 kHz mono s16le frames into the encoder) is the one seam the swap must meet |
 | 6 | **Authority** | Any joined trustee may **open**; the **opener** may end the session for all; leaving is always per-trustee; the session **auto-ends when fewer than two remain**; `ConclaveEnd` ends any session. No convener gate on opening — membership is already the convener's |
 | 7 | **Crypto** | **DTLS-SRTP** with SDP fingerprints authenticated by the Signal session (Task 17 §3's argument, unchanged). **No SFrame in v1** — its attacker class (a compromised media hop) does not exist in a P2P mesh; the recorded revisit trigger is any relayed/BYO-transport mode ever shipping |
 | 8 | **Mute and indicators** | Local VAD (your own level meter) only in v1. Remote **mute flags** ride one new low-frequency `VoiceMute` control payload over the existing fan-out — a user action, not a stream, so relay cadence is fine. **No remote speaking indicators** in v1 |
@@ -317,18 +319,34 @@ an inbound `VoiceOffer` adds the joiner unmuted, the same `join` the joiner appl
 the answer closes the handshake only. A "handshake-unconfirmed" roster state is a deliberate
 Phase 2 decision, not an accident to introduce; see `DEEPSEEKPROBLEMS.MD` (2026-10-13).
 
-### Phase 2 — Real audio, two trustees (the spike promoted)
+### Phase 2 — Real audio, two trustees (the spike promoted) — LANDED 2026-10-13
 
 **Unblocked 2026-10-13** — the engine spike (§2 #4) resolved in favour of the daemon's own
-`webrtc` stack; the capture backend probe (§2 #5) is the first step of this phase.
+`webrtc` stack; the capture backend probe (§2 #5) was this phase's first step.
 
+- [x] Engine per Phase 0's decision: capture, Opus, RTP/DTLS, jitter, playout — in the daemon
+      (`crates/hush-daemon/src/voice_data.rs`, one `VoicePlane` per live session; the audio glue
+      — vendored-system Opus FFI, linear resampler, jitter buffer — in `crates/hush-audio`).
+      **Capture backend: `cpal`/ALSA**, the §2 #5 documented fallback — the `pipewire-rs` probe
+      could not run here (no dev headers, no sudo; `DEEPSEEKPROBLEMS.MD` 2026-10-13, `OPEN`);
+      the resampler/jitter contract keeps the swap behind one seam for the distro unit.
+- [x] Two joined trustees hold a real two-way voice conversation **inside a conclave** — the
+      offer is the join announcement (Phase 1's shape, kept) and now carries real gathered SDP;
+      the answer is built by the answering plane with its own outbound track. Both directions
+      decoded and played in the scripted run (see Verify).
 
-- [ ] Engine per Phase 0's decision: capture (`pipewire-rs` per §2 #5), Opus, RTP/DTLS, jitter,
-      playout — in the daemon.
-- [ ] Two joined trustees hold a real two-way voice conversation **inside a conclave** on a LAN.
-
-**Verify:** two daemons hold a two-way call; mute works and the flag reaches the peer; no media
-bytes on disk; `relay.db` and `strings` scans show no call plaintext.
+**Verify:** `./scripts/voice-dogfood.sh` (2026-10-13) — both daemons in
+`HUSH_VOICE_TEST_TONE=1` (synthetic capture, counted playout; no mic needed headless) over a
+real relay: open → join → the handshake closes, then **each side's stats line shows decoded
+frames from the peer** (`decoded=64`/`decoded=11` and climbing), Bob's mute reaches Alice, both
+leave paths end the room, no voice file exists in either vault, and a `strings` scan of
+`relay.db` finds no SDP plaintext (`m=audio`/`ice-ufrag`/`a=fingerprint` absent — the payloads
+were ciphertext end to end). The plane's own tests (`voice_data`) prove two planes on loopback
+exchange real Opus audio and that muting stops the sent audio. Full `cargo test --workspace`
+(652 tests) and the UI suite (tsc + 65 tests) green at the close of the slice. A human-ear run
+is `./scripts/run-two-ui.sh` (no tone env): unlock both, open/join in the conclave, speak —
+Phase 2's two-trustee scope means the joiner dials the one existing member; the N-way mesh and
+the per-pair offer addressing it needs (a `to` field on `VoiceOffer`/`VoiceAnswer`) are Phase 3.
 
 ### Phase 3 — Mesh N-way
 

@@ -691,6 +691,11 @@ impl Account {
     /// the onion address on file are left exactly as they were.
     pub async fn set_relay_clearnet(&mut self, url: &str) -> Result<(), Error> {
         self.state.relay = normalize_relay_base(url)?;
+        // The relay rides inside the invite payload, so a moved mailbox must
+        // drop the cached invite — otherwise "Copy my invite" keeps
+        // advertising the old address until the process restarts (the same
+        // rule `set_mail_handle` and `set_vault_name` follow).
+        self.state.invite_cache = None;
         self.save().await
     }
 
@@ -3837,6 +3842,28 @@ mod tests {
             Some("carol-granted-token")
         );
         assert!(contact.inbound_ready);
+    }
+
+    #[tokio::test]
+    async fn moving_the_relay_invalidates_the_cached_invite() {
+        let dir = scratch("relay-invite");
+        let mut account = Account::create(&dir, "pw", "http://127.0.0.1:1")
+            .await
+            .unwrap();
+        let first = account.invite().await.unwrap();
+
+        account
+            .set_relay_clearnet("http://127.0.0.1:2")
+            .await
+            .unwrap();
+        let second = account.invite().await.unwrap();
+
+        assert_ne!(
+            first, second,
+            "a cached invite must not survive a relay move: it advertises the old relay"
+        );
+        let decoded = crate::invite::InvitePayload::decode(&second).unwrap();
+        assert_eq!(decoded.relay, "http://127.0.0.1:2");
     }
 
     #[tokio::test]

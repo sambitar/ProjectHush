@@ -1,6 +1,7 @@
 mod account_worker;
 mod notes_store;
 mod paper_data;
+mod voice_data;
 mod paper_doc;
 mod paper_store;
 mod paths;
@@ -34,7 +35,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
 use hush_core::{
     ChatRecord, ConclaveRecord, Error, MessagePayload, PaperDescriptor, PendingInvite,
-    ReceivedMessage, VoiceManager, VoiceSession,
+    ReceivedMessage, VoiceEffect, VoiceManager, VoiceSession,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -107,6 +108,10 @@ struct App {
     /// this. Inbound payloads are applied from the recv poll; the routes apply
     /// the local user's actions before fanning them out.
     voices: Mutex<VoiceManager>,
+    /// Conclave voice's media planes (Task 23 Phase 2), keyed by session id,
+    /// created on demand when a room opens or an offer arrives. Same contract
+    /// as `paper_planes`: runtime-only, a peer-connection map, safe to lose.
+    voice_planes: Mutex<HashMap<String, Arc<voice_data::VoicePlane>>>,
     /// The neighborhoods read lane's transport (Task 22). `None` until a Tor
     /// relay client is wired in; a refresh with no source is a clear refusal, not
     /// a silent no-op. Runtime-only and safe to lose.
@@ -302,6 +307,7 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/voice/{conclave_id}/join", post(voice_join))
         .route("/api/voice/{conclave_id}/leave", post(voice_leave))
         .route("/api/voice/{conclave_id}/mute", post(voice_mute))
+        .route("/api/voice/{conclave_id}/stats", get(voice_stats))
         .route("/api/voice/{conclave_id}", get(voice_get))
         .route("/api/voice/state", get(voice_state))
         // Zines (Task 21). The literal `pen-name` segment is matched ahead of
@@ -461,7 +467,9 @@ pub(crate) async fn force_lock(state: &Arc<App>) {
     paper_planes_shutdown(state).await;
     // Voice rooms end with the lock outright (Task 23): a session is
     // live-only, so there is nothing to fall back to and nothing to save —
-    // this *is* the leave, and peers see it as one.
+    // this *is* the leave, and peers see it as one. The media planes go the
+    // same way: every peer connection closes, every capture stream stops.
+    voice_planes_shutdown(state).await;
     state.voices.lock().await.clear();
 }
 
@@ -530,6 +538,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay_probe_inflight: AtomicBool::new(false),
         paper_planes: Mutex::new(HashMap::new()),
         voices: Mutex::new(VoiceManager::new()),
+        voice_planes: Mutex::new(HashMap::new()),
         neighborhoods_source: Mutex::new(None),
         neighborhoods_sink: Mutex::new(None),
     };
@@ -1914,16 +1923,22 @@ async fn recv(
         let lookup = |id: &str| conclaves.get(id).cloned();
         let now = paper_now_ms();
         let mut answers: Vec<(String, MessagePayload)> = Vec::new();
+        // Rooms doomed by the sweep, with their session ids, so the planes
+        // drop after the manager lock releases.
+        let mut to_drop: Vec<String> = Vec::new();
         {
             let mut mgr = state.voices.lock().await;
             for received in &inbox.voices {
                 if let Some(answer) = voice_apply_inbound(
+                    &state,
                     &mut mgr,
                     &lookup,
                     &received.from_account,
                     &received.payload,
                     now,
-                ) {
+                )
+                .await
+                {
                     answers.push(answer);
                 }
             }
@@ -1944,19 +1959,27 @@ async fn recv(
                         None => false,
                     };
                     if !keep {
+                        if let Some(session) = mgr.session(&conclave_id) {
+                            to_drop.push(session.session.session_id.clone());
+                        }
                         mgr.end_conclave(&conclave_id);
                     }
                 }
             }
         }
+        for session_id in to_drop {
+            voice_plane_drop(&state, &session_id).await;
+        }
         for (conclave_id, answer) in answers {
-            let session_id = match &answer {
-                MessagePayload::VoiceAnswer { session_id, .. } => session_id.clone(),
+            let (session_id, sdp) = match &answer {
+                MessagePayload::VoiceAnswer {
+                    session_id, sdp, ..
+                } => (session_id.clone(), sdp.clone()),
                 _ => continue,
             };
             if let WorkResult::Err(e) = state
                 .worker
-                .send_voice_answer(&conclave_id, &session_id, VOICE_FAKE_SDP)
+                .send_voice_answer(&conclave_id, &session_id, &sdp)
                 .await
             {
                 eprintln!("hush-daemon: voice answer fan-out failed: {e}");
@@ -5820,20 +5843,68 @@ async fn paper_plane_reset(state: &Arc<App>, conclave_id: &str) {
 // ---------------------------------------------------------------------------
 // Voice — conclave voice rooms (Task 23) behind `/api/voice/*`.
 //
-// Phase 1 is the signaling plumbing: the room's state machine (`VoiceManager`)
-// is authoritative and in-memory, the control payloads fan out over the same
-// 1:1 sessions as everything else in a conclave, and there is no media yet —
-// the offers and answers carry a stub SDP so the whole join path is exercised
-// and its terminal states are verifiable without a codec. A locked vault is a
-// 401 (a locked vault holds no keys and must not even learn a room exists);
-// a restart is a leave; `ConclaveEnd` ends any room with the conclave.
+// The room's state machine (`VoiceManager`) is authoritative and in-memory;
+// the control payloads fan out over the same 1:1 sessions as everything else
+// in a conclave. Phase 2 replaced the Phase 1 stub SDP with the real media
+// plane (`voice_data::VoicePlane`, one per live session): an offer or answer
+// now carries a gathered SDP and the audio flows peer to peer. A locked vault
+// is a 401 (a locked vault holds no keys and must not even learn a room
+// exists); a restart is a leave; `ConclaveEnd` ends any room with the
+// conclave.
 // ---------------------------------------------------------------------------
 
-/// The stub SDP Phase 1 offers and answers carry. The wire shape is the real
-/// one (what the engine will put there in Phase 2); only the bytes are fake,
-/// so a two-daemon run can verify the exchange reaches its terminal states
-/// without pulling in a media stack.
-const VOICE_FAKE_SDP: &str = "fake-peer-sdp-v1";
+/// The media mode the daemon's voice planes run in: the synthetic tone when
+/// `HUSH_VOICE_TEST_TONE` is set (the dogfood's headless mode), the real
+/// devices otherwise.
+fn voice_media_mode() -> voice_data::MediaMode {
+    if std::env::var_os("HUSH_VOICE_TEST_TONE").is_some() {
+        voice_data::MediaMode::Tone
+    } else {
+        voice_data::MediaMode::Device
+    }
+}
+
+/// The plane for `session_id`, created on demand (a room's opener never
+/// dials, so its plane stays idle until the first inbound offer).
+async fn voice_plane_for(state: &Arc<App>, session_id: &str) -> Arc<voice_data::VoicePlane> {
+    let mut planes = state.voice_planes.lock().await;
+    planes
+        .entry(session_id.to_string())
+        .or_insert_with(|| {
+            Arc::new(voice_data::VoicePlane::new(
+                hush_core::config::resolve_stun_url(&state.dir),
+                voice_media_mode(),
+            ))
+        })
+        .clone()
+}
+
+/// The plane for `session_id` when one already exists — never creates. A
+/// payload that arrives for a session with no plane has nothing on the media
+/// side to act on.
+async fn voice_plane_get(state: &Arc<App>, session_id: &str) -> Option<Arc<voice_data::VoicePlane>> {
+    state.voice_planes.lock().await.get(session_id).cloned()
+}
+
+/// Drop one session's plane and close its connections.
+async fn voice_plane_drop(state: &Arc<App>, session_id: &str) {
+    let plane = state.voice_planes.lock().await.remove(session_id);
+    if let Some(plane) = plane {
+        plane.shutdown();
+    }
+}
+
+/// Close every voice plane. Locking the vault calls this beside
+/// `paper_planes_shutdown`: a locked vault holds no sessions and no sockets.
+async fn voice_planes_shutdown(state: &Arc<App>) {
+    let planes: Vec<Arc<voice_data::VoicePlane>> = {
+        let mut planes = state.voice_planes.lock().await;
+        planes.drain().map(|(_, plane)| plane).collect()
+    };
+    for plane in planes {
+        plane.shutdown();
+    }
+}
 
 #[derive(Serialize)]
 struct VoiceMemberView {
@@ -5945,7 +6016,12 @@ async fn voice_open(
         let live = mgr
             .session(&conclave_id)
             .expect("the room was just opened");
-        voice_view_of(live, &me)
+        let view = voice_view_of(live, &me);
+        // The opener's media plane exists from the open: it has nothing to
+        // dial yet, but the first joiner's offer must find it ready to
+        // answer.
+        voice_plane_for(&state, &view.session_id).await;
+        view
     };
     // Best-effort fan-out: the room is already local, and a send queues in the
     // outbox, so a trustee that is offline or locked receives it on drain.
@@ -5976,27 +6052,50 @@ async fn voice_join(
         })?;
     // The offer is the join announcement: joining dials every trustee already
     // in the room (the spec's §7 join row), and a peer that receives an offer
-    // treats its sender as in the room.
-    let (view, session_id) = {
+    // treats its sender as in the room. Each dialed peer gets its own offer —
+    // one peer connection per pair is the mesh — so the dial loop is over the
+    // roster as it stood before this join.
+    let (view, session_id, existing) = {
         let mut mgr = state.voices.lock().await;
         let session_id = mgr
             .session(&conclave_id)
             .map(|s| s.session.session_id.clone())
             .ok_or_else(|| voice_err(Error::VoiceNoSession.to_string()))?;
+        let existing: Vec<String> = mgr
+            .session(&conclave_id)
+            .map(|s| {
+                s.joined
+                    .iter()
+                    .map(|m| m.account.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         mgr.join(&voice_conclave_descriptor(record), &me, &session_id)
             .map_err(|e| voice_err(e.to_string()))?;
         let live = mgr
             .session(&conclave_id)
             .expect("the join just landed");
-        (voice_view_of(live, &me), session_id)
+        (voice_view_of(live, &me), session_id, existing)
     };
-    // Phase 1's offers carry the stub SDP (see `VOICE_FAKE_SDP`).
-    if let WorkResult::Err(e) = state
-        .worker
-        .send_voice_offer(&conclave_id, &session_id, VOICE_FAKE_SDP)
-        .await
-    {
-        eprintln!("hush-daemon: voice offer fan-out failed: {e}");
+    let plane = voice_plane_for(&state, &session_id).await;
+    for peer in existing.iter().filter(|p| *p != &me) {
+        // One gathered offer per pair, sent over the room's fan-out. The
+        // wire format carries no destination (Phase 3's known seam): with
+        // two trustees the fan-out's only recipient *is* the dialed peer.
+        let offer = match plane.offer(&peer).await {
+            Ok(offer) => offer,
+            Err(e) => {
+                eprintln!("hush-daemon: voice offer to {peer} failed: {e}");
+                continue;
+            }
+        };
+        if let WorkResult::Err(e) = state
+            .worker
+            .send_voice_offer(&conclave_id, &session_id, &offer)
+            .await
+        {
+            eprintln!("hush-daemon: voice offer fan-out failed: {e}");
+        }
     }
     Ok(Json(view))
 }
@@ -6020,8 +6119,19 @@ async fn voice_leave(
     };
     {
         let mut mgr = state.voices.lock().await;
-        mgr.leave(&conclave_id, &session_id, &me)
+        let effect = mgr
+            .leave(&conclave_id, &session_id, &me)
             .map_err(|e| voice_err(e.to_string()))?;
+        // Media teardown follows the room's state: the opener's (or the
+        // below-two) leave ends the session for everyone — every peer
+        // connection in it goes; any other leave only drops this vault's
+        // own link. The peer learns the rest from the fan-out below.
+        if effect == VoiceEffect::Ended {
+            voice_plane_drop(&state, &session_id).await;
+        } else {
+            let plane = voice_plane_for(&state, &session_id).await;
+            plane.forget(&me);
+        }
     }
     if let WorkResult::Err(e) = state
         .worker
@@ -6069,6 +6179,12 @@ async fn voice_mute(
             .map_err(|e| voice_err(e.to_string()))?;
         session_id
     };
+    // Capture stops before the flag fans out (the spec's `VoiceMute` note):
+    // the plane's gate is set first, so the wire never carries audio that
+    // the flag says is muted.
+    voice_plane_for(&state, &session_id)
+        .await
+        .set_muted(body.muted);
     if let WorkResult::Err(e) = state
         .worker
         .send_voice_mute(&conclave_id, &session_id, &me, body.muted)
@@ -6121,23 +6237,74 @@ async fn voice_state(
     }))
 }
 
-/// Apply one voice payload received from a peer to the local manager.
+#[derive(Serialize)]
+struct VoiceStatsResponse {
+    session_id: String,
+    sent_frames: usize,
+    decoded_frames: usize,
+    played_frames: usize,
+    peers_live: usize,
+}
+
+/// The media plane's counters for a live room: is audio actually flowing.
+/// Read-only and memory-only, like everything else under `/api/voice/*`.
+async fn voice_stats(
+    State(state): State<Arc<App>>,
+    Path(conclave_id): Path<String>,
+) -> Result<Json<VoiceStatsResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    paper_account_id(&state).await?;
+    let session_id = state
+        .voices
+        .lock()
+        .await
+        .session(&conclave_id)
+        .map(|s| s.session.session_id.clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "no voice session is open in this conclave".into(),
+                }),
+            )
+        })?;
+    let plane = voice_plane_get(&state, &session_id).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "no live media plane for this room".into(),
+            }),
+        )
+    })?;
+    let s = plane.stats();
+    Ok(Json(VoiceStatsResponse {
+        session_id,
+        sent_frames: s.sent_frames,
+        decoded_frames: s.decoded_frames,
+        played_frames: s.played_frames,
+        peers_live: s.peers_live,
+    }))
+}
+
+/// Apply one voice payload received from a peer to the local manager and the
+/// media plane.
 ///
 /// Authority was checked in `recv` (the sender is who the payload claims);
 /// what remains is the room's own rules, and an offer **is** the sender's join:
 /// a peer that offers is announcing itself into the room, so it is applied as
 /// one. Two joiners racing at the cap can therefore hold asymmetric views
-/// until the next leave — accepted for Phase 1 (two trustees), revisit at the
+/// until the next leave — accepted for Phase 2 (two trustees), revisit at the
 /// mesh phase where the spec's refusal surface lands.
 ///
 /// Returns `(conclave id, answer payload)` when the payload asks for one: an
-/// offer gets an answer, which in Phase 1 is the whole fake handshake. An
-/// error is logged and dropped by the caller — the messages in the same poll
-/// batch have already landed, and one peer's bad payload must not block the
-/// mailbox.
-fn voice_apply_inbound(
+/// offer gets an answer built by the media plane — real gathered SDP since
+/// Phase 2. An error is logged and dropped by the caller — the messages in
+/// the same poll batch have already landed, and one peer's bad payload must
+/// not block the mailbox.
+async fn voice_apply_inbound(
+    state: &Arc<App>,
     mgr: &mut VoiceManager,
-    conclave_of: &dyn Fn(&str) -> Option<ConclaveRecord>,
+    conclave_of: &impl Fn(&str) -> Option<ConclaveRecord>,
     from_account: &str,
     payload: &MessagePayload,
     now: u64,
@@ -6152,29 +6319,49 @@ fn voice_apply_inbound(
                 now,
             )
             .ok()?;
+            // Have the answering side ready: the joiner's offer can arrive
+            // in the same batch as the open.
+            voice_plane_for(state, &session.session_id).await;
             None
         }
-        MessagePayload::VoiceOffer { session_id, .. } => {
+        MessagePayload::VoiceOffer { session_id, sdp } => {
             let conclave_id = mgr.conclave_of(session_id)?.to_string();
             let record = conclave_of(&conclave_id)?;
-            mgr.join(&voice_conclave_descriptor(&record), from_account, session_id)
-                .ok()?;
+            // A join already on the roster is fine — the media handshake
+            // still needs its answer (a duplicated offer over the fan-out).
+            // Any other refusal (not a trustee, ended) must not be answered.
+            match mgr.join(&voice_conclave_descriptor(&record), from_account, session_id) {
+                Ok(_) | Err(Error::AlreadyConclaveTrustee) => {}
+                Err(_) => return None,
+            }
+            // The real answer: the media plane builds an answerer connection
+            // with its own outbound track against the joiner's gathered
+            // offer, and the answer carries this side's candidates.
+            let plane = voice_plane_for(state, session_id).await;
+            let answer = plane.answer(from_account, sdp).await.ok()?;
             Some((
                 conclave_id,
                 MessagePayload::VoiceAnswer {
                     session_id: session_id.clone(),
-                    sdp: VOICE_FAKE_SDP.into(),
+                    sdp: answer,
                 },
             ))
         }
-        MessagePayload::VoiceAnswer { session_id, .. } => {
-            // The answerer is in the room — evidence, not authority. Applying
-            // it as a join is idempotent: if this vault already holds them,
-            // the manager refuses and it drops.
+        MessagePayload::VoiceAnswer { session_id, sdp } => {
+            // The answerer is in the room — evidence, not authority. The
+            // join it carries is usually already on this vault's roster
+            // (the joiner joined locally first), and that must not stop the
+            // media half: the answer's real job is completing the handshake.
             let conclave_id = mgr.conclave_of(session_id)?.to_string();
             let record = conclave_of(&conclave_id)?;
-            mgr.join(&voice_conclave_descriptor(&record), from_account, session_id)
-                .ok()?;
+            let _ = mgr.join(&voice_conclave_descriptor(&record), from_account, session_id);
+            // The PC this vault dialed with gets its remote description.
+            let plane = voice_plane_for(state, session_id).await;
+            if let Err(e) = plane.accept_answer(from_account, sdp).await {
+                eprintln!(
+                    "hush-daemon: voice answer from {from_account} did not apply: {e}"
+                );
+            }
             None
         }
         MessagePayload::VoiceMute {
@@ -6186,7 +6373,17 @@ fn voice_apply_inbound(
         }
         MessagePayload::VoiceLeave { session_id, who } => {
             let conclave_id = mgr.conclave_of(session_id)?.to_string();
-            mgr.leave(&conclave_id, session_id, who).ok()?;
+            let ended = matches!(
+                mgr.leave(&conclave_id, session_id, who),
+                Ok(VoiceEffect::Ended)
+            );
+            // The leaver's own link goes either way; a room that ended takes
+            // the whole plane with it.
+            if ended {
+                voice_plane_drop(state, session_id).await;
+            } else if let Some(plane) = voice_plane_get(state, session_id).await {
+                plane.forget(who);
+            }
             None
         }
         _ => None,
@@ -6619,6 +6816,7 @@ mod drops_api_tests {
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
+        voice_planes: Mutex::new(HashMap::new()),
             neighborhoods_source: Mutex::new(None),
             neighborhoods_sink: Mutex::new(None),
         })
@@ -6900,6 +7098,7 @@ mod wallet_api_tests {
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
+        voice_planes: Mutex::new(HashMap::new()),
             neighborhoods_source: Mutex::new(None),
             neighborhoods_sink: Mutex::new(None),
         });
@@ -7423,6 +7622,7 @@ mod notes_api_tests {
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
+        voice_planes: Mutex::new(HashMap::new()),
             neighborhoods_source: Mutex::new(None),
             neighborhoods_sink: Mutex::new(None),
         })
@@ -8565,6 +8765,7 @@ mod voice_api_tests {
         for (method, path, body) in [
             ("GET", "/api/voice/c-1", None),
             ("GET", "/api/voice/state", None),
+            ("GET", "/api/voice/c-1/stats", None),
             ("POST", "/api/voice/c-1/open", None),
             ("POST", "/api/voice/c-1/join", None),
             ("POST", "/api/voice/c-1/leave", None),
@@ -8589,6 +8790,11 @@ mod voice_api_tests {
         let (status, err) = request(&router, "POST", "/api/voice/c-1/open", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
         assert!(err["error"].as_str().unwrap().contains("no conclave"));
+
+        // Stats is a read over the same rooms: nothing open, nothing to count.
+        let (status, err) = request(&router, "GET", "/api/voice/c-1/stats", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("no voice session"));
 
         // Join, leave and mute name a room that cannot exist either.
         for path in ["/api/voice/c-1/join", "/api/voice/c-1/leave"] {

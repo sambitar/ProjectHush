@@ -2,19 +2,22 @@
 # Voice dogfood: two daemons carry a live voice room over a real relay, and
 # both ends agree on the room's state at every step without any on-disk trace.
 #
-# This is the Phase 1 acceptance check from docs/tasks/conclave-voice.md,
+# This is the Phase 1+2 acceptance check from docs/tasks/conclave-voice.md,
 # scripted so it can be re-run after any change to the voice path:
 #
 #   1. Alice opens the room; the open fans out to Bob over the relay
 #   2. Bob joins; the offer is the join announcement and the answer closes it
 #   3. Both ends agree on the roster: two live speakers. The mute flag is
 #      advisory and only ever moves by an explicit VoiceMute
+#   3b. Real Opus audio crosses both ways: each daemon's stats line shows
+#       decoded frames from the peer (HUSH_VOICE_TEST_TONE=1 supplies the
+#       capture source; no microphone is needed headless)
 #   4. Bob mutes; Alice sees the mute
 #   5. Bob leaves; the room auto-ends for Alice (below two speakers)
 #   6. A re-open survives, and the opener's own leave ends the room for Bob
 #
-# Phase 1 carries stub SDP on the wire: the signalling is what is under test,
-# not audio.
+# The relay sees Signal ciphertext only: the SDP inside the payloads must
+# never appear in relay.db in plaintext.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc"
@@ -111,7 +114,10 @@ done
 
 for pair in "$VA:$RA:pa" "$VB:$RB:pb"; do
   dir="${pair%%:*}"; rest="${pair#*:}"; rt="${rest%%:*}"
-  HUSH_RUNTIME_DIR="$rt" "$DMN" --dir "$dir" >"$T/daemon-$(basename "$dir").log" 2>&1 &
+  # Tone mode: the voice plane's capture source is a synthetic 440 Hz tone
+  # and playout is counted, so the run needs no microphone and no speaker.
+  HUSH_RUNTIME_DIR="$rt" HUSH_VOICE_TEST_TONE=1 "$DMN" --dir "$dir" \
+    >"$T/daemon-$(basename "$dir").log" 2>&1 &
   PIDS+=($!)
 done
 for _ in $(seq 1 60); do
@@ -225,6 +231,30 @@ done
   || fail "bob's roster is not two speakers after the answer: $R_B"
 pass "the answer closed the handshake: both ends agree on two live speakers"
 
+# --- Real audio crosses both ways (Phase 2) -----------------------------------
+# The media handshake rides the same payloads: Alice answered Bob's offer with
+# real gathered SDP, so DTLS-SRTP connects and each side decodes the other's
+# tone. The stats line prints every 2 s while a connection is live; both
+# daemons must show decoded frames from the peer, played by the playout clock.
+audio_crossed() { # audio_crossed <log> <label>
+  for _ in $(seq 1 100); do
+    if grep -q "voice stats sent=[1-9]" "$1" 2>/dev/null; then
+      local line
+      line=$(grep "voice stats" "$1" | tail -1)
+      local decoded
+      decoded=$(echo "$line" | sed -n 's/.*decoded=\([0-9]*\).*/\1/p')
+      if [[ "${decoded:-0}" -ge 10 ]]; then
+        pass "$2: audio crossed ($line)"
+        return 0
+      fi
+    fi
+    sleep 0.2
+  done
+  fail "$2: no decoded audio after 20 s (last stats: $(grep 'voice stats' "$1" | tail -1 || echo none))"
+}
+audio_crossed "$T/daemon-a.log" "alice decodes bob's tone"
+audio_crossed "$T/daemon-b.log" "bob decodes alice's tone"
+
 # --- Bob mutes; alice sees it ------------------------------------------------
 api_at "$SOCK_B" POST "/api/voice/$CONCLAVE/mute" '{"muted":true}' >/dev/null
 [[ "$CODE" == "200" ]] || fail "bob's mute returned $CODE: $RESP"
@@ -299,8 +329,16 @@ VOICE_FILES=$(find "$VA" "$VB" -type f -name '*voice*' || true)
 [[ -z "$VOICE_FILES" ]] || fail "voice files exist in a vault, but the live plane must be memory-only: $VOICE_FILES"
 pass "no voice file on disk: the live plane stayed in memory"
 
+# The relay must never have seen the room's innards: the SDP (its audio
+# m-line, its ICE credentials) rode inside Signal ciphertext, so a plaintext
+# strings scan of relay.db finds neither.
+SDP_LEAK=$(strings "$T/relay.db" | grep -cE 'm=audio|ice-ufrag|a=fingerprint' || true)
+[[ "$SDP_LEAK" == "0" ]] || fail "relay.db carries plaintext SDP: $SDP_LEAK matches"
+pass "no SDP plaintext on the relay: the payloads were ciphertext end to end"
+
 echo
 echo "voice dogfood ok: two daemons agreed on a live room through open, join,"
-echo "mute, and both leave paths over a real relay, and nothing about the room"
-echo "was ever written down"
+echo "mute, and both leave paths over a real relay; Opus audio crossed both"
+echo "ways on the media plane; and nothing about the room — not even the SDP —"
+echo "was ever written down in plaintext"
 CLEAN=1
