@@ -2,7 +2,10 @@ import type {
   ConclaveDto,
   ConclaveMessageDto,
   ConclaveTrusteeDto,
+  IntroListsDto,
   PendingInviteDto,
+  PendingIntroDto,
+  PendingIntroRequestDto,
   TrusteeStateDto,
 } from "./api/types";
 
@@ -65,12 +68,45 @@ export interface PendingInvite {
   receivedAt: number;
 }
 
+/**
+ * An introduction request waiting on this vault.
+ *
+ * When `target` is this vault's account, the seeker wants our invite and
+ * consent is asked. Otherwise this vault is the courier: the request came from
+ * the seeker over their channel, and the relay prompt asks whether to carry it
+ * to a member this vault knows.
+ */
+export interface PendingIntroRequest {
+  conclaveId: string;
+  conclaveName: string;
+  seeker: string;
+  seekerNick: string;
+  target: string;
+  targetNick: string;
+  via: string;
+  receivedAt: number;
+}
+
+/** A delivered introduction waiting on an accept or dismiss. */
+export interface PendingIntro {
+  conclaveId: string;
+  conclaveName: string;
+  target: string;
+  targetNick: string;
+  via: string;
+  receivedAt: number;
+}
+
 let conclaves: Conclave[] = [];
 let pendingInvites: PendingInvite[] = [];
+let pendingIntroRequests: PendingIntroRequest[] = [];
+let pendingIntros: PendingIntro[] = [];
 
 export function clearConclaveStore(): void {
   conclaves = [];
   pendingInvites = [];
+  pendingIntroRequests = [];
+  pendingIntros = [];
 }
 
 function toMessage(m: ConclaveMessageDto): ConclaveMessage {
@@ -154,6 +190,59 @@ export function loadPendingInvites(dtos: PendingInviteDto[]): boolean {
 /** Invitations awaiting an accept or decline, newest first. */
 export function listPendingInvites(): PendingInvite[] {
   return [...pendingInvites].sort((a, b) => b.receivedAt - a.receivedAt);
+}
+
+function toIntroRequest(dto: PendingIntroRequestDto): PendingIntroRequest {
+  return {
+    conclaveId: dto.conclave_id,
+    conclaveName: dto.conclave_name,
+    seeker: dto.seeker,
+    seekerNick: dto.seeker_nick,
+    target: dto.target,
+    targetNick: dto.target_nick,
+    via: dto.via,
+    receivedAt: dto.received_ms,
+  };
+}
+
+function toIntro(dto: PendingIntroDto): PendingIntro {
+  return {
+    conclaveId: dto.conclave_id,
+    conclaveName: dto.conclave_name,
+    target: dto.target,
+    targetNick: dto.target_nick,
+    via: dto.via,
+    receivedAt: dto.received_ms,
+  };
+}
+
+/**
+ * Replace the introduction queues. Returns whether anything changed, so the
+ * poll can skip a repaint that would steal the caret for nothing.
+ */
+export function loadPendingIntros(dtos: IntroListsDto): boolean {
+  const requests = dtos.requests.map(toIntroRequest);
+  const intros = dtos.intros.map(toIntro);
+  const reqSig = (list: PendingIntroRequest[]) =>
+    list.map((r) => `${r.conclaveId}:${r.seeker}:${r.target}`).join("|");
+  const introSig = (list: PendingIntro[]) =>
+    list.map((i) => `${i.conclaveId}:${i.target}`).join("|");
+  const changed =
+    reqSig(requests) !== reqSig(pendingIntroRequests) ||
+    introSig(intros) !== introSig(pendingIntros);
+  pendingIntroRequests = requests;
+  pendingIntros = intros;
+  return changed;
+}
+
+/** Introduction requests awaiting consent or a relay decision, newest first. */
+export function listPendingIntroRequests(): PendingIntroRequest[] {
+  return [...pendingIntroRequests].sort((a, b) => b.receivedAt - a.receivedAt);
+}
+
+/** Delivered introductions awaiting an accept or dismiss, newest first. */
+export function listPendingIntros(): PendingIntro[] {
+  return [...pendingIntros].sort((a, b) => b.receivedAt - a.receivedAt);
 }
 
 /** Conclaves, newest first. Ended conclaves are included: they are read-only. */

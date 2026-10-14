@@ -54,6 +54,25 @@ pub struct UiPrefs {
     /// this stays a handoff and never a second source of truth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_onion_staged: Option<String>,
+    /// Chat auto-delete policy: what the log trims on its own. Lives here so
+    /// it survives lock/unlock and reads like the rest of the user's prefs.
+    #[serde(default)]
+    pub chat_auto_delete: ChatAutoDelete,
+}
+
+/// The chat auto-delete rules, as the Chat history dialog sets them. Both may
+/// be off (keep everything), on together, or anything between: `daily` is the
+/// "every day" switch, `keep_lines` the "old chats past XX lines go first"
+/// cap.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatAutoDelete {
+    /// Delete every chat message older than the current UTC day.
+    #[serde(default)]
+    pub daily: bool,
+    /// Keep at most this many messages per contact (oldest deleted first).
+    /// `None` keeps everything the daily rule does not cover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_lines: Option<u32>,
 }
 
 impl Default for UiPrefs {
@@ -74,6 +93,7 @@ impl Default for UiPrefs {
             appear_offline: false,
             relay_tor: false,
             relay_onion_staged: None,
+            chat_auto_delete: ChatAutoDelete::default(),
         }
     }
 }

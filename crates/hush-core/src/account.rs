@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::backup::{export_vault, import_vault};
-use crate::chat_log::{ChatLog, ChatRecordPayload, ConclaveRecord, MailAttachmentRecord, MailState};
+use crate::chat_log::{
+    ChatLog, ChatRecordPayload, ChatRetention, ConclaveRecord, MailAttachmentRecord, MailState,
+};
 use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeState};
 use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
 use crate::prekey::PreKeyRecord;
@@ -343,6 +345,48 @@ pub struct PendingInvite {
     pub received_ms: u64,
 }
 
+/// A request for an introduction, waiting on this vault.
+///
+/// The same record means two different things depending on who reads it: when
+/// `target` is this vault, the seeker wants *our* invite and consent is asked;
+/// otherwise the request came from the seeker and this vault is the courier
+/// being asked to relay it to a member it knows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingIntroRequest {
+    pub conclave_id: String,
+    pub conclave_name: String,
+    /// The account that wants to meet the target.
+    pub seeker: String,
+    /// The seeker's nickname as the sender knows it; display hint only.
+    pub seeker_nick: String,
+    /// The account whose invite is wanted.
+    pub target: String,
+    /// The target's nickname as the sender knows it; display hint only.
+    pub target_nick: String,
+    /// The account id of the member the request travelled through, so a
+    /// consented invite goes back over a channel that is known to exist.
+    pub via: String,
+    pub received_ms: u64,
+}
+
+/// An introduction received: another member's standing invite, carried by a
+/// mutual contact, waiting for this vault to accept or dismiss it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingIntro {
+    pub conclave_id: String,
+    pub conclave_name: String,
+    /// The account the invite belongs to.
+    pub target: String,
+    /// The target's nickname as the sender knows it; display hint only.
+    pub target_nick: String,
+    /// The account id of the member who carried the invite here.
+    pub via: String,
+    /// The target's standing invite. Never serialised to the UI: the UI
+    /// accepts or dismisses, the vault consumes it.
+    pub invite: String,
+    pub received_ms: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 struct AccountState {
     /// The relay this vault was created with: the clearnet canonical base.
@@ -401,6 +445,13 @@ struct AccountState {
     /// Conclave invitations received but not yet accepted or declined.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_invites: Vec<PendingInvite>,
+    /// Introduction requests waiting on this vault — consent when this vault
+    /// is the target, a relay decision when it is the courier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_intro_requests: Vec<PendingIntroRequest>,
+    /// Introductions received and not yet accepted or dismissed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_intros: Vec<PendingIntro>,
 }
 
 pub struct Account {
@@ -416,6 +467,10 @@ pub struct Account {
     /// relay mode is on. Runtime-only: the daemon re-applies it after every
     /// unlock and whenever the mode changes, so it is never persisted.
     relay_socks: Option<String>,
+    /// The chat auto-delete policy the daemon loaded from its prefs file.
+    /// Runtime-only like the proxy: the daemon re-applies it on unlock and
+    /// whenever the prefs change, and the log enforces it on every append.
+    chat_retention: ChatRetention,
 }
 
 impl Account {
@@ -447,6 +502,8 @@ impl Account {
             vault_name: None,
             revoked: Vec::new(),
             pending_invites: Vec::new(),
+            pending_intro_requests: Vec::new(),
+            pending_intros: Vec::new(),
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
@@ -459,6 +516,7 @@ impl Account {
             chat_log,
             pending_recovery_code: Some(recovery_code),
             relay_socks: None,
+            chat_retention: ChatRetention::default(),
         };
         account.save().await?;
         Ok(account)
@@ -541,6 +599,7 @@ impl Account {
             chat_log,
             pending_recovery_code,
             relay_socks: None,
+            chat_retention: ChatRetention::default(),
         };
         if needs_save {
             account.save().await?;
@@ -988,6 +1047,7 @@ impl Account {
         let master = *self.vault.master_key();
         self.chat_log
             .append_text(&master, nickname, true, text)?;
+        self.enforce_chat_retention();
         Ok(())
     }
 
@@ -1029,6 +1089,7 @@ impl Account {
             &blob_id,
             data.len() as u64,
         )?;
+        self.enforce_chat_retention();
         Ok(blob_id)
     }
 
@@ -1467,6 +1528,40 @@ impl Account {
     pub async fn delete_mail(&mut self, id: &str) -> Result<bool, Error> {
         let master = *self.vault.master_key();
         self.chat_log.remove_record(&master, id)
+    }
+
+    /// Delete 1:1 chat messages with a contact, optionally bounded to
+    /// `[from_ms, to_ms]` — no bounds means the entire history with them.
+    /// Returns how many records went. Mail with them is not chat history and
+    /// is untouched.
+    pub async fn remove_chat_history(
+        &mut self,
+        nickname: &str,
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+    ) -> Result<usize, Error> {
+        let master = *self.vault.master_key();
+        self.chat_log
+            .remove_for_contact(&master, nickname, from_ms, to_ms)
+    }
+
+    /// Install the chat auto-delete policy the daemon's prefs file states,
+    /// and run it once — unlock is when a "delete every day" rule catches up
+    /// with the days the vault spent locked.
+    pub async fn set_chat_retention(&mut self, retention: ChatRetention) -> Result<usize, Error> {
+        self.chat_retention = retention;
+        let master = *self.vault.master_key();
+        self.chat_log.retain_for_auto_delete(&master, retention)
+    }
+
+    /// Keep the log inside the auto-delete policy after a new chat record
+    /// landed. Best-effort: the message is already recorded (and sent), so a
+    /// retention failure must not fail the send.
+    fn enforce_chat_retention(&mut self) {
+        let master = *self.vault.master_key();
+        if let Err(e) = self.chat_log.retain_for_auto_delete(&master, self.chat_retention) {
+            eprintln!("hush: chat auto-delete pass failed: {e}");
+        }
     }
 
     /// Write attachment bytes to the vault and describe them for the log.
@@ -2194,7 +2289,445 @@ impl Account {
         Ok(())
     }
 
-    /// Leave a conclave. Any joined trustee may leave.
+    /// Offer an introduction between two joined trustees this vault knows.
+    ///
+    /// The "Introduce to…" action: this vault has both the seeker and the
+    /// target as contacts, so it asks the target to share its invite with the
+    /// seeker. Consent stays with the target — this only delivers the question.
+    pub async fn introduce_members(
+        &mut self,
+        conclave_id: &str,
+        seeker_account: &str,
+        target_account: &str,
+    ) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        if seeker_account == target_account || seeker_account == me || target_account == me {
+            return Err(Error::InvalidConclave);
+        }
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended {
+            return Err(Error::ConclaveEnded);
+        }
+        if !conclave.is_joined(&me) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        // Both legs must be real channels: the request goes to the target over
+        // one, and the consented invite will come back for the seeker over the
+        // other. Without either, the introduction could not be delivered.
+        if self.contact_nick_for_protocol(seeker_account).is_none() {
+            return Err(Error::ContactNotFound);
+        }
+        let target_nick = self
+            .contact_nick_for_protocol(target_account)
+            .ok_or(Error::ContactNotFound)?;
+        if !conclave.is_joined(seeker_account) || !conclave.is_joined(target_account) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        let seeker_roster_nick = conclave
+            .trustee(seeker_account)
+            .map(|t| t.nick.clone())
+            .unwrap_or_default();
+        let target_roster_nick = conclave
+            .trustee(target_account)
+            .map(|t| t.nick.clone())
+            .unwrap_or_default();
+        self.send_payload_inner(
+            &target_nick,
+            MessagePayload::ConclaveIntroReq {
+                conclave_id: conclave_id.to_string(),
+                name: conclave.name.clone(),
+                seeker: seeker_account.to_string(),
+                seeker_nick: seeker_roster_nick,
+                target: target_account.to_string(),
+                target_nick: target_roster_nick,
+            },
+            false,
+        )
+        .await?;
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Ask the conclave for an introduction to a member this vault cannot
+    /// reach: the "Request introduction" action.
+    ///
+    /// The request goes to every joined trustee this vault has a channel to —
+    /// each can either relay it to the target or is silently skipped. Whoever
+    /// first returns a consented invite wins; extras are dropped on arrival.
+    pub async fn request_intro(
+        &mut self,
+        conclave_id: &str,
+        target_account: &str,
+    ) -> Result<(), Error> {
+        let me = self.state.protocol_name.clone();
+        if target_account == me {
+            return Err(Error::InvalidConclave);
+        }
+        let conclave = self
+            .chat_log
+            .conclave(conclave_id)
+            .cloned()
+            .ok_or(Error::ConclaveNotFound)?;
+        if conclave.ended {
+            return Err(Error::ConclaveEnded);
+        }
+        if !conclave.is_joined(&me) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        if !conclave.is_joined(target_account) {
+            return Err(Error::NotConclaveTrustee);
+        }
+        if self.contact_nick_for_protocol(target_account).is_some() {
+            return Err(Error::ContactExists);
+        }
+        let my_nick = conclave
+            .trustee(&me)
+            .map(|t| t.nick.clone())
+            .unwrap_or_default();
+        let target_roster_nick = conclave
+            .trustee(target_account)
+            .map(|t| t.nick.clone())
+            .unwrap_or_default();
+        let couriers: Vec<String> = conclave
+            .joined()
+            .filter(|t| t.account_id != me && t.account_id != target_account)
+            .filter_map(|t| self.contact_nick_for_protocol(&t.account_id))
+            .collect();
+        if couriers.is_empty() {
+            return Err(Error::NoIntroCourier);
+        }
+        for nick in couriers {
+            self.send_payload_inner(
+                &nick,
+                MessagePayload::ConclaveIntroReq {
+                    conclave_id: conclave_id.to_string(),
+                    name: conclave.name.clone(),
+                    seeker: me.clone(),
+                    seeker_nick: my_nick.clone(),
+                    target: target_account.to_string(),
+                    target_nick: target_roster_nick.clone(),
+                },
+                false,
+            )
+            .await?;
+        }
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Relay a stored introduction request on to the target: the courier's
+    /// action on the relay prompt. The stored request is consumed either way.
+    pub async fn relay_intro_request(
+        &mut self,
+        conclave_id: &str,
+        seeker_account: &str,
+        target_account: &str,
+    ) -> Result<(), Error> {
+        self.introduce_members(conclave_id, seeker_account, target_account)
+            .await?;
+        self.state
+            .pending_intro_requests
+            .retain(|r| !(r.conclave_id == conclave_id && r.seeker == seeker_account));
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Answer a request addressed to this vault: share the standing invite
+    /// with the seeker (over the channel the request arrived on) or decline.
+    ///
+    /// Declining is silent, the same treatment `decline_conclave_invite`
+    /// gives a conclave invite: no notification, no state change on peers.
+    pub async fn answer_intro_request(
+        &mut self,
+        conclave_id: &str,
+        seeker_account: &str,
+        accept: bool,
+    ) -> Result<(), Error> {
+        let request = self
+            .state
+            .pending_intro_requests
+            .iter()
+            .find(|r| r.conclave_id == conclave_id && r.seeker == seeker_account)
+            .cloned();
+        let Some(request) = request else {
+            return Err(Error::InviteNotFound);
+        };
+        self.state
+            .pending_intro_requests
+            .retain(|r| !(r.conclave_id == conclave_id && r.seeker == seeker_account));
+        if accept {
+            let conclave = self
+                .chat_log
+                .conclave(conclave_id)
+                .cloned()
+                .ok_or(Error::ConclaveNotFound)?;
+            if !conclave.ended && conclave.is_joined(&self.state.protocol_name) {
+                let invite = self.invite().await?;
+                let my_nick = conclave
+                    .trustee(&self.state.protocol_name)
+                    .map(|t| t.nick.clone())
+                    .unwrap_or_default();
+                // The invite goes back the way the request came: the courier's
+                // channel is the one path known to exist.
+                let via_nick = self
+                    .contact_nick_for_protocol(&request.via)
+                    .ok_or(Error::ContactNotFound)?;
+                self.send_payload_inner(
+                    &via_nick,
+                    MessagePayload::ConclaveIntro {
+                        conclave_id: conclave_id.to_string(),
+                        name: conclave.name.clone(),
+                        target: self.state.protocol_name.clone(),
+                        target_nick: my_nick,
+                        seeker: seeker_account.to_string(),
+                        invite,
+                    },
+                    false,
+                )
+                .await?;
+            }
+        }
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Accept a received introduction: consume the invite and make the target
+    /// a contact. One consumed invite is a full mutual channel — the target's
+    /// queue arrives with it, and ours is granted in `add_contact`.
+    pub async fn accept_intro(
+        &mut self,
+        conclave_id: &str,
+        target_account: &str,
+        nickname: &str,
+    ) -> Result<(), Error> {
+        let intro = self
+            .state
+            .pending_intros
+            .iter()
+            .find(|i| i.conclave_id == conclave_id && i.target == target_account)
+            .cloned()
+            .ok_or(Error::InviteNotFound)?;
+        if nickname.trim().is_empty() {
+            return Err(Error::InvalidHandle);
+        }
+        // A nickname is how every send path finds a contact, so a collision
+        // with a different account would misroute messages. The UI dedupes;
+        // this is the backstop.
+        if self
+            .state
+            .contacts
+            .iter()
+            .any(|c| c.nickname == nickname && c.account_id != target_account)
+        {
+            return Err(Error::ContactExists);
+        }
+        self.state
+            .pending_intros
+            .retain(|i| !(i.conclave_id == conclave_id && i.target == target_account));
+        self.add_contact(nickname, &intro.invite).await?;
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Dismiss a received introduction without adding the contact.
+    pub async fn dismiss_intro(&mut self, conclave_id: &str, target_account: &str) -> Result<(), Error> {
+        self.state
+            .pending_intros
+            .retain(|i| !(i.conclave_id == conclave_id && i.target == target_account));
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Drop a held introduction request without relaying or answering it.
+    pub async fn dismiss_intro_request(
+        &mut self,
+        conclave_id: &str,
+        seeker_account: &str,
+    ) -> Result<(), Error> {
+        self.state
+            .pending_intro_requests
+            .retain(|r| !(r.conclave_id == conclave_id && r.seeker == seeker_account));
+        self.save().await?;
+        Ok(())
+    }
+
+    pub fn pending_intro_requests(&self) -> &[PendingIntroRequest] {
+        &self.state.pending_intro_requests
+    }
+
+    pub fn pending_intros(&self) -> &[PendingIntro] {
+        &self.state.pending_intros
+    }
+
+    /// Apply a received introduction request.
+    ///
+    /// Only two shapes are meaningful: this vault is the target (consent is
+    /// asked), or the sender is the seeker and this vault can reach the target
+    /// (a relay decision is asked). Anything else — a relayed request in a
+    /// stranger's name, a conclave this vault is not part of, a seeker or
+    /// target outside the roster — is consumed and dropped, the treatment
+    /// every other forged claim in the drain loop gets.
+    async fn receive_intro_req(
+        &mut self,
+        conclave_id: &str,
+        conclave_name: &str,
+        seeker: &str,
+        seeker_nick: &str,
+        target: &str,
+        target_nick: &str,
+        from_account: &str,
+    ) -> Result<bool, Error> {
+        let me = self.state.protocol_name.clone();
+        if seeker == target {
+            return Ok(false);
+        }
+        let Some(conclave) = self.chat_log.conclave(conclave_id).cloned() else {
+            return Ok(false);
+        };
+        if conclave.ended || !conclave.is_joined(&me) {
+            return Ok(false);
+        }
+        let is_target = target == me;
+        let is_courier = seeker == from_account && target != me;
+        if !is_target && !is_courier {
+            return Ok(false);
+        }
+        if is_target {
+            // Consent is only meaningful for a roster member this vault does
+            // not already know.
+            if seeker == me
+                || !conclave.is_joined(seeker)
+                || self.contact_nick_for_protocol(seeker).is_some()
+            {
+                return Ok(false);
+            }
+        } else {
+            // A courier can only help if the target is in the roster and a
+            // real channel to them exists. Silently skipped otherwise: no
+            // point telling the seeker something they cannot act on.
+            if !conclave.is_joined(target) || self.contact_nick_for_protocol(target).is_none() {
+                return Ok(false);
+            }
+        }
+        let record = PendingIntroRequest {
+            conclave_id: conclave_id.to_string(),
+            conclave_name: conclave_name.to_string(),
+            seeker: seeker.to_string(),
+            seeker_nick: seeker_nick.to_string(),
+            target: target.to_string(),
+            target_nick: target_nick.to_string(),
+            via: from_account.to_string(),
+            received_ms: now_ms(),
+        };
+        match self
+            .state
+            .pending_intro_requests
+            .iter_mut()
+            .find(|r| r.conclave_id == conclave_id && r.seeker == seeker)
+        {
+            Some(existing) => *existing = record,
+            None => self.state.pending_intro_requests.push(record),
+        }
+        Ok(true)
+    }
+
+    /// Apply a received introduction.
+    ///
+    /// The invite is only ever valid in its owner's name, so `target` must
+    /// equal the sender. This vault is either the seeker (the introduction is
+    /// stored for the accept prompt) or the courier (it is forwarded to the
+    /// seeker over the seeker's channel). Everything else is dropped.
+    async fn receive_intro(
+        &mut self,
+        conclave_id: &str,
+        conclave_name: &str,
+        target: &str,
+        target_nick: &str,
+        seeker: &str,
+        invite: &str,
+        from_account: &str,
+    ) -> Result<bool, Error> {
+        let me = self.state.protocol_name.clone();
+        if seeker == target || target == me {
+            return Ok(false);
+        }
+        let Some(conclave) = self.chat_log.conclave(conclave_id).cloned() else {
+            return Ok(false);
+        };
+        if conclave.ended || !conclave.is_joined(&me) {
+            return Ok(false);
+        }
+        if !conclave.is_joined(target) {
+            return Ok(false);
+        }
+        if seeker == me {
+            // The introduction is for this vault. Known contacts need nothing;
+            // malformed invites are not stored; a second copy replaces the
+            // first, so a fresh invite always wins.
+            if self.contact_nick_for_protocol(target).is_some() {
+                return Ok(false);
+            }
+            // The invite is self-authenticating: it must name the roster
+            // member it claims, so a courier cannot swap in their own
+            // identity and become the channel.
+            let payload = match InvitePayload::decode(invite) {
+                Ok(p) => p,
+                Err(_) => return Ok(false),
+            };
+            if payload.protocol_name != target {
+                return Ok(false);
+            }
+            let record = PendingIntro {
+                conclave_id: conclave_id.to_string(),
+                conclave_name: conclave_name.to_string(),
+                target: target.to_string(),
+                target_nick: target_nick.to_string(),
+                via: from_account.to_string(),
+                invite: invite.to_string(),
+                received_ms: now_ms(),
+            };
+            match self
+                .state
+                .pending_intros
+                .iter_mut()
+                .find(|i| i.conclave_id == conclave_id && i.target == target)
+            {
+                Some(existing) => *existing = record,
+                None => self.state.pending_intros.push(record),
+            }
+            return Ok(true);
+        }
+        // Courier: forward to the seeker over their channel, consuming any
+        // relay prompt this delivery answers.
+        let Some(seeker_nick) = self.contact_nick_for_protocol(seeker) else {
+            return Ok(false);
+        };
+        if !conclave.is_joined(seeker) {
+            return Ok(false);
+        }
+        self.state
+            .pending_intro_requests
+            .retain(|r| !(r.conclave_id == conclave_id && r.seeker == seeker));
+        self.send_payload_inner(
+            &seeker_nick,
+            MessagePayload::ConclaveIntro {
+                conclave_id: conclave_id.to_string(),
+                name: conclave_name.to_string(),
+                target: target.to_string(),
+                target_nick: target_nick.to_string(),
+                seeker: seeker.to_string(),
+                invite: invite.to_string(),
+            },
+            false,
+        )
+        .await?;
+        Ok(true)
+    }
+
     ///
     /// If the convener leaves, the conclave ends for everyone (decision a): the
     /// convener is the only trustee who can administer or close it, so a departed
@@ -3105,6 +3638,56 @@ impl Account {
                         relay.delete(&queue_id, &read_token, &blob_id).await?;
                         continue;
                     }
+                    MessagePayload::ConclaveIntroReq {
+                        conclave_id,
+                        name,
+                        seeker,
+                        seeker_nick,
+                        target,
+                        target_nick,
+                    } => {
+                        if self
+                            .receive_intro_req(
+                                &conclave_id,
+                                &name,
+                                &seeker,
+                                &seeker_nick,
+                                &target,
+                                &target_nick,
+                                &from_account,
+                            )
+                            .await?
+                        {
+                            dirty = true;
+                        }
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        continue;
+                    }
+                    MessagePayload::ConclaveIntro {
+                        conclave_id,
+                        name,
+                        target,
+                        target_nick,
+                        seeker,
+                        invite,
+                    } => {
+                        if self
+                            .receive_intro(
+                                &conclave_id,
+                                &name,
+                                &target,
+                                &target_nick,
+                                &seeker,
+                                &invite,
+                                &from_account,
+                            )
+                            .await?
+                        {
+                            dirty = true;
+                        }
+                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        continue;
+                    }
                     _ => {}
                 }
 
@@ -3114,6 +3697,7 @@ impl Account {
                         let master = *self.vault.master_key();
                         self.chat_log
                             .append_file(&master, &nick, false, name, &id, data.len() as u64)?;
+                        self.enforce_chat_retention();
                         (Some(id), Vec::new())
                     }
                     MessagePayload::Mail {
@@ -3153,6 +3737,7 @@ impl Account {
                     MessagePayload::Text { body } => {
                         let master = *self.vault.master_key();
                         self.chat_log.append_text(&master, &nick, false, body)?;
+                        self.enforce_chat_retention();
                         (None, Vec::new())
                     }
                     // A conclave message. The conclave must already exist and
@@ -3208,6 +3793,8 @@ impl Account {
                     | MessagePayload::ConclaveLeave { .. }
                     | MessagePayload::ConclaveUpdate { .. }
                     | MessagePayload::ConclaveEnd { .. }
+                    | MessagePayload::ConclaveIntroReq { .. }
+                    | MessagePayload::ConclaveIntro { .. }
                     // Handed over above, into `zine_grants`: a read key is not
                     // a chat message and must never be rendered as one.
                     | MessagePayload::ZineGrant { .. } => {
@@ -3618,6 +4205,8 @@ mod tests {
             vault_name: None,
             revoked: Vec::new(),
             pending_invites: Vec::new(),
+            pending_intro_requests: Vec::new(),
+            pending_intros: Vec::new(),
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
         fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();
@@ -3911,6 +4500,231 @@ mod tests {
             !names.iter().any(|n| n.ends_with(LEGACY_DEVICE_FILE)),
             "an unmigrated vault must not export its identity key: {names:?}"
         );
+    }
+
+    // ---- introductions -------------------------------------------------
+
+    const SAM: &str = "aa";
+    const FRIEND: &str = "bb";
+    const STRANGER: &str = "cc";
+
+    async fn intro_vault(name: &str) -> Account {
+        let dir = scratch(name);
+        Account::create(&dir, "pw", "http://127.0.0.1:1")
+            .await
+            .unwrap()
+    }
+
+    /// Seed the account's conclave record: three joined members, one conclave.
+    /// `me` is the role this vault plays — the state machine compares senders
+    /// and targets against the account's own protocol name. Returns the real
+    /// conclave id, which `create_conclave` mints.
+    fn seed_mesh_conclave(account: &mut Account, me: &str) -> String {
+        let master = *account.vault.master_key();
+        account.state.protocol_name = me.to_string();
+        let members = [
+            ("sam", SAM),
+            ("friend", FRIEND),
+            ("stranger", STRANGER),
+        ];
+        let trustees: Vec<ConclaveTrustee> = members
+            .iter()
+            .map(|(nick, id)| ConclaveTrustee {
+                nick: nick.to_string(),
+                account_id: id.to_string(),
+                state: TrusteeState::Joined,
+            })
+            .collect();
+        account
+            .chat_log
+            .create_conclave(&master, "mesh", SAM, &trustees)
+            .unwrap()
+    }
+
+    /// Seed a contact edge without touching the relay: identity material is
+    /// never used by the introduction state machine, only looked up.
+    fn seed_contact(account: &mut Account, nick: &str, id: &str) {
+        account.state.contacts.push(Contact {
+            nickname: nick.to_string(),
+            account_id: id.to_string(),
+            identity_key: vec![7u8; 33],
+            queue_id: format!("{nick}-queue"),
+            queue_token: format!("{nick}-token"),
+            delivery_queue_id: None,
+            delivery_queue_token: None,
+            mail_handle: None,
+            mail_vault: None,
+            inbound_ready: false,
+        });
+    }
+
+    #[tokio::test]
+    async fn an_intro_request_addressed_to_this_vault_waits_for_consent() {
+        let mut stranger = intro_vault("intro-target").await;
+        let cid = seed_mesh_conclave(&mut stranger, STRANGER);
+
+        // The friend relays Sam's request; the stranger is the target.
+        let dirty = stranger
+            .receive_intro_req(&cid, "mesh", SAM, "sam", STRANGER, "stranger", FRIEND)
+            .await
+            .unwrap();
+        assert!(dirty, "a request addressed to this vault must be stored");
+        assert_eq!(stranger.pending_intro_requests().len(), 1);
+        assert_eq!(stranger.pending_intro_requests()[0].via, FRIEND);
+
+        // A second copy replaces the first instead of stacking prompts.
+        stranger
+            .receive_intro_req(&cid, "mesh", SAM, "sam", STRANGER, "stranger", FRIEND)
+            .await
+            .unwrap();
+        assert_eq!(stranger.pending_intro_requests().len(), 1);
+
+        // Declining is silent and clears the record.
+        stranger
+            .answer_intro_request(&cid, SAM, false)
+            .await
+            .unwrap();
+        assert!(stranger.pending_intro_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_relayed_intro_request_for_an_unreachable_target_is_dropped() {
+        let mut friend = intro_vault("intro-courier").await;
+        let cid = seed_mesh_conclave(&mut friend, FRIEND);
+
+        // The courier does not know the target: it cannot help, so the
+        // request is consumed without leaving a relay prompt.
+        let dirty = friend
+            .receive_intro_req(&cid, "mesh", SAM, "sam", STRANGER, "stranger", SAM)
+            .await
+            .unwrap();
+        assert!(!dirty);
+        assert!(friend.pending_intro_requests().is_empty());
+
+        // Knowing the target makes the same request a relay prompt.
+        seed_contact(&mut friend, "stranger", STRANGER);
+        let dirty = friend
+            .receive_intro_req(&cid, "mesh", SAM, "sam", STRANGER, "stranger", SAM)
+            .await
+            .unwrap();
+        assert!(dirty);
+        assert_eq!(friend.pending_intro_requests().len(), 1);
+
+        // Dismissing it clears the record without sending anything.
+        friend
+            .dismiss_intro_request(&cid, SAM)
+            .await
+            .unwrap();
+        assert!(friend.pending_intro_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_delivered_intro_is_stored_and_accepting_adds_the_contact() {
+        let mut sam = intro_vault("intro-seeker").await;
+        let cid = seed_mesh_conclave(&mut sam, SAM);
+
+        // A forged origin — an invite "for" someone else's account — is
+        // dropped: the invite is only valid in its owner's name.
+        let dirty = sam
+            .receive_intro(
+                &cid, "mesh", STRANGER, "stranger", SAM, "not-a-real-invite", FRIEND,
+            )
+            .await
+            .unwrap();
+        assert!(!dirty, "the invite must come from the account it names");
+
+        // A courier cannot swap in their own invite: the payload must name
+        // the roster member it claims.
+        let swapped = {
+            let mut friend_vault = intro_vault("intro-swap").await;
+            friend_vault.state.protocol_name = FRIEND.to_string();
+            friend_vault.invite().await.unwrap()
+        };
+        let dirty = sam
+            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &swapped, FRIEND)
+            .await
+            .unwrap();
+        assert!(!dirty, "an invite naming someone else must be dropped");
+
+        // The real shape: the stranger's own invite, carried by the friend.
+        let invite = {
+            let mut stranger = intro_vault("intro-owner").await;
+            stranger.state.protocol_name = STRANGER.to_string();
+            stranger.invite().await.unwrap()
+        };
+        let dirty = sam
+            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND)
+            .await
+            .unwrap();
+        assert!(dirty);
+        assert_eq!(sam.pending_intros().len(), 1);
+
+        // Accepting consumes the invite and creates the mutual contact.
+        sam.accept_intro(&cid, STRANGER, "stranger").await.unwrap();
+        assert!(sam.pending_intros().is_empty());
+        let contact = sam
+            .contacts()
+            .iter()
+            .find(|c| c.account_id == STRANGER)
+            .expect("the introduced member must become a contact");
+        assert_eq!(contact.nickname, "stranger");
+
+        // A late duplicate has nothing to add.
+        sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND)
+            .await
+            .unwrap();
+        assert!(sam.pending_intros().is_empty());
+        assert_eq!(sam.contacts().iter().filter(|c| c.account_id == STRANGER).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_intro_cannot_collide_with_another_contacts_nickname() {
+        let mut sam = intro_vault("intro-nick").await;
+        let cid = seed_mesh_conclave(&mut sam, SAM);
+        seed_contact(&mut sam, "taken", "deadbeef");
+        let invite = {
+            let mut stranger = intro_vault("intro-owner-2").await;
+            stranger.state.protocol_name = STRANGER.to_string();
+            stranger.invite().await.unwrap()
+        };
+        sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND)
+            .await
+            .unwrap();
+
+        assert!(sam.accept_intro(&cid, STRANGER, "taken").await.is_err());
+        // The pending record survives a rejected nickname: the caller picks
+        // another one rather than losing the introduction.
+        assert_eq!(sam.pending_intros().len(), 1);
+    }
+
+    #[test]
+    fn intro_payloads_round_trip_through_their_tags() {
+        let req = MessagePayload::ConclaveIntroReq {
+            conclave_id: "c1".into(),
+            name: "mesh".into(),
+            seeker: SAM.into(),
+            seeker_nick: "sam".into(),
+            target: STRANGER.into(),
+            target_nick: "stranger".into(),
+        };
+        let intro = MessagePayload::ConclaveIntro {
+            conclave_id: "c1".into(),
+            name: "mesh".into(),
+            target: STRANGER.into(),
+            target_nick: "stranger".into(),
+            seeker: SAM.into(),
+            invite: "hush-invite-1".into(),
+        };
+        for payload in [req, intro] {
+            let decoded = MessagePayload::decode(&payload.encode().unwrap()).unwrap();
+            match (payload, decoded) {
+                (MessagePayload::ConclaveIntroReq { seeker, .. }, MessagePayload::ConclaveIntroReq { seeker: s, .. })
+                | (MessagePayload::ConclaveIntro { seeker, .. }, MessagePayload::ConclaveIntro { seeker: s, .. }) => {
+                    assert_eq!(seeker, s);
+                }
+                _ => panic!("intro payload did not round trip"),
+            }
+        }
     }
 
 }

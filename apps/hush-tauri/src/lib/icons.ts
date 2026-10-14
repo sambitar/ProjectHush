@@ -43,6 +43,7 @@ import {
   Handshake,
   Users,
   UserPlus,
+  Footprints,
   Globe,
   ExternalLink,
   ShieldCheck,
@@ -80,6 +81,7 @@ import {
   Redo2,
   Mic,
   MicOff,
+  Forward,
   type IconNode,
 } from "lucide";
 
@@ -89,6 +91,7 @@ const ICONS = {
   trusts: Handshake,
   conclaves: Users,
   addMember: UserPlus,
+  kick: Footprints,
   mail: Mail,
   files: Folder,
   vault: Shield,
@@ -167,6 +170,7 @@ const ICONS = {
   redo: Redo2,
   mic: Mic,
   micOff: MicOff,
+  forward: Forward,
 } satisfies Record<string, IconNode>;
 
 /**

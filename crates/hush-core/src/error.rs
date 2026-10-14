@@ -58,6 +58,8 @@ pub enum Error {
     NotConclaveTrustee,
     #[error("no pending invite for that conclave")]
     InviteNotFound,
+    #[error("no member of this conclave can carry that introduction")]
+    NoIntroCourier,
     #[error("that person is already a trustee of this conclave")]
     AlreadyConclaveTrustee,
     #[error("malformed drop container")]

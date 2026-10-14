@@ -86,3 +86,6 @@ export function notePreview(note: NoteDto, max = 90): string {
   if (flat.length <= max) return flat;
   return `${flat.slice(0, max - 1).trimEnd()}…`;
 }
+
+/** Note-to-text-file helpers, kept here so callers need one store import. */
+export { noteFileName, noteToFileText } from "./notesShare";

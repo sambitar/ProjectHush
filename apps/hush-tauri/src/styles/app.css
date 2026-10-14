@@ -1425,6 +1425,7 @@
   top: calc(100% + var(--space-1));
   right: 0;
   min-width: 224px;
+  max-width: min(360px, 80vw);
   padding: var(--space-1);
   display: flex;
   flex-direction: column;
@@ -1432,6 +1433,10 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-2);
+  /* A long list (e.g. a whole note board offered as mail attachments) scrolls
+     inside the popup instead of running off the viewport. */
+  max-height: 60vh;
+  overflow-y: auto;
 }
 
 /* The `display: flex` above would otherwise beat the `hidden` attribute. */
@@ -1980,11 +1985,20 @@
   flex-shrink: 0;
 }
 
-.conclave-end {
+.conclave-end,
+.conclave-delete {
   width: auto;
   background: var(--danger);
   border-color: var(--danger);
   color: #fff;
+}
+
+/* The paper pane's action row: Save as note sits above the editor, out of
+   the toolbar's way, and works on a live paper and a frozen one alike. */
+.paper-pane-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: var(--space-2);
 }
 
 .conclave-members {
@@ -2029,6 +2043,48 @@
 .member-chip-remove:hover {
   background: var(--danger-soft, var(--accent-soft));
   color: var(--danger, var(--accent-strong));
+}
+
+/* A chip's whole click is its trustee menu (like the trust rows), so the
+ * component's own three-dots trigger is hidden — the nick is the trigger. */
+.member-chip {
+  cursor: pointer;
+}
+
+.member-chip .member-chip-menu .overflow-trigger {
+  display: none;
+}
+
+.member-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The identity dialog behind "View identity". */
+.identity-modal {
+  text-align: center;
+}
+
+.identity-modal h2 {
+  margin: var(--space-3) 0 0;
+}
+
+.identity-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+  text-align: left;
+  margin-top: var(--space-3);
+}
+
+.identity-row .muted {
+  flex: none;
+  min-width: 72px;
+}
+
+.identity-id {
+  word-break: break-all;
+  user-select: all;
 }
 
 /* A trustee's role or join state, shown inline on the chip. */
@@ -2093,6 +2149,76 @@
   background: var(--surface);
 }
 
+/* Introduction prompts and the unreachable-members warning. They ride
+ * between the roster and the history: a conclave only carries traffic
+ * between members who are each other's contacts, and these say so. */
+.conclave-banners {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4) 0;
+}
+
+.conclave-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.conclave-banner svg {
+  flex: none;
+  margin-top: 2px;
+}
+
+.conclave-banner p {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+
+.conclave-banner-warn {
+  border: 1px solid color-mix(in srgb, var(--warning, #d9a13c) 55%, var(--border));
+  background: color-mix(in srgb, var(--warning, #d9a13c) 10%, transparent);
+  color: var(--text);
+}
+
+.conclave-banner-info {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* The "Introduce to…" picker and the consent dialog. */
+.conclave-intro-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-3) 0;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.conclave-intro-candidate {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.conclave-intro-candidate:hover {
+  background: var(--surface-2);
+}
+
 .conclave-messages {
   flex: 1;
   min-height: 0;
@@ -2105,9 +2231,53 @@
   margin-top: var(--space-4);
 }
 
-/* The sender's name above an incoming bubble, since a conclave has several. */
+/* The sender's name above an incoming bubble, since a conclave has several.
+ * The hue is per trustee (set inline); the lightness is per theme. */
 .conclave-sender {
   margin: 0 var(--space-2) 2px;
+  color: hsl(var(--sender-h, 0), 55%, 40%);
+}
+
+:root[data-theme="dark"] .conclave-sender {
+  color: hsl(var(--sender-h, 0), 55%, 70%);
+}
+
+/* An incoming conclave message is a row: the trustee's avatar, then the
+ * name-and-bubble column. Own messages keep the plain right-aligned column. */
+.conclave-group {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.conclave-avatar {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  margin-top: 2px;
+}
+
+.conclave-avatar .avatar-initials {
+  font-size: 11px;
+}
+
+.conclave-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+/* The trustee's hue tints the bubble itself — a whitish pastel per trustee
+ * on light, a deep muted tone on dark, matching the avatar and sender name.
+ * To go back to neutral bubbles, delete this block: --sender-h is then only
+ * read by the sender name. */
+.conclave-group .bubble.in {
+  background: hsl(var(--sender-h, 0), 45%, 93%);
+}
+
+:root[data-theme="dark"] .conclave-group .bubble.in {
+  background: hsl(var(--sender-h, 0), 30%, 22%);
 }
 
 .conclave-create-modal,
@@ -3756,6 +3926,10 @@ button.library-item-main {
 .notes-body-input {
   width: 100%;
   min-height: 260px;
+  /* A note can run long (a saved paper especially): the editor caps the
+     textarea and scrolls inside it instead of stretching the page. */
+  max-height: min(60vh, 640px);
+  overflow-y: auto;
   resize: vertical;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -3801,15 +3975,131 @@ button.library-item-main {
    the top and a lifted corner. The paper keeps its own colour in both app
    themes (a real sticky does not go dark when the lights do), so the ink is a
    fixed dark rather than --text. */
+/* The Chat history dialog: label-left, control-right rows, like Settings. */
+.chat-history-modal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.chat-history-modal p {
+  margin: 0;
+}
+
+.chat-history-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  border: 0;
+  margin: 0;
+  padding: var(--space-3) 0 0;
+}
+
+/* Divider between sections, from the second on: adjacency, not
+ * first-of-type, because the fieldset is a first-of-type of its own tag. */
+.chat-history-section + .chat-history-section {
+  border-top: 1px solid var(--border);
+}
+
+fieldset.chat-history-section {
+  min-width: 0;
+  min-inline-size: 0;
+}
+
+/* The rules block stacks: a fieldset ignores flex layout for its legend and
+ * one row per rule reads better than a crushed line of wrapped labels. */
+.chat-history-auto {
+  display: block;
+}
+
+.chat-history-auto legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+}
+
+.chat-history-auto > button {
+  margin-top: var(--space-2);
+}
+
+.chat-history-rule {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+}
+
+.chat-history-lines {
+  width: 96px;
+  margin-left: var(--space-2);
+}
+
+/* The date range stacks like the rules block: label on top, then the two
+ * pickers sharing the row with the delete button. */
+.chat-history-range {
+  display: block;
+}
+
+.chat-history-dates {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.chat-history-dates .input-field {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
+
+/* The armed second press of a delete — a louder restatement, not a new row. */
+.chat-history-section .btn-danger.armed {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.chat-history-done {
+  align-self: flex-end;
+}
+
+/* The attach-a-note picker over the mail compose: a search field and the
+   Notes pane's rows, because a board can hold hundreds of notes and a flat
+   menu would neither fit nor scale. */
+.note-picker-modal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.note-picker-head h2 {
+  margin: 0;
+}
+
+.note-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-height: 120px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.note-picker-list .note-row {
+  width: 100%;
+  text-align: left;
+}
+
 .note-view-modal {
   --sticky-ink: #14141a;
   --sticky-ink-dim: rgba(20, 20, 26, 0.58);
   position: relative;
   width: min(420px, 100%);
-  /* Portrait but squarish at rest; the note grows it with its text, up to the
-     viewport, after which the body scrolls inside. */
+  /* Portrait but squarish at rest; the note grows it with its text, up to a
+     bounded card — not the whole screen — after which the body scrolls
+     inside. */
   min-height: min(58vh, 470px);
-  max-height: min(88vh, 820px);
+  max-height: min(70vh, 640px);
   display: flex;
   flex-direction: column;
   overflow: visible;
@@ -3820,7 +4110,9 @@ button.library-item-main {
   box-shadow:
     0 26px 52px -18px rgba(20, 20, 40, 0.45),
     0 6px 14px rgba(20, 20, 40, 0.16);
-  transform: rotate(-0.8deg);
+  /* No body tilt: the sticky keeps its hand-made look through the tape (which
+     tilts on its own) and the lifted corner, but a transformed box renders its
+     native scrollbar rotated with it — a skewed scrollbar reads as broken. */
 }
 
 /* Tape holding the note to the wall. */
@@ -3858,6 +4150,26 @@ button.library-item-main {
 .note-view-title {
   margin: 0;
   color: var(--sticky-ink);
+}
+
+/* Title and the corner forward mark share the first row. */
+.note-view-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+/* The forward mark reads as ink on the paper, not app chrome — it sits in the
+   sticky's corner, away from the tape (top-centre) and the fold (bottom-right). */
+.note-view-forward {
+  color: var(--sticky-ink);
+  flex-shrink: 0;
+  margin: calc(var(--space-1) * -1) 0 0;
+}
+
+.note-view-forward:hover {
+  background: rgba(20, 20, 40, 0.1);
 }
 
 .note-view-meta {

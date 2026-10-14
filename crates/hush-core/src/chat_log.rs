@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,6 +10,42 @@ use crate::crypto::{decrypt, encrypt, MASTER_KEY_LEN};
 use crate::error::Error;
 use crate::payload::{ConclaveTrustee, TrusteeState};
 use crate::vault::BlobId;
+
+/// The chat auto-delete policy, as the daemon's prefs file states it. The log
+/// itself enforces it on every append; mail, drafts and drops are out of scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRetention {
+    /// Delete every chat message older than the current UTC day.
+    #[serde(default)]
+    pub daily: bool,
+    /// Keep at most this many chat messages per contact, oldest deleted
+    /// first. `None` keeps whatever the daily rule does not cover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_lines: Option<u32>,
+}
+
+/// Whether a record is a 1:1 chat message (text or file), as opposed to the
+/// mail, draft and drop records that share the same log.
+fn is_chat_payload(r: &ChatRecord) -> bool {
+    matches!(
+        r.payload,
+        ChatRecordPayload::Text { .. } | ChatRecordPayload::File { .. }
+    )
+}
+
+/// Whether `ts_ms` sits inside an optional `[from, to]` millisecond window.
+fn in_range(ts_ms: u64, from_ms: Option<u64>, to_ms: Option<u64>) -> bool {
+    from_ms.map_or(true, |f| ts_ms >= f) && to_ms.map_or(true, |t| ts_ms <= t)
+}
+
+/// The millisecond at which the current UTC day began. The daily rule is a
+/// whole-day purge, and the boundary is UTC: the log has no timezone of its
+/// own, and a local boundary would make the purge depend on where the vault
+/// happens to run.
+fn utc_day_start_ms() -> u64 {
+    let now = now_ms();
+    now - (now % 86_400_000)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRecord {
@@ -441,6 +478,87 @@ impl ChatLog {
         }
         self.save(master)?;
         Ok(true)
+    }
+
+    /// Drop chat messages for one contact, optionally bounded to `[from_ms,
+    /// to_ms]`. Returns how many records went. Only the 1:1 chat payloads
+    /// (text and file) are touched: mail, drafts and drops share this log and
+    /// have their own deletion rules.
+    pub fn remove_for_contact(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        contact_nick: &str,
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+    ) -> Result<usize, Error> {
+        let before = self.file.messages.len();
+        self.file.messages.retain(|r| {
+            !(is_chat_payload(r) && r.contact_nick == contact_nick && in_range(r.ts_ms, from_ms, to_ms))
+        });
+        let removed = before - self.file.messages.len();
+        if removed > 0 {
+            self.save(master)?;
+        }
+        Ok(removed)
+    }
+
+    /// Enforce the chat auto-delete policy across every contact: `daily`
+    /// deletes chat messages older than the current UTC day, `keep_lines`
+    /// caps how many chat messages one contact may hold and deletes the
+    /// oldest past it. Mail, drafts and drops are never touched. Returns how
+    /// many records went.
+    pub fn retain_for_auto_delete(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        retention: ChatRetention,
+    ) -> Result<usize, Error> {
+        let ChatRetention {
+            daily,
+            keep_lines: cap,
+        } = retention;
+        if !daily && cap.is_none() {
+            return Ok(0);
+        }
+        let before = self.file.messages.len();
+
+        if daily {
+            let cutoff = utc_day_start_ms();
+            self.file
+                .messages
+                .retain(|r| !(is_chat_payload(r) && r.ts_ms < cutoff));
+        }
+
+        if let Some(cap) = cap {
+            // Walk newest-first and keep the first `cap` chat records per
+            // contact; the log arrives in append order, so the oldest sit at
+            // the front and are the ones that go.
+            let mut kept: HashMap<&str, u32> = HashMap::new();
+            let mut keep = vec![true; self.file.messages.len()];
+            for (i, r) in self.file.messages.iter().enumerate().rev() {
+                if is_chat_payload(r) {
+                    let count = kept.entry(r.contact_nick.as_str()).or_insert(0);
+                    if *count >= cap {
+                        keep[i] = false;
+                    } else {
+                        *count += 1;
+                    }
+                }
+            }
+            let mut i = 0;
+            self.file
+                .messages
+                .retain(|_| {
+                    let k = keep[i];
+                    i += 1;
+                    k
+                });
+        }
+
+        let removed = before - self.file.messages.len();
+        if removed > 0 {
+            self.save(master)?;
+        }
+        Ok(removed)
     }
 
     /// The conclaves this vault holds, in creation order.

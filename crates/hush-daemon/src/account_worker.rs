@@ -2,10 +2,12 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use hush_core::{
-    Account, ChatRecord, ConclaveRecord, InboxResult, MessagePayload, PaperDescriptor,
-    PendingInvite, VoiceDescriptor,
+  Account, ChatRecord, ChatRetention, ConclaveRecord, InboxResult, MessagePayload,
+  PaperDescriptor, PendingInvite, PendingIntro, PendingIntroRequest, VoiceDescriptor,
 };
 use tokio::sync::{mpsc, oneshot};
+
+use crate::ui_prefs;
 
 pub struct AccountWorker {
     tx: mpsc::Sender<Work>,
@@ -163,6 +165,21 @@ enum Work {
         reply: oneshot::Sender<WorkResult>,
     },
     Messages {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Delete 1:1 chat messages with a contact, optionally bounded to a time
+    /// range — no bounds means the entire history with them.
+    DeleteChats {
+        nick: String,
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Install the chat auto-delete policy from the prefs file and run it
+    /// once. While locked there is nothing live to enforce: unlock loads it.
+    SetChatRetention {
+        daily: bool,
+        keep_lines: Option<u32>,
         reply: oneshot::Sender<WorkResult>,
     },
     Blob {
@@ -484,6 +501,59 @@ enum Work {
         conclave_id: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Offer an introduction between two joined trustees this vault knows.
+    IntroduceMembers {
+        conclave_id: String,
+        seeker: String,
+        target: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Ask the conclave for an introduction to a member this vault cannot
+    /// reach.
+    RequestIntro {
+        conclave_id: String,
+        target: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Relay a stored introduction request on to its target.
+    RelayIntroRequest {
+        conclave_id: String,
+        seeker: String,
+        target: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Answer a request addressed to this vault: share the standing invite or
+    /// decline.
+    AnswerIntroRequest {
+        conclave_id: String,
+        seeker: String,
+        accept: bool,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Consume a received introduction: make the target a contact.
+    AcceptIntro {
+        conclave_id: String,
+        target: String,
+        nickname: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Drop a received introduction without adding the contact.
+    DismissIntro {
+        conclave_id: String,
+        target: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Drop a held introduction request without relaying or answering it.
+    DismissIntroRequest {
+        conclave_id: String,
+        seeker: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// The introduction records waiting on this vault: requests to answer or
+    /// relay, and delivered invites to accept or dismiss.
+    PendingIntros {
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// Delete an ended conclave and its message log from this vault. Local
     /// only: nothing is broadcast, and shared-file blobs stay in the vault.
     DeleteConclave {
@@ -599,6 +669,28 @@ impl From<hush_core::PublicIdentity> for PublicIdentityDto {
     }
 }
 
+/// A delivered introduction as the UI sees it: no invite string. Accepting or
+/// dismissing is a decision the vault executes, not data the page handles.
+#[derive(serde::Serialize)]
+pub struct PendingIntroView {
+    pub conclave_id: String,
+    pub conclave_name: String,
+    pub target: String,
+    pub target_nick: String,
+    pub via: String,
+    pub received_ms: u64,
+}
+
+/// Both introduction queues in one GET, so a poll stays one round trip.
+#[derive(serde::Serialize)]
+pub struct IntroLists {
+    /// Requests this vault must answer (it is the target) or relay (it is a
+    /// courier the seeker asked).
+    pub requests: Vec<PendingIntroRequest>,
+    /// Delivered invites waiting on an accept or dismiss.
+    pub intros: Vec<PendingIntroView>,
+}
+
 pub enum WorkResult {
     Ok,
     Invite(String),
@@ -627,6 +719,8 @@ pub enum WorkResult {
     Backup(Vec<u8>),
     RecoveryCode(String),
     Messages(Vec<ChatRecord>),
+    /// How many chat records a delete or retention pass removed.
+    ChatsDeleted(usize),
     /// The thread the mail was filed under, and whether the relay took it.
     MailSent {
         thread_id: String,
@@ -679,6 +773,10 @@ pub enum WorkResult {
     ConclaveAccepted(ConclaveRecord),
     /// Conclave invitations received but not yet accepted or declined.
     PendingInvites(Vec<PendingInvite>),
+    /// Introduction records waiting on this vault: requests to answer or
+    /// relay, and delivered invites to accept or dismiss. A delivered intro's
+    /// invite string never leaves the vault — the UI only accepts/dismisses.
+    PendingIntros(IntroLists),
     /// The descriptor a hub succession sent, when this vault was the convener
     /// that inherited it. `None` is the ordinary answer for every other trustee
     /// that saw the same departure.
@@ -721,6 +819,25 @@ impl AccountWorker {
                                     // rotated inbox cleared the cached invite in
                                     // `finish_open`, so the next invite mints a
                                     // fresh one.
+                                    let mut a = a;
+                                    // Chat auto-delete: install the policy the
+                                    // prefs file states and run it once — unlock
+                                    // is when a daily rule catches up with the
+                                    // days the vault spent locked.
+                                    let prefs = ui_prefs::load(&dir);
+                                    let retention = ChatRetention {
+                                        daily: prefs.chat_auto_delete.daily,
+                                        keep_lines: prefs.chat_auto_delete.keep_lines,
+                                    };
+                                    match a.set_chat_retention(retention).await {
+                                        Ok(n) if n > 0 => {
+                                            eprintln!("hush: chat auto-delete removed {n} messages");
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            eprintln!("hush: chat auto-delete pass failed: {e}")
+                                        }
+                                    }
                                     account = Some(a);
                                     WorkResult::Ok
                                 }
@@ -928,6 +1045,42 @@ impl AccountWorker {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => WorkResult::Messages(a.chat_history()),
+                            };
+                            (reply, result)
+                        }
+                        Work::DeleteChats {
+                            nick,
+                            from_ms,
+                            to_ms,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.remove_chat_history(&nick, from_ms, to_ms).await {
+                                    Ok(n) => WorkResult::ChatsDeleted(n),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SetChatRetention {
+                            daily,
+                            keep_lines,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                // Locked: the policy is already in the prefs
+                                // file and unlock will load and enforce it.
+                                None => WorkResult::Ok,
+                                Some(a) => {
+                                    match a
+                                        .set_chat_retention(ChatRetention { daily, keep_lines })
+                                        .await
+                                    {
+                                        Ok(n) => WorkResult::ChatsDeleted(n),
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
                             };
                             (reply, result)
                         }
@@ -1709,6 +1862,144 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::IntroduceMembers {
+                            conclave_id,
+                            seeker,
+                            target,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .introduce_members(&conclave_id, &seeker, &target)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RequestIntro {
+                            conclave_id,
+                            target,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.request_intro(&conclave_id, &target).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RelayIntroRequest {
+                            conclave_id,
+                            seeker,
+                            target,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .relay_intro_request(&conclave_id, &seeker, &target)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::AnswerIntroRequest {
+                            conclave_id,
+                            seeker,
+                            accept,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .answer_intro_request(&conclave_id, &seeker, accept)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::AcceptIntro {
+                            conclave_id,
+                            target,
+                            nickname,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .accept_intro(&conclave_id, &target, &nickname)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::DismissIntro {
+                            conclave_id,
+                            target,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.dismiss_intro(&conclave_id, &target).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::PendingIntros { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::PendingIntros(IntroLists {
+                                    requests: a.pending_intro_requests().to_vec(),
+                                    intros: a
+                                        .pending_intros()
+                                        .iter()
+                                        .map(|i| PendingIntroView {
+                                            conclave_id: i.conclave_id.clone(),
+                                            conclave_name: i.conclave_name.clone(),
+                                            target: i.target.clone(),
+                                            target_nick: i.target_nick.clone(),
+                                            via: i.via.clone(),
+                                            received_ms: i.received_ms,
+                                        })
+                                        .collect(),
+                                }),
+                            };
+                            (reply, result)
+                        }
+                        Work::DismissIntroRequest {
+                            conclave_id,
+                            seeker,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .dismiss_intro_request(&conclave_id, &seeker)
+                                    .await
+                                {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::DeleteConclave { conclave_id, reply } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
@@ -1920,6 +2211,34 @@ impl AccountWorker {
 
     pub async fn messages(&self) -> WorkResult {
         self.call(|reply| Work::Messages { reply }).await
+    }
+
+    /// Delete 1:1 chat messages with a contact, optionally bounded by time.
+    /// Returns how many records went. See [`Work::DeleteChats`].
+    pub async fn delete_chats(
+        &self,
+        nick: String,
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+    ) -> WorkResult {
+        self.call(|reply| Work::DeleteChats {
+            nick,
+            from_ms,
+            to_ms,
+            reply,
+        })
+        .await
+    }
+
+    /// Install the chat auto-delete policy and run it once. See
+    /// [`Work::SetChatRetention`].
+    pub async fn set_chat_retention(&self, daily: bool, keep_lines: Option<u32>) -> WorkResult {
+        self.call(|reply| Work::SetChatRetention {
+            daily,
+            keep_lines,
+            reply,
+        })
+        .await
     }
 
     pub async fn blob(&self, id_hex: &str) -> WorkResult {
@@ -2526,6 +2845,100 @@ impl AccountWorker {
             reply,
         })
         .await
+    }
+
+    /// Offer an introduction between two members this vault knows.
+    pub async fn introduce_members(
+        &self,
+        conclave_id: &str,
+        seeker: &str,
+        target: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::IntroduceMembers {
+            conclave_id: conclave_id.to_string(),
+            seeker: seeker.to_string(),
+            target: target.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Ask the conclave for an introduction to a member this vault cannot reach.
+    pub async fn request_intro(&self, conclave_id: &str, target: &str) -> WorkResult {
+        self.call(|reply| Work::RequestIntro {
+            conclave_id: conclave_id.to_string(),
+            target: target.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Relay a stored introduction request on to its target.
+    pub async fn relay_intro_request(
+        &self,
+        conclave_id: &str,
+        seeker: &str,
+        target: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::RelayIntroRequest {
+            conclave_id: conclave_id.to_string(),
+            seeker: seeker.to_string(),
+            target: target.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Answer a request addressed to this vault.
+    pub async fn answer_intro_request(
+        &self,
+        conclave_id: &str,
+        seeker: &str,
+        accept: bool,
+    ) -> WorkResult {
+        self.call(|reply| Work::AnswerIntroRequest {
+            conclave_id: conclave_id.to_string(),
+            seeker: seeker.to_string(),
+            accept,
+            reply,
+        })
+        .await
+    }
+
+    /// Consume a received introduction: make the target a contact.
+    pub async fn accept_intro(&self, conclave_id: &str, target: &str, nickname: &str) -> WorkResult {
+        self.call(|reply| Work::AcceptIntro {
+            conclave_id: conclave_id.to_string(),
+            target: target.to_string(),
+            nickname: nickname.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Drop a received introduction without adding the contact.
+    pub async fn dismiss_intro(&self, conclave_id: &str, target: &str) -> WorkResult {
+        self.call(|reply| Work::DismissIntro {
+            conclave_id: conclave_id.to_string(),
+            target: target.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Drop a held introduction request without relaying or answering it.
+    pub async fn dismiss_intro_request(&self, conclave_id: &str, seeker: &str) -> WorkResult {
+        self.call(|reply| Work::DismissIntroRequest {
+            conclave_id: conclave_id.to_string(),
+            seeker: seeker.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// The introduction records waiting on this vault.
+    pub async fn pending_intros(&self) -> WorkResult {
+        self.call(|reply| Work::PendingIntros { reply }).await
     }
 
     /// The account's drop key and the page outsiders post to.

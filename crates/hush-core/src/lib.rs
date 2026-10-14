@@ -21,7 +21,10 @@ mod vault;
 mod voice;
 mod wire;
 
-pub use account::{Account, Contact, DropInboxReport, MailOutcome, PendingInvite};
+pub use account::{
+  Account, Contact, DropInboxReport, MailOutcome, PendingInvite, PendingIntro,
+  PendingIntroRequest,
+};
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{
     ClientConfig, ConfigSource, DEFAULT_DAEMON_ADDR, DEFAULT_RELAY_URL, ENV_DAEMON_ADDR,
@@ -38,8 +41,8 @@ pub use drop::{
 pub use device::{DeviceKeys, DEVICE_ID};
 pub use recovery::{generate_recovery_code, normalize_recovery_code, recovery_files_exist};
 pub use chat_log::{
-    ChatRecord, ChatRecordPayload, ConclaveMessage, ConclaveRecord, MailAttachmentRecord,
-    MailState,
+    ChatRecord, ChatRecordPayload, ChatRetention, ConclaveMessage, ConclaveRecord,
+    MailAttachmentRecord, MailState,
 };
 pub use error::Error;
 pub use invite::InvitePayload;

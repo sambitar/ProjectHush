@@ -270,6 +270,53 @@ pub enum MessagePayload {
     /// `ended` flag makes it read-only on every peer rather than only on the
     /// convener's.
     ConclaveEnd { descriptor: ConclaveDescriptor },
+    /// A request for an introduction inside a conclave.
+    ///
+    /// Two joined trustees who are not each other's contacts cannot exchange
+    /// anything directly — conclave fan-out only rides pairwise 1:1 sessions —
+    /// so the mesh is completed by a member who knows them both. The `seeker`
+    /// wants the `target`'s invite; whoever receives this request either *is*
+    /// the target (consent is asked) or a member with a direct channel to the
+    /// target (the courier, who relays it on the seeker's behalf).
+    ///
+    /// Like every conclave control payload it rides an existing 1:1 session,
+    /// so the sender is authenticated by the session itself; receivers still
+    /// verify the claim matches the sender (see `Account::receive_intro_req`).
+    ConclaveIntroReq {
+        conclave_id: String,
+        /// The conclave's name, so prompts can say where the request came from.
+        name: String,
+        /// The account that wants to meet the target.
+        seeker: String,
+        /// The seeker's nickname as the sender knows it. Display hint only:
+        /// the sender's nicknames need not match the receiver's.
+        seeker_nick: String,
+        /// The account whose invite is wanted.
+        target: String,
+        /// The target's nickname as the sender knows it.
+        target_nick: String,
+    },
+    /// An introduction consented to by its owner: their standing invite,
+    /// addressed to one seeker, carried by a member who knows them both.
+    ///
+    /// The invite is the same signed capability an out-of-band swap would use;
+    /// the conclave merely replaces the meeting place. The `target` field must
+    /// equal the sender's account id — an invite is only ever delivered in the
+    /// name of the account that sent it — and `seeker` names the one member
+    /// allowed to consume it.
+    ConclaveIntro {
+        conclave_id: String,
+        name: String,
+        /// The account the invite belongs to; must equal the sender.
+        target: String,
+        /// The target's nickname as the sender knows it.
+        target_nick: String,
+        /// The one member this introduction is addressed to.
+        seeker: String,
+        /// The target's standing invite (`Account::invite`), minted with their
+        /// explicit consent.
+        invite: String,
+    },
     /// A grant of the sender's per-contact receive queue.
     ///
     /// Delivered into the recipient's inbox (the grant channel) and encrypted by

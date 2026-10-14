@@ -139,6 +139,46 @@ export interface PendingInviteDto {
   received_ms: number;
 }
 
+/**
+ * An introduction request waiting on this vault.
+ *
+ * When `target` is this vault, the seeker wants our invite and consent is
+ * asked; otherwise this vault is the courier being asked to relay the request.
+ * The invite string itself never appears here: accepting or dismissing is a
+ * decision the vault executes, not data the page handles.
+ */
+export interface PendingIntroRequestDto {
+  conclave_id: string;
+  conclave_name: string;
+  /** The account that wants to meet the target. */
+  seeker: string;
+  seeker_nick: string;
+  /** The account whose invite is wanted. */
+  target: string;
+  target_nick: string;
+  /** The account the request travelled through. */
+  via: string;
+  received_ms: number;
+}
+
+/** A delivered introduction waiting on an accept or dismiss. */
+export interface PendingIntroDto {
+  conclave_id: string;
+  conclave_name: string;
+  /** The account the invite belongs to. */
+  target: string;
+  target_nick: string;
+  /** The account who carried the invite here. */
+  via: string;
+  received_ms: number;
+}
+
+/** Both introduction queues in one GET. */
+export interface IntroListsDto {
+  requests: PendingIntroRequestDto[];
+  intros: PendingIntroDto[];
+}
+
 export interface ChatRecordDto {
   id: string;
   contact_nick: string;
@@ -175,6 +215,11 @@ export interface ChatRecordDto {
         /** When the dropper sealed it, which is not when it arrived. */
         created_unix: number;
       };
+}
+
+/** `POST /api/chats/delete` — how many chat records the delete removed. */
+export interface DeleteChatsResponse {
+  deleted: number;
 }
 
 /**

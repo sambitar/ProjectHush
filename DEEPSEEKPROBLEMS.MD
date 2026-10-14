@@ -7,6 +7,309 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-14 — Conclave introductions
+
+### The intro tests were written but never actually passed, and one hid a real protocol bug [FIXED]
+
+- Attempted: after landing the intro slice, `cargo test -p hush-core
+  --lib` was run to verify the state machine before calling the flow done.
+- Symptom: 4 of 142 tests failed. Three test-harness causes stacked:
+  `intro_vault` was a sync `fn` awaiting `Account::create` (E0728 plus six
+  cascading E0277 "Account is not a future"), the test seed never set the
+  account's own `protocol_name`, so no test vault matched its roster role,
+  and every call hardcoded `"c1"` as the conclave id while
+  `create_conclave` mints a UUID — so `chat_log.conclave("c1")` returned
+  `None` and the receive paths short-circuited to "not dirty" before any
+  assertion could exercise state. The fourth failure was real:
+  `receive_intro` opened with `if target != from_account { return }`, which
+  is unsatisfiable in the legitimate courier-forwarded case (the sender is
+  the courier, never the target) — the add-as-trust path was unreachable
+  end-to-end.
+- Resolution: `intro_vault` is `async fn`; `seed_mesh_conclave` takes the
+  local role, sets `protocol_name`, and returns the real id, which all
+  calls now thread through. The authenticity guard was replaced with the
+  correct backstop: the decoded invite's `protocol_name` must equal the
+  roster target, so a courier cannot swap in their own identity and become
+  the channel — verified by a new swap-attack test case. Suite green:
+  142 passed, 0 failed.
+- Lesson: a test suite that has never compiled and run is not a
+  verification, and "should pass" claims must be backed by fresh output.
+  Guards that mirror the happy path's origin assumptions should be checked
+  against every forwarding topology the protocol allows, not just the
+  direct one.
+
+### Release build failed on committed code: AccountState initializer and serde derives [FIXED]
+
+- Attempted: `cargo build --release -p hush-daemon -p hush-cli` after the
+  master commit to deploy the intro flow to the running daemons.
+- Symptom: `hush-core` failed first — `error[E0063]: missing fields
+  `pending_intro_requests` and `pending_intros` in initializer of
+  `AccountState`` at the vault-create path (old vaults deserialize with
+  defaults, but the create initializer names every field). Then
+  `hush-daemon` failed — `error: cannot find derive macro \`Serialize\`` on
+  `PendingIntroView` and `IntroLists` in account_worker.rs, which also broke
+  `intro_lists`' Handler impl (E0277) since the response type was not
+  `IntoResponse`.
+- Resolution: added the two fields to both initializers (init plus the test
+  fixture), and matched the file's fully-qualified `serde::Serialize`
+  convention. Release build green in 2m37s.
+- Lesson: "the daemon compiles" must mean the exact commit being shipped,
+  not the working tree of an earlier hour; type-deriving errors cascade
+  into unrelated Handler trait errors, so the first error in an axum route
+  is often not the root cause.
+
+### New UI called new daemon-only endpoints unconditionally, so a successful conclave creation reported failure [FIXED]
+
+- Attempted: the introductions UI slice added `api.introLists()` to
+  `reloadConclaves` alongside the existing `pendingInvites()` call.
+- Symptom: the user reported "why i cant create conclave". Reproduction in
+  the live UI: `POST /api/conclaves` succeeded server-side (two duplicate
+  "aasd" conclaves appeared in the list), but `reloadConclaves` ran after
+  the POST inside the same try/catch, the daemon's `/api/conclaves/intros`
+  route does not exist on the still-running pre-intro release binary, and
+  `request` turns a 404 into a throw — so `createConclave` caught it and
+  announced "Couldn't create the conclave." after the vault had already
+  created it. The modal closed, the list never reloaded, and every other
+  `reloadConclaves` caller inherited the same poisoned await.
+- Resolution: `const intros = await api.introLists().catch(() => null);` —
+  an introduction is an addition, not a dependency, so a daemon without the
+  routes degrades to "nothing pending" until the freeze lifts and the
+  daemon is rebuilt. Verified green with `npx tsc --noEmit`.
+- Lesson: when in-flight UI gains calls to endpoints that only a newer
+  daemon serves, every such call must degrade at the fetch boundary, and a
+  work step that reports failure must never sit in the same try block as
+  the step whose success it announces.
+
+### "Can't create conclave" root cause outside the repo: the vaults' relay is a dead Cloudflare quick tunnel [FIXED]
+
+- Attempted: full trace of the create path with a fetch instrument in the
+  live page (`window.__reqLog`), then a direct `curl` of the daemon.
+- Symptom: `POST /api/conclaves` returns 400 with body
+  `relay error: error sending request for url (https://ban-therapeutic-daughter-organic.trycloudflare.com/q/...)`;
+  every `/api/presence/heartbeat` 400s the same way, which is what the
+  "Hush is disconnected." header reflects. `curl` to the tunnel host: 000.
+  Conclave creation queues invites through the relay, so a dead relay
+  blocks it.
+- Cause: both `instances/peer-a` and `instances/peer-b` vaults store the
+  quick-tunnel URL set on 2026-10-10; the manual `trycloudflare` process on
+  the VPS died (quick-tunnel hostnames are assigned at process start and
+  change on every restart — the failure mode this log already documented).
+  The VPS itself is healthy: `hush-relay` is alive on
+  `http://137.184.129.205:8790` (401 on `/q/health` = route answers), a
+  token-based named tunnel "hush" runs, and the onion address on file
+  answers in principle but no local Tor SOCKS exists on the workstation.
+- Resolution so far: the durable fix is `hush-cli relay set --url <live
+  relay>` for **every** vault that talks to the dead one (the CLI's own
+  help: "contacts on the old relay must move too — the mailbox lives on
+  the relay"). `set` opens the encrypted vault and needs the passphrase,
+  and peer-a's daemon holds the vault lock, so the user is in the loop for
+  the passphrase and the choice of target (direct IP HTTP vs the named
+  tunnel's hostname from their Cloudflare dashboard). Left OPEN until the
+  move is done and creation is verified end-to-end.
+- Resolution: FIXED on 2026-10-14. Direct `http://137.184.129.205:8790`
+  was refused by the daemon's own guardrail — `insecure relay URL: use
+  HTTPS except for localhost` — which is why the tunnel setup existed.
+  Stood up a quick tunnel to the relay under systemd
+  (`cloudflared-hush-quick.service`, `Restart=always`,
+  `--url http://127.0.0.1:8790`) on the VPS; new hostname
+  `https://remedy-relief-patricia-main.trycloudflare.com` (verified 401 on
+  `/q/health` through the edge). Moved both workstation vaults with
+  `hush-cli relay set`, restarted peer-a's daemon, unlocked, heartbeat
+  204, and created a conclave through the real UI — modal closed, announce
+  fired, entry in the list. Caveats recorded below in the client-config
+  entry. Permanent follow-up: add a Public Hostname route to the already
+  running named tunnel in the user's Cloudflare dashboard, then one
+  `relay set` per vault — quick-tunnel hostnames still change if the
+  tunnel process is recreated.
+- Lesson: the daemon's 400 "relay error: error sending request" text is
+  the one string that separates "UI/logic bug" from "infrastructure down";
+  check it before touching code when a whole feature class (anything that
+  queues: invites, conclave creation, heartbeats) fails at once.
+
+### `hush-cli relay set` and `client-config.json` are two separate stores that must be moved together [FIXED]
+
+- Attempted: moved both vaults with `hush-cli relay set` and expected the
+  plaintext `client-config.json` mirror to follow, the way the log note
+  about the two agreeing "by construction" implied.
+- Symptom: `relay set` reported "direct base updated", yet
+  `client-config.json` still carried the dead trycloudflare URL for both
+  peer-a and peer-b. A first `config set --relay-url …` invocation also
+  failed silently-ish (clap usage error; the flag is `--relay`).
+- Resolution: `hush-cli config set --relay <url>` per vault — the config
+  command is the writer for that file, and it prints the caveat itself:
+  "an existing vault keeps the relay it was created with" (the vault's
+  encrypted state wins at runtime; the config file steers the demo
+  scripts' relay-start decision and new-vault creation). Verified both
+  files with grep afterwards.
+- Lesson: any project with an encrypted source of truth plus a plaintext
+  "mirror" needs one command that updates both; until then, the mirror
+  will silently drift and the next reader (script or human) will trust the
+  stale half.
+
+### The agent suggested swapping invites "in the conclave chat" — there is no channel to carry them [FIXED]
+
+- Attempted: asked how the user could add a conclave stranger as a contact,
+  I proposed a cheap fix: "Copy my invite" in the member menu and paste the
+  code into the conclave chat for the other side to click.
+- Symptom: the user immediately asked "how can they send me the code if i
+  cant see their messages". They were right — reading
+  `Account::send_conclave_message` (account.rs, the `filter_map(contact_nick_for_protocol)`
+  over the joined roster) shows fan-out silently skips trustees who are not
+  the sender's contacts, and inbound conclave messages from unknown senders
+  are dropped. Between two non-contact members there is no channel in either
+  direction; the roster updates they both see travel via the mutual contact's
+  session, which is why the stranger still appears in the list.
+- Resolution: the whole suggestion was withdrawn. The real fix became the
+  introduction flow: a request/invite pair of control payloads relayed
+  through a member who holds both edges, with consent on the invite owner's
+  side and a pending-record store mirroring `pending_invites`.
+- Lesson: before proposing UX that rides a channel, verify the channel
+  exists in the transport — roster visibility is not conversational reachability.
+
+### Conclave fan-out drops non-contact trustees silently [FIXED]
+
+- Context: discovered while answering the question above.
+  `send_conclave_message` targets only `joined ∧ my contacts`
+  (`filter_map`), and inbound conclave messages from non-contact senders are
+  consumed and dropped. A conclave whose members are not a full mesh therefore
+  half-works with no error anywhere: chips show joined, messages vanish.
+- Resolution: accepted as the transport's design (per-pair sessions, no
+  relay-side room) and made visible instead of changed — the conclave view
+  now renders an unreachable-members warning banner computed from the local
+  roster versus contacts, and the introduction flow gives every member a way
+  to close their own gaps.
+- Lesson: when delivery is pairwise, group state can look healthy while
+  delivery is broken; surface the gap locally rather than trusting the roster.
+
+### Introduction slice is written but unverified until the end-of-work compile [OPEN]
+
+- Context: the standing instruction is to not compile anything until the UI
+  work is finished. This slice touched wire format and daemon: two new
+  `MessagePayload` variants (`ConclaveIntroReq`, `ConclaveIntro`), pending
+  stores on `AccountState` (`pending_intro_requests`, `pending_intros`,
+  `#[serde(default)]`, so old vaults load), six public `Account` methods, two
+  private receive handlers wired into the drain loop before the control
+  catch-all, the inbox-dto match in `main.rs` and the CLI match extended,
+  seven daemon routes, and the UI (chip menu items, three banner kinds, two
+  modals, store + api bindings).
+- Symptom: none observed yet, which is the problem. `tsc --noEmit` and the
+  84 Node tests pass, but the Rust side has not been compiled by anything —
+  including the five new `#[tokio::test]`/`#[test]` tests in account.rs.
+  The running daemon on `127.0.0.1:9876` predates all of it, so the new UI
+  will fail against it (no such routes) and the new payloads sent by an old
+  daemon's drain will decode as `Unknown` and be dropped.
+- Verification needed before calling this done: `cargo build`, restart the
+  daemon, then a three-vault walk (Sam / Friend / Stranger): request intro →
+  forward → consent → accept → both sides show the new contact and the
+  warning banner clears.
+
+## 2026-10-14 — Note attachments in internal mail
+
+### The Chat history auto-delete fieldset rendered as a crushed flex row [FIXED]
+
+- Attempted: reusing the label-left/control-right `.chat-history-section`
+  row layout on the auto-delete `fieldset`, with a `:first-of-type` rule to
+  drop the divider on the first section.
+- Symptom: the user saw a broken dialog. Geometric audit via CDP confirmed
+  two defects: the fieldset inherited `display: flex` as a ROW, so the three
+  radio labels sat side by side wrapping into 100px-wide columns (heights
+  117px/160px) and the "Save rules" button was crushed to 36px wide; and
+  `:first-of-type` matched the fieldset anyway (it is the first of its own
+  tag), silently stripping its divider.
+- Resolution: `fieldset.chat-history-auto { display: block; min-inline-size: 0 }`
+  with one full-width radio row per rule, and the divider moved from
+  `:first-of-type`-complement to `.chat-history-section + .chat-history-section`.
+- Lesson: a `fieldset` is never a drop-in for a `div` in a flex utility —
+  the legend is special-cased out of flex flow and the tag is its own
+  first-of-type, so both the layout and the sibling selectors silently
+  misfire.
+
+### Screenshots do not reach the agent's context in this session [OPEN]
+
+- Attempted: `browser_take_screenshot` plus `Read` on the saved PNG (full
+  size and PIL-resized to 588×424). The files are valid PNGs on disk.
+- Symptom: `Read` returns "Read image file" with no image data attached —
+  every image read this session rendered nothing.
+- Status: tooling problem, not a repo problem. UI verification ran through
+  CDP geometry (bounding boxes, computed styles, a11y snapshots) instead,
+  which caught the fieldset bugs above. Pixel-level confirmation (colors,
+  aliasing, actual glyph rendering) remains undone until an image-capable
+  session.
+
+### Chat history daemon slice is written but unverified until the end-of-work compile [OPEN]
+
+- Context: the Chat history dialog (export / delete / delete range /
+  auto-delete) needs daemon support that did not exist. Wrote it —
+  `hush-core::chat_log` gained `remove_for_contact` and `retain_for_auto_delete`
+  (chat payloads only; mail/drafts/drops share the log and are excluded),
+  `Account` gained `remove_chat_history` / `set_chat_retention` plus a
+  post-append enforcement hook, `account_worker` gained `DeleteChats` /
+  `SetChatRetention` work with the policy loaded from `ui-prefs.json` at
+  unlock, and `main.rs` gained `POST /api/chats/delete` with the prefs PUT
+  forwarding the policy to the worker.
+- Symptom: nothing. That is the problem — the standing instruction is to not
+  compile until the UI work is finished, and the daemon serving
+  `127.0.0.1:9876` predates all of it. The delete buttons against the old
+  daemon will fail (no such route) and the auto-delete save is silently
+  dropped by the old daemon's serde (unknown-field tolerant).
+- Verification needed before calling this done: `cargo build`, restart the
+  daemon, then — delete entire history, delete a date range, auto-delete
+  keep-lines (send more than N messages, reopen, expect a trim), daily
+  (backdate a record, unlock, expect a purge). Export-as-txt is client-side
+  over the existing `/api/messages` and works against the old daemon.
+- Lesson: log the gap when a slice spans an uncompiled boundary — an
+  unverified Rust claim must stay visible, not blend into a green frontend
+  summary.
+
+### A popup anchored at the bottom of a scroll container is clipped mid-row [WORKED AROUND]
+
+- Attempted: the first "Attach note" control was an `OverflowMenu` anchored
+  under a trigger in `.mail-compose-actions`, which sits at the bottom edge of
+  the `.mail-compose` scroll container (`overflow-y: auto`).
+- Symptom: the menu opened (a11y tree showed the rows) but a row press was
+  intercepted — `elementFromPoint` at the row's centre returned `.main-pane`.
+  CDP geometry showed the popup's second row below the container's clip edge;
+  clipped content keeps its `getBoundingClientRect` but does not paint or
+  hit-test.
+- Resolution: replaced the popup with a searchable picker modal
+  (`renderMailNotePicker`) — also the better shape at the user's 100-notes
+  scale, which is what prompted the rework. The `ContactPicker.dropUp`
+  precedent (same clipping case, solved by opening upwards) remains the
+  pattern if a popup is ever wanted there again.
+- Lesson: in this app, a DOM element can measure fine while being
+  unclickable — before blaming an event handler on a dead click, probe
+  `elementFromPoint` and each ancestor's `overflow`/rect first.
+
+### A node --test cannot import a module whose import chain is extensionless [FIXED]
+
+- Attempted: put `noteToFileText`/`noteFileName` in `notesStore.ts` and unit
+  test them via `notesShare.test.ts` importing `./notesStore.ts`.
+- Symptom: `Error [ERR_MODULE_NOT_FOUND]: Cannot find module
+  '.../src/lib/api/daemon'` — node ESM resolves imports exactly, and
+  `notesStore.ts` imports `"./api/daemon"` without an extension (fine for
+  Vite, fatal for the `node --test src/lib/*.test.ts` runner).
+- Resolution: the pure helpers moved to a leaf module `notesShare.ts` whose
+  only import is `import type` (erased at runtime), re-exported from
+  `notesStore.ts` so callers keep one store import. All 84 tests pass.
+- Lesson: anything a node test imports must be a leaf with `import type`-only
+  or extension-bearing imports — the existing test-covered modules
+  (`paperText`, `markdown`, `voicePill`) all follow that shape for a reason.
+
+### Pre-existing type errors in the paper-text slice surfaced by tsc [FIXED]
+
+- Symptom: `npx tsc --noEmit` failed on `paperText.ts(103)` (implicit `any`
+  on the Yjs delta `.map` callback) and `paperText.test.ts(46)`
+  (`setAttribute("level", level)` — the Yjs typing says `string` while the
+  editor writes a number at runtime). These had survived because only
+  `npm test` was re-run after the paper-text slice, not tsc.
+- Resolution: typed the delta callback (`(d: { insert?: unknown })`), and kept
+  the runtime number with a cast in the test helper — a first instinct of
+  `String(level)` silently broke `headingLevel`, which requires
+  `typeof level === "number"`, and the heading test caught it.
+- Lesson: `setAttribute` stores whatever you give it; a type-cast fix must
+  preserve the runtime shape the consumer checks, not just satisfy the
+  compiler.
+
 ## 2026-10-13 — Conclave voice Phase 2 two-peer test
 
 ### Conclave chat never auto-scrolled to a new message [FIXED]

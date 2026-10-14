@@ -15,6 +15,7 @@ import type {
   NeighborhoodArticleDto,
   NeighborhoodCommentDto,
   NeighborhoodsViewDto,
+  NoteDto,
   NotesStateDto,
   PublicIdentityDto,
   WalletChain,
@@ -48,7 +49,9 @@ import {
   clearNotesStore,
   deleteNote as deleteNoteRecord,
   getNotesState,
+  noteFileName,
   notePreview,
+  noteToFileText,
   peekNotesState,
   saveNote,
   searchNotes,
@@ -195,7 +198,12 @@ import {
   listPendingInvites,
   loadConclaves,
   loadPendingInvites,
+  loadPendingIntros,
+  listPendingIntroRequests,
+  listPendingIntros,
   type Conclave,
+  type PendingIntro,
+  type PendingIntroRequest,
 } from "./lib/conclaveStore";
 import {
   attachEditor,
@@ -204,8 +212,10 @@ import {
   flushPaperEdits,
   openPaper,
   paperHasFocus,
+  paperPlainText,
   paperSession,
 } from "./lib/paperStore";
+import { toBase64 } from "./lib/paperWire";
 import { voicePill } from "./lib/voicePill";
 import {
   attachZineEditor,
@@ -267,7 +277,7 @@ import { icon, type IconName } from "./lib/icons";
 import { avatarWithPresence, createAvatarEl, initialsFor } from "./components/ui/Avatar";
 import { RichTextEditor } from "./components/ui/RichTextEditor";
 import { ContactPicker } from "./components/ui/ContactPicker";
-import { OverflowMenu } from "./components/ui/OverflowMenu";
+import { OverflowMenu, type OverflowMenuItem } from "./components/ui/OverflowMenu";
 import { bodyToDisplayHtml, isBlankHtml, sanitizeHtml } from "./lib/richText";
 import { markdownToHtml } from "./lib/markdown";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
@@ -557,6 +567,13 @@ export class App {
   private liveRegion!: HTMLElement;
   private addFriendOpen = false;
   private profileNick: string | null = null;
+  /** The contact whose Chat history dialog is open, if any. */
+  private chatHistoryNick: string | null = null;
+  /** The trustee whose identity dialog is open, if any. */
+  private identityTarget: { nick: string; accountId: string } | null = null;
+  /** "Introduce to…" picker: which member the chosen contact is offered to. */
+  private introPicker: { conclaveId: string; target: string; targetNick: string } | null =
+    null;
   private paletteOpen = false;
   /** True while the Vault pane is showing the exchanged-files browser. */
   private filesOpen = false;
@@ -680,6 +697,10 @@ export class App {
   private mailComposeTo = "";
   private mailComposeSubject = "";
   private mailComposeBody = "";
+  /** The attach-a-note picker, open over the compose. */
+  private mailNotePickerOpen = false;
+  /** The picker's search text, held so a re-render cannot forget it. */
+  private mailNotePickerQuery = "";
   /**
    * Attachments held for the open compose.
    *
@@ -1431,10 +1452,16 @@ export class App {
   private async reloadConclaves(): Promise<boolean> {
     const list = await api.conclaves();
     const invites = await api.pendingInvites();
+    // The introduction endpoints are new: a daemon that predates them has no
+    // such routes, and `request` turns a 404 into a throw. An introduction is
+    // an addition, not a dependency — degrade to "nothing pending" so the
+    // conclave list, creation and every action here keep working unchanged.
+    const intros = await api.introLists().catch(() => null);
     if (!list) return false;
     const changed = loadConclaves(list);
     const invitesChanged = invites ? loadPendingInvites(invites) : false;
-    return changed || invitesChanged;
+    const introsChanged = intros ? loadPendingIntros(intros) : false;
+    return changed || invitesChanged || introsChanged;
   }
 
   private stopPoll(): void {
@@ -1794,6 +1821,15 @@ export class App {
     if (this.readsConfirmUrl) this.root.appendChild(this.renderReadsConfirm());
     if (this.torrentsDeleteId) this.root.appendChild(this.renderTorrentsDeleteModal());
     if (this.notesViewingId) this.root.appendChild(this.renderNoteViewModal());
+    if (this.chatHistoryNick)
+      this.root.appendChild(this.renderChatHistoryModal());
+    if (this.identityTarget)
+      this.root.appendChild(this.renderIdentityModal());
+    if (this.introPicker) this.root.appendChild(this.renderIntroPicker());
+    if (this.pendingIntroConsent())
+      this.root.appendChild(this.renderIntroConsent());
+    if (this.mailNotePickerOpen)
+      this.root.appendChild(this.renderMailNotePicker());
     if (this.zinesPenNameOpen) this.root.appendChild(this.renderZinesPenNameModal());
     if (this.zinesForgetId) this.root.appendChild(this.renderZinesForgetModal());
     if (this.zinesShareId) this.root.appendChild(this.renderZinesShareModal());
@@ -2064,8 +2100,14 @@ export class App {
     shield.appendChild(icon("vault"));
     this.updateTorPillInto(shield);
     rail.appendChild(shield);
+    // Rail order: the everyday conversation surfaces first — chats, then
+    // the people they are with, then the two ways to reach them (mail and
+    // conclaves) — and the content rails after.
     rail.appendChild(this.railBtn("chats", "Chats", "chats", unreadTotal()));
     rail.appendChild(this.railBtn("trusts", "Trusts", "trusts"));
+    rail.appendChild(
+      this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())),
+    );
     rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
     rail.appendChild(this.railBtn("zines", "Zines", "zines"));
     rail.appendChild(this.railBtn("reads", "Reads", "reads"));
@@ -2078,7 +2120,6 @@ export class App {
       ),
     );
     rail.appendChild(this.railBtn("irc", "IRC", "irc", ircUnreadTotal()));
-    rail.appendChild(this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())));
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
@@ -2296,6 +2337,16 @@ export class App {
             void setChatSoundMuted(nick, !isChatSoundMuted(nick)).then(() =>
               this.render(),
             );
+          },
+        },
+        {
+          id: "history",
+          label: "Chat history",
+          icon: "drafts",
+          chevron: true,
+          onSelect: () => {
+            this.chatHistoryNick = nick;
+            this.render();
           },
         },
         {
@@ -3551,20 +3602,164 @@ export class App {
         isConvener &&
         trustee.accountId !== me &&
         (trustee.state === "joined" || trustee.state === "invited");
-      if (canKick) {
-        const rm = document.createElement("button");
-        rm.type = "button";
-        rm.className = "member-chip-remove";
-        rm.setAttribute(
-          "aria-label",
-          `Remove ${displayNick(trustee.nick)} from ${conclave.name}`,
-        );
-        rm.title = "Remove from conclave";
-        rm.textContent = "×";
-        rm.onclick = () =>
-          void this.kickConclaveTrustee(conclave.id, trustee.nick);
-        chip.appendChild(rm);
+      const isMe = trustee.accountId === me;
+
+      // Clicking a nick opens the trustee's actions. Chat and mail take it
+      // aside; identity is the verify-who-I'm-talking-to surface; resend
+      // rides the same invite call the convener's picker uses, so a lost
+      // invite is one click away; kick stays convener-only. The whole chip
+      // is the menu's surface, the same shape as the trust rows.
+      const items: OverflowMenuItem[] = [];
+      // Chat and mail need a 1:1 relationship: a trustee the convener added
+      // who is not this vault's contact has no thread to open and no address
+      // to mail — offering either would dead-end, so they are contact-only.
+      const isMyContact =
+        !isMe && !!trustee.nick && this.contacts.some((c) => c.nickname === trustee.nick);
+      if (isMyContact) {
+        items.push({
+          id: "chat",
+          label: "Chat directly",
+          icon: "chats",
+          onSelect: () => this.openChat(trustee.nick),
+        });
+        items.push({
+          id: "email",
+          label: "Send mail",
+          icon: "mail",
+          onSelect: () => this.emailContact(trustee.nick),
+        });
       }
+      if (!isMe && isConvener && trustee.state === "invited" && trustee.nick) {
+        items.push({
+          id: "reinvite",
+          label: "Resend invite",
+          icon: "send",
+          onSelect: () => {
+            void api
+              .inviteConclaveTrustee(conclave.id, trustee.nick)
+              .then(() => {
+                this.announce(`Invite sent to ${displayNick(trustee.nick)}`);
+                this.render();
+              })
+              .catch((e) =>
+                this.announce(
+                  e instanceof Error ? e.message : "Invite failed",
+                ),
+              );
+          },
+        });
+      }
+      // The mesh fix-up actions. A conclave only carries messages between
+      // members who are each other's contacts; these two complete that mesh
+      // through a member who knows both sides.
+      const joinedOthers = joinedTrustees(conclave).filter(
+        (t) => t.accountId !== me,
+      );
+      // Introduce to…: share this (known) member's invite with another member
+      // this vault knows. Both legs must be real channels — the request rides
+      // one, the consented invite comes back for the seeker over the other —
+      // so the picker only offers members this vault can actually reach.
+      const introduceable = joinedOthers.filter(
+        (t) =>
+          t.accountId !== trustee.accountId &&
+          this.contacts.some((c) => c.nickname === t.nick),
+      );
+      if (isMyContact && !conclave.ended && introduceable.length > 0) {
+        items.push({
+          id: "introduce",
+          label: "Introduce to…",
+          icon: "addMember",
+          chevron: true,
+          onSelect: () => {
+            this.introPicker = {
+              conclaveId: conclave.id,
+              target: trustee.accountId,
+              targetNick: trustee.nick,
+            };
+            this.render();
+          },
+        });
+      }
+      // Request introduction: this member is a stranger here, so ask the
+      // members this vault can reach to carry the request to them.
+      if (
+        !isMyContact &&
+        !isMe &&
+        !conclave.ended &&
+        trustee.state === "joined" &&
+        joinedOthers.some(
+          (t) =>
+            t.accountId !== trustee.accountId &&
+            this.contacts.some((c) => c.nickname === t.nick),
+        )
+      ) {
+        items.push({
+          id: "requestIntro",
+          label: "Request introduction",
+          icon: "trusts",
+          onSelect: () => {
+            void api
+              .requestIntro(conclave.id, trustee.accountId)
+              .then(() => {
+                this.announce(
+                  `Introduction to ${displayNick(trustee.nick)} requested`,
+                );
+                this.render();
+              })
+              .catch((e) =>
+                this.announce(
+                  e instanceof Error ? e.message : "Request failed",
+                ),
+              );
+          },
+        });
+      }
+      items.push({
+        id: "identity",
+        label: "View identity",
+        icon: "shieldCheck",
+        chevron: true,
+        onSelect: () => {
+          this.identityTarget = {
+            nick: trustee.nick,
+            accountId: trustee.accountId,
+          };
+          this.render();
+        },
+      });
+      if (canKick) {
+        items.push({
+          id: "kick",
+          label: "Kick from conclave",
+          icon: "kick",
+          danger: true,
+          separatorBefore: true,
+          onSelect: () => void this.kickConclaveTrustee(conclave.id, trustee.nick),
+        });
+      }
+
+      const chipName =
+        trustee.accountId === me ? "You" : displayNick(trustee.nick);
+      const menu = new OverflowMenu({
+        label: `Options for ${chipName} in ${conclave.name}`,
+        surface: chip,
+        items,
+      });
+      menu.element.classList.add("member-chip-menu");
+      chip.appendChild(menu.element);
+      chip.setAttribute("role", "button");
+      chip.tabIndex = 0;
+      chip.setAttribute("aria-label", `Options for ${chipName}`);
+      chip.onclick = (e) => {
+        if (menu.element.contains(e.target as Node)) return;
+        menu.toggleMenu();
+      };
+      chip.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          menu.toggleMenu();
+        }
+      };
       members.appendChild(chip);
     }
 
@@ -3588,12 +3783,34 @@ export class App {
       }
       const group = document.createElement("div");
       group.className = `bubble-group ${msg.outgoing ? "out" : "in"}`;
+      // Incoming conclave messages carry the sender's identity: an initials
+      // avatar and a name in the trustee's own colour, both derived from one
+      // stable hue so a trustee reads as one colour everywhere.
+      let body: HTMLElement = group;
       if (!msg.outgoing) {
-        // A conclave is several people, so the sender has to be named.
+        const name = msg.from ? displayNick(msg.from) : "Unknown";
+        const key =
+          this.contacts.find((c) => c.nickname === msg.from)?.protocol_name ??
+          msg.from ??
+          "unknown";
+        const av = createAvatarEl(key, "sm", false, name);
+        av.classList.add("conclave-avatar");
+        av.setAttribute("aria-hidden", "true");
         const who = document.createElement("div");
-        who.className = "conclave-sender text-12 muted";
-        who.textContent = msg.from ? displayNick(msg.from) : "Unknown";
-        group.appendChild(who);
+        who.className = "conclave-sender text-12";
+        if (msg.from) {
+          // The lightness is theme's business: the hue is per trustee, the
+          // CSS picks a readable tone for light and dark. The var sits on
+          // the group so the bubble tint reads it too.
+          group.style.setProperty("--sender-h", String(hueFromKey(key)));
+        } else {
+          who.classList.add("muted");
+        }
+        who.textContent = name;
+        body = document.createElement("div");
+        body.className = "conclave-body";
+        body.appendChild(who);
+        group.append(av, body);
       }
       const b = document.createElement("div");
       b.className = `bubble ${msg.outgoing ? "out" : "in"} tail`;
@@ -3620,7 +3837,7 @@ export class App {
       } else {
         b.textContent = msg.body;
       }
-      group.appendChild(b);
+      body.appendChild(b);
       scroll.appendChild(group);
     }
     // Decided while detached, applied after attachment (see render()): the
@@ -3712,10 +3929,311 @@ export class App {
       pane.append(this.renderPaperSurface(conclave.id, me));
       return pane;
     }
+    // Warnings and prompts ride between the roster and the history: a member
+    // this vault cannot reach, a request waiting to be relayed, an invitation
+    // waiting to be accepted.
+    const banners = this.renderConclaveBanners(conclave, me);
     pane.append(header, members, tabs);
     if (voiceBar) pane.append(voiceBar);
+    if (banners) pane.append(banners);
     pane.append(scroll, composer);
     return pane;
+  }
+
+  /** The raw roster nickname for a trustee, empty when the roster lacks them. */
+  private trusteeNickFor(conclaveId: string, accountId: string): string {
+    return (
+      conclaveById(conclaveId)?.trustees.find((t) => t.accountId === accountId)
+        ?.nick ?? ""
+    );
+  }
+
+  /** Display name for a trustee, falling back to the sender's own hint. */
+  private trusteeDisplayName(
+    conclaveId: string,
+    accountId: string,
+    hint: string,
+  ): string {
+    const nick = this.trusteeNickFor(conclaveId, accountId);
+    if (nick) return displayNick(nick);
+    if (hint) return displayNick(hint);
+    return "a member";
+  }
+
+  /** First nickname not already in use, derived from `base`. */
+  private uniqueNick(base: string): string {
+    const clean = base.trim().toLowerCase() || "trust";
+    const taken = new Set(this.contacts.map((c) => c.nickname.toLowerCase()));
+    if (!taken.has(clean)) return clean;
+    let i = 2;
+    while (taken.has(`${clean}-${i}`)) i += 1;
+    return `${clean}-${i}`;
+  }
+
+  /**
+   * The prompts and warnings that ride between the roster and the history.
+   *
+   * Three kinds, and they can coexist: the unreachable-members warning (this
+   * vault's own missing legs, computed from its roster and contacts), a relay
+   * prompt per introduction request this vault holds as courier, and an accept
+   * prompt per introduction delivered to it. All three exist because a
+   * conclave carries traffic only between members who are each other's
+   * contacts — a gap is invisible to the member who could fix it until
+   * someone's request says so.
+   */
+  private renderConclaveBanners(conclave: Conclave, me: string): HTMLElement | null {
+    if (conclave.ended) return null;
+    const unreachable = joinedTrustees(conclave).filter(
+      (t) =>
+        t.accountId !== me && !this.contacts.some((c) => c.nickname === t.nick),
+    );
+    const requests = listPendingIntroRequests().filter(
+      (r) => r.conclaveId === conclave.id,
+    );
+    const intros = listPendingIntros().filter(
+      (i) => i.conclaveId === conclave.id,
+    );
+    if (!unreachable.length && !requests.length && !intros.length) return null;
+
+    const box = document.createElement("div");
+    box.className = "conclave-banners";
+
+    if (unreachable.length) {
+      const b = document.createElement("div");
+      b.className = "conclave-banner conclave-banner-warn";
+      b.appendChild(icon("alert"));
+      const p = document.createElement("p");
+      const who = unreachable.map((t) => displayNick(t.nick)).join(", ");
+      p.textContent =
+        unreachable.length === 1
+          ? `${who} can't be reached from here directly — messages you send won't arrive, and theirs won't reach you. Use this member's menu → Request introduction, or ask someone who knows you both to introduce you.`
+          : `${unreachable.length} members can't be reached from here directly — messages you send won't arrive, and theirs won't reach you. Use a member's menu → Request introduction, or ask someone who knows both sides to introduce you.`;
+      b.appendChild(p);
+      box.appendChild(b);
+    }
+
+    for (const r of requests) {
+      if (r.target === me) continue; // Addressed to this vault: consent modal.
+      const b = document.createElement("div");
+      b.className = "conclave-banner conclave-banner-info";
+      b.appendChild(icon("trusts"));
+      const p = document.createElement("p");
+      p.textContent = `${this.trusteeDisplayName(conclave.id, r.seeker, r.seekerNick)} asked for an introduction to ${this.trusteeDisplayName(conclave.id, r.target, r.targetNick)}.`;
+      const fwd = document.createElement("button");
+      fwd.type = "button";
+      fwd.className = "btn-secondary pressable text-13";
+      fwd.textContent = "Forward request";
+      fwd.onclick = () => {
+        void api
+          .relayIntroRequest(r.conclaveId, r.seeker, r.target)
+          .then(() => {
+            this.announce("Introduction request forwarded");
+            this.render();
+          })
+          .catch((e) =>
+            this.announce(e instanceof Error ? e.message : "Forward failed"),
+          );
+      };
+      const drop = document.createElement("button");
+      drop.type = "button";
+      drop.className = "btn-secondary pressable text-13";
+      drop.textContent = "Dismiss";
+      drop.onclick = () => {
+        void api
+          .dismissIntroRequest(r.conclaveId, r.seeker)
+          .then(() => this.render());
+      };
+      b.append(p, fwd, drop);
+      box.appendChild(b);
+    }
+
+    for (const i of intros) {
+      const b = document.createElement("div");
+      b.className = "conclave-banner conclave-banner-info";
+      b.appendChild(icon("trusts"));
+      const p = document.createElement("p");
+      const via = this.trusteeDisplayName(conclave.id, i.via, "");
+      p.textContent = `${this.trusteeDisplayName(conclave.id, i.target, i.targetNick)} shared their invite with you${via === "a member" ? "" : ` via ${via}`}. Adding them makes you mutual contacts.`;
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "btn-primary pressable text-13";
+      add.textContent = "Add as trust";
+      add.onclick = () => {
+        const nick = this.uniqueNick(
+          this.trusteeNickFor(conclave.id, i.target) || i.targetNick,
+        );
+        void api
+          .acceptIntro(i.conclaveId, i.target, nick)
+          .then((contacts) => {
+            if (contacts) this.contacts = contacts;
+            this.announce(`${displayNick(nick)} added to your trusts`);
+            this.render();
+          })
+          .catch((e) =>
+            this.announce(e instanceof Error ? e.message : "Accept failed"),
+          );
+      };
+      const drop = document.createElement("button");
+      drop.type = "button";
+      drop.className = "btn-secondary pressable text-13";
+      drop.textContent = "Dismiss";
+      drop.onclick = () => {
+        void api.dismissIntro(i.conclaveId, i.target).then(() => this.render());
+      };
+      b.append(p, add, drop);
+      box.appendChild(b);
+    }
+
+    return box.childElementCount ? box : null;
+  }
+
+  /** The "Introduce to…" seeker picker for a chosen target member. */
+  private renderIntroPicker(): HTMLElement {
+    const pick = this.introPicker!;
+    const conclave = conclaveById(pick.conclaveId);
+    const me = this.status?.protocol_name ?? "";
+    const targetName = this.trusteeDisplayName(
+      pick.conclaveId,
+      pick.target,
+      pick.targetNick,
+    );
+
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.onclick = (e) => {
+      if (e.target === back) this.introPickerClose();
+    };
+
+    const modal = document.createElement("div");
+    modal.className = "modal conclave-intro-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `Introduce ${targetName}`);
+    const title = document.createElement("h2");
+    title.className = "text-22";
+    title.textContent = `Introduce ${targetName} to…`;
+    const sub = document.createElement("p");
+    sub.className = "text-13 muted";
+    sub.textContent = `${targetName} will be asked to share their invite. The member you pick receives it and can add them as a contact — nothing is shared until they agree.`;
+    modal.append(title, sub);
+
+    const list = document.createElement("div");
+    list.className = "conclave-intro-candidates";
+    const candidates = (conclave?.trustees ?? []).filter(
+      (t) =>
+        t.accountId !== me &&
+        t.accountId !== pick.target &&
+        t.state === "joined" &&
+        this.contacts.some((c) => c.nickname === t.nick),
+    );
+    if (!candidates.length) {
+      const none = document.createElement("p");
+      none.className = "text-13 muted";
+      none.textContent = "No one here can carry this introduction yet.";
+      list.appendChild(none);
+    }
+    for (const t of candidates) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "conclave-intro-candidate pressable";
+      const name = this.trusteeDisplayName(pick.conclaveId, t.accountId, t.nick);
+      row.appendChild(createAvatarEl(t.accountId, "sm", false, name));
+      const label = document.createElement("span");
+      label.textContent = name;
+      row.appendChild(label);
+      row.onclick = () => {
+        void api
+          .introduceMembers(pick.conclaveId, t.accountId, pick.target)
+          .then(() => {
+            this.announce(`Introduction of ${targetName} to ${name} requested`);
+            this.introPickerClose();
+          })
+          .catch((e) =>
+            this.announce(e instanceof Error ? e.message : "Introduce failed"),
+          );
+      };
+      list.appendChild(row);
+    }
+    modal.appendChild(list);
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => this.introPickerClose();
+    actions.appendChild(cancel);
+    modal.appendChild(actions);
+
+    back.appendChild(modal);
+    return back;
+  }
+
+  private introPickerClose(): void {
+    this.introPicker = null;
+    this.render();
+  }
+
+  /** The first introduction request addressed to this vault, if any. */
+  private pendingIntroConsent(): PendingIntroRequest | null {
+    const me = this.status?.protocol_name ?? "";
+    return (
+      listPendingIntroRequests().find((r) => r.target === me && r.seeker !== me) ??
+      null
+    );
+  }
+
+  /** Consent dialog: a conclave member wants this vault's invite. */
+  private renderIntroConsent(): HTMLElement {
+    const r = this.pendingIntroConsent()!;
+    const seekerName = this.trusteeDisplayName(r.conclaveId, r.seeker, r.seekerNick);
+    const viaName = this.trusteeDisplayName(r.conclaveId, r.via, "");
+    const via = viaName === "a member" ? "" : `, relayed by ${viaName}`;
+
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal conclave-intro-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Introduction request");
+    const title = document.createElement("h2");
+    title.className = "text-22";
+    title.textContent = "Introduction request";
+    const p = document.createElement("p");
+    p.className = "text-15";
+    p.textContent = `${seekerName} would like to meet you in ${r.conclaveName}${via}. Sharing your invite lets them add you as a contact — the same code you would hand over in person.`;
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const no = document.createElement("button");
+    no.type = "button";
+    no.className = "btn-secondary pressable";
+    no.textContent = "Not now";
+    no.onclick = () => {
+      void api
+        .answerIntroRequest(r.conclaveId, r.seeker, false)
+        .then(() => this.render());
+    };
+    const yes = document.createElement("button");
+    yes.type = "button";
+    yes.className = "btn-primary pressable";
+    yes.textContent = "Share my invite";
+    yes.onclick = () => {
+      void api
+        .answerIntroRequest(r.conclaveId, r.seeker, true)
+        .then(() => {
+          this.announce(`Invite shared with ${seekerName}`);
+          this.render();
+        })
+        .catch((e) =>
+          this.announce(e instanceof Error ? e.message : "Share failed"),
+        );
+    };
+    actions.append(no, yes);
+    modal.append(title, p, actions);
+    back.appendChild(modal);
+    return back;
   }
 
   /** Leave the Paper surface: drop the editor, its sync loop and the host.
@@ -3930,6 +4448,23 @@ export class App {
     }
     try {
       const conclave = conclaveById(conclaveId);
+      // Save as note works on a live paper and on a frozen one alike: the
+      // text lives in the ydoc either way, and the note is this vault's own.
+      const actions = document.createElement("div");
+      actions.className = "paper-pane-actions";
+      const saveNoteBtn = document.createElement("button");
+      saveNoteBtn.type = "button";
+      saveNoteBtn.className = "btn-secondary pressable paper-save-note";
+      saveNoteBtn.textContent = "Save as note";
+      saveNoteBtn.title = "Save this paper as a note in your vault";
+      saveNoteBtn.onclick = () => {
+        saveNoteBtn.disabled = true;
+        void this.savePaperAsNote(conclaveId).finally(() => {
+          saveNoteBtn.disabled = false;
+        });
+      };
+      actions.appendChild(saveNoteBtn);
+      host.appendChild(actions);
       // An ended conclave is read-only on every peer, and so is one this vault
       // is no longer a joined trustee of (kicked, or an invitation never
       // accepted): the daemon refuses the write and the relay refuses the
@@ -3950,6 +4485,39 @@ export class App {
     }
     this.paperHost = host;
     return host;
+  }
+
+  /**
+   * Save the conclave's paper as a personal note: the note's subject is the
+   * conclave's name, the body is the paper's text. Works while the conclave
+   * is on and after it has ended — the note belongs to this vault alone;
+   * nothing is sent to the other trustees.
+   */
+  private async savePaperAsNote(conclaveId: string): Promise<void> {
+    const title = conclaveById(conclaveId)?.name ?? "Conclave";
+    try {
+      // The button lives on the paper's own surface, so the session is
+      // usually already open. If not (a save from a stale surface), a
+      // throwaway session reads the merged doc — opened, drained, closed.
+      let s = paperSession();
+      const wasOpen = s !== null && s.conclaveId === conclaveId;
+      if (!wasOpen) s = await openPaper(conclaveId);
+      try {
+        const body = s ? paperPlainText(s) : "";
+        if (!body.trim()) {
+          showToast("The paper is empty — nothing to save.", { kind: "error" });
+          return;
+        }
+        await saveNote({ title, body });
+        showToast("Paper saved as a note", { kind: "success" });
+      } finally {
+        if (!wasOpen) closePaper();
+      }
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't save the paper as a note.",
+      );
+    }
   }
 
   private openConclaveCreate(): void {
@@ -9255,13 +9823,17 @@ export class App {
     body?: string;
     /** Attachment refs to carry over, with bytes loaded back from the vault. */
     attachments?: MailAttachmentRef[];
+    /** Notes to attach as text files — handed over from a note's read popup. */
+    notes?: NoteDto[];
   }): void {
     this.mailComposeOpen = true;
     this.mailDraftId = opts.draftId ?? null;
     this.mailReplyTo = opts.to ?? null;
     this.mailReplyThread = opts.threadId ?? null;
     this.mailSubjectSeed = opts.subject ?? null;
-    this.mailComposeFiles = [];
+    this.mailComposeFiles = (opts.notes ?? []).map((n) =>
+      this.noteAsAttachment(n),
+    );
     // A brand-new message has no conversation to return to. Without this,
     // opening compose from a thread and then saving a draft or pressing Back
     // lands on the folder list while the reading pane still shows the thread
@@ -9448,6 +10020,26 @@ export class App {
       files.value = "";
     };
 
+    // Attaching a personal note rides the ordinary file pipeline: the note is
+    // serialised to a .txt and joins `mailComposeFiles`, so caps and saving a
+    // draft treat it exactly like any other file. The picker is a modal with
+    // a search field rather than a menu — a board can hold hundreds of notes.
+    const attachNote = document.createElement("button");
+    attachNote.type = "button";
+    attachNote.className = "btn-secondary text-13 pressable";
+    attachNote.textContent = "Attach note";
+    attachNote.onclick = () => {
+      this.mailNotePickerOpen = true;
+      this.render();
+      // The cache can still be empty on a first open from the mail pane;
+      // once the board is in, rebuild with the rows (a no-op when cached).
+      void getNotesState().then((loaded) => {
+        if (!this.mailNotePickerOpen) return;
+        this.notesState = loaded;
+        this.render();
+      });
+    };
+
     const err = document.createElement("p");
     err.className = "text-13";
     err.style.color = "var(--danger)";
@@ -9480,7 +10072,7 @@ export class App {
 
     const actions = document.createElement("div");
     actions.className = "mail-compose-actions";
-    actions.append(attach, saveDraft);
+    actions.append(attach, attachNote, saveDraft);
     // Only a saved draft can be discarded. A brand new message is thrown away
     // by closing compose, which is what Back already does.
     if (this.mailDraftId) {
@@ -9522,6 +10114,29 @@ export class App {
     }
     this.mailComposeFiles = next;
     after();
+  }
+
+  /**
+   * A note as a compose attachment: serialised to a .txt so it rides the
+   * ordinary file pipeline — caps, drafts, and the recipient's save/open flow
+   * need no new attachment kind.
+   */
+  private attachNoteToCompose(note: NoteDto): void {
+    this.mailComposeFiles.push(this.noteAsAttachment(note));
+  }
+
+  /** The bytes of a note as a text-file attachment. */
+  private noteAsAttachment(note: NoteDto): {
+    name: string;
+    dataBase64: string;
+    size: number;
+  } {
+    const bytes = new TextEncoder().encode(noteToFileText(note));
+    return {
+      name: noteFileName(note),
+      dataBase64: toBase64(bytes),
+      size: bytes.byteLength,
+    };
   }
 
   /** The client-side half of the daemon's caps, so the limit is explained
@@ -11800,6 +12415,364 @@ export class App {
     this.render();
   }
 
+  /**
+   * The attach-a-note picker: a search field over the whole board and rows
+   * like the Notes pane's, because a board can hold hundreds of notes and a
+   * flat menu would neither fit nor scale. Picking one serialises it into the
+   * open compose as a text-file attachment.
+   */
+  private renderMailNotePicker(): HTMLElement {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.onclick = (e) => {
+      if (e.target === back) this.mailNotePickerClose();
+    };
+
+    const modal = document.createElement("div");
+    modal.className = "modal note-picker-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Attach a note");
+
+    const head = document.createElement("div");
+    head.className = "note-picker-head";
+    const title = document.createElement("h2");
+    title.className = "text-22";
+    title.textContent = "Attach a note";
+    head.appendChild(title);
+
+    const search = document.createElement("input");
+    search.type = "search";
+    search.className = "input-field notes-search";
+    search.placeholder = "Search notes…";
+    search.value = this.mailNotePickerQuery;
+    search.setAttribute("aria-label", "Search notes");
+
+    const list = document.createElement("div");
+    list.className = "note-picker-list";
+    this.renderMailNoteRows(list);
+
+    search.addEventListener("input", () => {
+      this.mailNotePickerQuery = search.value;
+      this.renderMailNoteRows(list);
+    });
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "btn-secondary pressable";
+    close.textContent = "Cancel";
+    close.addEventListener("click", () => this.mailNotePickerClose());
+
+    modal.append(head, search, list, close);
+    back.appendChild(modal);
+    return back;
+  }
+
+  /** Fill the picker's list for the current query, in place. */
+  private renderMailNoteRows(container: HTMLElement): void {
+    const state = this.notesState ?? peekNotesState();
+    const notes = searchNotes(state, this.mailNotePickerQuery);
+    container.innerHTML = "";
+    if (!notes.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted text-15";
+      empty.textContent = this.mailNotePickerQuery.trim()
+        ? `No notes match “${this.mailNotePickerQuery.trim()}”.`
+        : "No notes yet — create one in Notes.";
+      container.appendChild(empty);
+      return;
+    }
+    for (const note of notes) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `note-row pressable paper-${note.color}`;
+      const t = document.createElement("div");
+      t.className = "note-row-title text-15";
+      t.textContent = note.title.trim() || "Untitled";
+      const p = document.createElement("div");
+      p.className = "note-row-preview muted text-13";
+      p.textContent = notePreview(note) || "Empty note";
+      const meta = document.createElement("div");
+      meta.className = "note-row-meta muted text-12";
+      meta.textContent = formatRelative(note.updated_at * 1000);
+      row.append(t, p, meta);
+      row.addEventListener("click", () => {
+        this.attachNoteToCompose(note);
+        this.mailNotePickerClose();
+      });
+      container.appendChild(row);
+    }
+  }
+
+  private mailNotePickerClose(): void {
+    this.mailNotePickerOpen = false;
+    this.mailNotePickerQuery = "";
+    this.render();
+  }
+
+  /**
+   * The Chat history dialog: export as text, the two deletes, and the
+   * auto-delete rules. Opened from a conversation's three-dots menu, so the
+   * export and deletes are scoped to that contact; auto-delete is vault-wide
+   * by nature — the chat log is one file — and says so.
+   */
+  private renderChatHistoryModal(): HTMLElement {
+    const nick = this.chatHistoryNick!;
+    const label = displayNick(nick);
+
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.onclick = (e) => {
+      if (e.target === back) this.chatHistoryClose();
+    };
+
+    const modal = document.createElement("div");
+    modal.className = "modal chat-history-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `Chat history with ${label}`);
+
+    const title = document.createElement("h2");
+    title.className = "text-22";
+    title.textContent = "Chat history";
+    const sub = document.createElement("p");
+    sub.className = "muted text-13";
+    sub.textContent = `Messages with ${label}. Deleted messages are gone from the vault for good — there is no undo.`;
+    modal.append(title, sub);
+
+    // --- Export: a text file of the conversation, downloaded locally. ------
+    const exportRow = document.createElement("div");
+    exportRow.className = "chat-history-section";
+    const exportLabel = document.createElement("div");
+    exportLabel.className = "text-15";
+    exportLabel.textContent = "Export as txt";
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "btn-secondary pressable";
+    exportBtn.textContent = "Export";
+    exportBtn.onclick = () => void this.exportChatTxt(exportBtn, nick);
+    exportRow.append(exportLabel, exportBtn);
+    modal.appendChild(exportRow);
+
+    // --- Deletes: two-step buttons, since a row of modals would be worse. --
+    const armDelete = (
+      btn: HTMLButtonElement,
+      label: string,
+      action: () => Promise<void>,
+    ) => {
+      let armed = false;
+      btn.onclick = () => {
+        if (!armed) {
+          armed = true;
+          btn.textContent = "Really delete?";
+          btn.classList.add("armed");
+          return;
+        }
+        btn.disabled = true;
+        action()
+          .catch((e) =>
+            this.announce(e instanceof Error ? e.message : "Delete failed"),
+          )
+          .finally(() => {
+            // A success re-renders and rebuilds this dialog; a failure has
+            // to disarm anyway — a primed delete that outlived its context
+            // would be a trap.
+            armed = false;
+            btn.textContent = label;
+            btn.classList.remove("armed");
+            btn.disabled = false;
+          });
+      };
+    };
+
+    const wholeRow = document.createElement("div");
+    wholeRow.className = "chat-history-section";
+    const wholeLabel = document.createElement("div");
+    wholeLabel.className = "text-15";
+    wholeLabel.textContent = "Delete entire history";
+    const wholeBtn = document.createElement("button");
+    wholeBtn.type = "button";
+    wholeBtn.className = "btn-danger pressable";
+    wholeBtn.textContent = "Delete";
+    armDelete(wholeBtn, "Delete", async () => {
+      await api.deleteChats(nick);
+      this.announce("Chat history deleted");
+      await this.refreshChatHistory();
+    });
+    wholeRow.append(wholeLabel, wholeBtn);
+    modal.appendChild(wholeRow);
+
+    const rangeRow = document.createElement("div");
+    rangeRow.className = "chat-history-section chat-history-range";
+    const rangeLabel = document.createElement("div");
+    rangeLabel.className = "text-15";
+    rangeLabel.textContent = "Delete date range";
+    const dates = document.createElement("div");
+    dates.className = "chat-history-dates";
+    const fromInput = document.createElement("input");
+    fromInput.type = "date";
+    fromInput.className = "input-field";
+    fromInput.setAttribute("aria-label", "From date");
+    const toInput = document.createElement("input");
+    toInput.type = "date";
+    toInput.className = "input-field";
+    toInput.setAttribute("aria-label", "To date");
+    const rangeBtn = document.createElement("button");
+    rangeBtn.type = "button";
+    rangeBtn.className = "btn-danger pressable";
+    rangeBtn.textContent = "Delete";
+    rangeBtn.disabled = true;
+    const msOf = (v: string, endOfDay: boolean): number | null => {
+      if (!v) return null;
+      const t = new Date(
+        `${v}T${endOfDay ? "23:59:59.999" : "00:00:00"}`,
+      ).getTime();
+      return Number.isFinite(t) ? t : null;
+    };
+    const rangeReady = () => {
+      rangeBtn.disabled = !(fromInput.value && toInput.value);
+    };
+    fromInput.addEventListener("input", rangeReady);
+    toInput.addEventListener("input", rangeReady);
+    armDelete(rangeBtn, "Delete", async () => {
+      const from = msOf(fromInput.value, false);
+      const to = msOf(toInput.value, true);
+      if (from === null || to === null) return;
+      await api.deleteChats(nick, from, to);
+      this.announce("Chat history deleted");
+      await this.refreshChatHistory();
+    });
+    dates.append(fromInput, toInput, rangeBtn);
+    rangeRow.append(rangeLabel, dates);
+    modal.appendChild(rangeRow);
+
+    // --- Auto-delete: the rules the log enforces on its own. ---------------
+    const prefs = uiPrefsSnapshot().chat_auto_delete;
+    const mode =
+      prefs.daily ? "daily" : prefs.keep_lines != null ? "lines" : "off";
+    const auto = document.createElement("fieldset");
+    auto.className = "chat-history-section chat-history-auto";
+    const autoLegend = document.createElement("legend");
+    autoLegend.className = "text-15";
+    autoLegend.textContent = "Auto delete (all chats)";
+    auto.appendChild(autoLegend);
+
+    let keepLines = prefs.keep_lines ?? 500;
+    const radios: { value: string; text: string }[] = [
+      { value: "off", text: "Keep everything" },
+      { value: "daily", text: "Every day — messages older than today go" },
+      { value: "lines", text: "Old chats — keep only the last" },
+    ];
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn-secondary pressable";
+    save.textContent = "Save rules";
+    const linesInput = document.createElement("input");
+    linesInput.type = "number";
+    linesInput.className = "input-field chat-history-lines";
+    linesInput.min = "1";
+    linesInput.max = "100000";
+    linesInput.value = String(keepLines);
+    linesInput.setAttribute("aria-label", "Lines to keep");
+    const current = (): { daily: boolean; keep_lines: number | null } => {
+      const chosen = auto.querySelector<HTMLInputElement>(
+        "input[name=chat-auto-delete]:checked",
+      )?.value;
+      if (chosen === "daily") return { daily: true, keep_lines: null };
+      if (chosen === "lines")
+        return {
+          daily: false,
+          keep_lines: Math.max(1, Math.floor(Number(linesInput.value) || keepLines)),
+        };
+      return { daily: false, keep_lines: null };
+    };
+    for (const r of radios) {
+      const row = document.createElement("label");
+      row.className = "chat-history-rule text-15";
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = "chat-auto-delete";
+      input.value = r.value;
+      input.checked = mode === r.value;
+      row.append(input, document.createTextNode(r.text));
+      if (r.value === "lines") row.appendChild(linesInput);
+      auto.appendChild(row);
+    }
+    save.onclick = () => {
+      const next = current();
+      keepLines = next.keep_lines ?? keepLines;
+      void patchUiPrefs({ chat_auto_delete: next })
+        .then(() => {
+          this.announce("Auto-delete rules saved");
+          this.render();
+        })
+        .catch((e) =>
+          this.announce(e instanceof Error ? e.message : "Save failed"),
+        );
+    };
+    auto.appendChild(save);
+    modal.appendChild(auto);
+
+    const done = document.createElement("button");
+    done.type = "button";
+    done.className = "btn-secondary pressable chat-history-done";
+    done.textContent = "Done";
+    done.addEventListener("click", () => this.chatHistoryClose());
+    modal.appendChild(done);
+
+    back.appendChild(modal);
+    return back;
+  }
+
+  /** The conversation as a text file, downloaded where the browser puts files. */
+  private async exportChatTxt(btn: HTMLButtonElement, nick: string): Promise<void> {
+    btn.disabled = true;
+    try {
+      const records = (await api.messages()) ?? [];
+      const who = displayNick(nick);
+      const lines: string[] = [
+        `Conversation with ${who}`,
+        `Exported ${formatAbsolute(Date.now())}`,
+        "",
+      ];
+      for (const r of records) {
+        if (r.contact_nick !== nick) continue;
+        const stamp = `[${formatAbsolute(r.ts_ms)}]`;
+        const sender = r.outgoing ? "Me" : who;
+        if (r.payload.t === "text") {
+          lines.push(`${stamp} ${sender}: ${r.payload.body}`);
+        } else if (r.payload.t === "file") {
+          lines.push(
+            `${stamp} ${sender}: (file) ${r.payload.name} (${formatBytes(r.payload.size)})`,
+          );
+        }
+      }
+      const bytes = new TextEncoder().encode(`${lines.join("\n")}\n`);
+      await downloadBase64File(
+        `chat-${nick.replace(/[^a-zA-Z0-9._-]+/g, "-")}.txt`,
+        toBase64(bytes),
+      );
+      this.announce("Chat exported");
+    } catch {
+      this.announce("Chat export failed");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  /** Pull the log back out of the daemon after a delete and repaint. */
+  private async refreshChatHistory(): Promise<void> {
+    const history = await api.messages();
+    if (history) loadHistory(history);
+    // The dialog stays open over the trimmed thread.
+    this.render();
+  }
+
+  private chatHistoryClose(): void {
+    this.chatHistoryNick = null;
+    this.render();
+  }
+
   private notesOpenNote(id: string): void {
     const note = (this.notesState?.notes ?? []).find((n) => n.id === id);
     if (!note) return;
@@ -12027,9 +13000,26 @@ export class App {
       return back;
     }
 
+    // The head row carries the forward-to-mail action as a corner mark, like
+    // a page turned out of a pad — it reads as a property of the note, not a
+    // command in a row of them.
+    const head = document.createElement("div");
+    head.className = "note-view-head";
     const title = document.createElement("h2");
     title.className = "text-22 note-view-title";
     title.textContent = note.title.trim() || "Untitled";
+    const forward = document.createElement("button");
+    forward.type = "button";
+    forward.className = "btn-icon-round pressable note-view-forward";
+    forward.setAttribute("aria-label", "Send as mail");
+    forward.title = "Send as mail";
+    forward.appendChild(icon("forward"));
+    forward.addEventListener("click", () => {
+      this.notesCloseView();
+      this.rail = "mail";
+      this.openCompose({ notes: [note] });
+    });
+    head.append(title, forward);
 
     const meta = document.createElement("div");
     meta.className = "muted text-12 note-view-meta";
@@ -12083,7 +13073,7 @@ export class App {
       actions.appendChild(del);
     }
 
-    modal.append(title, meta, body, actions);
+    modal.append(head, meta, body, actions);
     back.appendChild(modal);
     return back;
   }
@@ -13054,8 +14044,98 @@ export class App {
    * contact (mute, delete) live in the menu that opened it, so each is decided
    * in one place.
    */
-  private renderProfile(): HTMLElement {
-    const nick = this.profileNick!;
+  /**
+   * Who am I actually talking to? The identity dialog behind a trustee's
+   * nick: their display name, their address in this vault, and the account
+   * id their messages are signed with — copyable, so two trustees in two
+   * conclaves can compare the string out of band and verify it is the same
+   * person.
+   */
+  private renderIdentityModal(): HTMLElement {
+    const target = this.identityTarget!;
+    const c = this.contacts.find((x) => x.nickname === target.nick);
+    // The vault's own trustee entry has no nick — the chip says "You", and so
+    // does this dialog.
+    const name = target.nick ? displayNick(target.nick) : "You";
+
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.onclick = (e) => {
+      if (e.target === back) this.identityClose();
+    };
+
+    const modal = document.createElement("div");
+    modal.className = "modal identity-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `Identity of ${name}`);
+
+    modal.appendChild(createAvatarEl(target.accountId, "lg", false, name));
+    const title = document.createElement("h2");
+    title.className = "text-22";
+    title.textContent = name;
+    modal.appendChild(title);
+
+    if (c) {
+      const addr = document.createElement("div");
+      addr.className = "identity-row text-13";
+      const addrLabel = document.createElement("span");
+      addrLabel.className = "muted";
+      addrLabel.textContent = "Mail";
+      const addrValue = document.createElement("span");
+      addrValue.textContent = this.contactAddress(c);
+      addr.append(addrLabel, addrValue);
+      modal.appendChild(addr);
+    }
+
+    const id = document.createElement("div");
+    id.className = "identity-row text-13";
+    const idLabel = document.createElement("span");
+    idLabel.className = "muted";
+    idLabel.textContent = "Account id";
+    const idValue = document.createElement("span");
+    idValue.className = "identity-id";
+    idValue.textContent = target.accountId;
+    id.append(idLabel, idValue);
+    modal.appendChild(id);
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "btn-secondary pressable";
+    copy.textContent = "Copy account id";
+    copy.onclick = () => {
+      void navigator.clipboard
+        .writeText(target.accountId)
+        .then(() => {
+          this.announce("Account id copied");
+          this.identityClose();
+        })
+        .catch(() =>
+          // The webview can refuse the clipboard; the id is select-all, so
+          // a manual copy is one drag away. Say so instead of hanging.
+          this.announce("Copy blocked — select the id and copy manually"),
+        );
+    };
+    const done = document.createElement("button");
+    done.type = "button";
+    done.className = "btn-primary pressable";
+    done.textContent = "Done";
+    done.onclick = () => this.identityClose();
+    actions.append(copy, done);
+    modal.appendChild(actions);
+
+    back.appendChild(modal);
+    return back;
+  }
+
+  private identityClose(): void {
+    this.identityTarget = null;
+    this.render();
+  }
+
+  private renderProfile(): HTMLElement {    const nick = this.profileNick!;
     const c = this.contacts.find((x) => x.nickname === nick);
     const back = document.createElement("div");
     back.className = "modal-backdrop";

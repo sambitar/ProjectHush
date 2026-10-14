@@ -24,7 +24,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use account_worker::{AccountWorker, ContactDto, PenNameDto, PublicIdentityDto, WorkResult};
+use account_worker::{
+  AccountWorker, ContactDto, IntroLists, PenNameDto, PublicIdentityDto, WorkResult,
+};
 use axum::{
     extract::{Path, Query, State},
     http::{header, Method, StatusCode},
@@ -392,6 +394,17 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/conclaves/trustees/leave", post(leave_conclave))
         .route("/api/conclaves/invites", get(pending_invites))
         .route("/api/conclaves/end", post(end_conclave))
+        .route("/api/conclaves/intros", get(intro_lists))
+        .route("/api/conclaves/intros/introduce", post(intro_introduce))
+        .route("/api/conclaves/intros/request", post(intro_request))
+        .route("/api/conclaves/intros/relay", post(intro_relay))
+        .route("/api/conclaves/intros/answer", post(intro_answer))
+        .route("/api/conclaves/intros/accept", post(intro_accept))
+        .route("/api/conclaves/intros/dismiss", post(intro_dismiss))
+        .route(
+            "/api/conclaves/intros/requests/dismiss",
+            post(intro_request_dismiss),
+        )
         .route("/api/conclaves/{id}", delete(delete_conclave))
         .route("/api/invite", post(invite))
         .route("/api/contacts", get(contacts))
@@ -404,6 +417,7 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/presence/offline", post(presence_offline))
         .route("/api/recv", post(recv))
         .route("/api/messages", get(messages))
+        .route("/api/chats/delete", post(delete_chats))
         .route("/api/blob/{id}", get(blob))
         .route("/api/blob/{id}/materialize", post(blob_materialize))
         .route("/api/backup/export", post(backup_export))
@@ -1433,6 +1447,157 @@ async fn pending_invites(
     }
 }
 
+/// Both members of an introduction this vault can see: the seeker it wants to
+/// meet and the target whose invite would be shared.
+#[derive(Deserialize)]
+struct IntroPairRequest {
+    conclave_id: String,
+    seeker: String,
+    target: String,
+}
+
+/// A request whose seeker is this vault.
+#[derive(Deserialize)]
+struct IntroTargetRequest {
+    conclave_id: String,
+    target: String,
+}
+
+#[derive(Deserialize)]
+struct IntroAnswerRequest {
+    conclave_id: String,
+    seeker: String,
+    accept: bool,
+}
+
+/// A request identified by the seeker that sent it.
+#[derive(Deserialize)]
+struct IntroSeekerRequest {
+    conclave_id: String,
+    seeker: String,
+}
+
+#[derive(Deserialize)]
+struct IntroAcceptRequest {
+    conclave_id: String,
+    target: String,
+    nickname: String,
+}
+
+/// The introduction queues: requests to answer or relay, invites to accept.
+async fn intro_lists(
+    State(state): State<Arc<App>>,
+) -> Result<Json<IntroLists>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.pending_intros().await)?;
+    match result {
+        WorkResult::PendingIntros(lists) => Ok(Json(lists)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// The "Introduce to…" action: ask a member this vault knows to share their
+/// invite with another member it also knows.
+async fn intro_introduce(
+    State(state): State<Arc<App>>,
+    Json(body): Json<IntroPairRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .introduce_members(&body.conclave_id, &body.seeker, &body.target)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The "Request introduction" action: ask the conclave's reachable members to
+/// carry the request to someone this vault cannot reach.
+async fn intro_request(
+    State(state): State<Arc<App>>,
+    Json(body): Json<IntroTargetRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.request_intro(&body.conclave_id, &body.target).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The courier's relay action on a request it is holding.
+async fn intro_relay(
+    State(state): State<Arc<App>>,
+    Json(body): Json<IntroPairRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .relay_intro_request(&body.conclave_id, &body.seeker, &body.target)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The target's consent: share the standing invite, or decline silently.
+async fn intro_answer(
+    State(state): State<Arc<App>>,
+    Json(body): Json<IntroAnswerRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .answer_intro_request(&body.conclave_id, &body.seeker, body.accept)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Consume a delivered introduction: the contact is added vault-side, so the
+/// page only learns the fresh contact list afterwards.
+async fn intro_accept(
+    State(state): State<Arc<App>>,
+    Json(body): Json<IntroAcceptRequest>,
+) -> Result<Json<Vec<ContactDto>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .accept_intro(&body.conclave_id, &body.target, &body.nickname)
+            .await,
+    )?;
+    let result = map_err(state.worker.contacts().await)?;
+    match result {
+        WorkResult::Contacts(contacts) => Ok(Json(contacts)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Dismiss a delivered introduction.
+async fn intro_dismiss(
+    State(state): State<Arc<App>>,
+    Json(body): Json<IntroTargetRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.dismiss_intro(&body.conclave_id, &body.target).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Drop a held introduction request without relaying or answering it.
+async fn intro_request_dismiss(
+    State(state): State<Arc<App>>,
+    Json(body): Json<IntroSeekerRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .dismiss_intro_request(&body.conclave_id, &body.seeker)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// End a conclave for everyone: the convener broadcasts an `ended` descriptor so
 /// the conclave becomes read-only on every peer, not only locally.
 async fn end_conclave(
@@ -2090,7 +2255,9 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         | MessagePayload::ConclaveDecline { .. }
         | MessagePayload::ConclaveLeave { .. }
         | MessagePayload::ConclaveUpdate { .. }
-        | MessagePayload::ConclaveEnd { .. } => None,
+        | MessagePayload::ConclaveEnd { .. }
+        | MessagePayload::ConclaveIntroReq { .. }
+        | MessagePayload::ConclaveIntro { .. } => None,
         // A paper payload is not a chat message either: it is routed into the
         // paper store, never the inbox. A voice payload (Task 23) likewise
         // never renders in the inbox — its state surfaces through /api/voice/*.
@@ -2118,6 +2285,50 @@ async fn messages(
     let result = map_err(state.worker.messages().await)?;
     match result {
         WorkResult::Messages(list) => Ok(Json(list)),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteChatsRequest {
+    contact: String,
+    /// Inclusive lower bound, ms since the epoch; absent = since forever.
+    #[serde(default)]
+    from_ms: Option<u64>,
+    /// Inclusive upper bound; absent = up to now.
+    #[serde(default)]
+    to_ms: Option<u64>,
+}
+
+/// Delete 1:1 chat messages with a contact — the Chat history dialog's
+/// "delete entire history" (no bounds) and "delete date range" (with one).
+/// Mail, drafts and drops share the underlying log and are never touched.
+async fn delete_chats(
+    State(state): State<Arc<App>>,
+    Json(body): Json<DeleteChatsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    if body.contact.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "contact is required".into(),
+            }),
+        ));
+    }
+    let result = map_err(
+        state
+            .worker
+            .delete_chats(body.contact, body.from_ms, body.to_ms)
+            .await,
+    )?;
+    match result {
+        WorkResult::ChatsDeleted(n) => Ok(Json(serde_json::json!({ "deleted": n }))),
         _ => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
@@ -2581,6 +2792,14 @@ async fn put_ui_prefs(
             }),
         ));
     }
+    if body.chat_auto_delete.keep_lines.is_some_and(|n| n > 100_000) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "chat_auto_delete.keep_lines must be at most 100000".into(),
+            }),
+        ));
+    }
     let relay_changed = ui_prefs::load(&state.dir).relay_tor != body.relay_tor;
     ui_prefs::save(&state.dir, &body).map_err(|e| {
         (
@@ -2594,6 +2813,15 @@ async fn put_ui_prefs(
     if relay_changed {
         sync_wallet_relay(&state).await;
     }
+    // The chat log enforces the auto-delete policy live, so the worker has to
+    // hold the one that was just saved.
+    state
+        .worker
+        .set_chat_retention(
+            body.chat_auto_delete.daily,
+            body.chat_auto_delete.keep_lines,
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

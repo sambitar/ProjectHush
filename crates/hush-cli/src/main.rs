@@ -264,7 +264,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | MessagePayload::ConclaveDecline { .. }
                     | MessagePayload::ConclaveLeave { .. }
                     | MessagePayload::ConclaveUpdate { .. }
-                    | MessagePayload::ConclaveEnd { .. } => {}
+                    | MessagePayload::ConclaveEnd { .. }
+                    | MessagePayload::ConclaveIntroReq { .. }
+                    | MessagePayload::ConclaveIntro { .. } => {}
                     // Paper payloads are routed to the paper store, and an
                     // unknown tag has nothing to print, so neither is an inbox
                     // item.

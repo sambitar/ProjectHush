@@ -3,6 +3,7 @@ import { isTauriShell } from "../tauriEnv";
 import type {
   ChatRecordDto,
   ContactDto,
+  IntroListsDto,
   InviteResponse,
   MailboxDto,
   NotesNoteResponse,
@@ -188,6 +189,12 @@ export const api = {
     request<null>("/api/presence/offline", { method: "POST" }),
   recv: () => request<RecvResponse>("/api/recv", { method: "POST" }),
   messages: () => request<ChatRecordDto[]>("/api/messages"),
+  /** Delete 1:1 chat messages with a contact; no bounds = the whole history. */
+  deleteChats: (contact: string, from_ms?: number, to_ms?: number) =>
+    request<{ deleted: number }>("/api/chats/delete", {
+      method: "POST",
+      body: JSON.stringify({ contact, from_ms, to_ms }),
+    }),
   mail: () => request<MailboxDto>("/api/mail"),
   sendMail: (
     to: string,
@@ -284,6 +291,53 @@ export const api = {
     }),
   /** Invitations received but not yet accepted or declined. */
   pendingInvites: () => request<PendingInviteDto[]>("/api/conclaves/invites"),
+  /** The introduction queues: requests to answer or relay, invites to accept. */
+  introLists: () => request<IntroListsDto>("/api/conclaves/intros"),
+  /**
+   * Offer an introduction: ask a member this vault knows (the target) to share
+   * their invite with another member it also knows (the seeker).
+   */
+  introduceMembers: (conclaveId: string, seeker: string, target: string) =>
+    request<null>("/api/conclaves/intros/introduce", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId, seeker, target }),
+    }),
+  /** Ask the conclave for an introduction to a member this vault cannot reach. */
+  requestIntro: (conclaveId: string, target: string) =>
+    request<null>("/api/conclaves/intros/request", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId, target }),
+    }),
+  /** Relay a held introduction request on to its target. */
+  relayIntroRequest: (conclaveId: string, seeker: string, target: string) =>
+    request<null>("/api/conclaves/intros/relay", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId, seeker, target }),
+    }),
+  /** Answer a request addressed to this vault: share the invite or decline. */
+  answerIntroRequest: (conclaveId: string, seeker: string, accept: boolean) =>
+    request<null>("/api/conclaves/intros/answer", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId, seeker, accept }),
+    }),
+  /** Consume a delivered introduction: add the target as a contact. */
+  acceptIntro: (conclaveId: string, target: string, nickname: string) =>
+    request<ContactDto[]>("/api/conclaves/intros/accept", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId, target, nickname }),
+    }),
+  /** Dismiss a delivered introduction without adding the contact. */
+  dismissIntro: (conclaveId: string, target: string) =>
+    request<null>("/api/conclaves/intros/dismiss", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId, target }),
+    }),
+  /** Drop a held introduction request without relaying or answering it. */
+  dismissIntroRequest: (conclaveId: string, seeker: string) =>
+    request<null>("/api/conclaves/intros/requests/dismiss", {
+      method: "POST",
+      body: JSON.stringify({ conclave_id: conclaveId, seeker }),
+    }),
   /**
    * End a conclave for everyone: the convener broadcasts an `ended` descriptor
    * so it becomes read-only on every peer. The log is kept on every vault.

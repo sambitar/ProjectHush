@@ -23,6 +23,7 @@ import {
   richTextSchema as schema,
   toolbarButtons,
 } from "./proseSchema";
+import { xmlFragmentToPlainText } from "./paperText";
 import {
   fromBase64,
   isDecodable,
@@ -565,4 +566,13 @@ export function attachEditor(
 /** Whether the paper surface currently holds the caret. */
 export function paperHasFocus(): boolean {
   return !!editor && editor.hasFocus();
+}
+
+/**
+ * The paper's whole text, flattened the way a note reads: headings prefixed,
+ * lists marked, nesting indented (see `paperText`). Works on a session that
+ * is mounted or merely opened — the text lives in the ydoc, not the editor.
+ */
+export function paperPlainText(s: PaperSession): string {
+  return xmlFragmentToPlainText(s.ydoc.getXmlFragment(FRAGMENT_NAME));
 }

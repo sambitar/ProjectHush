@@ -19,6 +19,16 @@ export interface UiPrefsDto {
   chat_sound_muted: string[];
   /** When true, this vault stops heartbeating so every contact sees it offline. */
   appear_offline: boolean;
+  /** Chat auto-delete rules the daemon's log enforces on its own. */
+  chat_auto_delete: ChatAutoDeleteDto;
+}
+
+/** The chat auto-delete rules: a daily purge, a per-contact line cap, both, or neither. */
+export interface ChatAutoDeleteDto {
+  /** Delete every chat message older than the current UTC day. */
+  daily: boolean;
+  /** Keep at most this many messages per contact, oldest deleted first. */
+  keep_lines: number | null;
 }
 
 const defaultPrefs = (): UiPrefsDto => ({
@@ -35,6 +45,7 @@ const defaultPrefs = (): UiPrefsDto => ({
   chat_sound: true,
   chat_sound_muted: [],
   appear_offline: false,
+  chat_auto_delete: { daily: false, keep_lines: null },
 });
 
 let cache: UiPrefsDto | null = null;
@@ -76,6 +87,7 @@ export async function patchUiPrefs(
     chat_sound: patch.chat_sound ?? base.chat_sound,
     chat_sound_muted: patch.chat_sound_muted ?? base.chat_sound_muted,
     appear_offline: patch.appear_offline ?? base.appear_offline,
+    chat_auto_delete: patch.chat_auto_delete ?? base.chat_auto_delete,
   };
   await persistUiPrefs(merged);
   return merged;
@@ -146,6 +158,7 @@ function normalize(raw: UiPrefsDto): UiPrefsDto {
     chat_sound: raw.chat_sound ?? true,
     chat_sound_muted: raw.chat_sound_muted ?? [],
     appear_offline: raw.appear_offline ?? false,
+    chat_auto_delete: raw.chat_auto_delete ?? { daily: false, keep_lines: null },
   };
 }
 
