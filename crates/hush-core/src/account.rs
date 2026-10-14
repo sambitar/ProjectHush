@@ -385,6 +385,12 @@ pub struct PendingIntro {
     /// accepts or dismisses, the vault consumes it.
     pub invite: String,
     pub received_ms: u64,
+    /// True when this is the acceptance half of an introduction: the sender
+    /// already consumed one of our invites and opened their session, so our
+    /// accept must add them as a contact without consuming the attached
+    /// bundle (the session comes from their first message instead).
+    #[serde(default)]
+    pub reverse: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -901,7 +907,78 @@ impl Account {
         Ok(encoded)
     }
 
+    /// A one-consumer invite, minted on demand.
+    ///
+    /// Unlike [`Self::invite`], this never touches the shared cache: the
+    /// bundle inside burns a one-time prekey, so an invite can be safely
+    /// consumed by exactly one peer. Intro cards ride this, because the
+    /// card's recipient is by definition a second consumer — a cached
+    /// invite would point their session at a prekey this vault may have
+    /// already deleted, leaving every message they send undecryptable.
+    pub async fn fresh_invite(&mut self) -> Result<String, Error> {
+        let local_id = self.device.device_id();
+        let bundle = mint_prekey_bundle(self.device.store_mut(), local_id).await?;
+        // The invite carries the *delivery* token: a contact only ever needs to
+        // put messages in this inbox, never to read or burn it.
+        let payload = invite_from_bundle(
+            &self.state.relay,
+            &self.state.protocol_name,
+            self.device.queue_id(),
+            &self.device.queue_token(),
+            self.state.mail_handle.as_deref(),
+            Some(self.vault_name()),
+            &bundle,
+        )?;
+        let encoded = payload.encode()?;
+        self.save().await?;
+        Ok(encoded)
+    }
+
     pub async fn add_contact(&mut self, nickname: &str, invite_str: &str) -> Result<(), Error> {
+        let payload = self.prepare_contact(nickname, invite_str)?;
+        let bundle = payload.to_prekey_bundle()?;
+        let local_name = self.state.protocol_name.clone();
+        process_contact_bundle(
+            self.device.store_mut(),
+            &local_name,
+            &payload.protocol_name,
+            &bundle,
+        )
+        .await?;
+        self.finish_contact(nickname, payload).await?;
+        // Hand this account's per-contact queue to the contact, which is what
+        // makes deleting them revocable. Best effort: the next drain re-grants
+        // if the relay was down.
+        if let Err(e) = self.grant_queues_to(nickname).await {
+            eprintln!("hush: could not grant a queue to {nickname}: {e}");
+        }
+        Ok(())
+    }
+
+    /// Add a contact from an intro card *without* consuming the invite's
+    /// prekey bundle.
+    ///
+    /// The reverse half of an introduction: the sender already consumed our
+    /// invite, so their messages will arrive as a prekey chain we have never
+    /// seen. libsignal refuses an incoming prekey message when a session for
+    /// that address already exists, so we must not create one here — the
+    /// contact record pins identity and queue routing only, and the session
+    /// builds from their first message. Nothing is granted back: our queue
+    /// credentials travelled with the invite they consumed.
+    pub async fn add_contact_from_intro(
+        &mut self,
+        nickname: &str,
+        invite_str: &str,
+    ) -> Result<(), Error> {
+        let payload = self.prepare_contact(nickname, invite_str)?;
+        self.finish_contact(nickname, payload).await
+    }
+
+    /// Validate an invite for a new contact and decode it.
+    ///
+    /// Shared by [`Self::add_contact`] and [`Self::add_contact_from_intro`]:
+    /// the relay must match, and the account must be new.
+    fn prepare_contact(&self, nickname: &str, invite_str: &str) -> Result<InvitePayload, Error> {
         let payload = InvitePayload::decode(invite_str)?;
         if normalize_relay(&payload.relay) != normalize_relay(&self.state.relay) {
             return Err(Error::RelayMismatch(payload.relay.clone(), self.state.relay.clone()));
@@ -914,15 +991,18 @@ impl Account {
         {
             return Err(Error::ContactExists);
         }
-        let bundle = payload.to_prekey_bundle()?;
-        let local_name = self.state.protocol_name.clone();
-        process_contact_bundle(
-            self.device.store_mut(),
-            &local_name,
-            &payload.protocol_name,
-            &bundle,
-        )
-        .await?;
+        if nickname.trim().is_empty() {
+            return Err(Error::InvalidHandle);
+        }
+        Ok(payload)
+    }
+
+    /// Store a validated contact record and persist it.
+    async fn finish_contact(
+        &mut self,
+        nickname: &str,
+        payload: InvitePayload,
+    ) -> Result<(), Error> {
         self.state.contacts.push(Contact {
             nickname: nickname.to_string(),
             account_id: payload.protocol_name.clone(),
@@ -942,12 +1022,6 @@ impl Account {
         // as still blocked.
         self.state.revoked.retain(|a| a != &payload.protocol_name);
         self.save().await?;
-        // Hand this account's per-contact queue to the contact, which is what
-        // makes deleting them revocable. Best effort: the next drain re-grants
-        // if the relay was down.
-        if let Err(e) = self.grant_queues_to(nickname).await {
-            eprintln!("hush: could not grant a queue to {nickname}: {e}");
-        }
         Ok(())
     }
 
@@ -2466,7 +2540,7 @@ impl Account {
                 .cloned()
                 .ok_or(Error::ConclaveNotFound)?;
             if !conclave.ended && conclave.is_joined(&self.state.protocol_name) {
-                let invite = self.invite().await?;
+                let invite = self.fresh_invite().await?;
                 let my_nick = conclave
                     .trustee(&self.state.protocol_name)
                     .map(|t| t.nick.clone())
@@ -2485,6 +2559,7 @@ impl Account {
                         target_nick: my_nick,
                         seeker: seeker_account.to_string(),
                         invite,
+                        reverse: false,
                     },
                     false,
                 )
@@ -2495,9 +2570,24 @@ impl Account {
         Ok(())
     }
 
-    /// Accept a received introduction: consume the invite and make the target
-    /// a contact. One consumed invite is a full mutual channel — the target's
-    /// queue arrives with it, and ours is granted in `add_contact`.
+    /// Accept a received introduction and make the other member a contact.
+    ///
+    /// Two shapes, distinguished by `intro.reverse`:
+    ///
+    /// Forward card (we sought the introduction): the card carries the
+    /// target's fresh invite. We consume it and become the session initiator
+    /// — exactly like a direct contact add — and send our own fresh invite
+    /// back as a reverse card.
+    ///
+    /// Reverse card (the other side accepted first): the sender already
+    /// consumed our invite and will message us on that session. We must add
+    /// them as a contact *without* consuming the attached bundle: consuming
+    /// would create an outbound session that shadows their incoming prekey
+    /// chain, and libsignal refuses a prekey message when a session for that
+    /// address already exists. Our session comes from decrypting their first
+    /// message instead, which needs no action from us; their queue
+    /// credentials arrived with our own invite when they consumed it, so
+    /// there is nothing to grant either.
     pub async fn accept_intro(
         &mut self,
         conclave_id: &str,
@@ -2528,7 +2618,53 @@ impl Account {
         self.state
             .pending_intros
             .retain(|i| !(i.conclave_id == conclave_id && i.target == target_account));
-        self.add_contact(nickname, &intro.invite).await?;
+        if intro.reverse {
+            self.add_contact_from_intro(nickname, &intro.invite).await?;
+        } else {
+            self.add_contact(nickname, &intro.invite).await?;
+        }
+        // The reverse card goes out on the forward path only: it is what
+        // tells the other side we accepted, and carries the fresh invite
+        // they will use to open their session. A reverse-card accept needs
+        // no reply — the sender already holds everything of ours there is.
+        if intro.reverse {
+            self.save().await?;
+            return Ok(());
+        }
+        if let Some(conclave) = self.chat_log.conclave(conclave_id).cloned() {
+            if !conclave.ended && conclave.is_joined(target_account) {
+                if let (Some(via_nick), Ok(my_invite)) = (
+                    self.contact_nick_for_protocol(&intro.via),
+                    self.fresh_invite().await,
+                ) {
+                    let my_nick = conclave
+                        .trustee(&self.state.protocol_name)
+                        .map(|t| t.nick.clone())
+                        .unwrap_or_default();
+                    let reverse = MessagePayload::ConclaveIntro {
+                        conclave_id: conclave_id.to_string(),
+                        name: conclave.name.clone(),
+                        target: self.state.protocol_name.clone(),
+                        target_nick: my_nick,
+                        seeker: target_account.to_string(),
+                        invite: my_invite,
+                        reverse: true,
+                    };
+                    // Best effort: the contact edge works one way if the
+                    // courier is down, and the card can be re-earned by
+                    // repeating the introduction.
+                    if let Err(e) = self
+                        .send_payload_inner(&via_nick, reverse, false)
+                        .await
+                    {
+                        eprintln!(
+                            "hush: intro return-card to {} failed: {e}",
+                            short_name(target_account)
+                        );
+                    }
+                }
+            }
+        }
         self.save().await?;
         Ok(())
     }
@@ -2650,6 +2786,7 @@ impl Account {
         seeker: &str,
         invite: &str,
         from_account: &str,
+        reverse: bool,
     ) -> Result<bool, Error> {
         let me = self.state.protocol_name.clone();
         if seeker == target || target == me {
@@ -2689,6 +2826,7 @@ impl Account {
                 via: from_account.to_string(),
                 invite: invite.to_string(),
                 received_ms: now_ms(),
+                reverse,
             };
             match self
                 .state
@@ -2721,6 +2859,7 @@ impl Account {
                 target_nick: target_nick.to_string(),
                 seeker: seeker.to_string(),
                 invite: invite.to_string(),
+                reverse,
             },
             false,
         )
@@ -3670,6 +3809,7 @@ impl Account {
                         target_nick,
                         seeker,
                         invite,
+                        reverse,
                     } => {
                         if self
                             .receive_intro(
@@ -3680,6 +3820,7 @@ impl Account {
                                 &seeker,
                                 &invite,
                                 &from_account,
+                                *reverse,
                             )
                             .await?
                         {
@@ -4579,12 +4720,16 @@ mod tests {
             .unwrap();
         assert_eq!(stranger.pending_intro_requests().len(), 1);
 
-        // Declining is silent and clears the record.
+        // Declining is silent and clears the record without adding a contact.
         stranger
             .answer_intro_request(&cid, SAM, false)
             .await
             .unwrap();
         assert!(stranger.pending_intro_requests().is_empty());
+        assert!(
+            stranger.contact_nick_for_protocol(SAM).is_none(),
+            "a declined introduction must not create a contact"
+        );
     }
 
     #[tokio::test]
@@ -4627,7 +4772,7 @@ mod tests {
         // dropped: the invite is only valid in its owner's name.
         let dirty = sam
             .receive_intro(
-                &cid, "mesh", STRANGER, "stranger", SAM, "not-a-real-invite", FRIEND,
+                &cid, "mesh", STRANGER, "stranger", SAM, "not-a-real-invite", FRIEND, false,
             )
             .await
             .unwrap();
@@ -4641,7 +4786,7 @@ mod tests {
             friend_vault.invite().await.unwrap()
         };
         let dirty = sam
-            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &swapped, FRIEND)
+            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &swapped, FRIEND, false)
             .await
             .unwrap();
         assert!(!dirty, "an invite naming someone else must be dropped");
@@ -4653,7 +4798,7 @@ mod tests {
             stranger.invite().await.unwrap()
         };
         let dirty = sam
-            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND)
+            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false)
             .await
             .unwrap();
         assert!(dirty);
@@ -4670,7 +4815,7 @@ mod tests {
         assert_eq!(contact.nickname, "stranger");
 
         // A late duplicate has nothing to add.
-        sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND)
+        sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false)
             .await
             .unwrap();
         assert!(sam.pending_intros().is_empty());
@@ -4687,7 +4832,7 @@ mod tests {
             stranger.state.protocol_name = STRANGER.to_string();
             stranger.invite().await.unwrap()
         };
-        sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND)
+        sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false)
             .await
             .unwrap();
 
@@ -4695,6 +4840,38 @@ mod tests {
         // The pending record survives a rejected nickname: the caller picks
         // another one rather than losing the introduction.
         assert_eq!(sam.pending_intros().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reverse_intro_adds_the_contact_without_consuming_the_bundle() {
+        let mut sam = intro_vault("intro-reverse").await;
+        let cid = seed_mesh_conclave(&mut sam, SAM);
+
+        // The stranger accepted our invite first, so their card comes back
+        // flagged reverse: the bundle inside must stay unconsumed.
+        let invite = {
+            let mut stranger = intro_vault("intro-reverse-owner").await;
+            stranger.state.protocol_name = STRANGER.to_string();
+            stranger.invite().await.unwrap()
+        };
+        let dirty = sam
+            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, true)
+            .await
+            .unwrap();
+        assert!(dirty);
+
+        sam.accept_intro(&cid, STRANGER, "stranger").await.unwrap();
+        assert!(sam.pending_intros().is_empty());
+        let contact = sam
+            .contacts()
+            .iter()
+            .find(|c| c.account_id == STRANGER)
+            .expect("the reverse card still makes the sender a contact");
+        assert_eq!(contact.nickname, "stranger");
+        assert!(
+            contact.delivery_queue_id.is_none(),
+            "a reverse accept must not grant a queue: our credentials already travelled with the invite the sender consumed"
+        );
     }
 
     #[test]
@@ -4714,6 +4891,7 @@ mod tests {
             target_nick: "stranger".into(),
             seeker: SAM.into(),
             invite: "hush-invite-1".into(),
+            reverse: false,
         };
         for payload in [req, intro] {
             let decoded = MessagePayload::decode(&payload.encode().unwrap()).unwrap();

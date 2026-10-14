@@ -9,6 +9,71 @@ resolution, and the status.
 
 ## 2026-10-14 — Conclave introductions
 
+### Both sides consuming an invite leaves every message undecryptable; reverse card must not consume [FIXED]
+
+- Attempted: the reverse-invite handshake was wired end to end
+  (`accept_intro` sending the acceptor's invite back through the courier),
+  both sides accepted their cards, both showed each other as contacts —
+  and yet not one message decrypted in either direction. `POST /api/recv`
+  on the target returned only "Could not decrypt a queued message —
+  unknown sender or session not ready", on both the old mesh (iv-a2/d2)
+  and a clean relay wipe.
+- Symptom: the 1:1 probes and conclave messages landed on the peer's
+  inbox as blobs that never decrypted. A cli-built mesh (a3/c3/d3, one
+  invite consumed twice) decrypted fine, which eliminated the one-time
+  prekey double-consumption theory: libsignal falls back to the signed
+  prekey. The real difference was session direction. In the card flow
+  BOTH sides ran `process_contact_bundle` (the seeker on the consent
+  card, the target on the reverse card), so each vault held an outbound
+  session for the other's address. libsignal refuses an incoming
+  `PreKeySignalMessage` when a session already exists for that address,
+  so neither side could ever establish the *other's* chain: every first
+  message failed, and the ratchet never started.
+- Resolution: the reverse card is now marked `reverse: true` in
+  `MessagePayload::ConclaveIntro` and threaded through `receive_intro`
+  into `PendingIntro.reverse`. `accept_intro` branches on it: forward
+  cards consume the bundle (the acceptor is the session initiator,
+  identical to a direct contact add); reverse cards go through the new
+  `add_contact_from_intro`, which pins identity and queue routing without
+  touching the session store and without granting a queue back (the
+  acceptor's credentials already travelled with the invite the sender
+  consumed). The target's session builds from the seeker's first prekey
+  message. Card invites also mint via the new `Account::fresh_invite`
+  instead of the shared cached invite. Verified live on the a3/c3/d3
+  mesh: a3's conclave message decrypted at d3 with zero warnings, d3's
+  reply decrypted at a3 with zero warnings.
+- Lesson: in a Signal-style stack the bundle consumer and the first
+  message sender must be the same party. Any flow where the *owner* of a
+  mailbox also consumes the peer's bundle creates two disjoint session
+  pairs, and the failure is silent until the first message.
+
+### Queue rotation on device migration strands every contact holding a pre-rotation grant [OPEN]
+
+- Attempted: after migrating the demo vaults to the introduction-capable
+  binary, the second handshake round stalled: the courier relayed the
+  request (`POST /api/conclaves/intros/relay` returned 204) but the target's
+  `/api/conclaves/intros` stayed empty through repeated `POST /api/recv`
+  polls.
+- Symptom: the relay's sqlite db shows the relayed blob sitting in a queue
+  the target never reads. Root cause: `device.enc` appeared today on both
+  demo vaults — the legacy migration rotated the device queue token — and
+  every contact still delivers to the pre-rotation queue id or with the
+  pre-rotation delivery token from a stale invite/grant. The writer's PUT
+  succeeds (the relay binds an unclaimed queue to the first credential), the
+  owner reads a different derived queue id, so messages silently vanish.
+  The intro request leg that worked earlier today rode a queue claimed
+  before the rotation; after the relay db wipe the same delivery re-created
+  the queue under the writer's stale credential.
+- Resolution needed: the rotation path (legacy migration, restore, or any
+  future rotation) must re-send a `QueueGrant` to every contact so stored
+  delivery targets converge on the current derivation; alternatively the
+  daemon should detect repeated undelivered sends. The bulletin queue
+  already dodges this by never publishing its id — per-contact queues have
+  no such escape.
+- Lesson: rotating a capability invalidates every copy of it ever handed
+  out; a rotation without a redistribution step is a partition, not an
+  upgrade.
+
 ### The intro tests were written but never actually passed, and one hid a real protocol bug [FIXED]
 
 - Attempted: after landing the intro slice, `cargo test -p hush-core

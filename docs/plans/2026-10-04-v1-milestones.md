@@ -33,9 +33,10 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **O — Zines** | After **19**'s spine (reused) + a relay bulletin lane; independent of **17**/**18** media | **21** members-only long-form blogs ("zines") with comments, broadcast on a relay bulletin | Spec resolved 2026-10-12 by grilling; planning only |
 | **P — Neighborhoods** | After **21** (front page) + **11** (public identity, shared crate, Tor egress) | **22** public long-form from Nostr (NIP-23), badged on the zines front page behind a control | Spec resolved 2026-10-13 by grilling; planning only |
 | **Q — Conclave voice** | After **C** stabilizes (same gate as **17**); engine spike shared with **17** Phase 2 | **23** group voice inside a conclave | Forks resolved 2026-10-13 — decisions **delegated to agent judgment, user review pending**; planning only, Phase 1 not approved |
+| **R — Trustee reach** | After **D** (mail) lands; independent of the media tasks | **24** per-trustee surface scope — **mail only** or **mail + chat + conclave** | Idea captured 2026-10-14; planning only, not grilled |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
 
-**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane. **Zines** (O) is the members-only long-form commons: also a data feature, reusing **19**'s spine, and it is the one task that adds a relay ability (a broadcast bulletin) — also independent of the media plane. It reshapes **Articles** (G) from a native Nostr build into an optional export. **Neighborhoods** (P) is the public counterpart to zines: it reads public Nostr long-form onto the same page, badged and behind a control, and it is where the separate **public identity** lives.
+**Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane. **Zines** (O) is the members-only long-form commons: also a data feature, reusing **19**'s spine, and it is the one task that adds a relay ability (a broadcast bulletin) — also independent of the media plane. It reshapes **Articles** (G) from a native Nostr build into an optional export. **Neighborhoods** (P) is the public counterpart to zines: it reads public Nostr long-form onto the same page, badged and behind a control, and it is where the separate **public identity** lives. **Trustee reach** (R) is a small contact-policy change on top of **mail** (D): when you add a trustee you choose whether they may reach you by **mail only** or by **mail + chat + conclave**, so a member can add someone they only want to correspond with by mail.
 
 Detailed specs follow **by task ID** (1, 2, …). Dependency order is in the table above.
 
@@ -727,6 +728,40 @@ signaling slice). Task **18** §10 #13 and Task **20** §3 #5 defer here.
 **Distro-readiness:** audio capture is the first sandbox exception the daemon genuinely needs
 (PipeWire socket, or `/dev/snd` only if the capture fallback is exercised); extends the shipped
 unit's documented exceptions and the dependency list. Media is never on disk.
+
+---
+
+### Task 24: Trustee reach — mail-only or full (planning only)
+
+**Status:** **Phase R** — idea captured **2026-10-14**; **planning only**, not grilled to decision
+level. No code until a phase is approved.
+
+**Goal:** When you add a **trustee** (a person in your circle — the Trusts pane), you choose which
+surfaces they may use with you. Two options: **Mail only** (mail both ways; no live 1:1 chat, no
+conclaves together) or **Full** (mail + chat + conclave — today's behaviour, the default). Mail is
+the floor: every trustee can always reach you by mail.
+
+**Why:** some members want to add people they only want to correspond with by mail — a professional
+contact, a one-off introduction — without opening a live chat thread or pulling them into a conclave.
+The app currently offers all three surfaces to every trustee the moment they are added.
+
+→ **[`docs/tasks/trustee-reach.md`](../tasks/trustee-reach.md)**
+
+**Key decisions captured:** the scope lives on the trustee record and is **announced to the peer**,
+so both ends agree; **effective reach is the narrower of the two sides** (if either chose mail-only,
+the relationship is mail-only for both); enforced at the **daemon boundary** (refusals, not just a
+hidden button), the way the convener-only invite rule already is; mail rides the same 1:1 Signal
+session as chat, so this is a **policy** gate, not a transport one.
+
+**Open questions:** intersection vs one-way; whether mail-only gates attachments or only the live
+surfaces; changing the scope mid-relationship; the two options' copy and name.
+
+**Depends on:** Task **5** (daemon), **5d** (mail), **5h** (presence), conclave fan-out (done),
+**5c** encrypted store (done). **Independent of** the **17** / **18** / **19** / **23** media work —
+no new transport, no new egress. Outsiders / drops (**5e** / **5f**) are out of scope.
+
+**Distro-readiness:** no new runtime deps and no new egress; a field in the existing encrypted store
+plus an announcement on the existing session.
 
 ---
 

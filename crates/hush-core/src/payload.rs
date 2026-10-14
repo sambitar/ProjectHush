@@ -316,6 +316,14 @@ pub enum MessagePayload {
         /// The target's standing invite (`Account::invite`), minted with their
         /// explicit consent.
         invite: String,
+        /// True when this card is the acceptance half: the sender already
+        /// consumed the receiver's invite and opened their session, so the
+        /// receiver must add the sender as a contact *without* consuming the
+        /// attached bundle. Both sides consuming would leave each holding an
+        /// outbound session that shadows the other's first prekey message,
+        /// and every message in both directions would be undecryptable.
+        #[serde(default)]
+        reverse: bool,
     },
     /// A grant of the sender's per-contact receive queue.
     ///
