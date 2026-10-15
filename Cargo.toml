@@ -5,7 +5,7 @@ members = [
   "crates/hush-cli",
   "crates/hush-daemon",
   "crates/hush-wallet",
-  "crates/hush-articles",
+  "crates/hush-atproto",
   "crates/hush-audio",
   "crates/voice-spike",
   "apps/hush-tauri/src-tauri",

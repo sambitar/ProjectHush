@@ -11,7 +11,7 @@ scattered on a board or gathered into **regions** — with **drag-and-drop**, pl
 **checklists** you can tick off. Entirely **local** and **encrypted** under the vault; included in
 backup by the existing whole-vault export.
 
-**Not the same as:** Article **library annotations** (Task **12.3**, tied to Nostr addresses) or
+**Not the same as:** Article **library annotations** (Task **12.3**, tied to public-lane addresses) or
 **Confidential** containers (Task **10**). Notes are everyday scratch space, reached from the Vault.
 
 **Relationship to other docs:** follows the daemon-only-state and vault-sidecar posture of
@@ -74,7 +74,7 @@ whiteboard SaaS.
 
 ## Policy / threat model
 
-- **Private by default** — nothing is sent to `hush-relay` or Nostr; there is no network path.
+- **Private by default** — nothing is sent to `hush-relay` or the public lane; there is no network path.
 - **No collaboration** — no shared board, no live co-editing. (Sending a single note as an E2E
   file/message is a possible later, fan-out feature — not this task.)
 - **No engagement metrics** — personal only.

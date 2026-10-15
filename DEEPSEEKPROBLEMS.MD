@@ -7,6 +7,378 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-15 — Posts that opened as a title with nothing under them
+
+### The reported symptom had three causes, and the loudest one was not a bug in the parser [FIXED]
+
+- Attempted: "im opening some posts and it shows no content just the title" reads like a parsing
+  fault, so the first move was to go looking in `reads::rich_text_to_text` / `standard::body_text`
+  for a block type the walker did not know.
+- Symptom: measuring first said otherwise. Of **105** cached documents, **50** opened with an empty
+  body. Of those 50:
+  - **48** had `textContent=false content=false path=yes` — **no body in the record at all**. Keys
+    were `$type, description, path, publishedAt, site, tags, title, updatedAt`. These are *pointer*
+    documents: the words are on the author's own site.
+  - **2** had `content=true` — a real parse gap, `{"$type": "co.idno.html", "html": "…"}`, where the
+    words sit in an `html` field and only `plaintext` was collected.
+
+  So the parser was responsible for **2** of 50. The other 48 were a **missing feature**: the record
+  is a pointer, Hush stored the `path`, and nothing ever joined it to the publication's `url`. A
+  third gap sat behind both: `description` was **written on publish and never read back**, so even
+  the author's own summary was thrown away at ingest.
+- Resolution: three changes, each measured against the live cache.
+  - `description` is read at ingest and is the index row's `preview` fallback.
+  - `fetch_follow` reads the account's `site.standard.publication` records in the same pass and
+    resolves `url` + `path` into `Document.url`; the reader offers it instead of a blank page.
+  - `hush_atproto::html` reduces `html` blocks, moved down from the daemon rather than copied.
+  - Re-measured live: `with url: 104`, `with description: 102`, empty-bodied documents **48** (which
+    is now *correct* — those records have no body), front-page rows with an empty preview **50 → 0**.
+- Lesson: the symptom named the wrong layer. "No content" suggested the extractor; the numbers said
+  **96% of it was a document shape nobody had modelled**, and only the remaining 4% was the extractor.
+  Classifying the failures before opening the parser would have found the dominant cause first. The
+  tell was in the data the whole time: those records had `path` and `description` and no
+  `textContent`/`content` at all, which is not a parse failure, it is a different kind of record.
+
+### `pkill -f` matched the shell that was running it, and the pattern was too broad [FIXED]
+
+- Attempted: restart the dev daemon with
+  `pkill -f "hush-daemon --dir instances/peer-a"` to stop the old process before starting a new one.
+- Symptom: **no output at all** from the command, exit 0. `pkill -f` matches the *full command line*
+  of every process, and the shell executing that very command contains the pattern in its own
+  argument list — so it killed itself before it could print anything, and the build and restart never
+  ran. A second attempt with a broader pattern (`pkill -f "[h]ush-daemon"`) worked, but **also killed
+  three unrelated `hush-daemon` processes** (`/tmp/iv-a3`, `/tmp/iv-c3`, `/tmp/iv-d3`, all on
+  release builds). Those looked like leftover test fixtures, but they were running before this
+  session started and were not mine to stop.
+- Resolution: use a bracket pattern (`"[h]ush-daemon"`) so the pattern cannot match the matching
+  command itself, and scope the pattern to the exact vault (`--dir instances/peer-a`) so a restart
+  cannot reach a process it was not aimed at.
+- Lesson: `pkill -f` is a foot-gun in two directions at once — it can kill the caller, and it can
+  reach processes outside the intended target. This was tooling damage, not a repo problem: no code
+  in this workspace was wrong. The three killed daemons were collateral and were not restarted.
+
+### A backgrounded build-and-run chain raced its own build, and the stale binary lied [FIXED]
+
+- Attempted: start the dev daemon on the new code with
+  `cargo build -p hush-daemon … && setsid nohup ./target/debug/hush-daemon … &` — the `&` binds to the
+  **whole** `&&` chain, so the build went to the background too and `sleep 8` ran in the foreground
+  alongside it.
+- Symptom: the daemon answered, the refresh returned `200`, and the result was **wrong in a way that
+  looked like a code bug**: `changed: 0`, and `x.get('url')` returned `None` for every document. The
+  conclusion nearly drawn was that `absorb` refuses to update existing documents. It does not —
+  `absorb` replaces on `*existing != document`. The real cause was that the **old binary** had won the
+  race and was still serving; it had never heard of the `url` field, which is why the key was *absent*
+  rather than empty. `changed: 0` was the old code correctly reporting that nothing had changed.
+- Resolution: run the build to completion in the foreground, *then* start the process as a separate
+  step. Confirmed by a positive signal rather than by absence of an error: the new binary answered
+  `{"error":"locked"}` (a freshly started vault) and, after `POST /api/unlock`, returned
+  `changed: 104` and `with url: 104`.
+- Lesson: the distinguishing evidence was **absent key vs empty value** — a `#[serde(default)]` field
+  is always serialised, so `"url"` missing entirely meant the serialiser predated the field, not that
+  the value was empty. Checking which binary was actually running would have cost one `pgrep` and
+  saved a wrong hypothesis about `absorb`. Chaining a build and a run behind one `&` is never safe.
+
+### `<img src="x">` without a closing slash swallowed the rest of the paragraph [FIXED]
+
+- Attempted: write a test for the newly-moved HTML reducer asserting that an image contributes
+  nothing: `to_text(r#"<p>before <img src="x.png" alt="ignored"> after</p>"#)` should be
+  `"before  after"`.
+- Symptom: the assertion failed with `left: "before"`, `right: "before  after"` — the words ` after`
+  were **gone**. `parse_tag` treats `img` as an ordinary opening tag, so the tree builder pushed a
+  frame for it and every following word was collected *inside* an `img` node that renders nothing.
+  The tag only avoided this when written self-closing (`<img … />`), which is what the zines
+  sanitizer emits — so the zines lane never hit it, and pointing the same reducer at
+  stranger-authored record HTML is what exposed it.
+- Resolution: added `is_void` (the standard void-element list: `area, base, br, col, embed, hr, img,
+  input, link, meta, param, source, track, wbr`) and the tree builder now closes those immediately
+  instead of opening a frame. The test passes as first written. This is a **fix to the zines lane as
+  well**, since both callers share the one implementation.
+- Lesson: this was the good case — a test written from an assumption failed immediately and named the
+  bug, rather than passing without exercising the path. It also shows why the reducer belongs in one
+  place: the bug had been latent in the daemon for as long as it existed, and only surfaced when a
+  second caller with different input reached the same code.
+
+## 2026-10-15 — Explore (publication discovery)
+
+### The frontend test file was written for `vitest`; the project uses `node --test` [FIXED]
+
+- Attempted: add `apps/hush-tauri/src/lib/explorePage.test.ts` for the new follow-list rules, and
+  copied the `import { describe, expect, it } from "vitest"` shape from habit.
+- Symptom: two failures at once, which is what made it worth logging.
+  `npx tsc --noEmit` reported `src/lib/explorePage.test.ts(1,38): error TS2307: Cannot find module
+  'vitest' or its corresponding type declarations.` And `npx vitest run` reported
+  `Test Files 5 failed | 1 passed (6)` — my new file passed, and **four existing test files failed
+  with `Error: No test suite found in file ...`**, because vitest was collecting `*.test.ts` files
+  that contain no vitest suites at all. The real runner is `"test": "node --test src/lib/*.test.ts"`,
+  and the existing files use `node:test` with `node:assert/strict`.
+- Resolution: rewrote the test with `node:test` / `node:assert/strict` and ran the project's own
+  command. `npm test` → 71 pass, 0 fail. `npx tsc --noEmit` → clean.
+- Lesson: a runner is a project decision, not a default. `vitest` was not a dependency and had no
+  config; a two-second read of `package.json` scripts would have prevented writing the file twice.
+  The misleading signal was that vitest *did* run and *did* find the file — it just could not find a
+  suite in it, and blamed four innocent files rather than the one that was wrong.
+
+### The first Explore dialog showed two publications per screen [FIXED]
+
+- Attempted: lay out the discovery dialog as one block per publication — name, address, description,
+  `via <seed>`, and a `Follow` button.
+- Symptom: reported as "the explore section/pane is poorly designed ui", and the measurements agreed
+  rather than leaving it a matter of taste. In the browser: **2 rows visible** of 66 (a 417px list
+  against rows averaging 269px), scroll height **18,967px**, row heights swinging **105px to 386px**
+  because descriptions ran 5 to 329 characters with no clamp, **62** of 66 rows carrying a
+  `btn-primary` button, and `via leaflet.pub` / `via pckt.blog` printed **66 times** to convey **2**
+  distinct values. The three-sentence intro sat above all of it.
+- Resolution: a fixed **52px** two-line row (description clipped with `text-overflow: ellipsis`), the
+  `Follow` control demoted to a quiet bordered button with no primary styling, the list **grouped by
+  seed** under a sticky heading (`via pckt.blog · 39`) so provenance is stated once per group instead
+  of once per row, a filter over name/handle/URL/description, and the intro cut to one line with the
+  rest behind `title`. Re-measured: **9 rows visible**, scroll **3,503px** (5.4x shorter), row height
+  flat at 52px, **0** primary buttons. Filter verified live: `book` → 4 rows, `zzzz` → the empty
+  note, cleared → 66.
+- Lesson: "it looks bad" was measurable. Two numbers — rows visible and row-height variance — named
+  the cause (unclamped prose in a row that had no height contract) and would have caught it before
+  the screenshot. A sticky heading also needs the *modal's* surface colour, not the page's: the first
+  attempt used `var(--bg)` and rendered a `rgb(18,18,24)` band across a `rgb(27,27,36)` dialog.
+
+### Testing the follow route against the live vault replaced the user's reading list [FIXED]
+
+- Attempted: verify the no-account follow path by POSTing a single follow to
+  `POST /api/atproto/follows` on the running dev vault.
+- Symptom: the route replaces the **whole** list by design, so
+  `{"follows":[{"did":"did:plc:btxr...","name":"Leaflet Lab Notes"}]}` silently dropped the vault's
+  other follow. `follows` went from two entries to one, and nothing in the response said a follow had
+  been removed.
+- Resolution: re-POSTed the original two entries and confirmed them restored
+  (`['leaflet.pub', 'pckt.blog']`). No data was lost permanently because the list is two DIDs and
+  both were known.
+- Lesson: this is the route behaving exactly as documented — "Replace the whole list" — and the
+  mistake was testing a destructive whole-list write against real state with a partial payload. A
+  replace-shaped route needs the current value read first and echoed back, or a throwaway vault.
+  The frontend helper is written to do this correctly (`toggleFollow` takes the current list and
+  returns the whole next one), which is the part the unit tests now pin.
+
+### A daemon started with `&` from a one-shot shell did not survive the command [WORKED AROUND]
+
+- Attempted: restart the dev daemon with the new binary —
+  `env ... ./target/release/hush-daemon --dir instances/peer-a --socket "$SOCK" > log 2>&1 &` — then
+  poll `/api/status` in the same command.
+- Symptom: the log file contained the daemon's own startup lines
+  (`hush-daemon vault=... socket=...`), so it had clearly started, but `pgrep` found no process, the
+  socket did not exist, and `curl` got nothing. The parent shell exiting reaped the child.
+- Resolution: `setsid env ... daemon ... > log 2>&1 < /dev/null &` — the daemon then stayed up
+  (confirmed by `pgrep` and a live `/api/status`). Tooling-related, not a repo problem: this is a
+  property of the sandboxed one-shot shell, not of `hush-daemon`.
+- Lesson: a backgrounded process in a one-shot command needs `setsid` (and `< /dev/null`) or it dies
+  with the shell that spawned it. The misleading part is the log file, which makes it look like the
+  process started successfully — the same trap applies to `cargo build` in the background, where a
+  killed build leaves an **older binary in place** that looks like a successful no-op.
+
+### A doc-comment edit deleted the `///` separator from an unrelated method [FIXED]
+
+- Attempted: insert a new `describe_repo` method above `parse` in `xrpc.rs` using a `StrReplace`
+  anchored on the line `/// Turn a response into T...`, while separately having edited the
+  `resolve_handle` doc comment.
+- Symptom: the `resolve_handle` doc comment lost its blank `///` separator line, merging two
+  paragraphs. Caught by reading the region back, not by a test.
+- Resolution: restored the separator line, then inserted `describe_repo` against a unique anchor.
+- Lesson: `StrReplace` on a short, generic line (`/// ...`) is how a one-line insertion becomes a
+  one-line deletion somewhere else. Anchor on the surrounding code, and read the region back after
+  editing a file that has several near-identical comment blocks.
+
+## 2026-10-15 — Website placeholder build
+
+### Reveal-on-scroll hid whole sections from any visitor without JavaScript [FIXED]
+
+- Attempted: fade-up scroll animations on `website/` (`.reveal` opacity 0 in CSS, IntersectionObserver in `main.js` adds `.is-visible`).
+- Symptom: the CSS hid `.reveal` unconditionally, so the class name promised JS would run. A browser with JS disabled (or a crawler with none) gets every feature card, screenshot frame, download card, and FAQ item rendered at `opacity: 0` — the page looks finished in a JS browser and is mostly blank otherwise. Found by reading the selector chain while fixing a related hack (`main.js` initially flashed `body` to `display:none` to force a paint, which is a blank page if JS throws before the restore line).
+- Resolution: hidden state gated on `html.js .reveal`; the `js` class is the first thing `main.js` sets. Reduced-motion override matched to `html.js .reveal` for the same specificity. Verified in the browser with JS on; gating verified by reading, not by a no-JS run.
+- Lesson: CSS that assumes "the script will run" is a single-file dependency the CSS cannot see. Any state introduced by JS must be introduced by JS in the DOM (a class on `<html>`), not assumed by the stylesheet.
+
+### `git commit` committed 15 pre-staged deletions that were never mine to commit [FIXED]
+
+- Attempted: commit the new `website/` directory on the `website` branch with `git add website/ && git commit -m ...`.
+- Symptom: `git show --stat` reported **20 files changed, 1772 insertions(+), 4356 deletions(-)**. The commit included deletions of `crates/hush-articles/*`, `apps/hush-tauri/src/lib/markdown.*`, and two task docs. The first git-status snapshot showed them as if unstaged, but part of the user's in-flight work was already staged in the index before the session started — `git add website/` only added my files; the bare `git commit` committed everything staged.
+- Resolution: `git reset --soft HEAD~1` (index preserved), then `git commit -- website/` so the pathspec restricts the commit. Verified after: commit touches exactly 5 website files, the 15 deletions are back to staged-but-uncommitted (`D ` in the first column), and `status --porcelain | wc -l` is 54 again.
+- Lesson: `git add <dir>` does not make a commit of `<dir>`. In a dirty worktree, a bare `git commit` publishes whatever the index happens to hold. Use `git commit -- <pathspec>` whenever the commit must be a subset of the index.
+
+### SMIL `<animate>` children of a `<g>` target the group, not the sibling circle beside them [FIXED]
+
+- Attempted: dashed encryption rings around packets in the security simulation, with `<animate attributeName="opacity">` elements written as children of the packet `<g class="pkt">`, one beside each `<circle class="pkt-ring">`.
+- Symptom: `.pkt-ring` has `opacity: 0` in CSS, and the animates the code "aimed" at the rings actually targeted the group's opacity (SMIL default target is the animate's parent). Result: three ring animates fought over one group opacity, and the rings themselves never appeared. Caught by reading the restructure, not by a screenshot — the small packet renders made the missing rings look like a style choice.
+- Resolution: restructured so each animated circle contains its own `<animate>` child (a child targets its parent element), verified phase-by-phase in the browser: amber handshake dot visible, purple data dot with visible dashed ring visible, label swap visible.
+- Lesson: with SMIL, placement *is* targeting. An `<animate>` affects its parent, so writing animations "next to" the element they should drive silently drives something else — in this case a wrapper, which hid the bug behind a plausible-looking render.
+
+
+
+
+## 2026-10-15 — Reading real publications
+
+### The docs recorded public comments as impossible, and the network disagreed [FIXED]
+
+- Attempted: answer whether comments on public documents can be fetched, and whether they can be
+  posted.
+- Symptom: `docs/tasks/atproto.md` recorded Comments as **"None. Standard.site has no comment
+  record"** (decisions row 13), and open question #5 said inventing one "would be wrong". Both are
+  true about the *lexicon* and false about the ecosystem.
+- What was actually there: there is no comment record, and nobody uses one. A document carries
+  `bskyPostRef` pointing at an `app.bsky.feed.post`, and the comments are **replies to that post**.
+  Measured live rather than assumed: 14 of 24 sampled documents carried a linked thread holding
+  **45 real replies**, one post with 14. Both halves are reachable with the session the member
+  already has — `app.bsky.feed.getPostThread` to read, `app.bsky.feed.post` with a reply ref to
+  write. No new auth, and no record invented.
+- Resolution: the decision table and the open question need rewriting, not the protocol. The
+  comment lane is unblocked.
+- Lesson: "the schema has no field for it" was read as "the ecosystem cannot do it". Absence in a
+  lexicon is not absence in practice, and the only way to tell the two apart is to look at real
+  records — which is the same lesson as the empty-body entry below, one layer up.
+
+### The thread link and the publication link were both dropped at ingest [FIXED]
+
+- Attempted: reach a post's comments, and tell one publication from another.
+- Symptom: `Document::from_record` kept `title`, body, `tags`, `publishedAt` and `path`, and threw
+  away everything else. Two of the discarded fields were load-bearing. `bskyPostRef` is the only
+  pointer to a post's comments, and `site` is the only field naming which publication a document
+  belongs to. Neither had a test, because nothing read them.
+- Consequence, measured: following two accounts (`leaflet.pub`, `pckt.blog`) pulls in **5 distinct
+  publications** — leaflet alone writes to 2 and pckt to 3. The lane could not tell them apart, so
+  "follow this blog" was really "follow everything this account writes".
+- Resolution: both preserved, `BskyPostRef` lenient about a missing `cid` (a shape that occurs
+  live) and refusing only a ref with no `uri`. Verified end-to-end after a live refresh, not just
+  in unit tests: **35 of 53** documents carry a thread link and **53 of 53** carry a publication
+  link across **5** distinct publications. The 35 matches the count from the independent survey
+  taken before the change, which is the evidence that nothing was lost in the mapping.
+
+### The frontend type-check printed "TSC CLEAN" while it was failing [FIXED]
+
+- Attempted: confirm `tsc --noEmit` passed after adding two fields to a DTO.
+- Symptom: `npx tsc --noEmit 2>&1 | tail -15 && echo "TSC CLEAN"` printed a real `error TS2345`
+  and then printed `TSC CLEAN` directly underneath it. A pipeline's exit status is the *last*
+  command's, so `&&` was reading `tail`'s success, not `tsc`'s.
+- Resolution: `set -o pipefail`. Re-run, which surfaced the error properly and then passed once the
+  test fixture was given the new field.
+- Lesson: this is tooling, not a repo problem, and it is the exact failure mode the log exists for —
+  a verification step that reports success without exercising the thing it claims to check. Never
+  gate a claim on the exit status of a pipeline ending in `tail` or `head`.
+
+### A heredoc fed to `python3 -` silently ate the pipe it was supposed to read [WORKED AROUND]
+
+- Attempted: parse a JSON API response inline, `curl ... | python3 - <<'PY' ... PY`.
+- Symptom: `json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)`. The heredoc
+  becomes stdin, so it replaced the pipe and the script never saw the response body at all. Nothing
+  was wrong with the response.
+- Resolution: write the response to a file and have the script read the file. Tooling, not a repo
+  problem.
+- Lesson: `python3 -` takes its *program* from stdin, so it cannot also take its *data* from a
+  pipe. Same shape as the entry above: the command looked like it ran and had not.
+
+### The reader showed 40 of 53 real blog posts as a title with nothing under it [FIXED]
+
+- Attempted: sign in to a real AT Protocol account and follow real publications, so a member can
+  actually read other people's blog posts.
+- Symptom: the lane filled correctly — `leaflet.pub` and `pckt.blog`, 53 documents, `failed: []`,
+  every title and date right — but opening them showed **no words**. 40 of the 53 had an empty
+  body, and all 38 from `leaflet.pub` did. `preview` was empty too, because it is derived from the
+  body. The titles were the only part of the post that survived.
+- Cause: `Document::from_record` read only `textContent`. That is the lexicon's own field and pckt
+  and offprint write it, but it is **optional**, and Leaflet — the largest publisher in the
+  ecosystem — writes a rich `content` tree instead (`pub.leaflet.content` → `pages[].blocks[].block`,
+  with the words in a `plaintext` field per block). pckt writes **both**, which is what made the
+  shape legible: `blog.pckt.content` → `items[]`.
+- Resolution: `body_text` returns `textContent` when the author wrote it, and otherwise walks
+  `content` for `plaintext` strings in document order. That single rule covers text, header,
+  blockquote, code and list blocks in both shapes. Re-measured against the live network after the
+  fix: **40 changed, 0 of 53 empty**, median body 3,070 characters. The walk reproduces
+  `textContent` character-for-character (length ratio 1.00 on all 13 records that carry both
+  encodings), which is the ground truth that made this safe to land without guessing.
+- Note on ordering: `serde_json` here has no `preserve_order`, so object keys iterate alphabetically.
+  That is harmless because every sequence that matters — pages, blocks, list items — is an array,
+  and an object holds at most one `plaintext`. Said in the function's doc comment so it is not
+  rediscovered as a bug.
+- Lesson: "the wire format is standardised" is not the same as "everyone writes the same field".
+  Both encodings are valid Standard.site, and the optional field is the one Hush happened to pick.
+  The stub PDS in the test suite agreed with our code and could never have caught this — only a real
+  peer could, which is exactly what the open entry below was warning about.
+
+### The reader had never been run against a real PDS [FIXED, read half only]
+
+- This closes the **read** half of the 2026-10-14 entry below. The lane now has real evidence:
+  a live account, two live publications, 53 documents pulled, parsed and rendered. The remaining
+  gap is the **write** half — see the amended entry below.
+
+## 2026-10-14 — Nostr removal and the AT Protocol public lane
+
+### Nostr survived the "removal" as dead code, dead deps, and dangling doc links [FIXED]
+
+- Attempted: remove every Nostr surface (relays, BIP340, `npub`/`naddr`/`nevent`, NIP-23 export,
+  NIP-22 comments, `public-identity.enc`, the neighborhoods read lane) and replace it with the
+  AT Protocol / Standard.site lane. The code removal itself went cleanly — `crates/hush-articles/`
+  deleted, the daemon routes and the frontend pane rebuilt, `cargo test --workspace` and the
+  frontend suite green.
+- Symptom: a repo-wide grep at the *end* of the slice still found live remnants the build never
+  complained about, because none of them are referenced:
+  - `apps/hush-tauri/src/lib/markdown.ts` — "a minimal Markdown renderer for NIP-23 bodies" — plus
+    its test file, left with a now-unused `import { markdownToHtml }` in `app.ts` (no
+    `noUnusedLocals`, so `tsc` passed).
+  - `crates/hush-core/Cargo.toml` still declared `k256 = { version = "0.13", features = ["schnorr"] }`
+    (BIP340) and `bech32` (npub/nsec). Neither is used anywhere in the workspace.
+  - Doc comments in `crates/hush-atproto/src/standard.rs` and `crates/hush-daemon/src/zine_store.rs`
+    still said "the retired Nostr export", and `docs/`, `PROTOCOL.md`, `THREAT_MODEL.md` and
+    `apps/hush-tauri/API_GAPS.md` linked to `hush-articles.md` / `neighborhoods.md`, both deleted.
+- Resolution: removed the import and deleted `markdown.ts` + `markdown.test.ts` (the ATProto body is
+  plaintext by design, so the renderer had no consumer); dropped `k256` and `bech32` from
+  `hush-core`; rewrote the comments; repointed or rewrote every doc link; added the public-lane
+  sections to `PROTOCOL.md`, `THREAT_MODEL.md` and `DISTRO_READINESS.md`. Test count fell 77 → 64
+  because the 13 Markdown-renderer tests went with the renderer.
+- Lesson: deleting a feature is not the same as removing it. A clean build proves nothing about
+  unreferenced files, unused Cargo dependencies, and documentation links — only a whole-repo grep
+  for the feature's vocabulary does. Run that grep before declaring the removal done, not after.
+
+### The public lane is verified against a stub PDS, not a live one [OPEN — narrowed 2026-10-15]
+
+- Attempted: publish a zine to a real AT Protocol account and read a real publication back.
+- Symptom: no live PDS, no app password, and no network egress in this environment. The Rust tests
+  run the real `reqwest` client against an **in-process stub PDS and stub PLC directory**, and the
+  frontend is covered by unit tests over a mocked daemon API. Nothing in this slice has been driven
+  against `bsky.social`, `pckt.blog`, `leaflet.pub` or any other real PDS.
+- **Update 2026-10-15:** the **read** half is now closed — see the entry above. A live account
+  (`sambitar.pckt.cafe` on `pds.pckt.cafe`), two live publications, 53 documents read back and
+  rendered, and that is what found the empty-body bug the stub could not.
+- Resolution still needed: the **write** half. No document has been published to a real repo from
+  Hush, and no `site.standard.publication` has been written to one, so the record shape and the
+  reader's URL are still only exercised against the stub.
+- Lesson: "the HTTP client really runs in the test" removes the trait-mock problem; it does not
+  remove the "our stub agrees with our code" problem. Only a real peer closes that gap — and the
+  read half is the proof.
+
+### A new method reused the name `zinesPublish` and silently shadowed the draft editor's [FIXED]
+
+- Attempted: add the public-lane publish modal method to the `App` class in
+  `apps/hush-tauri/src/app.ts`.
+- Symptom: the draft editor already had a `zinesPublish` method, so the class ended up with two
+  members of the same name — the second wins, and the draft editor's publish button would have
+  called the wrong one.
+- Resolution: renamed the public-lane method to `zinesPublishToWeb` (the modal and the route
+  handler follow the same name).
+- Lesson: in a 14k-line single-class UI file, grep the class for the method name before adding one.
+
+### The byline-truncation test asserted the wrong truncation width [FIXED]
+
+- Attempted: assert a long byline renders shortened.
+- Symptom: expected `'a-very-…'`, actual `'a-very-l…'` — the helper truncates to 12 characters
+  before appending the ellipsis, and the assertion had been written from memory.
+- Resolution: asserted the real output and pinned the width in the test.
+- Lesson: a failure here is the test doing its job; write the expectation from the code's contract,
+  not from an eyeball.
+
+### `atprotoRefresh` dereferenced a possibly-null daemon response [FIXED]
+
+- Attempted: wire `api.atprotoRefresh()` into the pane.
+- Symptom: TypeScript's type allowed the response to be absent, and the handler read fields off it
+  without a check — a daemon that answered empty would have thrown a property-access error instead
+  of a clear message.
+- Resolution: an explicit `if (!out) throw new Error(...)` before the response is read.
+- Lesson: an optional return from the daemon API is a real branch; treat it as one at the call site.
+
 ## 2026-10-14 — Conclave introductions
 
 ### Both sides consuming an invite leaves every message undecryptable; reverse card must not consume [FIXED]

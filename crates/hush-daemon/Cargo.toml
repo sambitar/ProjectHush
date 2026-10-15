@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
 hex = "0.4"
 hush-core = { path = "../hush-core" }
-hush-articles = { path = "../hush-articles" }
+hush-atproto = { path = "../hush-atproto" }
 hush-wallet = { path = "../hush-wallet" }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
@@ -70,7 +70,3 @@ tower = { version = "0.5", features = ["util"] }
 # A real Ed25519 keypair for the zine store tests: a signature that was not
 # really made proves nothing, so the fixture signs rather than stands in.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-# Verifying an exported article's BIP340 signature under the public identity's
-# own key: the whole point of the export is that a relay's check passes, and a
-# signature this crate merely produced proves nothing about that.
-k256 = { version = "0.13", features = ["schnorr"] }

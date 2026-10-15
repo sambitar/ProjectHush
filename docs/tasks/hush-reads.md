@@ -7,9 +7,9 @@ strip the HN surfaces and search — Reads is now a **source list**. One built-i
 (reader mode, save/hide/read markers) is identical for every source.
 
 **Relationship to other docs:** Shares the daemon-only-network and sanitized-rendering
-posture of [`hush-articles.md`](hush-articles.md) and
+posture of [`atproto.md`](atproto.md) and
 [`knowledge-layer-roadmap.md`](../plans/knowledge-layer-roadmap.md), but reads **public**
-data — no Nostr, no pen names, no publishing.
+data — no accounts, no pen names, no publishing.
 
 ---
 

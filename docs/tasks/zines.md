@@ -4,17 +4,16 @@
 explicitly approved.
 
 **Index:** New **Task 21** in [`docs/plans/2026-10-04-v1-milestones.md`](../plans/2026-10-04-v1-milestones.md)
-(Phase **O**). **Reshapes Task 11** ([`hush-articles.md`](hush-articles.md)) — Nostr stops being the
-native shape and becomes an optional **export bridge**. Builds on Task **19**'s sidecar-store +
-fan-out spine ([`conclave-paper.md`](conclave-paper.md)); adds one relay ability.
+(Phase **O**). Builds on Task **19**'s sidecar-store + fan-out spine
+([`conclave-paper.md`](conclave-paper.md)); adds one relay ability.
 
-**Neighborhoods (Task 22, 2026-10-13):** the front page can also carry **public** long-form pulled
-from Nostr, on the **same page** behind a control-pane switch and always badged `public post`. Public
-posts use a **separate public identity** (never the pen name) and egress over **Tor**. See
-[`neighborhoods.md`](neighborhoods.md). The earlier "a separate public surface" idea is superseded by
-the mixed page; the badge and the default-off switch are what keep the two sides distinguishable.
+**The public lane (Task 22, reshaped 2026-10-14):** the front page can also carry **public**
+long-form, on the **same page** behind a control-pane switch and always badged `public post`. The
+transport is **AT Protocol / Standard.site** — the member's own DID and PDS, an app password
+exchanged for a session, no key minted by Hush. See [`atproto.md`](atproto.md). The earlier Nostr
+lane (relays, `npub`/`naddr`, a separate public identity, NIP-23 export, NIP-22 comments) is gone.
 
-    10|**Goal:** Every member has a **zine** — a long-form post with a comments section, published under
+**Goal:** Every member has a **zine** — a long-form post with a comments section, published under
 their **pen name**, readable by **all members** (not just contacts), end-to-end encrypted, with no
 server holding plaintext. A pen name holds **many** zines: each post is its own zine, with its own
 read key and its own revision chain. Posts and comments are **broadcast** to a relay **bulletin**
@@ -23,7 +22,7 @@ sessions. Sections (tags) ride inside the encrypted post. Browsing is local and 
 newspaper you read what you want from, with no follows and no algorithm.
 
 **Name:** **zines** (product name, lowercase in prose). An article is a zine; a tag is a **section**.
-    20|
+
 **Amended 2026-10-13 (before Phase 2):** Phase 1 shipped a zine as one post with a revision chain and
 made the pen name's seal key the post id, which limited a pen name to a single post — the id could
 not address two things. The model below is the corrected one: the pen name's seal key is
@@ -31,9 +30,9 @@ not address two things. The model below is the corrected one: the pen name's sea
 where it belongs, in the read-key row of Section 2.
 
 **Non-goals (this task):** images/media (a later phase); public plaintext or the public IPFS DHT
-    20|(Section 1); a relay-side category registry (Section 1); follows/subscriptions (newspaper model);
-cross-relay federation (Section 4); Nostr as the native transport (now an export bridge); a
-Hush-operated Nostr relay.
+(Section 1); a relay-side category registry (Section 1); follows/subscriptions (newspaper model);
+cross-relay federation (Section 4); a public transport inside the private lane (the public lane is a
+separate surface, [`atproto.md`](atproto.md)); a Hush-operated server of any kind.
 
 ---
 
@@ -44,7 +43,7 @@ they are the reason the architecture is shaped the way it is.
 
 **"Articles live on IPFS and vanish when nobody logs in" is not how IPFS GC works, and the public
 DHT is a metadata leak.**
-    30|
+
 - Blocks vanish when **no node anywhere pins or seeds them**. An author's login only re-provides
   their *own* content; what keeps a zine alive is **readers pinning it**. Availability is a function
   of the readers, not the author's uptime — so "people who do not log in lose their blog" is not a
@@ -56,7 +55,7 @@ DHT is a metadata leak.**
   bootstrap, a new egress surface in [`DISTRO_READINESS.md`](../DISTRO_READINESS.md)) that text-only
   v1 does not need.
 
-    40|**"The relay holds the names of categories" is a relay directory, which the founding constraint
+**"The relay holds the names of categories" is a relay directory, which the founding constraint
 forbids.** [`PROTOCOL.md`](../PROTOCOL.md): the relay sees ciphertext, size, time, slot ID, IP —
 never names, never a directory, never a social graph. A plaintext category registry makes the relay
 a public interest graph and is a typosquat magnet (free-form tags, first-writer-wins). Categories
@@ -68,7 +67,7 @@ cap, no relay knowledge.
 carrying **opaque blobs** — no names, no tags, no pen names. Content addressing and "hold what you
 hold" live in the members' vaults, which is where the availability story actually is.
 
-    50|---
+---
 
 ## 2. Decisions locked (2026-10-12)
 
@@ -83,7 +82,7 @@ hold" live in the members' vaults, which is where the availability story actuall
 | Comments | Blobs encrypted to the pen name's **public** key, published to the same lane; the author pulls, merges accepted ones, republishes |
 | Edits | New blobs; a revision pointer in the descriptor, **per post**; old revisions age out with the window and are pruned locally |
 | Browsing | **Newspaper model** — no follows, no subscriptions; the full local index (all / by section / by pen name), local mute per pen name |
-| Beyond Hush | Optional later **export** (Nostr NIP-23) signed under a **separate public identity**, never the pen-name keys — a button, not a second product. The paired **read** lane is **neighborhoods** (Task 22): badged public posts on the same front page behind a control |
+| Beyond Hush | Optional, explicit **publish** to the open social web (AT Protocol / Standard.site), under the member's **own account** — a button, not a second product. The paired **read** lane is the same surface (Task 22): badged public posts on the same front page behind a control |
 | Scope | **Text-only rich text** (Paper's toolbar: bold/italic/underline, lists, headings) |
 | Milestone | Task **21** / Phase **O** |
 
@@ -459,10 +458,10 @@ Phase 4's remaining box is ticked above: the byline filter landed 2026-10-13.
 
 ### Phase 5 — Retention, hardening, docs
 - [x] Holder **re-post sweep** (rate-limited, signature-verified) keeps held zines in the window; per-zine and total caps surface reasons.
-- [x] `DISTRO_READINESS.md` (bulletin storage growth on the relay; no new client egress), `THREAT_MODEL.md`, `PROTOCOL.md`.
-- [x] Nostr **export** (sign a NIP-23 event with the **public identity**, never the pen name; publish over Tor) — the reshaped Task 11. **Landed 2026-10-13**: `POST /api/zines/{id}/export`, reachable from the zine page's `Export to neighborhoods`. See [`neighborhoods.md`](neighborhoods.md) Phase **4**.
+- [x] `DISTRO_READINESS.md` (bulletin storage growth on the relay; no new client egress **for zines themselves** — the public lane's egress is its own entry), `THREAT_MODEL.md`, `PROTOCOL.md`.
+- [x] Public **publish** (a `site.standard.document` in the member's own ATProto repo, never the pen name; reachable from the zine page as `Publish to the open web`). **Reshaped 2026-10-14** from the Nostr export: `POST /api/zines/{id}/publish`. See [`atproto.md`](atproto.md) Phase 2.
 
-**Verify:** a zine survives the window on a holder's re-post with the author offline; full dogfood with no plaintext on disk; export produces a verifiable NIP-23 event.
+**Verify:** a zine survives the window on a holder's re-post with the author offline; full dogfood with no plaintext on disk; publishing produces a record readable by another Standard.site client.
 
 **Landed (2026-10-13).** The sweep runs at the end of every bulletin pass (`zines_sync`, step 5):
 `ZinesState::repost_due` selects held blobs the relay has not seen for `ZINES_REPOST_AFTER_MS`
@@ -507,7 +506,7 @@ are recorded here so the earlier text is not trusted over the code):
   (done); **5c** encrypted store (done); **6** backup (must include `zines.enc` and pen-name keys).
 - **New relay work:** the bulletin lane (Phase 2) — the only server-side change.
 - **Independent of** **17**/**18** media work and of the postponed voice/video plane.
-- **Reshapes Task 11:** Nostr export becomes Phase 5's optional tail, not the native transport.
+- **Reshapes Task 11:** the public surface becomes an explicit publish tail (AT Protocol), not a native transport.
 - **Schedule after Paper Phase 5** (the remaining DataChannel wiring, presence, and docs), since
   zines reuse that spine; the spec is written and locked in the meantime.
 
@@ -521,7 +520,7 @@ are recorded here so the earlier text is not trusted over the code):
 - Images/media in v1 (their own later phase: EXIF strip, re-encode, hash-addressed media).
 - A CRDT for articles or comments — one writer per document.
 - Cross-relay bulletin federation — reach is the holder re-post sweep.
-- A first-party Nostr relay.
+- A first-party server of any kind (relay bulletin, PDS, AppView).
 
 ---
 

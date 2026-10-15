@@ -4399,18 +4399,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "hush-articles"
+name = "hush-atproto"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bech32",
+ "axum",
  "futures-util",
  "hex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.21",
  "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]
@@ -4439,13 +4439,11 @@ dependencies = [
  "argon2",
  "axum",
  "base64 0.22.1",
- "bech32",
  "chacha20poly1305",
  "ed25519-dalek",
  "hex",
  "http-body-util",
  "hush-relay",
- "k256",
  "libsignal-protocol",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -4478,12 +4476,11 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
- "hush-articles",
+ "hush-atproto",
  "hush-audio",
  "hush-core",
  "hush-relay",
  "hush-wallet",
- "k256",
  "libc",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -5148,7 +5145,6 @@ dependencies = [
  "once_cell",
  "serdect",
  "sha2 0.10.9",
- "signature",
 ]
 
 [[package]]
@@ -9489,22 +9485,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-tungstenite"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
-dependencies = [
- "futures-util",
- "log",
- "rustls",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls",
- "tungstenite",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "tokio-util"
 version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9718,24 +9698,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "tungstenite"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.10.3",
- "rustls",
- "rustls-pki-types",
- "sha1 0.11.0",
- "thiserror 2.0.21",
-]
 
 [[package]]
 name = "typeid"

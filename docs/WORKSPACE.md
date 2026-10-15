@@ -9,7 +9,9 @@ hush/                         # working name; product name later
     hush-relay/               # HTTP relay binary (dumb)
     hush-daemon/              # local API over the core (unix socket or localhost)
     hush-cli/                 # optional dogfood without UI
-    hush-articles/            # (Task 11, reshaped) Nostr **export** of a zine (NIP-23) only — not in workspace yet
+    hush-atproto/             # the public lane: AT Protocol / Standard.site (Task 11/22)
+    hush-audio/               # Opus capture and playback for calls
+    hush-wallet/              # BTC/ETH wallet (Task 8)
   apps/
     hush-tauri/               # Tauri shell; UI talks only to hush-daemon
   docs/                       # already started at repo root docs/

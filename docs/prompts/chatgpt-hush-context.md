@@ -15,7 +15,7 @@ Hush is **not** “another social network.” It is:
 
 1. **Private capsule (v1 center):** E2E 1:1 chat and files (Signal/libsignal), local encrypted vault, add-friends by QR/invite only — no phone directory, no global username search.
 2. **Dumb relay:** First-party VPS holds **ciphertext** on **rotating queue IDs**, not per-person inboxes. Relay may see size, time, slot ID, IP — **not** names or a social graph.
-3. **Members-only commons (later):** **zines** — every member's own blog of long-form articles with a comments section, broadcast on a relay **bulletin** and readable by **all members**, E2EE, under **pen names** (keys separate from messaging). Optional **Nostr export** pushes a zine beyond the membership, over **Tor** — public by design, clearly labeled in UI.
+3. **Members-only commons (later):** **zines** — every member's own blog of long-form articles with a comments section, broadcast on a relay **bulletin** and readable by **all members**, E2EE, under **pen names** (keys separate from messaging). The **public lane** (AT Protocol / Standard.site) publishes a zine to the member's **own** ATProto account — public by design, clearly labeled in UI, nothing minted by Hush.
 
 Positioning: **quiet ownership** — “your data on your machine; we cannot read it.” Calm capsule, **not** activist/“uncensored” hero marketing.
 
@@ -49,7 +49,7 @@ When brainstorming features, prefer ideas that:
 - Strengthen **private** chat/files first (encrypted local store, sealed sender, per-contact files, backup/recovery).
 - Separate **messaging identity** from **pen names** for anything public.
 - Use **argument + evidence** over popularity: typed links (supports/refutes/evidence), explainable feeds (“included because…”), local library with **private** annotations.
-- Keep graphs, briefing, debates, projects **on-device** (SQLite/FTS/edges) with optional **publish** to Nostr — not a Hush-hosted global social graph DB.
+- Keep graphs, briefing, debates, projects **on-device** (SQLite/FTS/edges) with optional **publish** to the public lane — not a Hush-hosted global social graph DB.
 - Ship in **phases** (see milestones **Recommended build order**): messaging polish (Phase C) → **5d** mail → outsider drop **5e/5f** → **16** notes → **11** Articles → **12–15** knowledge → **10** Confidential → **7** ship when producing.
 - For AI: **“ask my library”** with local retrieval + optional user API key — not default “send everything to OpenAI” or training on user data.
 
@@ -63,15 +63,15 @@ Stop or heavily rework suggestions that include:
 - Global **For You** / engagement ML feeds, **like counts**, follower leaderboards, viral “trending.”
 - **Hush-operated** public follow graph or “who follows whom” on first-party servers.
 - **Phone/email as identity**, global username directory, or “find anyone on Hush.”
-- **Facebook-style groups/circles** on our relay; public Nostr “communities” as default social layer.
+- **Facebook-style groups/circles** on our relay; a public “community” as the default social layer.
 - **In-app crowdfunding/wallets** as core knowledge-layer feature.
-- **First-party Nostr relay** at launch (curated relay *list* is OK).
+- **A Hush-operated PDS** at launch (the member's own account is the model).
 - **“Uncensored”** branding, activist-first positioning, or marketing that implies beating nation-states.
-- **Reading/sc scanning E2E** messages for safety or ads.
+- **Reading/scanning E2E** messages for safety or ads.
 - **Scope explosion** — proposing 10 major surfaces before v1 dogfood works.
 - **Centralized “Hush feed”** on hush-relay (messaging relay stays dumb ciphertext queues only).
 
-When an idea is partly good, **adapt** it: e.g. “Ideas feed” → theses + tagged comments, no vote counts; “Circles” → small **private messaging** rooms later; “Briefing” → on-device digest with **reasons**, not trending.
+When an idea is partly good, **adapt** it: e.g. “Ideas feed” → theses + tagged linked documents, no vote counts; “Circles” → small **private messaging** rooms later; “Briefing” → on-device digest with **reasons**, not trending.
 
 ## How you should respond
 
@@ -84,10 +84,10 @@ When an idea is partly good, **adapt** it: e.g. “Ideas feed” → theses + ta
 
 ## Repo truth (snapshot — human may update)
 
-- Stack: Rust workspace (hush-core, hush-relay, hush-daemon), apps/hush-tauri.
+- Stack: Rust workspace (hush-core, hush-relay, hush-daemon, hush-atproto), apps/hush-tauri.
 - v1 goal: two people QR-add, encrypted text + small file via relay, unlock vault; live chat when both online (**5h**); async mail **5d** later.
 - Pre-ship dogfood: **Phase C** polish next; **Task 7** signed releases deferred until producing.
-- Planning docs: docs/DESIGN.md, docs/THREAT_MODEL.md, docs/plans/2026-10-04-v1-milestones.md, docs/plans/knowledge-layer-roadmap.md, docs/tasks/hush-articles.md.
+- Planning docs: docs/DESIGN.md, docs/THREAT_MODEL.md, docs/plans/2026-10-04-v1-milestones.md, docs/plans/knowledge-layer-roadmap.md, docs/tasks/atproto.md.
 
 Acknowledge this context briefly when the human starts a new topic, then give concrete, policy-filtered advice.
 ```

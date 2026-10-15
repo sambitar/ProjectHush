@@ -4461,8 +4461,8 @@ fieldset.chat-history-section {
 }
 
 /* The lane's own switch, set apart from the two view controls above it: those
-   decide what of this vault's corpus to show, and this one decides whether a
-   public network is read at all. */
+   decide what of this vault's corpus to show, and this one is the door to
+   another network's stories. */
 .zines-public {
   display: flex;
   flex-direction: column;
@@ -4477,7 +4477,13 @@ fieldset.chat-history-section {
   line-height: 1.45;
 }
 
+.zines-public-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
 .zines-public-refresh,
+.zines-public-setup,
 .zines-offer-public {
   align-self: flex-start;
 }
@@ -4863,6 +4869,30 @@ fieldset.chat-history-section {
   color: var(--text-dim);
 }
 
+/* A record that carries no body: the author's summary and where the article
+   actually lives. Given its own measure so it reads as the article rather than
+   as chrome beside one. */
+.atproto-pointer {
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2, 8px);
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.atproto-pointer-summary {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.atproto-pointer-open {
+  align-self: flex-start;
+}
+
 .zine-article-body pre,
 .zine-article-body code {
   font-family: var(--font-mono, monospace);
@@ -4969,103 +4999,15 @@ fieldset.chat-history-section {
   color: var(--danger);
 }
 
-/* --- Public replies on a neighborhoods article ---------------------------- */
+/* --- A public document read from the open social web ---------------------- */
 
-/* A public comment is not the sealed thread of a private zine: it is out on a
-   public network, signed by a key the reader never picked, and this page can
-   only choose not to draw it. It is set apart from the zine's own comments
-   rather than merged with them, because they are different things held in
-   different stores under different keys. */
-.post-comments,
-.post-composer {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border);
-}
-
-.post-comments h2,
-.post-composer h2 {
-  margin: 0;
-}
-
-/* Indent is depth, carried as a number rather than as nested elements. The
-   clamp is on the drawing side too: a thread of strangers' words is not the
-   place to find out how a deeply nested container behaves. */
-.post-comment {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  margin-left: calc(var(--post-depth, 0) * var(--space-4));
-  border-radius: var(--radius-md);
-  background: var(--surface);
-}
-
-.post-comment-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1);
-}
-
-.post-comment-body {
+/* The body is plaintext, by the lexicon, so it is set as text and given the
+   line breaks the author typed. It is never parsed as markup: a stranger's
+   words are not a document this app renders. */
+.atproto-body {
   white-space: pre-wrap;
-  line-height: 1.5;
   overflow-wrap: anywhere;
-}
-
-.post-comment-reply {
-  align-self: flex-start;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--accent-strong);
-  cursor: pointer;
-}
-
-.post-comment-reply:hover {
-  text-decoration: underline;
-}
-
-.post-reply-to {
-  margin: 0;
-  padding: var(--space-1) var(--space-2);
-  border-left: 2px solid var(--accent);
-}
-
-.post-composer-input {
-  width: 100%;
-  min-height: 76px;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-  color: var(--text);
-  font: inherit;
-  font-size: 13px;
-  line-height: 1.5;
-  resize: vertical;
-}
-
-.post-composer-input:focus {
-  outline: none;
-  border-color: var(--accent-strong);
-}
-
-.post-composer-actions {
-  display: flex;
-  gap: var(--space-2);
-}
-
-.post-composer-actions .btn-primary,
-.post-composer-actions .btn-secondary,
-.post-identity {
-  width: auto;
-}
-
-.post-identity {
-  align-self: flex-start;
+  line-height: 1.6;
 }
 
 /* The active byline filter, on the page it narrows. It sits between the strip
@@ -5249,48 +5191,281 @@ fieldset.chat-history-section {
 
 .zine-pen-modal,
 .zine-forget-modal,
-.zine-export-modal {
+.zine-publish-modal {
   max-width: 460px;
 }
 
 /* What leaves, and what does not: a list rather than a sentence, so the author
    can see both halves at once. A leading marker distinguishes them without
    relying on colour alone. */
-.zine-export-list {
+.zine-publish-list {
   margin: var(--space-3) 0 0;
   padding-left: var(--space-4);
   list-style: none;
 }
 
-.zine-export-list li {
+.zine-publish-list li {
   position: relative;
   padding-left: var(--space-4);
   margin-bottom: var(--space-1);
 }
 
-.zine-export-list li::before {
+.zine-publish-list li::before {
   position: absolute;
   left: 0;
 }
 
-.zine-export-goes::before {
+.zine-publish-goes::before {
   content: "→";
 }
 
-.zine-export-stays::before {
+.zine-publish-stays::before {
   content: "×";
 }
 
-.zine-export-stays {
+.zine-publish-stays {
   color: var(--text-muted);
 }
 
-.zine-export-result {
+.zine-publish-result {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   margin-top: var(--space-3);
   flex-wrap: wrap;
+}
+
+/* --- The public lane's setup dialog --------------------------------------- */
+
+.atproto-modal {
+  max-width: 520px;
+}
+
+/* The discovery dialog.
+   Sized and spaced around seeing many publications at once. The first version
+   used one generous block per entry and averaged 269px a row, so two of
+   sixty-six were visible inside a 19,000px scroll. A row is now a fixed two
+   lines, and the list gets the height it needs to be scannable. */
+.atproto-explore-modal {
+  max-width: 560px;
+  width: min(560px, calc(100vw - var(--space-6)));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.atproto-explore-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.atproto-explore-head h2 {
+  margin: 0;
+}
+
+.atproto-explore-close {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 var(--space-1);
+}
+
+.atproto-explore-close:hover {
+  color: var(--text);
+}
+
+.atproto-explore-intro,
+.atproto-explore-meta,
+.atproto-explore-empty {
+  margin: 0;
+}
+
+/* The filter and the count share a line: the count is what tells a reader
+   whether the field is worth typing into. */
+.atproto-explore-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.atproto-explore-search {
+  flex: 1;
+  min-width: 0;
+  padding: 6px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2, 6px);
+  background: var(--surface, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.atproto-explore-meta {
+  flex: none;
+  white-space: nowrap;
+}
+
+.atproto-explore-list {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--space-1);
+  max-height: 58vh;
+  overflow-y: auto;
+  padding-right: var(--space-2);
+}
+
+/* Stated once per run rather than on every row: there are two possible values
+   across sixty-six rows, so repeating it per row was noise, and grouping shows
+   the shape of where the list came from. */
+.atproto-explore-group {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: var(--space-3) 0 var(--space-1);
+  padding: var(--space-1) 0;
+  background: var(--surface);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.atproto-explore-group:first-child {
+  margin-top: 0;
+}
+
+/* Two lines, fixed height, text clipped rather than wrapped: descriptions run
+   from 5 characters to 329, and unclipped they made rows swing 105px to 386px. */
+.atproto-explore-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 52px;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.atproto-explore-row:last-child {
+  border-bottom: none;
+}
+
+.atproto-explore-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.atproto-explore-name,
+.atproto-explore-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.atproto-explore-name {
+  color: var(--text);
+}
+
+.atproto-explore-sub {
+  margin-top: 2px;
+}
+
+/* Quiet by default: this is a browsing surface, and a primary button on every
+   row made all sixty-six shout at once. Only the followed state is marked, and
+   it is marked by weight rather than by colour, because it is a state and not a
+   call to action. */
+.atproto-explore-follow {
+  flex: none;
+  min-width: 84px;
+  padding: 5px var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2, 6px);
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+
+.atproto-explore-follow:hover:not(:disabled) {
+  border-color: var(--text-muted);
+}
+
+.atproto-explore-follow.is-following {
+  border-color: transparent;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.atproto-explore-follow:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* The way into discovery from the pane. */
+.zines-explore {
+  margin-top: var(--space-2);
+}
+
+.zines-offer-explore {
+  margin-top: var(--space-2);
+}
+
+.atproto-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.atproto-card h3 {
+  margin: 0;
+}
+
+.atproto-card p {
+  margin: 0;
+}
+
+.atproto-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.atproto-field-label {
+  color: var(--text-muted);
+}
+
+.atproto-connect,
+.atproto-disconnect,
+.atproto-publication-save,
+.atproto-follows-save {
+  align-self: flex-start;
+}
+
+.atproto-follows {
+  width: 100%;
+  min-height: 84px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.atproto-follows:focus {
+  outline: none;
+  border-color: var(--accent-strong);
 }
 
 /* The article's address, on the article and in the dialog. Monospaced and

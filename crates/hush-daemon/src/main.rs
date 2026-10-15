@@ -24,9 +24,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use account_worker::{
-  AccountWorker, ContactDto, IntroLists, PenNameDto, PublicIdentityDto, WorkResult,
-};
+use account_worker::{AccountWorker, ContactDto, IntroLists, PenNameDto, WorkResult};
 use axum::{
     extract::{Path, Query, State},
     http::{header, Method, StatusCode},
@@ -114,15 +112,6 @@ struct App {
     /// created on demand when a room opens or an offer arrives. Same contract
     /// as `paper_planes`: runtime-only, a peer-connection map, safe to lose.
     voice_planes: Mutex<HashMap<String, Arc<voice_data::VoicePlane>>>,
-    /// The neighborhoods read lane's transport (Task 22). `None` until a Tor
-    /// relay client is wired in; a refresh with no source is a clear refusal, not
-    /// a silent no-op. Runtime-only and safe to lose.
-    neighborhoods_source: Mutex<Option<Arc<dyn hush_articles::RelaySource>>>,
-    /// The neighborhoods write half: publishing an export or a comment. Separate
-    /// from the source because reading the network and speaking on the member's
-    /// behalf are not the same capability, and the daemon wires them
-    /// independently. `None` until a Tor relay client is wired in.
-    neighborhoods_sink: Mutex<Option<Arc<dyn hush_articles::RelaySink>>>,
 }
 
 #[derive(Serialize)]
@@ -335,34 +324,25 @@ fn api_router(state: Arc<App>) -> Router {
             "/api/zines/{zine_id}/discard-comment",
             post(zines_discard_comment),
         )
-        // Task 11: publish the zine to the neighborhoods as a NIP-23 article.
-        // The same post can be exported again after an edit: NIP-23 is editable
-        // by address, so a re-export replaces the article rather than adding one.
-        .route("/api/zines/{zine_id}/export", post(zines_export))
-        // Neighborhoods (Task 22): the public Nostr read lane. `identity` is
-        // minted on an explicit create, never on a read, so a stray GET cannot
-        // publish under a key nobody chose.
+        // Task 11: publish the zine to the open web as a Standard.site document.
+        // The record key is derived from the zine id, so a re-publish replaces
+        // the record rather than adding a second one beside it.
+        .route("/api/zines/{zine_id}/publish", post(zines_publish_public))
+        // The public lane (Task 22): the member's own ATProto connection, the
+        // publications they read, and the cached index of what those published.
+        // `connect` is the only route that carries a credential.
+        .route("/api/atproto", get(atproto_view))
+        .route("/api/atproto/connect", post(atproto_connect))
+        .route("/api/atproto/disconnect", post(atproto_disconnect))
         .route(
-            "/api/neighborhoods/identity",
-            get(neighborhoods_identity).post(neighborhoods_create_identity),
+            "/api/atproto/publication",
+            post(atproto_set_publication),
         )
-        // The read lane: the cached index, one article, a forced pull, and the
-        // lane's settings. The literal segments are matched ahead of `{addr}`.
-        .route("/api/neighborhoods", get(neighborhoods_index))
-        .route(
-            "/api/neighborhoods/settings",
-            get(neighborhoods_settings).post(neighborhoods_set_settings),
-        )
-        .route("/api/neighborhoods/refresh", post(neighborhoods_refresh))
-        .route("/api/neighborhoods/{addr}", get(neighborhoods_get))
-        // Task 22, comments: one way out, signed by the public identity, and
-        // read-only replies back in. Separate from the zines comment thread in
-        // every way that matters — different store, different key, different
-        // page — so a public comment can never be mistaken for a sealed one.
-        .route(
-            "/api/neighborhoods/{addr}/comment",
-            post(neighborhoods_comment),
-        )
+        .route("/api/atproto/follows", post(atproto_set_follows))
+        .route("/api/atproto/refresh", post(atproto_refresh))
+        .route("/api/atproto/explore", get(atproto_explore))
+        .route("/api/atproto/explore/refresh", post(atproto_explore_refresh))
+        .route("/api/atproto/document", get(atproto_document))
         .route("/api/torrents/state", get(torrents_state))
         .route("/api/torrents/key", post(torrents_set_key))
         .route("/api/torrents/test", post(torrents_test_key))
@@ -496,7 +476,7 @@ pub(crate) async fn force_lock(state: &Arc<App>) {
 /// "Could not automatically determine the process-level CryptoProvider from
 /// Rustls crate features" — and the request that triggered it never answers,
 /// which leaves the socket listening and every later call timing out. That is
-/// how one neighborhoods refresh over `wss://` took the whole daemon down.
+/// how one relay handshake took the whole daemon down.
 ///
 /// Installing one is rustls's documented remedy, and `ring` is the same choice
 /// the desktop shell makes for its own client (`hush-tauri/src-tauri/src/irc/tls.rs`).
@@ -553,8 +533,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paper_planes: Mutex::new(HashMap::new()),
         voices: Mutex::new(VoiceManager::new()),
         voice_planes: Mutex::new(HashMap::new()),
-        neighborhoods_source: Mutex::new(None),
-        neighborhoods_sink: Mutex::new(None),
     };
     let state = Arc::new(app);
 
@@ -4323,610 +4301,6 @@ async fn zines_set_pen_name(
     Ok(Json(zines_view(&parsed, None, None, Some(pen_name))))
 }
 
-/// The public identity this vault publishes and comments under on the public
-/// Nostr network (neighborhoods, Task 22). `null` before one exists.
-async fn neighborhoods_identity(
-    State(state): State<Arc<App>>,
-) -> Result<Json<Option<PublicIdentityDto>>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    match state.worker.public_identity().await {
-        WorkResult::PublicIdentity(id) => Ok(Json(id)),
-        WorkResult::Err(msg) => Err(worker_err(msg)),
-        _ => Err(unexpected_worker_response()),
-    }
-}
-
-/// Mint the public identity, returning the one now in force.
-///
-/// A create when one already exists returns it rather than erroring: the
-/// caller's question is "which identity do I publish under", and the answer is
-/// the same either way.
-async fn neighborhoods_create_identity(
-    State(state): State<Arc<App>>,
-) -> Result<Json<PublicIdentityDto>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    match state.worker.create_public_identity().await {
-        WorkResult::PublicIdentity(Some(id)) => Ok(Json(id)),
-        WorkResult::Err(msg) => Err(worker_err(msg)),
-        _ => Err(unexpected_worker_response()),
-    }
-}
-
-// --- Neighborhoods: the read lane (Task 22) -------------------------------
-//
-// The crate (`hush-articles`) holds the lane's logic — the gate, the dedupe, the
-// index — and knows nothing of the vault or the network. The daemon owns the
-// sidecar (`neighborhoods.enc`), the routes, and the transport (`App`'s
-// `neighborhoods_source`), which stays `None` until a Tor relay client is wired
-// in. A refresh with no transport is a clear refusal, not a silent no-op.
-
-/// The cap on the allowlist. A curated set, not a firehose.
-const NEIGHBORHOOD_ALLOWLIST_CAP: usize = 50;
-/// The cap on the reading-time floor, in minutes.
-const NEIGHBORHOOD_MINUTES_CAP: u32 = 180;
-
-/// The lane's settings as the UI sees them.
-#[derive(Serialize)]
-struct NeighborhoodSettingsDto {
-    allowlist: Vec<String>,
-    min_minutes: u32,
-    default_show: bool,
-}
-
-impl From<&hush_articles::Settings> for NeighborhoodSettingsDto {
-    fn from(s: &hush_articles::Settings) -> Self {
-        Self {
-            allowlist: s.allowlist.clone(),
-            min_minutes: s.min_minutes,
-            default_show: s.default_show,
-        }
-    }
-}
-
-/// A patch to the settings: the caller sends only the fields it changed.
-#[derive(Deserialize)]
-struct NeighborhoodSettingsBody {
-    allowlist: Option<Vec<String>>,
-    min_minutes: Option<u32>,
-    default_show: Option<bool>,
-}
-
-/// One article in the index. No body, so the index stays a list.
-#[derive(Serialize)]
-struct NeighborhoodSummaryDto {
-    address: String,
-    event_id: String,
-    pubkey: String,
-    d: String,
-    title: String,
-    summary: Option<String>,
-    sections: Vec<String>,
-    created_at: u64,
-    published_at: Option<u64>,
-    reading_minutes: u32,
-}
-
-impl From<&hush_articles::Article> for NeighborhoodSummaryDto {
-    fn from(a: &hush_articles::Article) -> Self {
-        Self {
-            address: a.address(),
-            event_id: a.event_id.clone(),
-            pubkey: a.pubkey.clone(),
-            d: a.d.clone(),
-            title: a.title.clone(),
-            summary: a.summary.clone(),
-            sections: a.sections.clone(),
-            created_at: a.created_at,
-            published_at: a.published_at,
-            reading_minutes: hush_articles::reading_minutes(&a.content),
-        }
-    }
-}
-
-/// One article in full, with its Markdown body. The body is stored as the relay
-/// sent it; rendering and sanitising happen in the UI's one renderer.
-#[derive(Serialize)]
-struct NeighborhoodArticleDto {
-    #[serde(flatten)]
-    summary: NeighborhoodSummaryDto,
-    content: String,
-    /// The thread under this article, oldest first. Empty for an article whose
-    /// replies this vault does not read — which is every article but the ones it
-    /// published itself.
-    replies: Vec<NeighborhoodCommentDto>,
-}
-
-/// One public comment, as the page reads it.
-///
-/// No `mine` flag: whether a comment is this vault's own is a comparison the
-/// page makes against the public identity it already holds, and asking the
-/// worker for that identity on every article open would be a second read of the
-/// vault to answer a question the reader can answer itself.
-#[derive(Serialize)]
-struct NeighborhoodCommentDto {
-    event_id: String,
-    pubkey: String,
-    /// Plaintext, by the spec. The page renders it as text, never as markup: a
-    /// comment is not Markdown, and a stranger's text is not markup here.
-    content: String,
-    created_at: u64,
-    /// The comment this answers, when it answers one rather than the article.
-    parent_id: Option<String>,
-}
-
-impl From<&hush_articles::Comment> for NeighborhoodCommentDto {
-    fn from(c: &hush_articles::Comment) -> Self {
-        Self {
-            event_id: c.event_id.clone(),
-            pubkey: c.pubkey.clone(),
-            content: c.content.clone(),
-            created_at: c.created_at,
-            parent_id: c.parent_id.clone(),
-        }
-    }
-}
-
-fn neighborhood_thread(
-    parsed: &hush_articles::NeighborhoodsState,
-    address: &str,
-) -> Vec<NeighborhoodCommentDto> {
-    parsed
-        .replies_for(address)
-        .iter()
-        .map(NeighborhoodCommentDto::from)
-        .collect()
-}
-
-/// The index payload: what the page shows, plus the facets it can filter by.
-#[derive(Serialize)]
-struct NeighborhoodsView {
-    articles: Vec<NeighborhoodSummaryDto>,
-    sections: Vec<NeighborhoodSectionView>,
-    settings: NeighborhoodSettingsDto,
-}
-
-#[derive(Serialize)]
-struct NeighborhoodSectionView {
-    name: String,
-    count: usize,
-}
-
-fn neighborhoods_view(
-    parsed: &hush_articles::NeighborhoodsState,
-    section: Option<&str>,
-    pubkey: Option<&str>,
-) -> NeighborhoodsView {
-    NeighborhoodsView {
-        articles: parsed
-            .index(section, pubkey)
-            .iter()
-            .map(NeighborhoodSummaryDto::from)
-            .collect(),
-        sections: parsed
-            .sections()
-            .into_iter()
-            .map(|(name, count)| NeighborhoodSectionView { name, count })
-            .collect(),
-        settings: NeighborhoodSettingsDto::from(parsed.settings()),
-    }
-}
-
-/// Read the cache and settings sidecar. A missing file is an empty cache, not an
-/// error: that is the state before the first refresh.
-async fn neighborhoods_state(
-    state: &App,
-) -> Result<hush_articles::NeighborhoodsState, (StatusCode, Json<ApiError>)> {
-    match state.worker.secret_read(hush_articles::STATE_FILE).await {
-        WorkResult::Secret(raw) => hush_articles::NeighborhoodsState::decode(raw.as_deref())
-            .map_err(neighborhoods_internal),
-        WorkResult::Err(msg) => Err(worker_err(msg)),
-        _ => Err(unexpected_worker_response()),
-    }
-}
-
-async fn neighborhoods_persist(
-    state: &App,
-    parsed: &hush_articles::NeighborhoodsState,
-) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let bytes = parsed.encode().map_err(neighborhoods_internal)?;
-    match state.worker.secret_write(hush_articles::STATE_FILE, bytes).await {
-        WorkResult::Ok => Ok(()),
-        WorkResult::Err(msg) => Err(worker_err(msg)),
-        _ => Err(unexpected_worker_response()),
-    }
-}
-
-fn neighborhoods_internal(message: String) -> (StatusCode, Json<ApiError>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ApiError { error: message }),
-    )
-}
-
-fn neighborhoods_bad_request(message: String) -> (StatusCode, Json<ApiError>) {
-    (StatusCode::BAD_REQUEST, Json(ApiError { error: message }))
-}
-
-/// A relay URL must be a websocket URL with a host. `ws://` is allowed for a
-/// local or onion relay; the shipped allowlist is all `wss://`.
-fn validate_relay_url(url: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let trimmed = url.trim();
-    let host = trimmed
-        .strip_prefix("wss://")
-        .or_else(|| trimmed.strip_prefix("ws://"));
-    match host {
-        Some(host) if !host.trim_matches('/').is_empty() => Ok(()),
-        _ => Err(neighborhoods_bad_request(format!(
-            "`{url}` is not a websocket relay URL"
-        ))),
-    }
-}
-
-#[derive(Deserialize)]
-struct NeighborhoodIndexQuery {
-    section: Option<String>,
-    #[serde(rename = "pub")]
-    pubkey: Option<String>,
-}
-
-/// The cached public index, newest first, filtered by section and author.
-async fn neighborhoods_index(
-    State(state): State<Arc<App>>,
-    Query(query): Query<NeighborhoodIndexQuery>,
-) -> Result<Json<NeighborhoodsView>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    let parsed = neighborhoods_state(&state).await?;
-    Ok(Json(neighborhoods_view(
-        &parsed,
-        query.section.as_deref(),
-        query.pubkey.as_deref(),
-    )))
-}
-
-/// One article with its body. 404 before it is held: this lane never fetches on
-/// demand, so an address the cache does not carry is simply not here yet.
-async fn neighborhoods_get(
-    State(state): State<Arc<App>>,
-    Path(addr): Path<String>,
-) -> Result<Json<NeighborhoodArticleDto>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    let parsed = neighborhoods_state(&state).await?;
-    match parsed.get(&addr) {
-        Some(article) => Ok(Json(NeighborhoodArticleDto {
-            summary: NeighborhoodSummaryDto::from(article),
-            content: article.content.clone(),
-            replies: neighborhood_thread(&parsed, &addr),
-        })),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("no neighborhood article is held for {addr}"),
-            }),
-        )),
-    }
-}
-
-/// Force a pull from the allowlisted relays (the switch-on path).
-async fn neighborhoods_refresh(
-    State(state): State<Arc<App>>,
-) -> Result<Json<NeighborhoodsView>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    // Read the sidecar first. There is no lock middleware: a locked vault is a
-    // 401 because the worker says so, so a route must reach the worker before it
-    // can answer anything else. Doing this after the transport check would let a
-    // locked vault learn whether a transport is configured.
-    let mut parsed = neighborhoods_state(&state).await?;
-
-    // The lane reads over Tor or not at all. The shell reports the SOCKS port
-    // when it starts Tor; without it there is no route, and a direct connection
-    // is not one the daemon will take on the user's behalf.
-    let source: Arc<dyn hush_articles::RelaySource> =
-        match state.neighborhoods_source.lock().await.clone() {
-            Some(source) => source,
-            None => {
-                let Some(proxy) = state.relay_socks.lock().await.clone() else {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(ApiError {
-                            error: "Tor is not running; neighborhoods are read over Tor only"
-                                .to_string(),
-                        }),
-                    ));
-                };
-                Arc::new(hush_articles::RelayClient::via_tor(proxy))
-            }
-        };
-
-    hush_articles::refresh(&source, &mut parsed, &export_scopes(&state).await?)
-        .await
-        .map_err(|m| (StatusCode::BAD_GATEWAY, Json(ApiError { error: m })))?;
-    neighborhoods_persist(&state, &parsed).await?;
-    Ok(Json(neighborhoods_view(&parsed, None, None)))
-}
-
-/// The threads this vault has a stake in: the addresses of the articles it
-/// published.
-///
-/// The reply pass reads only these. A member who has exported nothing has no
-/// thread anyone could be answering them on, so there is no second request to
-/// make — which is the egress rule applied to the read lane's second half.
-///
-/// Read through the same worker seam as everything else, so a locked vault
-/// refuses here rather than reading a sidecar the caller is not entitled to.
-async fn export_scopes(state: &App) -> Result<Vec<String>, (StatusCode, Json<ApiError>)> {
-    Ok(zines_sidecar(state).await?.export_scopes())
-}
-
-async fn neighborhoods_settings(
-    State(state): State<Arc<App>>,
-) -> Result<Json<NeighborhoodSettingsDto>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    let parsed = neighborhoods_state(&state).await?;
-    Ok(Json(NeighborhoodSettingsDto::from(parsed.settings())))
-}
-
-/// Persist a settings patch. Changing the allowlist does not itself read from it;
-/// egress is still the switch, and the switch is not this route.
-async fn neighborhoods_set_settings(
-    State(state): State<Arc<App>>,
-    Json(body): Json<NeighborhoodSettingsBody>,
-) -> Result<Json<NeighborhoodSettingsDto>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    let mut parsed = neighborhoods_state(&state).await?;
-    let mut settings = parsed.settings().clone();
-
-    if let Some(allowlist) = body.allowlist {
-        if allowlist.len() > NEIGHBORHOOD_ALLOWLIST_CAP {
-            return Err(neighborhoods_bad_request(format!(
-                "an allowlist holds at most {NEIGHBORHOOD_ALLOWLIST_CAP} relays"
-            )));
-        }
-        for relay in &allowlist {
-            validate_relay_url(relay)?;
-        }
-        settings.allowlist = allowlist;
-    }
-    if let Some(minutes) = body.min_minutes {
-        if minutes > NEIGHBORHOOD_MINUTES_CAP {
-            return Err(neighborhoods_bad_request(format!(
-                "the reading-time floor is at most {NEIGHBORHOOD_MINUTES_CAP} minutes"
-            )));
-        }
-        settings.min_minutes = minutes;
-    }
-    if let Some(default_show) = body.default_show {
-        settings.default_show = default_show;
-    }
-
-    parsed.set_settings(settings);
-    neighborhoods_persist(&state, &parsed).await?;
-    Ok(Json(NeighborhoodSettingsDto::from(parsed.settings())))
-}
-
-// ------------------------------------------------ the public comment (Task 22)
-//
-// The write half of the comment lane. Three things keep it separate from the
-// private thread, and all three are structural:
-//
-// 1. It is signed by the **public identity**, not the pen name, and the two keys
-//    are never derived from one another.
-// 2. It goes to the **public relays** as plaintext. Nothing here seals, and
-//    nothing here can: `CommentPlan` has no read key and no recipient.
-// 3. It is stored in the **neighborhoods** sidecar, beside the articles it
-//    answers, so the private thread's store never learns a public comment
-//    exists.
-//
-// The order of the refusals is the export's: the sidecar first, so a locked
-// vault is a 401 rather than a hint about which keys and relays are configured;
-// then the article, then the body, then the parent, then the identity, and only
-// then is anything signed. A comment that could not go out must not be cached as
-// though it had.
-
-/// The cap on a comment, in characters. A comment is a reply, not an article:
-/// the long-form lane is where writing lives.
-const NEIGHBORHOOD_COMMENT_CHARS: usize = 2000;
-
-/// A comment to post, and what it answers.
-#[derive(Deserialize)]
-struct NeighborhoodCommentBody {
-    body: String,
-    /// The comment this answers, when it answers one rather than the article.
-    /// Absent or empty is a top-level comment.
-    #[serde(default)]
-    parent_id: Option<String>,
-}
-
-/// What posting a comment answers with: the thread as it now stands.
-///
-/// The thread rather than the one comment, because the page shows a thread and
-/// the caller should not have to splice its own words into a list it did not
-/// build.
-#[derive(Serialize)]
-struct NeighborhoodCommentView {
-    address: String,
-    /// The id of the event that went out, hex.
-    event_id: String,
-    /// Whether a relay took it. `false` means the comment is not public: unlike
-    /// an export there is no address to retry, so it is not cached either.
-    published: bool,
-    /// Why the publish failed, when it did. Empty on success.
-    publish_error: String,
-    replies: Vec<NeighborhoodCommentDto>,
-}
-
-/// Post a NIP-22 comment on a public article, signed by the public identity.
-async fn neighborhoods_comment(
-    State(state): State<Arc<App>>,
-    Path(addr): Path<String>,
-    Json(body): Json<NeighborhoodCommentBody>,
-) -> Result<Json<NeighborhoodCommentView>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    let mut parsed = neighborhoods_state(&state).await?;
-
-    // The article must be held. A comment names the version it was written
-    // against, so commenting on something this vault does not hold would mean
-    // guessing at an event id — and a guessed one points a reader at nothing.
-    let article = parsed.get(&addr).cloned().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("no neighborhood article is held for {addr}"),
-            }),
-        )
-    })?;
-
-    let content = body.body.trim();
-    if content.is_empty() {
-        return Err(neighborhoods_bad_request(
-            "a comment needs something in it".to_string(),
-        ));
-    }
-    if content.chars().count() > NEIGHBORHOOD_COMMENT_CHARS {
-        return Err(neighborhoods_bad_request(format!(
-            "a comment is at most {NEIGHBORHOOD_COMMENT_CHARS} characters"
-        )));
-    }
-
-    // A reply has to answer a comment this vault holds **in this thread**.
-    // NIP-22 keeps the article as the root whatever is answered, so a parent
-    // from another thread would file the reply under the wrong article — and a
-    // parent this vault cannot read is one whose author it cannot name.
-    let parent = match body
-        .parent_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        Some(id) => {
-            let held = parsed
-                .replies_for(&addr)
-                .into_iter()
-                .find(|c| c.event_id == id)
-                .ok_or_else(|| {
-                    neighborhoods_bad_request(format!(
-                        "no comment {id} is held in the thread under {addr}"
-                    ))
-                })?;
-            Some(hush_articles::CommentParent {
-                event_id: held.event_id,
-                pubkey: held.pubkey,
-            })
-        }
-        None => None,
-    };
-
-    // The same refusal as the export: the identity is minted deliberately, so a
-    // comment refuses rather than creating the key it would speak under.
-    let identity = match state.worker.public_identity().await {
-        WorkResult::PublicIdentity(Some(id)) => id,
-        WorkResult::PublicIdentity(None) => {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ApiError {
-                    error: "mint a public identity before commenting in the neighborhoods"
-                        .to_string(),
-                }),
-            ))
-        }
-        WorkResult::Err(msg) => return Err(worker_err(msg)),
-        _ => return Err(unexpected_worker_response()),
-    };
-
-    let relays = parsed.settings().allowlist.clone();
-    if relays.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ApiError {
-                error: "no relays are configured; add one in Neighborhoods settings before commenting"
-                    .to_string(),
-            }),
-        ));
-    }
-
-    let sink: Arc<dyn hush_articles::RelaySink> = match state.neighborhoods_sink.lock().await.clone()
-    {
-        Some(sink) => sink,
-        None => {
-            let Some(proxy) = state.relay_socks.lock().await.clone() else {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ApiError {
-                        error: "Tor is not running; comments are posted over Tor only".to_string(),
-                    }),
-                ));
-            };
-            Arc::new(hush_articles::RelayClient::via_tor(proxy))
-        }
-    };
-
-    let now_s = paper_now_ms() / 1000;
-    let plan = hush_articles::CommentPlan {
-        root: hush_articles::CommentRoot {
-            address: addr.clone(),
-            event_id: article.event_id.clone(),
-            pubkey: article.pubkey.clone(),
-        },
-        parent,
-        content: content.to_string(),
-        relays: relays.clone(),
-    };
-
-    let unsigned = plan
-        .event(&identity.pubkey, now_s)
-        .map_err(neighborhoods_bad_request)?;
-    let id_bytes = unsigned.id_bytes().map_err(neighborhoods_internal)?;
-    let signature = match state.worker.public_identity_sign(id_bytes.to_vec()).await {
-        WorkResult::PublicIdentitySignature(Some(sig)) => sig,
-        WorkResult::PublicIdentitySignature(None) => {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ApiError {
-                    error: "mint a public identity before commenting in the neighborhoods"
-                        .to_string(),
-                }),
-            ))
-        }
-        WorkResult::Err(msg) => return Err(worker_err(msg)),
-        _ => return Err(unexpected_worker_response()),
-    };
-    let event = unsigned.signed(&signature).map_err(neighborhoods_internal)?;
-
-    // A comment that no relay took is not public, so it is not cached: unlike an
-    // export there is no address to come back to, and showing the member their
-    // own words in a thread they cannot point anyone at would be a lie the page
-    // has no way to correct later.
-    let (published, publish_error) = match sink.publish(&relays, &event).await {
-        Ok(report) => {
-            eprintln!("hush-daemon: commented on {addr}: {}", report.summary());
-            (true, String::new())
-        }
-        Err(message) => {
-            eprintln!("hush-daemon: commenting on {addr} failed: {message}");
-            (false, message)
-        }
-    };
-
-    if published {
-        parsed.absorb_replies(vec![hush_articles::Comment {
-            event_id: event.id.clone(),
-            pubkey: identity.pubkey.clone(),
-            content: content.to_string(),
-            created_at: now_s,
-            root: addr.clone(),
-            parent_id: plan.parent.as_ref().map(|p| p.event_id.clone()),
-        }]);
-        neighborhoods_persist(&state, &parsed).await?;
-    }
-
-    Ok(Json(NeighborhoodCommentView {
-        address: addr.clone(),
-        event_id: event.id,
-        published,
-        publish_error,
-        replies: neighborhood_thread(&parsed, &addr),
-    }))
-}
-
 fn zine_not_held(zine_id: &str) -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::NOT_FOUND,
@@ -4934,224 +4308,6 @@ fn zine_not_held(zine_id: &str) -> (StatusCode, Json<ApiError>) {
             error: format!("no zine is held for {zine_id}"),
         }),
     )
-}
-
-// ------------------------------------------------------ the export (Task 11)
-//
-// The one-way door from a private zine to a public NIP-23 article. Three things
-// make it one-way, and all three are structural rather than checks:
-//
-// 1. `ExportPlan` has no field for a comment thread, a revision history, a read
-//    key or a pen name, so there is nowhere for the private parts to be carried.
-// 2. The body is re-encoded from the sanitized HTML to Markdown, so the wire
-//    carries text rather than the author's stored markup.
-// 3. The `d` that links the private post to the public article is stored on
-//    `ZineFile` and never in the descriptor, which is what is sealed and
-//    published — so the link does not travel with the blob.
-//
-// A publish that fails is not a lost article: the address is recorded either
-// way, and a retry publishes the same address rather than a second one.
-
-/// What an export answers with: the article's address, and the post as it now
-/// stands.
-///
-/// `ZineView` is flattened rather than nested so the reader page can show
-/// "published" without a second request, and so the shape is still a zine to a
-/// caller that only reads that half.
-#[derive(serde::Serialize)]
-struct ZineExportView {
-    zine_id: String,
-    /// The NIP-23 `d` this article lives at. Minted once, stable across every
-    /// re-export.
-    d: String,
-    /// The NIP-01 address `30023:pubkey:d`. This is what a NIP-22 comment
-    /// references, and it is stable across edits.
-    address: String,
-    /// The shareable handle, with the allowlist as relay hints.
-    naddr: String,
-    /// The id of the event that was published, hex.
-    event_id: String,
-    /// The public key the article is signed by, hex.
-    pubkey: String,
-    /// When the article first went public, seconds. Set once.
-    published_at: u64,
-    /// Whether a relay took it. `false` is not a lost article: the address is
-    /// recorded and the retry publishes the same one.
-    published: bool,
-    /// Why the publish failed, when it did. Empty on success.
-    publish_error: String,
-    #[serde(flatten)]
-    view: ZineView,
-}
-
-/// Publish a zine to the neighborhoods as a NIP-23 article.
-///
-/// The order of the refusals matters as much as the publish does: the sidecar is
-/// read first, so a locked vault is a 401 rather than a hint about which keys
-/// and relays are configured; then the post, then the public identity, then the
-/// allowlist, and only then is an address minted. An export that could not go
-/// out must not leave a `d` behind for the next attempt to find and reuse.
-async fn zines_export(
-    State(state): State<Arc<App>>,
-    Path(zine_id): Path<String>,
-) -> Result<Json<ZineExportView>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
-    let mut parsed = zines_sidecar(&state).await?;
-
-    let zine = parsed
-        .get(&zine_id)
-        .cloned()
-        .ok_or_else(|| zine_not_held(&zine_id))?;
-    // A held zine is someone else's post. Publishing it would sign the author's
-    // words under this vault's public identity, which is a different person
-    // saying it.
-    if !zine.authored {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ApiError {
-                error: "only a zine this vault wrote can be published; a held one belongs to its author"
-                    .to_string(),
-            }),
-        ));
-    }
-
-    // The article is signed by the public identity, which is a separate key from
-    // the pen name and from the account. Minting it is a deliberate act, so a
-    // stray export refuses rather than creating the identity it would publish
-    // under.
-    let identity = match state.worker.public_identity().await {
-        WorkResult::PublicIdentity(Some(id)) => id,
-        WorkResult::PublicIdentity(None) => {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ApiError {
-                    error: "mint a public identity before publishing to the neighborhoods"
-                        .to_string(),
-                }),
-            ))
-        }
-        WorkResult::Err(msg) => return Err(worker_err(msg)),
-        _ => return Err(unexpected_worker_response()),
-    };
-
-    let relays = neighborhoods_state(&state).await?.settings().allowlist.clone();
-    if relays.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ApiError {
-                error: "no relays are configured; add one in Neighborhoods settings before publishing"
-                    .to_string(),
-            }),
-        ));
-    }
-
-    // The write half of the lane, wired the same way the read half is: over Tor
-    // or not at all. A direct connection is not one the daemon takes on the
-    // member's behalf.
-    let sink: Arc<dyn hush_articles::RelaySink> = match state.neighborhoods_sink.lock().await.clone()
-    {
-        Some(sink) => sink,
-        None => {
-            let Some(proxy) = state.relay_socks.lock().await.clone() else {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ApiError {
-                        error: "Tor is not running; articles are published over Tor only".to_string(),
-                    }),
-                ));
-            };
-            Arc::new(hush_articles::RelayClient::via_tor(proxy))
-        }
-    };
-
-    // The body is re-encoded from the sanitized HTML the daemon stores to
-    // Markdown, which is what NIP-23 clients render. The stored HTML never
-    // travels: a public client would show the tags as text.
-    let markdown = reads::rich_text_to_markdown(&zine.descriptor.body);
-    let now_ms = paper_now_ms();
-    let now_s = now_ms / 1000;
-
-    // Minted and persisted before the event is built, so a publish that failed
-    // does not move the address on the retry.
-    let export = parsed
-        .export_address(&zine_id, &identity.pubkey, now_s)
-        .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: m })))?;
-    zines_persist(&state, &parsed).await?;
-
-    let plan = hush_articles::ExportPlan {
-        d: export.d.clone(),
-        title: zine.descriptor.title.clone(),
-        // A zine has no author-written summary, so the card preview is the
-        // article's own opening prose rather than a placeholder.
-        summary: hush_articles::summary_of(&markdown),
-        sections: zine.descriptor.sections.clone(),
-        markdown,
-        published_at: export.published_at,
-    };
-
-    let unsigned = plan
-        .event(&identity.pubkey, now_s)
-        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
-    // The digest, not the serialized event: NIP-01 signs `sha256(...)` of the
-    // array, and hashing it again here would produce a signature that verifies
-    // against nothing a relay computes.
-    let id_bytes = unsigned
-        .id_bytes()
-        .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: m })))?;
-    let signature = match state.worker.public_identity_sign(id_bytes.to_vec()).await {
-        WorkResult::PublicIdentitySignature(Some(sig)) => sig,
-        WorkResult::PublicIdentitySignature(None) => {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(ApiError {
-                    error: "mint a public identity before publishing to the neighborhoods"
-                        .to_string(),
-                }),
-            ))
-        }
-        WorkResult::Err(msg) => return Err(worker_err(msg)),
-        _ => return Err(unexpected_worker_response()),
-    };
-    let event = unsigned
-        .signed(&signature)
-        .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: m })))?;
-
-    // A refusal is a status, not a lost article: the address is recorded either
-    // way, and the next export publishes the same one.
-    let (published, publish_error) = match sink.publish(&relays, &event).await {
-        Ok(report) => {
-            eprintln!("hush-daemon: exported zine {zine_id}: {}", report.summary());
-            (true, String::new())
-        }
-        Err(message) => {
-            eprintln!("hush-daemon: exporting zine {zine_id} failed: {message}");
-            (false, message)
-        }
-    };
-
-    parsed.record_export(&zine_id, &event.id, now_ms);
-    zines_persist(&state, &parsed).await?;
-
-    let naddr = plan
-        .naddr(&identity.pubkey, &relays)
-        .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: m })))?;
-    let updated = parsed
-        .get(&zine_id)
-        .cloned()
-        .ok_or_else(|| zine_not_held(&zine_id))?;
-
-    Ok(Json(ZineExportView {
-        zine_id,
-        d: plan.d.clone(),
-        address: plan.address(&identity.pubkey),
-        naddr,
-        event_id: event.id,
-        pubkey: identity.pubkey,
-        published_at: export.published_at,
-        published,
-        publish_error,
-        view: ZineView { zine: updated },
-    }))
 }
 
 /// Fetch the raw papers sidecar bytes through the worker and decode them.
@@ -5769,6 +4925,722 @@ async fn paper_update(
         eprintln!("hush-daemon: paper delta fan-out failed: {e}");
     }
     Ok(Json(view))
+}
+
+// ---------------------------------------------------------------------------
+// The public lane — AT Protocol, Standard.site (Task 22)
+// ---------------------------------------------------------------------------
+//
+// A zine stays private and local. What goes public is one document in the
+// member's own ATProto repo, written under the lexicons the open social web
+// agreed on (`site.standard.publication` and `site.standard.document`), so it is
+// readable by `pckt.blog`, `leaflet.pub`, `offprint.app` and anything else that
+// speaks them — and their posts are readable here.
+//
+// Three properties hold by construction rather than by care:
+//
+// - No key is minted here. The identity is a DID the member already owns and the
+//   credential is an app password they can revoke from their own account
+//   settings, so this vault is a guest and never the holder of the key.
+// - Nothing private can leave. The record shape has fields for a title, a body,
+//   tags and a date and nowhere to put a pen name, a read key or a comment
+//   thread, and the body is reduced to plaintext on the way out.
+// - The lane is curated. Reads go to the publications the member named, one PDS
+//   at a time; there is no firehose to subscribe to and no AppView in the path,
+//   which is what keeps this app from holding the social graph it refuses to
+//   hold.
+//
+// One thing publishing *does* disclose, and it belongs in the UI as much as
+// here: the record is written to the member's own repo, so a public zine links
+// this vault to their ATProto account. The pen name still covers the bulletin.
+
+/// The one place the lane's route is decided.
+///
+/// The same switch the relay and the wallet answer to: with the relay on Tor the
+/// lane goes through the same SOCKS proxy, and with it off the lane is direct,
+/// like the Reads pane. A second place to decide would be a second answer, and
+/// the two would drift.
+async fn atproto_xrpc(state: &App) -> Result<hush_atproto::Xrpc, (StatusCode, Json<ApiError>)> {
+    let socks = state.relay_socks.lock().await.clone();
+    // The directory is resolved here rather than defaulted inside the client, so
+    // a deployment that must use a mirror has one place to say so and the
+    // default stays beside the lexicon constants it belongs to.
+    let plc = hush_core::config::resolve_atproto_plc_url(&state.dir)
+        .unwrap_or_else(|| hush_atproto::DEFAULT_PLC_DIRECTORY.to_string());
+    hush_atproto::Xrpc::with_plc(socks.as_deref(), &plc).map_err(|e| atproto_err(&e))
+}
+
+/// A failure on the lane, as a status the UI can act on.
+///
+/// The distinction that matters is the one the crate draws: a refusal is the
+/// member's to fix (a revoked app password, a handle that does not exist) and is
+/// a 400, while a transport failure is the network's and is a 502. Collapsing
+/// the two is how a UI ends up telling someone to check their password when the
+/// real answer is that the proxy is not running.
+fn atproto_err(error: &hush_atproto::Error) -> (StatusCode, Json<ApiError>) {
+    let status = match error {
+        hush_atproto::Error::Refused { .. } | hush_atproto::Error::Invalid(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        hush_atproto::Error::Transport(_) | hush_atproto::Error::Json(_) => StatusCode::BAD_GATEWAY,
+        hush_atproto::Error::Proxy(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        Json(ApiError {
+            error: error.to_string(),
+        }),
+    )
+}
+
+fn atproto_not_connected() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ApiError {
+            error: "connect an ATProto account before publishing".to_string(),
+        }),
+    )
+}
+
+fn atproto_no_publication() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ApiError {
+            error: "set the publication a zine belongs to before publishing".to_string(),
+        }),
+    )
+}
+
+fn atproto_not_held(uri: &str) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            error: format!("no document is held for {uri}"),
+        }),
+    )
+}
+
+/// Fetch the public lane's connection through the worker.
+async fn atproto_connection(
+    state: &App,
+) -> Result<hush_atproto::Connection, (StatusCode, Json<ApiError>)> {
+    match state.worker.secret_read(hush_atproto::CONNECTION_FILE).await {
+        WorkResult::Secret(raw) => hush_atproto::Connection::decode(raw.as_deref())
+            .map_err(|e| atproto_err(&e)),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Persist the connection wholesale.
+async fn atproto_persist_connection(
+    state: &App,
+    connection: &hush_atproto::Connection,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let bytes = connection.encode().map_err(|e| atproto_err(&e))?;
+    match state
+        .worker
+        .secret_write(hush_atproto::CONNECTION_FILE, bytes)
+        .await
+    {
+        WorkResult::Ok => Ok(()),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Fetch the lane's cached state through the worker.
+async fn atproto_state(
+    state: &App,
+) -> Result<hush_atproto::AtprotoState, (StatusCode, Json<ApiError>)> {
+    match state.worker.secret_read(hush_atproto::STATE_FILE).await {
+        WorkResult::Secret(raw) => hush_atproto::AtprotoState::decode(raw.as_deref())
+            .map_err(|e| atproto_err(&e)),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Persist the lane's cached state wholesale.
+async fn atproto_persist_state(
+    state: &App,
+    lane: &hush_atproto::AtprotoState,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let bytes = lane.encode().map_err(|e| atproto_err(&e))?;
+    match state.worker.secret_write(hush_atproto::STATE_FILE, bytes).await {
+        WorkResult::Ok => Ok(()),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// The account this vault speaks as, as the pane sees it.
+///
+/// The app password and the tokens are deliberately absent: the webview has no
+/// use for them, and a token in a response is a token in a log.
+#[derive(Serialize)]
+struct AtprotoAccountView {
+    did: String,
+    handle: String,
+    pds: String,
+}
+
+/// One document in the index, without its body.
+///
+/// A page of fifty full articles would be megabytes of JSON for a screen that
+/// shows titles, so the body is one request away
+/// (`GET /api/atproto/document`) and the row carries a taste of it.
+#[derive(Serialize)]
+struct AtprotoDocumentView {
+    uri: String,
+    did: String,
+    handle: String,
+    title: String,
+    tags: Vec<String>,
+    /// The author's own string, kept verbatim for display.
+    published_at: String,
+    /// The same instant as a sortable number, parsed at ingest.
+    published_secs: i64,
+    path: String,
+    /// The author's own summary, when they wrote one. Empty otherwise.
+    description: String,
+    /// The document's own page on the author's site, when it has one.
+    ///
+    /// Empty when the record is not a pointer, or when the publication it
+    /// belongs to could not be read. A reader that finds a body in the record
+    /// shows it; one that does not has somewhere to send the member instead of a
+    /// bare title.
+    url: String,
+    preview: String,
+    /// The Bluesky thread this document was announced as, when there is one.
+    ///
+    /// Absent rather than null when the author linked no thread, so a client can
+    /// branch on presence without knowing the shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bsky_post_ref: Option<hush_atproto::BskyPostRef>,
+    /// The publication this document belongs to, as an `at://` URI. Empty when
+    /// the record names none.
+    site: String,
+}
+
+#[derive(Serialize)]
+struct AtprotoTagView {
+    name: String,
+    count: usize,
+}
+
+/// The whole public pane in one response: who this vault speaks as, where its
+/// posts are filed, who it reads, and what it has read.
+#[derive(Serialize)]
+struct AtprotoView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<AtprotoAccountView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publication: Option<hush_atproto::Publication>,
+    follows: Vec<hush_atproto::Follow>,
+    documents: Vec<AtprotoDocumentView>,
+    /// The tag facet of the cache, most used first.
+    tags: Vec<AtprotoTagView>,
+}
+
+/// The answer to a refresh: the pane, plus what the pass did.
+///
+/// Flattened rather than nested so the response is still an [`AtprotoView`] to
+/// every reader that only wants the index.
+#[derive(Serialize)]
+struct AtprotoRefreshView {
+    /// Documents that were new or had changed.
+    ///
+    /// Named `changed` rather than `documents` because the flattened view
+    /// already carries a `documents` — the index itself — and a flattened field
+    /// with the same name is silently overwritten by the one it flattens.
+    changed: usize,
+    /// Follows that could not be read, each with its reason. Reported rather
+    /// than raised: one publication whose PDS is down must not cost the member
+    /// every other page in the lane, and a lane that stops updating should say
+    /// why.
+    failed: Vec<String>,
+    #[serde(flatten)]
+    view: AtprotoView,
+}
+
+/// One document with its body, for the reading pane.
+#[derive(Serialize)]
+struct AtprotoDocumentFullView {
+    #[serde(flatten)]
+    document: AtprotoDocumentView,
+    /// The body as published: plaintext, because the lexicon's field forbids
+    /// markup.
+    text: String,
+}
+
+fn atproto_view_of(
+    connection: &hush_atproto::Connection,
+    lane: &hush_atproto::AtprotoState,
+) -> AtprotoView {
+    AtprotoView {
+        account: connection.session.as_ref().map(|s| AtprotoAccountView {
+            did: s.did.clone(),
+            handle: s.handle.clone(),
+            pds: s.pds.clone(),
+        }),
+        publication: connection.publication.clone(),
+        follows: lane.follows().to_vec(),
+        documents: lane
+            .index(None, None)
+            .into_iter()
+            .map(atproto_document_view)
+            .collect(),
+        tags: lane
+            .tags()
+            .into_iter()
+            .map(|(name, count)| AtprotoTagView { name, count })
+            .collect(),
+    }
+}
+
+fn atproto_document_view(document: &hush_atproto::Document) -> AtprotoDocumentView {
+    AtprotoDocumentView {
+        uri: document.uri.clone(),
+        did: document.did.clone(),
+        handle: document.handle.clone(),
+        title: document.title.clone(),
+        tags: document.tags.clone(),
+        published_at: document.published_at.clone(),
+        published_secs: document.published_secs,
+        path: document.path.clone(),
+        description: document.description.clone(),
+        url: document.url.clone(),
+        preview: atproto_preview(&document.text, &document.description),
+        bsky_post_ref: document.bsky_post_ref.clone(),
+        site: document.site.clone(),
+    }
+}
+
+/// A plain-text taste of a body, for the index row.
+///
+/// Falls back to the author's own description when the record carries no body. A
+/// **pointer** document — 48 of the 105 in one vault's live cache — keeps its
+/// words on the author's own site and only a description in the record, so
+/// without the fallback every one of those rows read as a title with nothing
+/// beside it.
+fn atproto_preview(text: &str, description: &str) -> String {
+    let source = if text.trim().is_empty() {
+        description
+    } else {
+        text
+    };
+    let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(160).collect()
+}
+
+/// A short taste of a body, for the lexicon's optional `description`.
+///
+/// Derived rather than asked for: the author already wrote the opening, and a
+/// second field to fill in would be one more thing between a zine and its
+/// publication. Long enough to be a sentence, short enough to be a card.
+fn atproto_description(text: &str) -> Option<String> {
+    const CARD_CHARS: usize = 200;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(CARD_CHARS).collect())
+}
+
+/// The pane, in one response.
+async fn atproto_view(
+    State(state): State<Arc<App>>,
+) -> Result<Json<AtprotoView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let connection = atproto_connection(&state).await?;
+    let lane = atproto_state(&state).await?;
+    Ok(Json(atproto_view_of(&connection, &lane)))
+}
+
+#[derive(Deserialize)]
+struct AtprotoConnectBody {
+    /// The PDS host, e.g. `https://bsky.social`.
+    #[serde(default)]
+    pds: String,
+    /// The handle or DID to sign in as.
+    #[serde(default)]
+    identifier: String,
+    /// An app password, never the account password: scoped to this use and
+    /// revocable from the member's own settings, which is the whole reason this
+    /// lane holds no key.
+    #[serde(default)]
+    password: String,
+}
+
+/// Sign in to a PDS with an app password and keep the session.
+///
+/// The password crosses this route once and is stored in the vault's encrypted
+/// sidecar: an app password is revocable and scoped by the member, and holding
+/// it is what lets a rotated access token cost a refresh rather than a
+/// re-sign-in. Nothing about it reaches the webview or a log.
+async fn atproto_connect(
+    State(state): State<Arc<App>>,
+    Json(body): Json<AtprotoConnectBody>,
+) -> Result<Json<AtprotoView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    // The vault is read *before* the credential is used, so a locked daemon
+    // refuses the route instead of relaying an app password to a PDS it has no
+    // business talking to yet — and so every route on the lane answers the lock
+    // the same way.
+    let mut connection = atproto_connection(&state).await?;
+    let xrpc = atproto_xrpc(&state).await?;
+    let session = xrpc
+        .create_session(&body.pds, &body.identifier, &body.password)
+        .await
+        .map_err(|e| atproto_err(&e))?;
+    // A different account is a different repo, and the publication pointer
+    // belonged to the old one: kept, it would address a record this session
+    // cannot write.
+    if connection.session.as_ref().map(|s| s.did.as_str()) != Some(session.did.as_str()) {
+        connection.publication = None;
+    }
+    connection.session = Some(session);
+    atproto_persist_connection(&state, &connection).await?;
+    let lane = atproto_state(&state).await?;
+    Ok(Json(atproto_view_of(&connection, &lane)))
+}
+
+/// Forget the connection, and revoke the session it was holding.
+///
+/// The revocation is best effort and happens first: it is what makes a restored
+/// backup of the sidecar worthless, because the refresh token inside it is dead.
+/// A PDS that cannot be reached must not keep a credential here, so the local
+/// half is cleared either way.
+///
+/// The follows and the cached index are deliberately kept. They are a reading
+/// list, not a credential, and clearing them would cost a member their lane for
+/// disconnecting an account they may reconnect a minute later.
+async fn atproto_disconnect(
+    State(state): State<Arc<App>>,
+) -> Result<Json<AtprotoView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let connection = atproto_connection(&state).await?;
+    if let Some(session) = connection.session.clone() {
+        if let Ok(xrpc) = atproto_xrpc(&state).await {
+            let _ = xrpc.delete_session(&session).await;
+        }
+    }
+    let cleared = hush_atproto::Connection::default();
+    atproto_persist_connection(&state, &cleared).await?;
+    let lane = atproto_state(&state).await?;
+    Ok(Json(atproto_view_of(&cleared, &lane)))
+}
+
+#[derive(Deserialize)]
+struct AtprotoPublicationBody {
+    /// The masthead: what the blog is called.
+    #[serde(default)]
+    name: String,
+    /// The member's own web address. The lexicon combines it with each
+    /// document's path to build a reader's link, and Hush neither hosts it nor
+    /// can invent one, so setup asks.
+    #[serde(default)]
+    url: String,
+}
+
+/// Write (or replace) the publication this vault's documents belong to.
+///
+/// Written at a fixed record key, so running setup again replaces the blog
+/// rather than starting a second one beside it.
+async fn atproto_set_publication(
+    State(state): State<Arc<App>>,
+    Json(body): Json<AtprotoPublicationBody>,
+) -> Result<Json<AtprotoView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut connection = atproto_connection(&state).await?;
+    let session = connection
+        .session
+        .clone()
+        .filter(|s| s.can_write())
+        .ok_or_else(atproto_not_connected)?;
+    let xrpc = atproto_xrpc(&state).await?;
+    let (publication, rotated) =
+        hush_atproto::ensure_publication(&xrpc, &session, &body.name, &body.url)
+            .await
+            .map_err(|e| atproto_err(&e))?;
+    connection.session = Some(rotated);
+    connection.publication = Some(publication);
+    atproto_persist_connection(&state, &connection).await?;
+    let lane = atproto_state(&state).await?;
+    Ok(Json(atproto_view_of(&connection, &lane)))
+}
+
+#[derive(Deserialize)]
+struct AtprotoFollowBody {
+    /// The account's DID. Takes precedence when given: it is the half that
+    /// cannot move.
+    #[serde(default)]
+    did: String,
+    /// The handle to resolve when no DID is given. Resolved against the
+    /// connected account's PDS, because a DID is what addresses a repo and
+    /// nobody knows their favourite blog's by heart.
+    #[serde(default)]
+    handle: String,
+    /// What to show on the page when the handle is not known.
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct AtprotoFollowsBody {
+    #[serde(default)]
+    follows: Vec<AtprotoFollowBody>,
+}
+
+/// Replace the follow list: the whole list, because that is what a curated lane
+/// is. A patch would make "what am I reading" a diff of a diff.
+async fn atproto_set_follows(
+    State(state): State<Arc<App>>,
+    Json(body): Json<AtprotoFollowsBody>,
+) -> Result<Json<AtprotoView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let connection = atproto_connection(&state).await?;
+    let xrpc = atproto_xrpc(&state).await?;
+    let mut follows = Vec::new();
+    for entry in body.follows {
+        let did = if !entry.did.trim().is_empty() {
+            entry.did.trim().to_string()
+        } else {
+            // Resolving a handle needs a PDS to ask, and the one this vault
+            // already speaks to is the member's own. A DID needs nobody's help,
+            // so a member who pastes one is not made to connect first.
+            let session = connection
+                .session
+                .as_ref()
+                .filter(|s| s.can_write())
+                .ok_or_else(atproto_not_connected)?;
+            xrpc.resolve_handle(&session.pds, &entry.handle)
+                .await
+                .map_err(|e| atproto_err(&e))?
+        };
+        follows.push(hush_atproto::Follow {
+            did,
+            handle: entry.handle.trim().to_string(),
+            name: entry.name.trim().to_string(),
+        });
+    }
+    let mut lane = atproto_state(&state).await?;
+    lane.set_follows(follows)
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    atproto_persist_state(&state, &lane).await?;
+    Ok(Json(atproto_view_of(&connection, &lane)))
+}
+
+/// Read every followed publication's documents and merge them into the cache.
+///
+/// The follow list is what bounds this: an empty lane is a no-op, not an error,
+/// and one unreachable PDS costs its own publication and nothing else.
+async fn atproto_refresh(
+    State(state): State<Arc<App>>,
+) -> Result<Json<AtprotoRefreshView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let connection = atproto_connection(&state).await?;
+    let xrpc = atproto_xrpc(&state).await?;
+    let mut lane = atproto_state(&state).await?;
+    let report = hush_atproto::refresh(&xrpc, &mut lane, hush_atproto::REFRESH_LIMIT).await;
+    atproto_persist_state(&state, &lane).await?;
+    Ok(Json(AtprotoRefreshView {
+        changed: report.documents,
+        failed: report.failed,
+        view: atproto_view_of(&connection, &lane),
+    }))
+}
+
+/// The discovery directory: what the last crawl found.
+#[derive(Serialize)]
+struct AtprotoExploreView {
+    /// Every publication the crawl found, sorted by name.
+    directory: Vec<hush_atproto::PublicationSummary>,
+    /// When it was crawled, unix seconds. `0` means never, which is the state
+    /// before the first crawl rather than a fault.
+    crawled_unix: u64,
+    /// Accounts that could not be probed, each with its reason. Reported rather
+    /// than raised: one unreachable PDS must not cost the member the directory.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    failed: Vec<String>,
+}
+
+impl AtprotoExploreView {
+    fn of(lane: &hush_atproto::AtprotoState) -> Self {
+        let (directory, crawled_unix) = lane.directory();
+        Self {
+            directory: directory.to_vec(),
+            crawled_unix,
+            failed: Vec::new(),
+        }
+    }
+}
+
+/// The cached directory, and nothing else.
+///
+/// Deliberately not a crawl: this is what a page loads on open, and it must cost
+/// no network. A crawl is the explicit button beside it.
+async fn atproto_explore(
+    State(state): State<Arc<App>>,
+) -> Result<Json<AtprotoExploreView>, (StatusCode, Json<ApiError>)> {
+    let lane = atproto_state(&state).await?;
+    Ok(Json(AtprotoExploreView::of(&lane)))
+}
+
+/// Crawl one hop from the shipped seeds and replace the directory.
+///
+/// Needs no session, by design: discovery is for the member who will never sign
+/// up, so requiring an account here would defeat the point of having it.
+async fn atproto_explore_refresh(
+    State(state): State<Arc<App>>,
+) -> Result<Json<AtprotoExploreView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let xrpc = atproto_xrpc(&state).await?;
+    let report = hush_atproto::explore(&xrpc, hush_atproto::SEEDS).await;
+    let mut lane = atproto_state(&state).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    lane.set_directory(report.found, now);
+    atproto_persist_state(&state, &lane).await?;
+    let mut view = AtprotoExploreView::of(&lane);
+    view.failed = report.failed;
+    Ok(Json(view))
+}
+
+#[derive(Deserialize)]
+struct AtprotoDocumentQuery {
+    #[serde(default)]
+    uri: String,
+}
+
+/// One document with its body, from the cache.
+///
+/// Served from what the last refresh read rather than re-fetched, so opening a
+/// page costs no network and no PDS learns which article was opened.
+async fn atproto_document(
+    State(state): State<Arc<App>>,
+    Query(query): Query<AtprotoDocumentQuery>,
+) -> Result<Json<AtprotoDocumentFullView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let lane = atproto_state(&state).await?;
+    let document = lane
+        .get(query.uri.trim())
+        .ok_or_else(|| atproto_not_held(&query.uri))?;
+    Ok(Json(AtprotoDocumentFullView {
+        document: atproto_document_view(document),
+        text: document.text.clone(),
+    }))
+}
+
+/// The answer to a public publish: what went out, and the pane either way.
+#[derive(Serialize)]
+struct ZinePublishView {
+    /// Whether the PDS accepted the record. `false` is not a lost article: the
+    /// zine is untouched and the publish can be tried again, which is why the
+    /// whole pane comes back either way rather than an error status.
+    published: bool,
+    /// Why it did not, when it did not. Empty on success.
+    publish_error: String,
+    /// The record's `at://` address. Empty when nothing was written.
+    uri: String,
+    cid: String,
+    /// The record key. Derived from the zine id, so it is the same on every
+    /// publish and a retry replaces the record rather than adding one.
+    rkey: String,
+    /// The web address a reader opens: the publication's base URL and the
+    /// document's path. Empty when no publication is set.
+    url: String,
+    zine_id: String,
+    #[serde(flatten)]
+    view: ZinesView,
+}
+
+/// Publish one zine to the open social web as a `site.standard.document`.
+///
+/// The private half stays private: what is built here is a title, a plaintext
+/// body, the sections as tags and a date, and the record shape has nowhere to put
+/// a pen name, a read key or a comment thread. The record key is derived from the
+/// zine id, so a re-publish after an edit replaces the record rather than adding
+/// a second document beside it — and the first publish time is held, so an edit
+/// does not claim the post was written later than it was.
+///
+/// One thing this discloses, and it is the member's call to make: the record goes
+/// into their own ATProto repo, so a public zine links this vault to that
+/// account. The pen name still covers the bulletin.
+async fn zines_publish_public(
+    State(state): State<Arc<App>>,
+    Path(zine_id): Path<String>,
+) -> Result<Json<ZinePublishView>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut connection = atproto_connection(&state).await?;
+    let session = connection
+        .session
+        .clone()
+        .filter(|s| s.can_write())
+        .ok_or_else(atproto_not_connected)?;
+    let publication = connection
+        .publication
+        .clone()
+        .ok_or_else(atproto_no_publication)?;
+    let mut parsed = zines_sidecar(&state).await?;
+    let Some(zine) = parsed.get(&zine_id) else {
+        return Err(zine_not_held(&zine_id));
+    };
+    if !zine.authored {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "only the pen name that wrote a zine can publish it".to_string(),
+            }),
+        ));
+    }
+    let title = zine.descriptor.title.clone();
+    let tags = zine.descriptor.sections.clone();
+    let text = reads::rich_text_to_text(&zine.descriptor.body);
+    let description = atproto_description(&text);
+
+    let now_ms = paper_now_ms();
+    // The address is minted and held *before* the record is built, so a publish
+    // that failed does not move it on the retry.
+    let address = parsed
+        .publish_address(&zine_id, &session.did, now_ms)
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
+    let rkey = hush_atproto::Post::rkey_for(&zine_id);
+    let post = hush_atproto::Post {
+        rkey: rkey.clone(),
+        title,
+        text,
+        description,
+        tags,
+        published_at_ms: address.published_at_ms,
+        updated_at_ms: (address.published_ms > 0).then_some(now_ms),
+    };
+    let xrpc = atproto_xrpc(&state).await?;
+    let (published, publish_error, uri, cid) =
+        match hush_atproto::publish(&xrpc, &session, &publication.uri, &post).await {
+            Ok((reference, rotated)) => {
+                connection.session = Some(rotated);
+                atproto_persist_connection(&state, &connection).await?;
+                parsed.record_publish(&zine_id, &reference.uri, &reference.cid, now_ms);
+                (true, String::new(), reference.uri, reference.cid)
+            }
+            Err(e) => (false, e.to_string(), String::new(), String::new()),
+        };
+    zines_persist(&state, &parsed).await?;
+    let pen_name = zines_pen_name_dto(&state).await?;
+    Ok(Json(ZinePublishView {
+        published,
+        publish_error,
+        uri,
+        cid,
+        rkey,
+        url: format!("{}/{}", publication.url.trim_end_matches('/'), post.rkey),
+        zine_id,
+        view: zines_view(&parsed, None, None, pen_name),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -7045,8 +6917,6 @@ mod drops_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
         voice_planes: Mutex::new(HashMap::new()),
-            neighborhoods_source: Mutex::new(None),
-            neighborhoods_sink: Mutex::new(None),
         })
     }
 
@@ -7327,8 +7197,6 @@ mod wallet_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
         voice_planes: Mutex::new(HashMap::new()),
-            neighborhoods_source: Mutex::new(None),
-            neighborhoods_sink: Mutex::new(None),
         });
         app.wallet
             .apply_relay(false, Some(TEST_SOCKS.to_string()))
@@ -7851,8 +7719,6 @@ mod notes_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
         voice_planes: Mutex::new(HashMap::new()),
-            neighborhoods_source: Mutex::new(None),
-            neighborhoods_sink: Mutex::new(None),
         })
     }
 
@@ -9081,291 +8947,6 @@ async fn zines_route_is_empty_until_a_pen_name_exists() {
 }
 
 #[tokio::test]
-async fn neighborhoods_identity_routes_are_401_while_locked() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
-    for (method, uri, body) in [
-        ("GET", "/api/neighborhoods/identity", None),
-        ("POST", "/api/neighborhoods/identity", Some("{}")),
-    ] {
-        let (status, _) = request(&router, method, uri, body).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
-    }
-}
-
-#[tokio::test]
-async fn a_public_identity_is_minted_once_then_read_back() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-
-    // No identity before one is minted: a read does not create one.
-    let (status, view) = request(&router, "GET", "/api/neighborhoods/identity", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert!(view.is_null(), "a fresh vault has no public identity");
-
-    // An explicit create mints it.
-    let (status, created) =
-        request(&router, "POST", "/api/neighborhoods/identity", Some("{}")).await;
-    assert_eq!(status, StatusCode::OK, "{created}");
-    let npub = created["npub"].as_str().unwrap().to_string();
-    let pubkey = created["pubkey"].as_str().unwrap().to_string();
-    assert!(npub.starts_with("npub1"), "{npub}");
-    assert_eq!(pubkey.len(), 64);
-
-    // A second create returns the same identity rather than minting a new one,
-    // so a retried request does not publish under a new key.
-    let (status, again) =
-        request(&router, "POST", "/api/neighborhoods/identity", Some("{}")).await;
-    assert_eq!(status, StatusCode::OK, "{again}");
-    assert_eq!(again["pubkey"], pubkey);
-
-    // And the read now returns it.
-    let (status, view) = request(&router, "GET", "/api/neighborhoods/identity", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["pubkey"], pubkey);
-}
-
-// --- Neighborhoods: the read lane (Task 22) -------------------------------
-
-/// A relay that returns a fixed batch per kind, so the lane is exercised without
-/// a network. The transport is what this stands in for; the gate, dedupe, cache,
-/// index, and routes are real.
-pub(super) struct FakeRelay {
-    events: Vec<hush_articles::RawEvent>,
-    /// What the reply pass is served. The lane asks with a different filter, so
-    /// one stub answers both halves of a refresh.
-    comments: Vec<hush_articles::RawEvent>,
-}
-
-impl FakeRelay {
-    /// A relay with articles and no comments: what a refresh reads before
-    /// anything has been exported.
-    pub(super) fn articles(events: Vec<hush_articles::RawEvent>) -> Arc<Self> {
-        Self::new(events, Vec::new())
-    }
-
-    /// A relay that answers both halves of a refresh.
-    pub(super) fn new(
-        events: Vec<hush_articles::RawEvent>,
-        comments: Vec<hush_articles::RawEvent>,
-    ) -> Arc<Self> {
-        Arc::new(Self { events, comments })
-    }
-}
-
-#[async_trait::async_trait]
-impl hush_articles::RelaySource for FakeRelay {
-    async fn fetch(
-        &self,
-        _relays: &[String],
-        filter: &hush_articles::Filter,
-    ) -> Result<Vec<hush_articles::RawEvent>, String> {
-        if filter.kinds == vec![hush_articles::KIND_LONG_FORM] {
-            Ok(self.events.clone())
-        } else {
-            Ok(self.comments.clone())
-        }
-    }
-}
-
-pub(super) fn long_form_event(
-    pubkey: &str,
-    d: &str,
-    created_at: u64,
-    body: &str,
-) -> hush_articles::RawEvent {
-    serde_json::from_value(serde_json::json!({
-        "id": format!("{pubkey}-{d}-{created_at}"),
-        "pubkey": pubkey,
-        "created_at": created_at,
-        "kind": hush_articles::KIND_LONG_FORM,
-        "tags": [["d", d], ["title", "A title"], ["t", "Rust"]],
-        "content": body,
-    }))
-    .unwrap()
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-#[tokio::test]
-async fn neighborhoods_read_routes_are_401_while_locked() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
-    for (method, uri, body) in [
-        ("GET", "/api/neighborhoods", None),
-        ("GET", "/api/neighborhoods/settings", None),
-        ("POST", "/api/neighborhoods/settings", Some("{}")),
-        ("POST", "/api/neighborhoods/refresh", None),
-        ("GET", "/api/neighborhoods/30023:aa:kept", None),
-    ] {
-        let (status, _) = request(&router, method, uri, body).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
-    }
-}
-
-#[tokio::test]
-async fn the_settings_start_curated_and_a_patch_touches_only_what_it_names() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-
-    let (status, view) = request(&router, "GET", "/api/neighborhoods/settings", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["min_minutes"], 3);
-    assert_eq!(view["default_show"], false, "public posts are hidden until opted in");
-    assert!(view["allowlist"].as_array().unwrap().len() >= 3);
-
-    let (status, view) = request(
-        &router,
-        "POST",
-        "/api/neighborhoods/settings",
-        Some(r#"{"min_minutes": 5, "default_show": true}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["min_minutes"], 5);
-    assert_eq!(view["default_show"], true);
-    assert!(
-        view["allowlist"].as_array().unwrap().len() >= 3,
-        "an unmentioned field is untouched"
-    );
-
-    // And it survives a fresh read of the sidecar.
-    let (status, view) = request(&router, "GET", "/api/neighborhoods/settings", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["min_minutes"], 5);
-    assert_eq!(view["default_show"], true);
-}
-
-#[tokio::test]
-async fn an_allowlist_entry_that_is_not_a_relay_is_refused() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-    let (status, view) = request(
-        &router,
-        "POST",
-        "/api/neighborhoods/settings",
-        Some(r#"{"allowlist": ["https://relay.example"]}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{view}");
-}
-
-#[tokio::test]
-async fn a_refresh_without_tor_is_refused_not_silent() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-    let (status, view) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "with no Tor there is no route, and the lane says so rather than reading in the clear: {view}"
-    );
-}
-
-/// The daemon builds the real transport when the shell has reported a Tor SOCKS
-/// port. With the proxy dead, every relay fails and the refresh is a 502 naming
-/// them — not a silent success, and not a direct connection.
-#[tokio::test]
-async fn a_refresh_with_tor_reported_but_unreachable_is_a_gateway_error() {
-    let dir = TempDir::new().unwrap();
-    let app = unlocked_app(dir.path()).await;
-    // A port that was bound and released: nothing is listening on it.
-    let dead = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        addr
-    };
-    *app.relay_socks.lock().await = Some(dead.to_string());
-    let router = api_router(app);
-
-    let (status, view) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_GATEWAY,
-        "the real Tor transport is built and every relay fails: {view}"
-    );
-    assert!(
-        view["error"].as_str().unwrap().contains("relay"),
-        "the failure names the relays: {view}"
-    );
-}
-
-#[tokio::test]
-async fn a_refresh_gates_caches_and_serves_the_index() {
-    let dir = TempDir::new().unwrap();
-    let app = unlocked_app(dir.path()).await;
-    *app.neighborhoods_source.lock().await = Some(FakeRelay::articles(vec![
-        long_form_event("aa", "kept", 20, &"word ".repeat(800)),
-        long_form_event("aa", "stub", 20, "too short"),
-        hush_articles::RawEvent {
-            kind: 1,
-            ..long_form_event("bb", "note", 20, &"word ".repeat(800))
-        },
-    ]));
-    let router = api_router(app);
-
-    let (status, view) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(
-        view["articles"].as_array().unwrap().len(),
-        1,
-        "the stub and the note are refused: {view}"
-    );
-    assert_eq!(view["articles"][0]["address"], "30023:aa:kept");
-    assert_eq!(view["articles"][0]["reading_minutes"], 4);
-    assert!(
-        view["articles"][0].get("content").is_none(),
-        "the index carries no body"
-    );
-    assert_eq!(view["sections"][0]["name"], "rust");
-    assert_eq!(view["sections"][0]["count"], 1);
-
-    // The index reads back from the sidecar and filters by section.
-    let (status, view) = request(&router, "GET", "/api/neighborhoods?section=rust", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["articles"].as_array().unwrap().len(), 1);
-    let (status, view) = request(&router, "GET", "/api/neighborhoods?section=nope", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert!(view["articles"].as_array().unwrap().is_empty());
-
-    // The article page carries the body; an address not held is a 404.
-    let (status, view) = request(&router, "GET", "/api/neighborhoods/30023:aa:kept", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert!(view["content"].as_str().unwrap().starts_with("word"));
-    let (status, _) = request(&router, "GET", "/api/neighborhoods/30023:aa:missing", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn the_neighborhoods_sidecar_is_ciphertext_at_rest() {
-    let dir = TempDir::new().unwrap();
-    let app = unlocked_app(dir.path()).await;
-    const TITLE: &str = "atrest-title-marker";
-    let mut event = long_form_event("aa", "kept", 20, &"word ".repeat(800));
-    event.tags[1][1] = TITLE.to_string();
-    *app.neighborhoods_source.lock().await = Some(FakeRelay::articles(vec![event]));
-    let router = api_router(app);
-
-    let (status, _) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let sidecar = std::fs::read(dir.path().join(hush_articles::STATE_FILE))
-        .expect("neighborhoods.enc exists after a refresh");
-    assert!(!sidecar.is_empty(), "sidecar is not empty");
-    assert!(
-        !contains(&sidecar, TITLE.as_bytes()),
-        "the cached title is not in the clear on disk"
-    );
-    assert!(
-        !contains(&sidecar, b"word word word"),
-        "the cached body is not in the clear on disk"
-    );
-}
-
-#[tokio::test]
 async fn a_pen_name_is_minted_then_renamed_without_moving_the_address() {
     let dir = TempDir::new().unwrap();
     let router = api_router(unlocked_app(dir.path()).await);
@@ -10186,902 +9767,895 @@ mod zines_bulletin_tests {
     }
 }
 
-/// The export (Task 11): a private zine re-encoded as a public NIP-23 article.
-///
-/// The transport is a stub, because what has to hold is not that a relay was
-/// reached but that the *event* is one a relay would accept: the right kind, the
-/// tags the gate reads, the body as Markdown rather than stored HTML, no private
-/// state anywhere in it, and a signature that verifies under the pubkey the
-/// event names. A fake sink is what lets all of that be asserted.
+
 #[cfg(test)]
-mod zine_export_api_tests {
+mod atproto_api_tests {
     use super::*;
-    use crate::notes_api_tests::{request, unlocked_app};
-    use hush_articles::{Event, PublishReport, RelaySink};
+    use crate::notes_api_tests::{build_app, request, unlocked_app};
+    use axum::{
+        extract::{Path, Query, State},
+        http::HeaderMap,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    /// A sink that keeps what it was handed and answers a fixed verdict.
+    /// One stub PDS that also answers as the PLC directory.
     ///
-    /// Shared with the comment tests: a comment is published the same way an
-    /// export is, so the stub that stands in for the network is the same one.
-    pub(super) struct FakeSink {
-        /// The event ids it was asked to publish, in order.
-        seen: std::sync::Mutex<Vec<Event>>,
-        /// What to answer with. `Err` is a total failure, as a network with no
-        /// reachable relay is.
-        verdict: Result<(), String>,
+    /// The same shape the crate's own tests use, and for the same reason: the
+    /// whole lane then runs over real HTTP through the real client, so what is
+    /// exercised is the route's wiring rather than a mock of it. It answers as
+    /// the directory too because `refresh` resolves each follow's DID before it
+    /// can ask that follow's repo anything.
+    struct Stub {
+        /// This stub's own base, filled in once the listener is bound.
+        base: String,
+        /// repo → its documents, as `listRecords` returns them.
+        repos: HashMap<String, Vec<serde_json::Value>>,
+        /// repo → its publication records. Separate from `repos` because the two
+        /// collections answer differently and a pointer document needs the
+        /// publication to be resolvable at all.
+        publications: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+        /// A PDS endpoint to answer for a DID that is not this stub.
+        foreign: HashMap<String, String>,
+        /// Every `putRecord` body the stub was handed, in order.
+        written: Mutex<Vec<serde_json::Value>>,
+        /// Every `Authorization` header a write arrived with.
+        auth: Mutex<Vec<String>>,
     }
 
-    impl FakeSink {
-        pub(super) fn accepting() -> Arc<Self> {
-            Arc::new(Self {
-                seen: std::sync::Mutex::new(Vec::new()),
-                verdict: Ok(()),
+    async fn plc(State(stub): State<Arc<Stub>>, Path(did): Path<String>) -> Json<serde_json::Value> {
+        let endpoint = stub
+            .foreign
+            .get(&did)
+            .cloned()
+            .unwrap_or_else(|| stub.base.clone());
+        Json(serde_json::json!({
+            "id": did,
+            "service": [{ "id": "#atproto_pds", "serviceEndpoint": endpoint }],
+        }))
+    }
+
+    async fn create_session() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "accessJwt": "access-1",
+            "refreshJwt": "refresh-1",
+            "did": "did:plc:writer",
+            "handle": "ada.test",
+        }))
+    }
+
+    async fn delete_session() -> StatusCode {
+        StatusCode::OK
+    }
+
+    async fn resolve_handle(Query(query): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+        let handle = query.get("handle").cloned().unwrap_or_default();
+        Json(serde_json::json!({ "did": format!("did:plc:{handle}") }))
+    }
+
+    async fn list_records(
+        State(stub): State<Arc<Stub>>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let repo = query.get("repo").cloned().unwrap_or_default();
+        let collection = query
+            .get("collection")
+            .cloned()
+            .unwrap_or_else(|| "site.standard.document".to_string());
+        // The two collections answer from different maps: a repo's publications
+        // are what a pointer document needs to become a link, and returning
+        // documents for both is what would hide the bug this covers.
+        let values: Vec<serde_json::Value> = if collection == "site.standard.publication" {
+            stub.publications
+                .lock()
+                .unwrap()
+                .get(&repo)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            stub.repos.get(&repo).cloned().unwrap_or_default()
+        };
+        let records: Vec<serde_json::Value> = values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                serde_json::json!({
+                    "uri": format!("at://{repo}/{collection}/{i}"),
+                    "cid": "bafy",
+                    "value": value,
+                })
             })
-        }
-
-        pub(super) fn refusing(reason: &str) -> Arc<Self> {
-            Arc::new(Self {
-                seen: std::sync::Mutex::new(Vec::new()),
-                verdict: Err(reason.to_string()),
-            })
-        }
-
-        pub(super) fn events(&self) -> Vec<Event> {
-            self.seen.lock().unwrap().clone()
-        }
+            .collect();
+        Json(serde_json::json!({ "records": records }))
     }
 
-    #[async_trait::async_trait]
-    impl RelaySink for FakeSink {
-        async fn publish(
-            &self,
-            relays: &[String],
-            event: &Event,
-        ) -> Result<PublishReport, String> {
-            self.seen.lock().unwrap().push(event.clone());
-            match &self.verdict {
-                Ok(()) => Ok(PublishReport {
-                    accepted: relays.to_vec(),
-                    refused: Vec::new(),
-                }),
-                Err(reason) => Err(reason.clone()),
-            }
-        }
+    async fn put_record(
+        State(stub): State<Arc<Stub>>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        stub.auth.lock().unwrap().push(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let collection = body["collection"].as_str().unwrap_or_default().to_string();
+        let rkey = body["rkey"].as_str().unwrap_or_default().to_string();
+        let repo = body["repo"].as_str().unwrap_or_default().to_string();
+        stub.written.lock().unwrap().push(body.clone());
+        Json(serde_json::json!({
+            "uri": format!("at://{repo}/{collection}/{rkey}"),
+            "cid": "bafyrecord",
+        }))
     }
 
-    /// A vault with a byline, a post, a public identity, an allowlist and a
-    /// stubbed sink: the whole state an export needs, in one place.
+    /// Bind the stub, serve it, and point this vault's `did:plc` resolution at
+    /// it.
     ///
-    /// The `TempDir` is returned rather than dropped: the worker holds the vault
-    /// path, so deleting the directory while the app is still in use would pull
-    /// the vault out from under it.
-    async fn exportable(
-        sink: Arc<FakeSink>,
-    ) -> (TempDir, Arc<App>, axum::Router, String, String) {
-        let dir = TempDir::new().unwrap();
-        let app = unlocked_app(dir.path()).await;
-        *app.neighborhoods_sink.lock().await = Some(sink);
-        let router = api_router(app.clone());
+    /// The directory is named through the config file rather than the
+    /// environment, so the setting is per-vault and two tests in one process
+    /// cannot race each other for it.
+    async fn stub_pds(
+        dir: &std::path::Path,
+        repos: HashMap<String, Vec<serde_json::Value>>,
+        foreign: HashMap<String, String>,
+    ) -> Arc<Stub> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let stub = Arc::new(Stub {
+            base: base.clone(),
+            repos,
+            publications: Mutex::new(HashMap::new()),
+            foreign,
+            written: Mutex::new(Vec::new()),
+            auth: Mutex::new(Vec::new()),
+        });
+        let router = Router::new()
+            .route(
+                "/xrpc/com.atproto.server.createSession",
+                post(create_session),
+            )
+            .route(
+                "/xrpc/com.atproto.server.deleteSession",
+                post(delete_session),
+            )
+            .route("/xrpc/com.atproto.repo.putRecord", post(put_record))
+            .route("/xrpc/com.atproto.repo.listRecords", get(list_records))
+            .route(
+                "/xrpc/com.atproto.identity.resolveHandle",
+                get(resolve_handle),
+            )
+            .route("/{did}", get(plc))
+            .with_state(stub.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let config = hush_core::config::ClientConfig {
+            atproto_plc_url: Some(base.clone()),
+            ..Default::default()
+        };
+        hush_core::config::save(dir, &config).unwrap();
+        stub
+    }
 
-        let (status, pen) = request(
-            &router,
+    fn document(title: &str, secs: u64, tags: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "title": title,
+            "textContent": format!("The body of {title}."),
+            "tags": tags,
+            "publishedAt": hush_atproto::rfc3339(secs * 1000),
+            "path": "/p",
+        })
+    }
+
+    /// Connect the vault to the stub, which is what every test past setup needs.
+    async fn connect(router: &axum::Router, pds: &str) -> serde_json::Value {
+        let (status, view) = request(
+            router,
+            "POST",
+            "/api/atproto/connect",
+            Some(&format!(
+                r#"{{"pds":"{pds}","identifier":"ada.test","password":"app-pw"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        view
+    }
+
+    /// Set the publication a publish needs, and return the stub's record of it.
+    async fn set_publication(router: &axum::Router) -> serde_json::Value {
+        let (status, view) = request(
+            router,
+            "POST",
+            "/api/atproto/publication",
+            Some(r#"{"name":"Ada's zine","url":"https://ada.example/"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        view
+    }
+
+    /// Choose a byline and write one zine, answering its id.
+    async fn write_a_zine(router: &axum::Router) -> String {
+        request(
+            router,
             "POST",
             "/api/zines/pen-name",
             Some(r#"{"name":"ada"}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{pen}");
-
         let (status, created) = request(
-            &router,
+            router,
             "POST",
             "/api/zines",
-            Some(r#"{"title":"On relays","sections":["Rust","Nostr"],"body":"<p>hello <strong>world</strong></p><p>Second.</p>"}"#),
+            Some(r#"{"title":"On relays","sections":["Rust"],"body":"<p>hello <strong>world</strong></p>"}"#),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{created}");
-        let zine_id = created["zine_id"].as_str().unwrap().to_string();
-
-        let (status, identity) = request(
-            &router,
-            "POST",
-            "/api/neighborhoods/identity",
-            Some("{}"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{identity}");
-        let pubkey = identity["pubkey"].as_str().unwrap().to_string();
-
-        // One relay, so the event's relay hints and the publish target are both
-        // non-empty and known.
-        let (status, _) = request(
-            &router,
-            "POST",
-            "/api/neighborhoods/settings",
-            Some(r#"{"allowlist":["wss://relay.example"],"min_minutes":1,"default_show":true}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-
-        (dir, app, router, zine_id, pubkey)
+        created["zine_id"].as_str().unwrap().to_string()
     }
 
-    pub(super) fn verify(event: &Event) {
-        use k256::schnorr::signature::hazmat::PrehashVerifier;
-        let xonly: [u8; 32] = hex::decode(&event.pubkey).unwrap().try_into().unwrap();
-        let verifying = k256::schnorr::VerifyingKey::from_bytes(&xonly).unwrap();
-        let signature = k256::schnorr::Signature::try_from(
-            hex::decode(&event.sig).unwrap().as_slice(),
-        )
-        .unwrap();
-        let id: [u8; 32] = hex::decode(&event.id).unwrap().try_into().unwrap();
-        verifying
-            .verify_prehash(&id, &signature)
-            .expect("a relay checks exactly this, against exactly this key");
-    }
-
-    /// The article that goes out is the one the gate and every other NIP-23
-    /// client will read: the kind, the `d` and `title` the gate requires, the
-    /// sections as `t`, a derived summary, the body as Markdown, and a signature
-    /// over the id under the pubkey the event names.
     #[tokio::test]
-    async fn an_export_publishes_a_signed_nip23_article() {
-        let sink = FakeSink::accepting();
-        let (_dir, _app, router, zine_id, pubkey) = exportable(sink.clone()).await;
+    async fn the_lane_starts_empty_and_names_no_account() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
 
-        let (status, out) = request(
+        let (status, view) = request(&router, "GET", "/api/atproto", None).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert!(view["account"].is_null(), "no account before one is connected");
+        assert!(view["publication"].is_null());
+        assert_eq!(view["follows"].as_array().unwrap().len(), 0);
+        assert_eq!(view["documents"].as_array().unwrap().len(), 0);
+        assert_eq!(view["tags"].as_array().unwrap().len(), 0);
+
+        // Nothing on the lane needs the network before an account exists, so a
+        // refresh with no follows is a no-op rather than a failure.
+        let (status, refreshed) = request(&router, "POST", "/api/atproto/refresh", None).await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        assert_eq!(refreshed["changed"], 0);
+        assert_eq!(refreshed["failed"].as_array().unwrap().len(), 0);
+    }
+
+    /// The credential is the one thing this route carries, and the one thing it
+    /// must not hand back. The webview has no use for an app password or a token
+    /// pair, and a token in a response is a token in a log.
+    #[tokio::test]
+    async fn a_connect_keeps_the_password_and_the_tokens_out_of_the_answer() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let stub = stub_pds(dir.path(), HashMap::new(), HashMap::new()).await;
+
+        let (status, view) = request(
             &router,
             "POST",
-            &format!("/api/zines/{zine_id}/export"),
+            "/api/atproto/connect",
+            Some(&format!(
+                r#"{{"pds":"{}","identifier":"ada.test","password":"app-pw"}}"#,
+                stub.base
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["account"]["did"], "did:plc:writer");
+        assert_eq!(view["account"]["handle"], "ada.test");
+        assert_eq!(view["account"]["pds"], stub.base);
+
+        let wire = view.to_string();
+        for secret in ["app-pw", "access-1", "refresh-1"] {
+            assert!(!wire.contains(secret), "{secret} reached the webview: {wire}");
+        }
+
+        // The session survives the request: the vault holds it, not the webview.
+        let (status, again) = request(&router, "GET", "/api/atproto", None).await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert_eq!(again["account"]["did"], "did:plc:writer");
+    }
+
+    #[tokio::test]
+    async fn a_pds_that_is_not_https_is_refused_before_a_request_is_made() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        for bad in [
+            // Cleartext to a host that is not this machine: an app password on
+            // the wire is the whole risk.
+            "http://pds.example",
+            "http://10.0.0.5:9876",
+            "bsky.social",
+            "ftp://pds.example",
+            // A name that merely begins with a loopback literal is not loopback.
+            "http://127.0.0.1.example.com",
+        ] {
+            let (status, err) = request(
+                &router,
+                "POST",
+                "/api/atproto/connect",
+                Some(&format!(
+                    r#"{{"pds":"{bad}","identifier":"ada.test","password":"app-pw"}}"#
+                )),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {err}");
+            assert!(err["error"].as_str().unwrap().contains("PDS"), "{bad}: {err}");
+        }
+    }
+
+    /// A publish needs two things that are not the zine: an account to write as
+    /// and a publication to write under. Both refusals are conflicts rather than
+    /// errors, because both are states the member can leave.
+    #[tokio::test]
+    async fn publishing_needs_an_account_and_then_a_publication() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let stub = stub_pds(dir.path(), HashMap::new(), HashMap::new()).await;
+        let zine_id = write_a_zine(&router).await;
+
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/publish"),
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{out}");
-        assert_eq!(out["published"], true, "{out}");
-        assert_eq!(out["publish_error"], "", "{out}");
-        assert_eq!(out["pubkey"], pubkey);
-        assert_eq!(out["d"].as_str().unwrap().len(), 32, "a 16-byte mint in hex");
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("connect"), "{err}");
+
+        connect(&router, &stub.base).await;
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/publish"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("publication"), "{err}");
+
+        // A post this vault does not hold is 404, not a conflict: there is
+        // nothing to publish and nothing the member can change.
+        set_publication(&router).await;
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{}/publish", "c".repeat(64)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+    }
+
+    /// The whole point of the lane: what goes out is a title, a plaintext body,
+    /// the sections as tags and a date, and nothing else. The record shape has
+    /// nowhere to put the private half, so the assertion is on the bytes the PDS
+    /// was actually handed.
+    #[tokio::test]
+    async fn a_publish_writes_a_document_and_the_private_half_stays_home() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let stub = stub_pds(dir.path(), HashMap::new(), HashMap::new()).await;
+        connect(&router, &stub.base).await;
+        set_publication(&router).await;
+        let zine_id = write_a_zine(&router).await;
+
+        let (status, published) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/publish"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{published}");
+        assert_eq!(published["published"], true, "{published}");
+        assert_eq!(published["publish_error"], "");
+
+        let rkey = published["rkey"].as_str().unwrap().to_string();
+        assert_eq!(rkey.len(), 32, "the record key is derived, not the zine id");
         assert_eq!(
-            out["address"],
-            format!("30023:{pubkey}:{}", out["d"].as_str().unwrap())
+            published["uri"],
+            format!("at://did:plc:writer/site.standard.document/{rkey}")
         );
-        assert!(out["naddr"].as_str().unwrap().starts_with("naddr1"), "{out}");
-        assert_eq!(out["event_id"].as_str().unwrap().len(), 64);
-        assert!(out["zine"]["export"].is_object(), "the address is recorded");
+        assert_eq!(
+            published["url"],
+            format!("https://ada.example/{rkey}"),
+            "the reader's link is the publication's address and the path"
+        );
 
-        let events = sink.events();
-        assert_eq!(events.len(), 1, "one event, to the one relay");
-        let event = &events[0];
-        assert_eq!(event.kind, 30023);
-        assert_eq!(event.pubkey, pubkey);
-        assert_eq!(event.id, out["event_id"].as_str().unwrap());
-        verify(event);
-
-        let tag = |name: &str| -> Option<String> {
-            event
-                .tags
-                .iter()
-                .find(|t| t[0] == name)
-                .map(|t| t[1].clone())
-        };
-        assert_eq!(tag("d"), Some(out["d"].as_str().unwrap().to_string()));
-        assert_eq!(tag("title"), Some("On relays".to_string()));
-        assert_eq!(tag("published_at"), Some(out["published_at"].to_string()));
-        let sections: Vec<String> = event
-            .tags
-            .iter()
-            .filter(|t| t[0] == "t")
-            .map(|t| t[1].clone())
-            .collect();
-        assert_eq!(sections, vec!["rust", "nostr"], "sections travel as `t`");
+        // The record itself, as the PDS received it.
+        let written = stub.written.lock().unwrap().clone();
+        assert_eq!(written.len(), 2, "the publication, then the document");
+        let record = &written[1];
+        assert_eq!(record["collection"], "site.standard.document");
+        assert_eq!(record["record"]["$type"], "site.standard.document");
+        assert_eq!(record["record"]["title"], "On relays");
+        assert_eq!(
+            record["record"]["textContent"], "hello world",
+            "the body arrives reduced to plaintext, with no markup left"
+        );
+        assert_eq!(record["record"]["tags"][0], "rust", "a section is normalized");
+        assert_eq!(
+            record["record"]["site"],
+            "at://did:plc:writer/site.standard.publication/self"
+        );
         assert!(
-            tag("summary").unwrap().starts_with("hello world"),
-            "a card preview is derived from the body: {event:?}"
+            record["record"].get("updatedAt").is_none(),
+            "a first publish has no update time: {record}"
         );
-
-        // The body is Markdown, not the stored HTML: a public client would show
-        // the tags as text.
-        assert!(event.content.contains("hello **world**"), "{}", event.content);
-        assert!(!event.content.contains("<p>"), "{}", event.content);
-        assert!(event.content.contains("Second."), "{}", event.content);
-        // And the address the app recorded is the one it published.
-        let (_, one) = request(&router, "GET", &format!("/api/zines/{zine_id}"), None).await;
-        assert_eq!(one["zine"]["export"]["d"], out["d"]);
-        assert_eq!(one["zine"]["export"]["last_event_id"], out["event_id"]);
-        assert_eq!(one["zine"]["export"]["published_at"], out["published_at"]);
-    }
-
-    /// The one-way door, asserted on the bytes that leave: a comment thread, a
-    /// revision history, the read key and the byline have nowhere to go. The
-    /// `d` is the interesting one — it is the only thing that could tie the
-    /// private post to the public article, and it must not be the zine id.
-    #[tokio::test]
-    async fn nothing_private_reaches_the_article() {
-        let sink = FakeSink::accepting();
-        let (_dir, _app, router, zine_id, _) = exportable(sink.clone()).await;
-
-        let (status, out) = request(
-            &router,
-            "POST",
-            &format!("/api/zines/{zine_id}/export"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{out}");
-        let (_, one) = request(&router, "GET", &format!("/api/zines/{zine_id}"), None).await;
-        let read_key = one["zine"]["read_key"].as_str().unwrap().to_string();
-
-        let event = &sink.events()[0];
-        let haystack = format!("{}{}", event.content, serde_json::to_string(&event.tags).unwrap());
-        for forbidden in [
-            "read_key",
-            "pen_name",
-            "pen_id",
-            "zine_id",
-            "prev_hash",
-            "comments",
-            "signature",
-            &read_key,
-            &zine_id,
+        let encoded = record.to_string();
+        for private in [
+            "pen", "zine_id", "read_key", "revision", "prev_hash", "comment", "read key",
         ] {
             assert!(
-                !haystack.contains(forbidden),
-                "`{forbidden}` reached the article: {haystack}"
+                !encoded.contains(private),
+                "{private} reached the public record: {encoded}"
             );
         }
-        assert_ne!(
-            out["d"].as_str().unwrap(),
-            zine_id,
-            "the address is not the post id, or the link would be public"
+
+        // The local half remembers where it went, so a row can link to it.
+        assert_eq!(
+            published["zines"][0]["public"]["uri"],
+            published["uri"],
+            "the index carries the public address back to the UI"
         );
-        assert!(
-            !event.tags.iter().any(|t| t[0] == "a" || t[0] == "e"),
-            "no reference back to anything private: {:?}",
-            event.tags
-        );
+        assert_eq!(published["zines"][0]["public"]["did"], "did:plc:writer");
+
+        // And it survives a restart, because it lives in the vault and not in
+        // the response.
+        let (status, index) = request(&router, "GET", "/api/zines", None).await;
+        assert_eq!(status, StatusCode::OK, "{index}");
+        assert_eq!(index["zines"][0]["public"]["uri"], published["uri"]);
     }
 
-    /// A re-export is an edit at the same address. The `d` and `published_at`
-    /// must not move — a new `d` would publish a second article beside the
-    /// first, and a moved `published_at` would claim the article was written
-    /// later than it was — while the content and the id do.
+    /// A re-publish replaces the record rather than adding one beside it, and an
+    /// edit does not claim the post was written later than it was.
     #[tokio::test]
-    async fn a_second_export_reuses_the_address_and_moves_only_the_content() {
-        let sink = FakeSink::accepting();
-        let (_dir, _app, router, zine_id, _) = exportable(sink.clone()).await;
+    async fn a_re_publish_replaces_the_record_and_holds_the_first_publish_time() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let stub = stub_pds(dir.path(), HashMap::new(), HashMap::new()).await;
+        connect(&router, &stub.base).await;
+        set_publication(&router).await;
+        let zine_id = write_a_zine(&router).await;
 
-        let (status, first) = request(
+        let (_, first) = request(
             &router,
             "POST",
-            &format!("/api/zines/{zine_id}/export"),
+            &format!("/api/zines/{zine_id}/publish"),
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{first}");
-
+        // Edit, then publish again.
         let (status, edited) = request(
             &router,
             "POST",
             "/api/zines",
             Some(&format!(
-                r#"{{"zine_id":"{zine_id}","title":"On relays, again","sections":["rust"],"body":"<p>rewritten</p>"}}"#
+                r#"{{"zine_id":"{zine_id}","title":"On relays","body":"<p>hello again</p>"}}"#
             )),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{edited}");
-        assert_eq!(edited["revision"], 2);
-
         let (status, second) = request(
             &router,
             "POST",
-            &format!("/api/zines/{zine_id}/export"),
+            &format!("/api/zines/{zine_id}/publish"),
             None,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{second}");
 
-        assert_eq!(second["d"], first["d"], "the address is the article's");
-        assert_eq!(second["address"], first["address"]);
-        assert_eq!(second["published_at"], first["published_at"]);
-        assert_ne!(second["event_id"], first["event_id"], "an edit is a new event");
-
-        let events = sink.events();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1].kind, 30023);
-        assert_eq!(events[1].content, "rewritten");
+        assert_eq!(second["rkey"], first["rkey"], "one record, replaced in place");
+        assert_eq!(second["uri"], first["uri"]);
+        let written = stub.written.lock().unwrap().clone();
+        let first_doc = written[1]["record"].clone();
+        let second_doc = written[2]["record"].clone();
         assert_eq!(
-            events[0].tags.iter().find(|t| t[0] == "d"),
-            events[1].tags.iter().find(|t| t[0] == "d"),
-            "the same `d` both times"
+            second_doc["publishedAt"], first_doc["publishedAt"],
+            "the first publish time is held: an edit is not a new post"
         );
-        verify(&events[1]);
-    }
-
-    /// A refusal is a status, not a lost article: the address is recorded either
-    /// way, so the retry publishes the same one rather than a second article.
-    #[tokio::test]
-    async fn a_refused_publish_keeps_the_address_for_the_retry() {
-        let sink = FakeSink::refusing("wss://relay.example: connection refused");
-        let (_dir, _app, router, zine_id, _) = exportable(sink).await;
-
-        let (status, out) = request(
-            &router,
-            "POST",
-            &format!("/api/zines/{zine_id}/export"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{out}");
-        assert_eq!(out["published"], false);
+        assert_eq!(second_doc["textContent"], "hello again");
         assert!(
-            out["publish_error"].as_str().unwrap().contains("connection refused"),
-            "{out}"
+            second_doc["updatedAt"].is_string(),
+            "the revision's own time goes in updatedAt: {second_doc}"
         );
-        assert_eq!(
-            out["zine"]["export"]["d"], out["d"],
-            "the address is minted before the publish, so a failure does not move it"
-        );
-
-        let (status, retry) = request(
-            &router,
-            "POST",
-            &format!("/api/zines/{zine_id}/export"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{retry}");
-        assert_eq!(retry["d"], out["d"], "the retry publishes the same article");
-        assert_eq!(retry["published_at"], out["published_at"]);
+        // One document write per publish, and the publication was written once.
+        assert_eq!(written.len(), 3);
     }
 
-    /// An export must not be the thing that mints the identity it publishes
-    /// under, and it must not leave an address behind for a retry to find when
-    /// it could not go out at all.
+    /// A handle is what a member reads and a DID is what addresses a repo, so
+    /// the route crosses that gap against the PDS this vault already speaks to —
+    /// and a DID needs nobody's help, so pasting one does not require an account.
     #[tokio::test]
-    async fn an_export_before_a_public_identity_is_refused_and_mints_nothing() {
+    async fn follows_resolve_a_handle_against_the_connected_pds_and_a_did_needs_nobody() {
         let dir = TempDir::new().unwrap();
-        let app = unlocked_app(dir.path()).await;
-        *app.neighborhoods_sink.lock().await = Some(FakeSink::accepting());
-        let router = api_router(app);
+        let router = api_router(unlocked_app(dir.path()).await);
+        let stub = stub_pds(dir.path(), HashMap::new(), HashMap::new()).await;
 
-        let (status, pen) = request(
+        // A DID is the answer already: no account, no request.
+        let (status, view) = request(
             &router,
             "POST",
-            "/api/zines/pen-name",
-            Some(r#"{"name":"ada"}"#),
+            "/api/atproto/follows",
+            Some(r#"{"follows":[{"did":"did:plc:known","name":"Known"}]}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{pen}");
-        let (status, created) = request(
-            &router,
-            "POST",
-            "/api/zines",
-            Some(r#"{"title":"On relays","body":"<p>hello</p>"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{created}");
-        let zine_id = created["zine_id"].as_str().unwrap().to_string();
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["follows"][0]["did"], "did:plc:known");
+        assert_eq!(view["follows"][0]["name"], "Known");
 
+        // A handle needs a PDS to ask, and there is not one without an account.
         let (status, err) = request(
             &router,
             "POST",
-            &format!("/api/zines/{zine_id}/export"),
-            None,
+            "/api/atproto/follows",
+            Some(r#"{"follows":[{"handle":"ada.test"}]}"#),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{err}");
-        assert!(
-            err["error"].as_str().unwrap().contains("public identity"),
-            "{err}"
-        );
 
-        let (_, one) = request(&router, "GET", &format!("/api/zines/{zine_id}"), None).await;
-        assert!(one["zine"]["export"].is_null(), "no address was minted");
-        let (status, identity) = request(&router, "GET", "/api/neighborhoods/identity", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(identity.is_null(), "and no identity was created either");
-    }
-
-    /// An empty allowlist is a configuration problem, not a gateway problem, and
-    /// it is refused before an address is minted: an export that cannot go out
-    /// must leave nothing behind.
-    #[tokio::test]
-    async fn an_export_with_no_relays_is_refused_and_mints_nothing() {
-        let sink = FakeSink::accepting();
-        let (_dir, _app, router, zine_id, _) = exportable(sink.clone()).await;
-        let (status, _) = request(
+        connect(&router, &stub.base).await;
+        let (status, view) = request(
             &router,
             "POST",
-            "/api/neighborhoods/settings",
-            Some(r#"{"allowlist":[],"min_minutes":1,"default_show":true}"#),
+            "/api/atproto/follows",
+            Some(r#"{"follows":[{"handle":"@ada.test"}]}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-
-        let (status, err) = request(
-            &router,
-            "POST",
-            &format!("/api/zines/{zine_id}/export"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{err}");
-        assert!(err["error"].as_str().unwrap().contains("no relays"), "{err}");
-        assert!(sink.events().is_empty(), "nothing was sent anywhere");
-
-        let (_, one) = request(&router, "GET", &format!("/api/zines/{zine_id}"), None).await;
-        assert!(one["zine"]["export"].is_null(), "no address was minted");
-    }
-
-    /// The export route is as private as the sidecar: a locked vault is a 401
-    /// before any of the policy above runs.
-    #[tokio::test]
-    async fn the_export_route_is_401_while_locked() {
-        use crate::notes_api_tests::build_app;
-        let dir = TempDir::new().unwrap();
-        let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
-        let (status, _) = request(
-            &router,
-            "POST",
-            &format!("/api/zines/{}/export", "a".repeat(64)),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-}
-
-/// Public commenting (Task 22, Phase 4): the write half of the comment lane.
-///
-/// The transport is a stub, because what has to hold is not that a relay was
-/// reached but that the *event* is the NIP-22 one other clients read: the right
-/// kind, the root tags that scope it to the article, the parent tags that scope a
-/// reply to the comment it answers, plaintext, and a signature that verifies
-/// under the public identity. And that the private thread is not involved at all.
-#[cfg(test)]
-mod neighborhood_comment_api_tests {
-    use super::*;
-    use crate::notes_api_tests::{request, unlocked_app};
-    use crate::zine_export_api_tests::{verify, FakeSink};
-    use crate::zines_api_tests::{long_form_event, FakeRelay};
-    use tempfile::TempDir;
-
-    /// A comment event as a relay would serve it.
-    fn comment_event(
-        id: &str,
-        root: &str,
-        parent: Option<&str>,
-        created_at: u64,
-        body: &str,
-    ) -> hush_articles::RawEvent {
-        let mut tags = vec![
-            serde_json::json!(["A", root]),
-            serde_json::json!(["K", hush_articles::KIND_LONG_FORM.to_string()]),
-            serde_json::json!(["P", "cc"]),
-        ];
-        match parent {
-            Some(parent) => {
-                tags.push(serde_json::json!(["e", parent]));
-                tags.push(serde_json::json!(["k", hush_articles::KIND_COMMENT.to_string()]));
-                tags.push(serde_json::json!(["p", "dd"]));
-            }
-            None => tags.push(serde_json::json!(["k", hush_articles::KIND_LONG_FORM.to_string()])),
-        }
-        serde_json::from_value(serde_json::json!({
-            "id": id,
-            "pubkey": "cc",
-            "created_at": created_at,
-            "kind": hush_articles::KIND_COMMENT,
-            "tags": tags,
-            "content": body,
-        }))
-        .unwrap()
-    }
-
-    async fn set_allowlist(router: &axum::Router) {
-        let (status, _) = request(
-            router,
-            "POST",
-            "/api/neighborhoods/settings",
-            Some(r#"{"allowlist":["wss://relay.example"],"min_minutes":1,"default_show":true}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    /// A vault with one article published and its thread readable: a byline, a
-    /// post, a public identity, an allowlist, a stubbed sink, and a stubbed relay
-    /// holding the article the export produced plus whatever `comments` builds.
-    ///
-    /// The export runs first so the address is the real one — the address is what
-    /// a comment is scoped to, so a made-up one would test the mapping against
-    /// something no member will ever have. `comments` is a function of that
-    /// address for the same reason.
-    ///
-    /// Returns the address, the public key, and the id of the article version the
-    /// relay serves — the last because a top-level comment's `e` tag names it.
-    async fn published(
-        sink: Arc<FakeSink>,
-        comments: impl FnOnce(&str) -> Vec<hush_articles::RawEvent>,
-    ) -> (TempDir, axum::Router, String, String, String) {
-        let dir = TempDir::new().unwrap();
-        let app = unlocked_app(dir.path()).await;
-        *app.neighborhoods_sink.lock().await = Some(sink);
-        let router = api_router(app.clone());
-
-        let (status, pen) = request(
-            &router,
-            "POST",
-            "/api/zines/pen-name",
-            Some(r#"{"name":"ada"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{pen}");
-        let (status, created) = request(
-            &router,
-            "POST",
-            "/api/zines",
-            Some(r#"{"title":"On relays","body":"<p>hello</p>"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{created}");
-        let zine_id = created["zine_id"].as_str().unwrap().to_string();
-
-        let (status, identity) = request(&router, "POST", "/api/neighborhoods/identity", Some("{}")).await;
-        assert_eq!(status, StatusCode::OK, "{identity}");
-        let pubkey = identity["pubkey"].as_str().unwrap().to_string();
-
-        set_allowlist(&router).await;
-
-        let (status, out) = request(
-            &router,
-            "POST",
-            &format!("/api/zines/{zine_id}/export"),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{out}");
-        let address = out["address"].as_str().unwrap().to_string();
-        let d = out["d"].as_str().unwrap().to_string();
-
-        // The relay now serves back the article that was published, plus
-        // whatever the test wants the thread to hold.
-        let article = long_form_event(&pubkey, &d, 20, &"word ".repeat(800));
-        let article_id = article.id.clone();
-        *app.neighborhoods_source.lock().await = Some(FakeRelay::new(
-            vec![article],
-            comments(&address),
-        ));
-
-        let (status, view) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
         assert_eq!(status, StatusCode::OK, "{view}");
         assert_eq!(
-            view["articles"].as_array().unwrap().len(),
-            1,
-            "the published article is cached: {view}"
+            view["follows"][0]["did"], "did:plc:ada.test",
+            "the `@` is a display habit, not part of a name"
         );
+        assert_eq!(view["follows"][0]["handle"], "@ada.test");
 
-        (dir, router, address, pubkey, article_id)
-    }
-
-    fn tag(event: &hush_articles::Event, name: &str) -> Option<String> {
-        event
-            .tags
-            .iter()
-            .find(|t| t[0] == name)
-            .map(|t| t[1].clone())
-    }
-
-    /// The comment that goes out is the one NIP-22 clients read: kind 1111,
-    /// plaintext, scoped to the article with both the root and the parent tags,
-    /// and signed by the public identity rather than the pen name.
-    #[tokio::test]
-    async fn a_comment_is_published_as_a_signed_nip22_event() {
-        let sink = FakeSink::accepting();
-        let (_dir, router, address, pubkey, article_id) = published(sink.clone(), |_| vec![]).await;
-
-        let (status, out) = request(
+        // The whole list is replaced, because that is what a curated lane is.
+        let (_, view) = request(
             &router,
             "POST",
-            &format!("/api/neighborhoods/{address}/comment"),
-            Some(r#"{"body":"  Worth reading.  "}"#),
+            "/api/atproto/follows",
+            Some(r#"{"follows":[{"did":"did:plc:one"},{"did":"did:plc:one"}]}"#),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{out}");
-        assert_eq!(out["published"], true, "{out}");
-        assert_eq!(out["publish_error"], "", "{out}");
-        assert_eq!(out["address"], address);
-        assert_eq!(out["event_id"].as_str().unwrap().len(), 64);
+        assert_eq!(view["follows"].as_array().unwrap().len(), 1, "deduplicated");
 
-        // The thread comes back with the comment already in it: the page shows a
-        // thread, so it should not have to splice its own words in.
-        let replies = out["replies"].as_array().unwrap();
-        assert_eq!(replies.len(), 1, "{out}");
-        assert_eq!(replies[0]["content"], "Worth reading.");
-        assert_eq!(replies[0]["pubkey"], pubkey);
-        assert!(replies[0]["parent_id"].is_null(), "a top-level comment");
-
-        // The export went out first; the comment is the second event.
-        let events = sink.events();
-        assert_eq!(events.len(), 2, "{events:?}");
-        let event = &events[1];
-        assert_eq!(event.kind, 1111);
-        assert_eq!(event.pubkey, pubkey);
-        assert_eq!(event.content, "Worth reading.", "plaintext, trimmed");
-        assert_eq!(event.id, out["event_id"].as_str().unwrap());
-        verify(event);
-
-        assert_eq!(tag(event, "A").as_deref(), Some(address.as_str()));
-        assert_eq!(tag(event, "K").as_deref(), Some("30023"));
-        assert_eq!(tag(event, "P").as_deref(), Some(pubkey.as_str()));
-        assert_eq!(
-            tag(event, "a").as_deref(),
-            Some(address.as_str()),
-            "a top-level comment's parent is the article"
-        );
-        assert_eq!(tag(event, "k").as_deref(), Some("30023"));
-        assert_eq!(tag(event, "p").as_deref(), Some(pubkey.as_str()));
-        assert_eq!(
-            tag(event, "e").as_deref(),
-            Some(article_id.as_str()),
-            "the parent event id is the article version's, not the comment's"
-        );
-    }
-
-    /// A reply keeps the article as its root and moves only the parent, which is
-    /// the whole of NIP-22 threading.
-    #[tokio::test]
-    async fn a_reply_scopes_to_the_article_and_names_the_comment_it_answers() {
-        let sink = FakeSink::accepting();
-        let (_dir, router, address, pubkey, _article_id) = published(sink.clone(), |address| {
-            vec![
-                // A comment in a thread this vault did not ask for. A relay
-                // answers what it likes; it is not one of its threads.
-                comment_event("other-thread", "30023:zz:elsewhere", None, 5, "not ours"),
-                comment_event("parent-1", address, None, 10, "first"),
-                comment_event("child-1", address, Some("parent-1"), 11, "answering"),
-            ]
-        })
-        .await;
-
-        // The article read carries the thread, oldest first, with the reply's
-        // parent named — and nothing from a thread this vault did not ask for.
-        let (status, article) =
-            request(&router, "GET", &format!("/api/neighborhoods/{address}"), None).await;
-        assert_eq!(status, StatusCode::OK, "{article}");
-        let replies = article["replies"].as_array().unwrap();
-        assert_eq!(replies.len(), 2, "{article}");
-        assert_eq!(replies[0]["content"], "first");
-        assert!(replies[0]["parent_id"].is_null());
-        assert_eq!(replies[1]["content"], "answering");
-        assert_eq!(replies[1]["parent_id"], "parent-1");
-
-        // Replying to the comment, not the article.
-        let (status, out) = request(
-            &router,
-            "POST",
-            &format!("/api/neighborhoods/{address}/comment"),
-            Some(r#"{"body":"Same here.","parent_id":"parent-1"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{out}");
-
-        let events = sink.events();
-        let event = &events[events.len() - 1];
-        assert_eq!(event.kind, 1111);
-        assert_eq!(
-            tag(event, "A").as_deref(),
-            Some(address.as_str()),
-            "the root stays the article"
-        );
-        assert_eq!(tag(event, "K").as_deref(), Some("30023"));
-        assert_eq!(tag(event, "P").as_deref(), Some(pubkey.as_str()));
-        assert_eq!(
-            tag(event, "e").as_deref(),
-            Some("parent-1"),
-            "the parent is the comment"
-        );
-        assert_eq!(
-            tag(event, "k").as_deref(),
-            Some("1111"),
-            "the parent kind is what tells a reply from a top-level comment"
-        );
-        assert_eq!(tag(event, "p").as_deref(), Some("cc"), "the parent's author");
-        assert!(
-            event.tags.iter().all(|t| t[0] != "a"),
-            "a reply has no lowercase address tag: the parent is a comment: {:?}",
-            event.tags
-        );
-        verify(event);
-
-        // And the thread now holds three, with the reply where it belongs.
-        let (_, article) =
-            request(&router, "GET", &format!("/api/neighborhoods/{address}"), None).await;
-        let replies = article["replies"].as_array().unwrap();
-        assert_eq!(replies.len(), 3, "{article}");
-        assert_eq!(replies[2]["parent_id"], "parent-1");
-    }
-
-    /// A comment names the version it was written against, so commenting on
-    /// something this vault does not hold would mean guessing at an event id.
-    #[tokio::test]
-    async fn commenting_on_an_article_this_vault_does_not_hold_is_a_404() {
-        let sink = FakeSink::accepting();
-        let (_dir, router, _address, _pubkey, _article_id) =
-            published(sink.clone(), |_| vec![]).await;
-
+        // Over the cap is refused with a reason, not silently truncated.
+        let many: Vec<String> = (0..hush_atproto::FOLLOWS_CAP + 1)
+            .map(|i| format!(r#"{{"did":"did:plc:{i}"}}"#))
+            .collect();
         let (status, err) = request(
             &router,
             "POST",
-            "/api/neighborhoods/30023:aa:missing/comment",
-            Some(r#"{"body":"hello"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
-        assert!(sink.events().len() == 1, "nothing was sent");
-    }
-
-    /// A parent this vault cannot read is one whose author it cannot name, and a
-    /// parent from another thread would file the reply under the wrong article.
-    #[tokio::test]
-    async fn a_reply_to_a_comment_that_is_not_held_is_refused() {
-        let sink = FakeSink::accepting();
-        let (_dir, router, address, _, _article_id) = published(sink.clone(), |_| vec![]).await;
-
-        let (status, err) = request(
-            &router,
-            "POST",
-            &format!("/api/neighborhoods/{address}/comment"),
-            Some(r#"{"body":"hello","parent_id":"not-held"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
-        assert!(
-            err["error"].as_str().unwrap().contains("not-held"),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_empty_or_oversized_comment_is_refused() {
-        let sink = FakeSink::accepting();
-        let (_dir, router, address, _, _article_id) = published(sink.clone(), |_| vec![]).await;
-
-        let (status, err) = request(
-            &router,
-            "POST",
-            &format!("/api/neighborhoods/{address}/comment"),
-            Some(r#"{"body":"   "}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
-
-        let huge = "x".repeat(NEIGHBORHOOD_COMMENT_CHARS + 1);
-        let (status, err) = request(
-            &router,
-            "POST",
-            &format!("/api/neighborhoods/{address}/comment"),
-            Some(&format!(r#"{{"body":"{huge}"}}"#)),
+            "/api/atproto/follows",
+            Some(&format!(r#"{{"follows":[{}]}}"#, many.join(","))),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
         assert!(err["error"].as_str().unwrap().contains("at most"), "{err}");
-        assert_eq!(sink.events().len(), 1, "only the export was ever sent");
     }
 
-    /// A comment must not be the thing that mints the identity it speaks under.
+    /// The read half: every followed repo is read from its own PDS, cached, and
+    /// the failures are reported per publication rather than raised, because one
+    /// unreachable host must not cost the member the rest of the lane.
     #[tokio::test]
-    async fn commenting_before_a_public_identity_is_refused_and_mints_nothing() {
+    async fn a_refresh_reads_every_followed_repo_and_reports_what_it_could_not() {
         let dir = TempDir::new().unwrap();
-        let app = unlocked_app(dir.path()).await;
-        *app.neighborhoods_sink.lock().await = Some(FakeSink::accepting());
-        // An article in the cache, with no identity in the vault: the cache is
-        // filled by a refresh, which mints nothing.
-        *app.neighborhoods_source.lock().await =
-            Some(FakeRelay::articles(vec![long_form_event(
-                "aa",
-                "kept",
-                20,
-                &"word ".repeat(800),
-            )]));
-        let router = api_router(app);
+        let router = api_router(unlocked_app(dir.path()).await);
+        let mut repos = HashMap::new();
+        repos.insert("did:plc:one".to_string(), vec![document("One", 100, &["Rust"])]);
+        repos.insert(
+            "did:plc:two".to_string(),
+            vec![document("Two", 200, &["rust", "notes"]), document("Three", 50, &[])],
+        );
+        let mut foreign = HashMap::new();
+        // A PDS nothing is listening on: reading this follow must fail alone.
+        foreign.insert("did:plc:down".to_string(), "http://127.0.0.1:1".to_string());
+        let stub = stub_pds(dir.path(), repos, foreign).await;
 
-        let (status, _) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
-        assert_eq!(status, StatusCode::OK);
+        let (status, view) = request(
+            &router,
+            "POST",
+            "/api/atproto/follows",
+            Some(
+                r#"{"follows":[
+                    {"did":"did:plc:one","handle":"one.test"},
+                    {"did":"did:plc:two","handle":"two.test"},
+                    {"did":"did:plc:down","handle":"down.test"}
+                ]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+
+        let (status, refreshed) = request(&router, "POST", "/api/atproto/refresh", None).await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        assert_eq!(refreshed["changed"], 3, "{refreshed}");
+        let failed = refreshed["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "{refreshed}");
+        assert!(
+            failed[0].as_str().unwrap().starts_with("down.test: "),
+            "{refreshed}"
+        );
+
+        // The index is newest first across follows, and carries a taste rather
+        // than a body: a page of fifty full articles is megabytes for a screen
+        // that shows titles.
+        let titles: Vec<&str> = refreshed["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(titles, vec!["Two", "One", "Three"]);
+        assert_eq!(refreshed["documents"][0]["preview"], "The body of Two.");
+        assert!(refreshed["documents"][0].get("text").is_none(), "no body in the index");
+
+        // The tag facet counts case-insensitively and is most-used first.
+        let tags: Vec<(String, u64)> = refreshed["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap().to_string(), t["count"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(tags, vec![("rust".to_string(), 2), ("notes".to_string(), 1)]);
+
+        // A second pass over unchanged repos is not a change, which is what
+        // makes a poll cheap enough to run on a timer.
+        let (_, again) = request(&router, "POST", "/api/atproto/refresh", None).await;
+        assert_eq!(again["changed"], 0);
+
+        // The body is one request away, served from the cache: opening a page
+        // costs no network and no PDS learns which article was opened.
+        let uri = refreshed["documents"][0]["uri"].as_str().unwrap();
+        let (status, full) = request(
+            &router,
+            "GET",
+            &format!("/api/atproto/document?uri={}", url_encode(uri)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{full}");
+        assert_eq!(full["title"], "Two");
+        assert_eq!(full["text"], "The body of Two.");
+        assert_eq!(
+            full["handle"], "two.test",
+            "the handle comes from the follow, because a record carries none"
+        );
 
         let (status, err) = request(
             &router,
+            "GET",
+            "/api/atproto/document?uri=at%3A%2F%2Fnope",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("no document"), "{err}");
+
+        let _ = stub;
+    }
+
+    /// A **pointer** document: the record carries a title, a description and a
+    /// `path`, and the words live on the author's own site rather than in the
+    /// record. Measured live, 48 of the 105 documents in one vault's cache were
+    /// this shape and every one opened as a title with nothing under it, because
+    /// only `textContent` and `content` were read and the `path` was never
+    /// joined to the publication's `url`.
+    #[tokio::test]
+    async fn a_pointer_document_becomes_a_link_instead_of_a_bare_title() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let mut repos = HashMap::new();
+        repos.insert(
+            "did:plc:pointer".to_string(),
+            vec![serde_json::json!({
+                "title": "The space to breathe",
+                "description": "A short note about slowing down.",
+                "path": "/the-space-to-breathe",
+                "site": "at://did:plc:pointer/site.standard.publication/0",
+                "publishedAt": hush_atproto::rfc3339(100_000),
+            })],
+        );
+        let stub = stub_pds(dir.path(), repos, HashMap::new()).await;
+        // The publication carries the half the document does not.
+        stub.publications.lock().unwrap().insert(
+            "did:plc:pointer".to_string(),
+            vec![serde_json::json!({
+                "name": "Ben Werdmuller",
+                "url": "https://werd.io",
+            })],
+        );
+
+        request(
+            &router,
             "POST",
-            "/api/neighborhoods/30023:aa:kept/comment",
-            Some(r#"{"body":"hello"}"#),
+            "/api/atproto/follows",
+            Some(r#"{"follows":[{"did":"did:plc:pointer","handle":"werd.test"}]}"#),
+        )
+        .await;
+
+        let (status, refreshed) = request(&router, "POST", "/api/atproto/refresh", None).await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        assert_eq!(refreshed["changed"], 1, "{refreshed}");
+
+        // The index row has something to show, from the author's own words.
+        assert_eq!(
+            refreshed["documents"][0]["preview"],
+            "A short note about slowing down."
+        );
+        // And the reader has somewhere to send the member, resolved at ingest.
+        assert_eq!(
+            refreshed["documents"][0]["url"],
+            "https://werd.io/the-space-to-breathe"
+        );
+
+        // The body is genuinely absent — this is not a parse failure, it is the
+        // record's shape, and the full view says so rather than pretending.
+        let uri = refreshed["documents"][0]["uri"].as_str().unwrap();
+        let (status, full) = request(
+            &router,
+            "GET",
+            &format!("/api/atproto/document?uri={}", url_encode(uri)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{full}");
+        assert_eq!(full["text"], "");
+        assert_eq!(full["url"], "https://werd.io/the-space-to-breathe");
+    }
+
+    /// The same record with no publication to resolve against: the body is still
+    /// absent, and the link is left empty rather than guessed. A wrong link sends
+    /// a reader somewhere the author never published.
+    #[tokio::test]
+    async fn a_pointer_document_with_no_readable_publication_has_no_link() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let mut repos = HashMap::new();
+        repos.insert(
+            "did:plc:pointer".to_string(),
+            vec![serde_json::json!({
+                "title": "Orphaned",
+                "path": "/orphaned",
+                "site": "at://did:plc:pointer/site.standard.publication/0",
+                "publishedAt": hush_atproto::rfc3339(100_000),
+            })],
+        );
+        let _stub = stub_pds(dir.path(), repos, HashMap::new()).await;
+
+        request(
+            &router,
+            "POST",
+            "/api/atproto/follows",
+            Some(r#"{"follows":[{"did":"did:plc:pointer"}]}"#),
+        )
+        .await;
+
+        let (status, refreshed) = request(&router, "POST", "/api/atproto/refresh", None).await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        assert_eq!(refreshed["changed"], 1, "{refreshed}");
+        assert_eq!(refreshed["documents"][0]["url"], "");
+        assert_eq!(refreshed["documents"][0]["preview"], "");
+    }
+
+    /// A third content shape, read from the live network: the words of a block in
+    /// an `html` field rather than a `plaintext` one. Two documents in one
+    /// vault's cache were exactly this and both opened with nothing under the
+    /// title.
+    #[tokio::test]
+    async fn an_html_content_block_reaches_the_reader() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let mut repos = HashMap::new();
+        repos.insert(
+            "did:plc:idno".to_string(),
+            vec![serde_json::json!({
+                "title": "Inkwell",
+                "content": { "$type": "co.idno.html",
+                    "html": "Inkwell is a <b>very</b> nicely implemented fediverse journaling platform." },
+                "publishedAt": hush_atproto::rfc3339(100_000),
+            })],
+        );
+        let _stub = stub_pds(dir.path(), repos, HashMap::new()).await;
+
+        request(
+            &router,
+            "POST",
+            "/api/atproto/follows",
+            Some(r#"{"follows":[{"did":"did:plc:idno"}]}"#),
+        )
+        .await;
+
+        let (status, refreshed) = request(&router, "POST", "/api/atproto/refresh", None).await;
+        assert_eq!(status, StatusCode::OK, "{refreshed}");
+        assert_eq!(
+            refreshed["documents"][0]["preview"],
+            "Inkwell is a very nicely implemented fediverse journaling platform."
+        );
+    }
+
+    /// Disconnecting drops the credential and nothing else. The reading list is
+    /// not a secret, and clearing it would cost a member their lane for
+    /// disconnecting an account they may reconnect a minute later.
+    #[tokio::test]
+    async fn disconnecting_forgets_the_session_and_keeps_the_reading_list() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let stub = stub_pds(dir.path(), HashMap::new(), HashMap::new()).await;
+        connect(&router, &stub.base).await;
+        request(
+            &router,
+            "POST",
+            "/api/atproto/follows",
+            Some(r#"{"follows":[{"did":"did:plc:known","name":"Known"}]}"#),
+        )
+        .await;
+
+        let (status, view) = request(&router, "POST", "/api/atproto/disconnect", None).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert!(view["account"].is_null(), "the credential is gone");
+        assert!(view["publication"].is_null(), "and the blog it wrote to");
+        assert_eq!(view["follows"].as_array().unwrap().len(), 1, "the list is not a credential");
+
+        // With no account there is nothing to write as, and the refusal says so.
+        let zine_id = write_a_zine(&router).await;
+        let (status, err) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{zine_id}/publish"),
+            None,
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{err}");
-        assert!(
-            err["error"].as_str().unwrap().contains("public identity"),
-            "{err}"
-        );
-
-        let (status, identity) = request(&router, "GET", "/api/neighborhoods/identity", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(identity.is_null(), "and no identity was created either");
     }
 
-    /// A comment no relay took is not public, so it is not cached. Unlike an
-    /// export there is no address to come back to, and showing the member their
-    /// own words in a thread they cannot point anyone at would be a lie the page
-    /// has no way to correct later.
     #[tokio::test]
-    async fn a_comment_no_relay_took_is_not_cached_as_though_it_had_been() {
-        let sink = FakeSink::refusing("wss://relay.example: connection refused");
-        let dir = TempDir::new().unwrap();
-        let app = unlocked_app(dir.path()).await;
-        *app.neighborhoods_sink.lock().await = Some(sink.clone());
-        let router = api_router(app.clone());
-
-        request(&router, "POST", "/api/zines/pen-name", Some(r#"{"name":"ada"}"#)).await;
-        let (_, created) = request(
-            &router,
-            "POST",
-            "/api/zines",
-            Some(r#"{"title":"On relays","body":"<p>hello</p>"}"#),
-        )
-        .await;
-        let zine_id = created["zine_id"].as_str().unwrap().to_string();
-        let (_, identity) = request(&router, "POST", "/api/neighborhoods/identity", Some("{}")).await;
-        let pubkey = identity["pubkey"].as_str().unwrap().to_string();
-        set_allowlist(&router).await;
-
-        // The export refuses too, so seed the cache with the article directly:
-        // what is under test is the comment, not the export.
-        *app.neighborhoods_source.lock().await = Some(FakeRelay::articles(vec![
-            long_form_event(&pubkey, "seed", 20, &"word ".repeat(800)),
-        ]));
-        let (status, _) = request(&router, "POST", "/api/neighborhoods/refresh", None).await;
-        assert_eq!(status, StatusCode::OK);
-        let address = format!("30023:{pubkey}:seed");
-
-        let (status, out) = request(
-            &router,
-            "POST",
-            &format!("/api/neighborhoods/{address}/comment"),
-            Some(r#"{"body":"hello"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{out}");
-        assert_eq!(out["published"], false);
-        assert!(
-            out["publish_error"].as_str().unwrap().contains("connection refused"),
-            "{out}"
-        );
-        assert!(
-            out["replies"].as_array().unwrap().is_empty(),
-            "nothing is cached for a comment that never went out: {out}"
-        );
-
-        // And it is not there on a fresh read either.
-        let (_, article) =
-            request(&router, "GET", &format!("/api/neighborhoods/{address}"), None).await;
-        assert!(article["replies"].as_array().unwrap().is_empty(), "{article}");
-        let _ = zine_id;
-    }
-
-    /// The comment route is as private as the sidecar: a locked vault is a 401
-    /// before any of the policy above runs.
-    #[tokio::test]
-    async fn the_comment_route_is_401_while_locked() {
-        use crate::notes_api_tests::build_app;
+    async fn every_lane_route_is_401_while_locked() {
         let dir = TempDir::new().unwrap();
         let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
-        let (status, _) = request(
-            &router,
-            "POST",
-            "/api/neighborhoods/30023:aa:kept/comment",
-            Some(r#"{"body":"hello"}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        for (method, uri, body) in [
+            ("GET", "/api/atproto".to_string(), None),
+            (
+                "POST",
+                "/api/atproto/connect".to_string(),
+                Some(r#"{"pds":"https://bsky.social","identifier":"a","password":"b"}"#),
+            ),
+            ("POST", "/api/atproto/disconnect".to_string(), None),
+            (
+                "POST",
+                "/api/atproto/publication".to_string(),
+                Some(r#"{"name":"n","url":"https://a.example"}"#),
+            ),
+            (
+                "POST",
+                "/api/atproto/follows".to_string(),
+                Some(r#"{"follows":[{"did":"did:plc:x"}]}"#),
+            ),
+            ("POST", "/api/atproto/refresh".to_string(), None),
+            ("GET", "/api/atproto/document?uri=at%3A%2F%2Fx".to_string(), None),
+            ("POST", format!("/api/zines/{}/publish", "a".repeat(64)), None),
+        ] {
+            let (status, _) = request(&router, method, &uri, body).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+
+    /// Percent-encode a query value, so a `?` or a `/` in a URI cannot split the
+    /// request line.
+    fn url_encode(value: &str) -> String {
+        value
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
     }
 }
 

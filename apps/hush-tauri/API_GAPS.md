@@ -1,6 +1,6 @@
 # Daemon API gaps (UI mocks)
 
-**Future rails:** Task **11** `/api/articles/*` and Task **12** library/edges/briefing — `docs/tasks/hush-articles.md`, `docs/tasks/knowledge-layer-phase-a.md`.
+**Future rails:** Task **11** `/api/zines/{id}/publish` (public lane, [`docs/tasks/atproto.md`](../../docs/tasks/atproto.md)) and Task **12** library/edges/briefing — [`docs/tasks/knowledge-layer-phase-a.md`](../../docs/tasks/knowledge-layer-phase-a.md).
 
 The Soft Daylight UI uses real daemon endpoints for unlock, lock, change-passphrase, invite, contacts, send, send-file-data, recv, and status.
 

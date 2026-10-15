@@ -31,6 +31,9 @@ pub const ENV_RELAY_ONION_URL: &str = "HUSH_RELAY_ONION_URL";
 /// Environment override for the STUN server used by the Conclave Paper data
 /// channel.
 pub const ENV_STUN_URL: &str = "HUSH_STUN_URL";
+/// Environment override for the PLC directory `did:plc` identifiers resolve
+/// against.
+pub const ENV_ATPROTO_PLC_URL: &str = "HUSH_ATPROTO_PLC_URL";
 /// Environment override for the daemon bind address (enables the TCP listener).
 pub const ENV_DAEMON_ADDR: &str = "HUSH_DAEMON_ADDR";
 /// Environment override for the daemon Unix socket path.
@@ -75,6 +78,12 @@ pub struct ClientConfig {
     /// deliberately without a default — see [`resolve_stun_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stun_url: Option<String>,
+    /// The directory a `did:plc` resolves against. Operator config: a deployment
+    /// that must go through a mirror names one here. Absent means the public
+    /// directory, which the daemon supplies so the default lives in one place
+    /// (`hush_atproto::DEFAULT_PLC_DIRECTORY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atproto_plc_url: Option<String>,
     /// TCP bind address for the daemon. Setting this opts the TCP listener back in;
     /// the default is Unix socket only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +104,7 @@ impl Default for ClientConfig {
                 relay_url: None,
                 onion_relay: None,
                 stun_url: None,
+                atproto_plc_url: None,
                 daemon_addr: None,
                 daemon_socket: None,
             }
@@ -181,6 +191,23 @@ pub fn resolve_stun_url(data_dir: &Path) -> Option<String> {
     }
     let file = load(data_dir);
     non_empty(file.stun_url.as_deref()).map(str::to_string)
+}
+
+/// The PLC directory a `did:plc` resolves against, when an operator configured
+/// one (env or config file).
+///
+/// `None` means the public directory. The public lane reads the repos the member
+/// named and asks the directory only about accounts they already chose to
+/// follow, so the default is the honest one — but a deployment that must reach
+/// the directory through a mirror needs a name for it, and this is that name.
+/// The default itself is supplied by the caller, so it lives beside the client
+/// that uses it.
+pub fn resolve_atproto_plc_url(data_dir: &Path) -> Option<String> {
+    if let Some(v) = non_empty(std::env::var(ENV_ATPROTO_PLC_URL).ok().as_deref()) {
+        return Some(v.to_string());
+    }
+    let file = load(data_dir);
+    non_empty(file.atproto_plc_url.as_deref()).map(str::to_string)
 }
 
 /// Effective daemon bind address plus the source that supplied it.

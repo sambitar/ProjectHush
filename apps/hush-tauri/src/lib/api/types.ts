@@ -694,9 +694,9 @@ export interface ZineSummaryDto {
   muted: boolean;
   /** Held but not yet openable — a blob arrived before its key did. */
   unreadable: boolean;
-  /** This post's public life, once it has one. Absent until the first export,
+  /** This post's public life, once it has one. Absent until the first publish,
    *  so a row can say "not published" rather than guessing. */
-  export: ZineExportDto | null;
+  public?: ZinePublicDto | null;
 }
 
 /** One comment the author has merged into the thread. */
@@ -750,25 +750,27 @@ export interface ZineDescriptorDto {
   comments: ZineCommentDto[];
 }
 
-/** One zine's public life on the Nostr network, once it has one.
+/** One zine's public life on the open social web, once it has one.
  *
- *  Absent until the first export. Local only: the `d` links this private post to
- *  a public article, so it never travels inside the sealed blob. */
-export interface ZineExportDto {
-  /** The NIP-23 `d` tag: the addressable id within the author's namespace.
-   *  Minted on the first export and stable forever, because NIP-23 is editable
-   *  by address and a new `d` would publish a second article instead of
-   *  updating the first. Deliberately not the `zine_id`. */
-  d: string;
-  /** The public key the article is signed by, hex. Already public — it is in
-   *  every event that went out — and held here so the `30023:pubkey:d` address
-   *  can be shown without fetching the identity. */
-  pubkey: string;
-  /** When the article first went public, unix seconds. Set once. */
-  published_at: number;
-  /** The id of the event this vault published last, hex. */
-  last_event_id: string;
-  /** When this vault last published, unix milliseconds. Local fact. */
+ *  Absent until the first publish. Local only: the `at://` address links this
+ *  private post to a public record, so it never travels inside the sealed blob.
+ *  The record key is not here either — it is derived from the zine id, so it can
+ *  always be recomputed and a lost sidecar cannot orphan a record. */
+export interface ZinePublicDto {
+  /** The account whose repo the record lives in. Already public: it is in the
+   *  record's own address. */
+  did: string;
+  /** The `at://` address of the record, so a link and a re-publish both have
+   *  somewhere to point. */
+  uri: string;
+  /** The content hash the PDS assigned to the last write. */
+  cid: string;
+  /** When it first went public, unix milliseconds. Set once and never moved: an
+   *  edit is a new write at the same address, and the lexicon's `publishedAt` is
+   *  the first publish rather than the latest. */
+  published_at_ms: number;
+  /** When this vault last wrote it, unix milliseconds. A local fact, never
+   *  published. */
   published_ms: number;
 }
 
@@ -784,8 +786,8 @@ export interface ZineFileDto {
   /** Pulled comments waiting for this vault's decision. Author-side only. */
   pending_comments: ZinePendingCommentDto[];
   muted: boolean;
-  /** This zine's public export, once it has one. */
-  export: ZineExportDto | null;
+  /** This zine's public record, once it has one. */
+  public: ZinePublicDto | null;
   updated_ms: number;
 }
 
@@ -799,106 +801,154 @@ export interface PenNameDto {
   sign_pk: string;
 }
 
-/** The public identity this vault publishes and comments under on the public
- *  Nostr network (neighborhoods). The public key only: the secret half never
- *  leaves the vault, because a Nostr event is signed inside it. */
-export interface PublicIdentityDto {
-  /** The x-only secp256k1 public key, hex. A Nostr event's `pubkey`. */
-  pubkey: string;
-  /** The bech32 `npub` handle. */
-  npub: string;
+// --- AT Protocol: the public lane (Task 22) -----------------------------------
+//
+// One dialect of the open social web: the Standard.site lexicons that
+// `pckt.blog`, `leaflet.pub` and `offprint.app` agreed on. The identity is a DID
+// the member already owns and the credential is a revocable app password, so
+// this vault is a guest and never the holder of a key. Nothing private has
+// anywhere to go in a record: a title, a plaintext body, tags and a date.
+
+/** The account this vault speaks as.
+ *
+ *  The app password and the token pair are deliberately absent: the webview has
+ *  no use for them, and a token in a response is a token in a log. */
+export interface AtprotoAccountDto {
+  did: string;
+  handle: string;
+  /** The PDS the session was minted against. */
+  pds: string;
 }
 
-/** The neighborhoods read lane's settings (Task 22). */
-export interface NeighborhoodSettingsDto {
-  /** The relays read from. A curated set with no Hush-run relay; user-editable. */
-  allowlist: string[];
-  /** The reading-time floor, in whole minutes. */
-  min_minutes: number;
-  /** Whether the front page shows public posts by default. Off by default,
-   *  because showing them is what triggers egress. */
-  default_show: boolean;
+/** The blog this vault's documents are filed under. */
+export interface AtprotoPublicationDto {
+  /** The `at://` address of the publication record. */
+  uri: string;
+  /** The masthead. */
+  name: string;
+  /** The member's own web address. The lexicon combines it with each document's
+   *  path to build a reader's link; Hush neither hosts it nor can invent one. */
+  url: string;
 }
 
-/** One public article in the neighborhoods index. No body: the index is a list. */
-export interface NeighborhoodSummaryDto {
-  /** The NIP-01 addressable id, the `a` tag: `30023:pubkey:d`. */
-  address: string;
-  /** The event id of the version this was mapped from. */
-  event_id: string;
-  pubkey: string;
-  /** The `d` tag: the addressable id within the author's namespace. */
-  d: string;
+/** One publication this vault reads. */
+export interface AtprotoFollowDto {
+  /** The account whose repo is read. The stable half: a handle can move. */
+  did: string;
+  /** The handle at the time it was added, for display only. */
+  handle: string;
+  /** What to show when the handle is not known. */
+  name: string;
+}
+
+/** One document in the index, without its body.
+ *
+ *  A page of fifty full articles would be megabytes of JSON for a screen that
+ *  shows titles, so the body is one request away and the row carries a taste. */
+export interface AtprotoDocumentDto {
+  /** The record's `at://` address, which is also its identity in the cache. */
+  uri: string;
+  did: string;
+  handle: string;
   title: string;
-  summary: string | null;
-  /** Normalised `t` tags. */
-  sections: string[];
-  created_at: number;
-  published_at: number | null;
-  /** Reading time in whole minutes, at 200 wpm. */
-  reading_minutes: number;
+  tags: string[];
+  /** The author's own string, kept verbatim for display. */
+  published_at: string;
+  /** The same instant as a sortable number, parsed at ingest. */
+  published_secs: number;
+  path: string;
+  /** The author's own summary, when they wrote one. Empty otherwise. */
+  description: string;
+  /** The document's own page on the author's site, when it has one.
+   *
+   *  Standard.site lets a document be a *pointer*: a title, a description and a
+   *  `path` under the publication's `url`, with the words living on the author's
+   *  own site rather than in the record. Resolved at ingest, so a reader with an
+   *  empty body has somewhere to send the member instead of showing a bare
+   *  title. Empty when the record is not a pointer or the publication could not
+   *  be read — never guessed, because a wrong link is worse than no link. */
+  url: string;
+  /** A plain-text taste of the body. */
+  preview: string;
+  /** The Bluesky thread this document was announced as, when there is one.
+   *
+   *  Standard.site has no comment record, so the comments on a post live on a
+   *  Bluesky thread the author's client linked. Absent when no thread was
+   *  linked, which is also the case for posts whose comments cannot be found. */
+  bsky_post_ref?: BskyPostRefDto | null;
+  /** The publication this document belongs to, as an `at://` URI. Empty when
+   *  the record names none. */
+  site: string;
 }
 
-/** One public article in full, with its Markdown body. */
-export interface NeighborhoodArticleDto extends NeighborhoodSummaryDto {
-  /** The Markdown body, as the relay sent it. Render through the one sanitizer. */
-  content: string;
-  /** The thread under this article, oldest first. Empty for an article whose
-   *  replies this vault does not read — every article but the ones it published
-   *  itself. */
-  replies: NeighborhoodCommentDto[];
+/** The Bluesky post a document was announced as: where its comments are. */
+export interface BskyPostRefDto {
+  uri: string;
+  /** Empty when the author's client linked a thread without one. */
+  cid: string;
 }
 
-/** One public comment, as the page reads it.
- *
- *  `content` is plaintext, by the spec. Render it as text, never as markup: a
- *  comment is not Markdown, and a stranger's text is not markup here. */
-export interface NeighborhoodCommentDto {
-  event_id: string;
-  /** The commenter's public key, hex. A key, not a name: the lane fetches no
-   *  kind:0 metadata, so the page names the key it holds. */
-  pubkey: string;
-  content: string;
-  created_at: number;
-  /** The comment this answers, when it answers one rather than the article. */
-  parent_id: string | null;
-}
-
-/** `POST /api/neighborhoods/{addr}/comment`: the thread as it now stands.
- *
- *  The thread rather than the one comment, because the page shows a thread and
- *  the caller should not have to splice its own words into a list it did not
- *  build. */
-export interface NeighborhoodCommentViewDto {
-  address: string;
-  /** The id of the event that went out, hex. */
-  event_id: string;
-  /** Whether a relay took it. `false` means the comment is not public: unlike an
-   *  export there is no address to retry, so it is not cached either. */
-  published: boolean;
-  /** Why the publish failed, when it did. Empty on success. */
-  publish_error: string;
-  replies: NeighborhoodCommentDto[];
-}
-
-/** A section facet: the tag and how many held articles carry it. */
-export interface NeighborhoodSectionDto {
+/** A section facet: the tag and how many cached documents carry it. */
+export interface AtprotoTagDto {
   name: string;
   count: number;
 }
 
-/** The neighborhoods index: what the page shows, plus its facets and settings. */
-export interface NeighborhoodsViewDto {
-  articles: NeighborhoodSummaryDto[];
-  sections: NeighborhoodSectionDto[];
-  settings: NeighborhoodSettingsDto;
+/** The whole public pane in one response: who this vault speaks as, where its
+ *  posts are filed, who it reads, and what it has read. */
+export interface AtprotoViewDto {
+  account?: AtprotoAccountDto | null;
+  publication?: AtprotoPublicationDto | null;
+  follows: AtprotoFollowDto[];
+  documents: AtprotoDocumentDto[];
+  tags: AtprotoTagDto[];
 }
 
-/** A patch to the neighborhoods settings: send only what changed. */
-export interface NeighborhoodSettingsPatch {
-  allowlist?: string[];
-  min_minutes?: number;
-  default_show?: boolean;
+/** `POST /api/atproto/refresh`: the pane, plus what the pass did.
+ *
+ *  `changed` rather than `documents`, because `documents` is already the index
+ *  this response carries. `failed` is reported rather than raised: one
+ *  publication whose PDS is down must not cost the member every other page. */
+export interface AtprotoRefreshDto extends AtprotoViewDto {
+  changed: number;
+  failed: string[];
+}
+
+/** `GET /api/atproto/document`: one document with its body.
+ *
+ *  Served from the cache, so opening a page costs no network and no PDS learns
+ *  which article was opened. */
+export interface AtprotoDocumentFullDto extends AtprotoDocumentDto {
+  /** The body as published: plaintext, because the lexicon's field forbids
+   *  markup. Render it as text, never as markup. */
+  text: string;
+}
+
+/** One publication the crawl found, as its own record declares it.
+ *
+ *  `uri` is the publication's address and `did` is the account hosting it:
+ *  following uses the `did`, which needs no resolver and therefore no account. */
+export interface AtprotoExploreEntryDto {
+  uri: string;
+  did: string;
+  handle: string;
+  name: string;
+  description: string;
+  url: string;
+  has_icon: boolean;
+  /** The seed this was reached through. Every entry came from somewhere. */
+  via: string;
+}
+
+/** `GET /api/atproto/explore`: the cached discovery directory.
+ *
+ *  `crawled_unix` is `0` before the first crawl, which is a state and not a
+ *  fault. Reading this costs no network; `POST /explore/refresh` is the crawl. */
+export interface AtprotoExploreDto {
+  directory: AtprotoExploreEntryDto[];
+  crawled_unix: number;
+  /** Accounts that could not be probed. Reported rather than raised. */
+  failed?: string[];
 }
 
 /** One row of the section facet. */
@@ -952,26 +1002,20 @@ export interface ZinesWriteDto extends ZinesViewDto {
   publish_error: string;
 }
 
-/** `POST /api/zines/{id}/export`: the article's public address, and the post as
- *  it now stands. Flattened rather than nested, so the reader page can show
- *  "published" without a second request. */
-export interface ZineExportViewDto extends ZineViewDto {
+/** `POST /api/zines/{id}/publish`: what went out, and the pane either way. */
+export interface ZinePublishViewDto extends ZineViewDto {
   zine_id: string;
-  /** The NIP-23 `d` the article lives at. Stable across every re-export. */
-  d: string;
-  /** The NIP-01 address `30023:pubkey:d`. What a NIP-22 comment references. */
-  address: string;
-  /** The shareable handle, with the allowlist as relay hints. */
-  naddr: string;
-  /** The id of the event that was published, hex. */
-  event_id: string;
-  /** The public key the article is signed by, hex. */
-  pubkey: string;
-  /** When the article first went public, unix seconds. */
-  published_at: number;
-  /** Whether a relay took it. `false` is not a lost article: the address is
-   *  recorded and the retry publishes the same one. */
+  /** Whether the PDS accepted the record. `false` is not a lost article: the
+   *  zine is untouched and the publish can be tried again. */
   published: boolean;
-  /** Why the publish failed, when it did. Empty on success. */
+  /** Why it did not, when it did not. Empty on success. */
   publish_error: string;
+  /** The record's `at://` address. Empty when nothing was written. */
+  uri: string;
+  cid: string;
+  /** The record key. Derived from the zine id, so it is the same on every
+   *  publish and a retry replaces the record rather than adding one. */
+  rkey: string;
+  /** The web address a reader opens. Empty when no publication is set. */
+  url: string;
 }

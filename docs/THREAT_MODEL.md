@@ -117,6 +117,28 @@ a comment is sealed to a pen name rather than sent to an inbox, so the author ca
 but cannot take it off the lane; and every member holds a copy of what they have received — zines are
 not "leaves nothing behind."
 
+## The public lane (AT Protocol / Standard.site, added 2026-10-14)
+
+Publishing a zine to the **open web** and reading other people's public documents back, added
+2026-10-14. This **replaced** the Nostr lane (relays, BIP340 signatures, `npub`/`naddr`/`nevent`,
+NIP-23 export, NIP-22 comments, and a per-vault public identity); nothing of that shape remains in
+the code. Full design: [`docs/tasks/atproto.md`](tasks/atproto.md) (Tasks **11** and **22**).
+
+| Surface | What it may see | Rule |
+|---|---|---|
+| Identity | The member's **own DID and PDS**, connected with an app password | Hush mints nothing and operates no PDS; the member revokes the session at their own account without Hush's help |
+| Session | An app password (once) and an access/refresh JWT pair | Its own encrypted sidecar (`atproto-connection.enc`), in the Task **6** backup, rotated on write, **never** in a response or a log; the credential-discipline test asserts the connect answer carries no password or token |
+| Publish | A **public, permanent record in the member's own repo** | Explicit per-post confirmation that lists what leaves (title, tags, body, first-publish date) and what does not (thread, history, pen name, read key); the record shape has **no field** for anything private, so stripping is a property of the shape rather than a step that can be forgotten |
+| Read egress | Each followed PDS learns **which publication was read and by whom** (its own access log); the member's own PDS learns nothing from a read | **Pull-only and per-repo**, so no index and no AppView accumulates a graph; routed through the relay's own proxy setting |
+| Opening a post | Nothing | Served from the cache; opening makes no request, so no PDS learns which document was opened |
+| Public→private linkage | A published zine links **this vault to that ATProto account** | Stated plainly in the dialog. The pen name still covers the bulletin; the private zine and its public record are **separate objects** and are never cross-linked or deduped |
+| At rest | `atproto-connection.enc` and `atproto-state.enc`, sealed under the vault master key | Cached public content is encrypted for **hygiene, not secrecy** — it is public either way |
+
+**Honest limits for user-facing copy:** a public post is **public, permanent and cannot be
+un-published from here**; the record lives in the member's own account, which is what can edit or
+remove it. Reading the lane reaches the network only when **Refresh** is pressed, and publishing only
+when **Publish** is pressed.
+
 ## Conclave voice (group audio in a conclave, added 2026-10-13)
 
 A live, in-memory voice room per conclave among trustees, added 2026-10-13 (spec:

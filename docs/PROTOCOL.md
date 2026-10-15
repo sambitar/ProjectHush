@@ -420,8 +420,18 @@ applies to every base, since each queue reference carries both.
 - Recovery code unwraps keys if the device is gone.
 - These are vault format, not relay protocol.
 
+## The public lane (not relay protocol)
+
+Long-form publishing has two surfaces, and only one of them is ours:
+
+- **Zines** are the members-only commons: a long-form post, its body sealed and broadcast on the relay **bulletin** (Task **21**). The relay still sees only opaque blobs keyed by nobody.
+- **The public lane** (Tasks **11** and **22**, [`tasks/atproto.md`](tasks/atproto.md)) is **AT Protocol / Standard.site**, and it does **not** go through the relay. A member connects **their own** DID and PDS with an app password (exchanged for an access/refresh session), and publishing a zine writes a `site.standard.document` record into **their own repo**; the reading list pulls `site.standard.document` records from the publications they follow. Nothing is minted, no PDS is operated by Hush, and there is no relay-side change.
+
+The two are separate objects: the private zine and its public record are never cross-linked, and the pen name that signs a bulletin post is not the publisher. Reads are **pull-only and per-repo**, so no index or AppView accumulates a graph. Egress goes through the **same proxy setting the relay uses** and is **lazy** — only Connect, Refresh and Publish reach the network; opening a cached post makes no request.
+
 ## Out of scope for this sketch
 
 - Groups, MLS (zines — Task **21** — is a members-only **broadcast commons**, not a follow-feed: no follows, no ranking, no relay-visible graph)
+- The public lane's wire format — that is the Standard.site lexicons, not this sketch; see [`tasks/atproto.md`](tasks/atproto.md)
 - Sealed-sender copy of Signal’s exact scheme (we use queues instead; review whether we still need sealed certificates)
 - P2P bypass of the relay (nice later; not required for v1)

@@ -362,8 +362,8 @@ pub fn parse_feed(bytes: &[u8]) -> std::result::Result<(String, Vec<StoryDto>), 
 ///
 /// The list is a `const` rather than a local because both directions of the
 /// format read it: [`sanitize_rich_text`] keeps exactly these tags, and
-/// [`rich_text_to_markdown`] knows exactly these — so a tag added for the editor
-/// is a tag the export can carry, or the pair fails a test.
+/// [`rich_text_to_text`] knows exactly these — so a tag added for the editor
+/// is a tag the reduction can carry, or the pair fails a test.
 pub const RICH_TEXT_TAGS: &[&str] = &[
     "p", "a", "i", "em", "b", "strong", "u", "s", "code", "pre", "blockquote", "ul", "ol", "li",
     "br", "hr", "h1", "h2", "h3", "h4",
@@ -391,618 +391,19 @@ pub fn sanitize_rich_text(raw: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Rich text out: sanitized HTML to Markdown (the export re-encode)
+// Rich text out: sanitized HTML to plaintext (what a public post carries)
 // ---------------------------------------------------------------------------
 
-/// Re-encode a sanitized rich-text body as Markdown.
+/// A body reduced to plaintext, for a field that forbids markup — the
+/// `textContent` of a `site.standard.document`, which is the one shape every
+/// reader of the open social web agrees on.
 ///
 /// The body a zine stores is sanitized HTML ([`sanitize_rich_text`]); the body a
-/// public article carries is Markdown. This is that translation. It knows
-/// [`RICH_TEXT_TAGS`] and nothing else — the same list the sanitizer keeps, so
-/// what the editor can produce is what the export can carry.
-///
-/// Two decisions are worth stating, because both are places a converter
-/// usually goes quietly wrong:
-///
-/// - **Entities are left alone in prose.** `&amp;` is passed through rather than
-///   turned back into `&`, for two reasons: Markdown reads entities, so the
-///   reader sees the right character either way, and it is what guarantees the
-///   result cannot contain a `<` that came from the body. Every raw `<` in the
-///   output is a tag this function emitted. Code spans and code blocks are the
-///   exception — nothing decodes entities inside a fence, so those are decoded.
-/// - **`u` becomes inline HTML.** Markdown has no underline; `s` has `~~` and
-///   the rest have their own markers. `<u>…</u>` degrades to the plain text on a
-///   client that strips HTML — the same as dropping the mark — and survives
-///   where HTML is allowed, which dropping it never would.
-///
-/// Anything it does not recognize keeps its text and loses its markup, so an
-/// unknown tag is never a reason to lose the words.
-pub fn rich_text_to_markdown(html: &str) -> String {
-    let mut stack = vec![root_frame()];
-    for token in tokenize(html) {
-        match token {
-            Token::Text(text) => stack
-                .last_mut()
-                .expect("the root frame is never popped")
-                .children
-                .push(Node::Text(text)),
-            Token::Tag(tag) if tag.closing => close_element(&mut stack, &tag.name),
-            Token::Tag(tag) if tag.self_closing || tag.name == "br" || tag.name == "hr" => {
-                let node = Node::Element {
-                    name: tag.name,
-                    href: tag.href,
-                    children: Vec::new(),
-                };
-                stack
-                    .last_mut()
-                    .expect("the root frame is never popped")
-                    .children
-                    .push(node);
-            }
-            Token::Tag(tag) => stack.push(Frame {
-                name: tag.name,
-                href: tag.href,
-                children: Vec::new(),
-            }),
-        }
-    }
-    // Anything still open at the end closes here, so a truncated body still
-    // exports its words rather than nothing.
-    while stack.len() > 1 {
-        let frame = stack.pop().expect("len > 1");
-        stack
-            .last_mut()
-            .expect("the root frame is never popped")
-            .children
-            .push(Node::Element {
-                name: frame.name,
-                href: frame.href,
-                children: frame.children,
-            });
-    }
-    let root = stack.pop().expect("the root frame");
-    render_blocks(&root.children).trim().to_string()
-}
-
-/// A tag, as the tokenizer found it. Only `href` is kept: it is the one
-/// attribute that carries meaning into Markdown, and the sanitizer has already
-/// dropped everything else that could matter.
-struct Tag {
-    name: String,
-    href: Option<String>,
-    closing: bool,
-    self_closing: bool,
-}
-
-enum Token {
-    Text(String),
-    Tag(Tag),
-}
-
-enum Node {
-    Text(String),
-    Element {
-        name: String,
-        href: Option<String>,
-        children: Vec<Node>,
-    },
-}
-
-/// An open element while the tree is being built. The bottom of the stack is a
-/// nameless root that no close tag can match.
-struct Frame {
-    name: String,
-    href: Option<String>,
-    children: Vec<Node>,
-}
-
-fn root_frame() -> Frame {
-    Frame {
-        name: String::new(),
-        href: None,
-        children: Vec::new(),
-    }
-}
-
-/// Attach the named element, closing anything still open inside it first.
-///
-/// A close tag with no open element is ignored, and unclosed inner elements are
-/// unwrapped into their parent rather than dropped: sanitized HTML is
-/// well-formed, so this is the defensive path, and losing a reader's paragraph
-/// to a stray `</p>` would be a worse failure than an odd nesting.
-fn close_element(stack: &mut Vec<Frame>, name: &str) {
-    let Some(position) = stack.iter().rposition(|f| f.name == name) else {
-        return;
-    };
-    while stack.len() > position + 1 {
-        let frame = stack.pop().expect("len > position + 1");
-        stack
-            .last_mut()
-            .expect("the root frame is never popped")
-            .children
-            .push(Node::Element {
-                name: frame.name,
-                href: frame.href,
-                children: frame.children,
-            });
-    }
-    let frame = stack.pop().expect("position is on the stack");
-    stack
-        .last_mut()
-        .expect("the root frame is never popped")
-        .children
-        .push(Node::Element {
-            name: frame.name,
-            href: frame.href,
-            children: frame.children,
-        });
-}
-
-fn tokenize(html: &str) -> Vec<Token> {
-    let bytes = html.as_bytes();
-    let mut tokens = Vec::new();
-    let mut cursor = 0;
-    let mut text_start = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor] != b'<' {
-            cursor += 1;
-            continue;
-        }
-        // A comment is markup, not text: skipped whole, and an unterminated one
-        // takes the rest of the input with it rather than leaking its body into
-        // the export as prose.
-        if html[cursor..].starts_with("<!--") {
-            if cursor > text_start {
-                tokens.push(Token::Text(html[text_start..cursor].to_string()));
-            }
-            cursor = match html[cursor..].find("-->") {
-                Some(offset) => cursor + offset + 3,
-                None => html.len(),
-            };
-            text_start = cursor;
-            continue;
-        }
-        // `cursor` is on an ASCII `<`, so it is a char boundary, and the search
-        // is bounded to the rest of the input.
-        let Some(offset) = html[cursor..].find('>') else {
-            break;
-        };
-        let end = cursor + offset;
-        match parse_tag(&html[cursor + 1..end]) {
-            Some(tag) => {
-                if cursor > text_start {
-                    tokens.push(Token::Text(html[text_start..cursor].to_string()));
-                }
-                tokens.push(Token::Tag(tag));
-                cursor = end + 1;
-                text_start = cursor;
-            }
-            // A `<` that begins no tag is text. Sanitized HTML escapes those,
-            // so this is the defensive path.
-            None => cursor += 1,
-        }
-    }
-    if text_start < html.len() {
-        tokens.push(Token::Text(html[text_start..].to_string()));
-    }
-    tokens
-}
-
-fn parse_tag(inner: &str) -> Option<Tag> {
-    let inner = inner.trim();
-    let (closing, rest) = match inner.strip_prefix('/') {
-        Some(rest) => (true, rest.trim_start()),
-        None => (false, inner),
-    };
-    let (rest, self_closing) = match rest.strip_suffix('/') {
-        Some(rest) => (rest.trim_end(), true),
-        None => (rest, false),
-    };
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let name = parts.next()?.trim().to_ascii_lowercase();
-    // A comment, a doctype, or a stray `<` produces a name that is not a tag
-    // name; refusing it here is what keeps `<!-- x -->` from becoming text.
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    let href = if closing {
-        None
-    } else {
-        parse_attrs(parts.next().unwrap_or_default())
-            .into_iter()
-            .find(|(key, _)| key == "href")
-            .map(|(_, value)| value)
-            .filter(|value| !value.trim().is_empty())
-    };
-    Some(Tag {
-        name,
-        href,
-        closing,
-        self_closing,
-    })
-}
-
-fn parse_attrs(raw: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut rest = raw;
-    loop {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
-        }
-        let name_end = rest
-            .find(|c: char| c.is_whitespace() || c == '=')
-            .unwrap_or(rest.len());
-        let name = rest[..name_end].to_ascii_lowercase();
-        if name.is_empty() {
-            break;
-        }
-        rest = rest[name_end..].trim_start();
-        let Some(after) = rest.strip_prefix('=') else {
-            out.push((name, String::new()));
-            continue;
-        };
-        let after = after.trim_start();
-        let (value, remainder) = match after.strip_prefix('"').or_else(|| after.strip_prefix('\'')) {
-            Some(quoted) => {
-                let quote = after.as_bytes()[0] as char;
-                match quoted.find(quote) {
-                    Some(end) => (quoted[..end].to_string(), &quoted[end + 1..]),
-                    None => (quoted.to_string(), ""),
-                }
-            }
-            None => {
-                let end = after.find(char::is_whitespace).unwrap_or(after.len());
-                (after[..end].to_string(), &after[end..])
-            }
-        };
-        out.push((name, value));
-        rest = remainder;
-    }
-    out
-}
-
-/// A tag whose content is its own line or lines, rather than running on.
-fn is_block(name: &str) -> bool {
-    matches!(
-        name,
-        "p" | "h1" | "h2" | "h3" | "h4" | "ul" | "ol" | "li" | "blockquote" | "pre" | "hr"
-    )
-}
-
-/// Render a sequence of blocks, joining them with the blank line Markdown needs
-/// between them. Stray inline content between blocks becomes its own paragraph
-/// rather than being dropped.
-fn render_blocks(nodes: &[Node]) -> String {
-    let mut blocks: Vec<String> = Vec::new();
-    let mut run = String::new();
-    for node in nodes {
-        match node {
-            Node::Element { name, .. } if is_block(name) => {
-                if !run.trim().is_empty() {
-                    blocks.push(run.trim().to_string());
-                }
-                run.clear();
-                let block = render_block(node);
-                if !block.trim().is_empty() {
-                    blocks.push(block);
-                }
-            }
-            _ => run.push_str(&render_inline_node(node)),
-        }
-    }
-    if !run.trim().is_empty() {
-        blocks.push(run.trim().to_string());
-    }
-    blocks.join("\n\n")
-}
-
-fn render_block(node: &Node) -> String {
-    let Node::Element {
-        name,
-        href: _,
-        children,
-    } = node
-    else {
-        return render_inline_node(node);
-    };
-    match name.as_str() {
-        "hr" => "---".to_string(),
-        "pre" => render_pre(children),
-        "blockquote" => render_blockquote(children),
-        "ul" => render_list(children, false),
-        "ol" => render_list(children, true),
-        "li" => render_list_item(children, "- ").0,
-        "h1" | "h2" | "h3" | "h4" => {
-            let level = name.as_bytes()[1] - b'0';
-            let text = render_inline(children);
-            if text.trim().is_empty() {
-                return String::new();
-            }
-            format!("{} {}", "#".repeat(level as usize), text.trim())
-        }
-        // `p`, and anything else that arrived as a block.
-        _ => render_inline(children).trim().to_string(),
-    }
-}
-
-fn render_inline(nodes: &[Node]) -> String {
-    let mut out = String::new();
-    for node in nodes {
-        out.push_str(&render_inline_node(node));
-    }
-    out
-}
-
-fn render_inline_node(node: &Node) -> String {
-    let Node::Element {
-        name,
-        href,
-        children,
-    } = node
-    else {
-        let Node::Text(text) = node else {
-            return String::new();
-        };
-        return text.clone();
-    };
-    let inner = render_inline(children);
-    match name.as_str() {
-        // Two spaces then a newline is Markdown's hard break.
-        "br" => "  \n".to_string(),
-        "b" | "strong" => wrap("**", &inner),
-        "i" | "em" => wrap("*", &inner),
-        "s" => wrap("~~", &inner),
-        "u" => wrap_pair("<u>", "</u>", &inner),
-        "code" => render_code_span(&plain_text(children)),
-        "a" => render_link(href.as_deref(), &inner),
-        // A block inside an inline context, or a tag this converter does not
-        // know: keep the words, drop the markup.
-        _ => inner,
-    }
-}
-
-/// Wrap inline content in a marker, keeping any surrounding whitespace
-/// *outside* the markers — `** bold **` is not emphasis in Markdown, so an
-/// author's stray space would silently lose the mark.
-fn wrap(marker: &str, inner: &str) -> String {
-    wrap_pair(marker, marker, inner)
-}
-
-/// The same, for a mark whose opening and closing forms differ.
-fn wrap_pair(open: &str, close: &str, inner: &str) -> String {
-    let trimmed = inner.trim();
-    if trimmed.is_empty() {
-        return inner.to_string();
-    }
-    let lead = &inner[..inner.len() - inner.trim_start().len()];
-    let trail = &inner[inner.trim_end().len()..];
-    format!("{lead}{open}{trimmed}{close}{trail}")
-}
-
-fn render_link(href: Option<&str>, label: &str) -> String {
-    let Some(url) = href else {
-        return label.to_string();
-    };
-    if !is_safe_url(url) {
-        // The sanitizer drops these, so reaching here means the body did not
-        // come from it. Emit the words without the link rather than a link a
-        // reader might follow.
-        return label.to_string();
-    }
-    let text = if label.trim().is_empty() {
-        url.to_string()
-    } else {
-        label.to_string()
-    };
-    format!("[{}]({})", text, markdown_url(url))
-}
-
-/// Only the schemes the sanitizer keeps. Checked case-insensitively, because a
-/// scheme is.
-fn is_safe_url(url: &str) -> bool {
-    let lowered = url.trim().to_ascii_lowercase();
-    RICH_TEXT_SCHEMES
-        .iter()
-        .any(|scheme| lowered.starts_with(&format!("{scheme}:")))
-}
-
-/// A link destination. A URL containing parentheses is wrapped in angle
-/// brackets, which is Markdown's own escape for the case — otherwise the first
-/// `)` closes the destination early and the rest of the URL becomes prose.
-fn markdown_url(url: &str) -> String {
-    let url = url.trim();
-    if url.contains(['(', ')', ' ']) {
-        format!("<{url}>")
-    } else {
-        url.to_string()
-    }
-}
-
-/// An inline code span. A body containing a backtick needs the doubled form,
-/// padded, or the span closes early.
-fn render_code_span(text: &str) -> String {
-    let decoded = decode_entities(text);
-    if decoded.trim().is_empty() {
-        return String::new();
-    }
-    if decoded.contains('`') {
-        format!("`` {decoded} ``")
-    } else {
-        format!("`{decoded}`")
-    }
-}
-
-/// A fenced code block. Nothing inside a fence is interpreted, so entities are
-/// decoded here — `&amp;` in the source means `&` to the reader, and a fence is
-/// the one place Markdown will not decode it for us.
-///
-/// The fence grows past the longest run of backticks in the body, so a snippet
-/// that contains a fence does not end its own block.
-fn render_pre(children: &[Node]) -> String {
-    let raw = decode_entities(&plain_text(children));
-    let body = raw.strip_suffix('\n').unwrap_or(&raw);
-    let fence = "`".repeat(longest_backtick_run(body).max(2) + 1);
-    format!("{fence}\n{body}\n{fence}")
-}
-
-fn longest_backtick_run(text: &str) -> usize {
-    let mut longest = 0;
-    let mut run = 0;
-    for c in text.chars() {
-        if c == '`' {
-            run += 1;
-            longest = longest.max(run);
-        } else {
-            run = 0;
-        }
-    }
-    longest
-}
-
-fn render_blockquote(children: &[Node]) -> String {
-    let inner = render_blocks(children);
-    inner
-        .lines()
-        .map(|line| {
-            if line.is_empty() {
-                ">".to_string()
-            } else {
-                format!("> {line}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn render_list(children: &[Node], ordered: bool) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    let mut index = 1;
-    for child in children {
-        let Node::Element { name, children, .. } = child else {
-            push_stray(&mut lines, child);
-            continue;
-        };
-        if name != "li" {
-            // A list with something other than items in it is degenerate markup,
-            // but the words still belong on the page.
-            push_stray(&mut lines, child);
-            continue;
-        }
-        let marker = if ordered {
-            format!("{index}. ")
-        } else {
-            "- ".to_string()
-        };
-        index += 1;
-        let (item, nested) = render_list_item(children, &marker);
-        lines.push(item);
-        if !nested.is_empty() {
-            for line in nested.lines() {
-                lines.push(format!("  {line}"));
-            }
-        }
-    }
-    lines.join("\n")
-}
-
-fn push_stray(lines: &mut Vec<String>, node: &Node) {
-    let text = render_inline_node(node).trim().to_string();
-    if !text.is_empty() {
-        lines.push(text);
-    }
-}
-
-/// One list item: its own line, and any nested list to follow it indented.
-fn render_list_item(children: &[Node], marker: &str) -> (String, String) {
-    let mut inline_run = String::new();
-    let mut nested = String::new();
-    for child in children {
-        match child {
-            Node::Element { name, .. } if name == "ul" || name == "ol" => {
-                let block = render_block(child);
-                if !block.trim().is_empty() {
-                    if !nested.is_empty() {
-                        nested.push('\n');
-                    }
-                    nested.push_str(&block);
-                }
-            }
-            _ => inline_run.push_str(&render_inline_node(child)),
-        }
-    }
-    let text = inline_run.trim();
-    let item = if text.is_empty() {
-        marker.trim_end().to_string()
-    } else {
-        format!("{marker}{text}")
-    };
-    (item, nested)
-}
-
-/// Every text node under `nodes`, concatenated: the content of a `pre` or a
-/// `code`, where markup inside does not mean anything.
-fn plain_text(nodes: &[Node]) -> String {
-    let mut out = String::new();
-    for node in nodes {
-        match node {
-            Node::Text(text) => out.push_str(text),
-            Node::Element { children, .. } => out.push_str(&plain_text(children)),
-        }
-    }
-    out
-}
-
-/// Decode the entities the HTML serializer emits, for the contexts where
-/// nothing else will. An entity that is not recognized is passed through as the
-/// literal text it looks like, rather than dropped.
-fn decode_entities(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find('&') {
-        out.push_str(&rest[..start]);
-        let tail = &rest[start..];
-        match tail[1..].find(';').map(|end| end + 1) {
-            // A `&` this far from a `;` is not an entity.
-            Some(end) if end <= 10 => {
-                let name = &tail[1..end];
-                match name {
-                    "amp" => out.push('&'),
-                    "lt" => out.push('<'),
-                    "gt" => out.push('>'),
-                    "quot" => out.push('"'),
-                    "apos" => out.push('\''),
-                    "nbsp" => out.push('\u{00a0}'),
-                    _ => match numeric_entity(name) {
-                        Some(c) => out.push(c),
-                        None => {
-                            out.push('&');
-                            out.push_str(name);
-                            out.push(';');
-                        }
-                    },
-                }
-                rest = &tail[end + 1..];
-            }
-            _ => {
-                out.push('&');
-                rest = &tail[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn numeric_entity(name: &str) -> Option<char> {
-    let digits = name.strip_prefix('#')?;
-    let code = match digits.strip_prefix(['x', 'X']) {
-        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-        None => digits.parse().ok()?,
-    };
-    char::from_u32(code)
-}
-
+/// public document carries is plaintext. This is that reduction, and it lives in
+/// [`hush_atproto::html`] because both halves of the workspace need it and the
+/// crate is the only one both can reach. Kept under this name so the callers and
+/// the tests below are unchanged.
+pub use hush_atproto::html::to_text as rich_text_to_text;
 
 // ---------------------------------------------------------------------------
 // Reader-mode fetch guard and extractor
@@ -1583,212 +984,29 @@ mod reads_tests {
         assert!(!clean.contains("<table"), "{clean}");
     }
 
-    #[test]
-    fn a_paragraph_and_its_marks_become_markdown() {
-        assert_eq!(
-            rich_text_to_markdown("<p>plain</p>"),
-            "plain",
-            "a paragraph is a bare line"
-        );
-        assert_eq!(
-            rich_text_to_markdown("<p><strong>bold</strong> and <em>em</em></p>"),
-            "**bold** and *em*"
-        );
-        // `b`/`i` are the same marks as `strong`/`em`, and `s` is GFM's.
-        assert_eq!(rich_text_to_markdown("<p><b>b</b><i>i</i><s>s</s></p>"), "**b***i*~~s~~");
-        // Markdown has no underline: it is carried as the inline HTML that
-        // degrades to the plain text where HTML is stripped.
-        assert_eq!(rich_text_to_markdown("<p><u>u</u></p>"), "<u>u</u>");
-
-        assert_eq!(
-            rich_text_to_markdown("<p>one</p><p>two</p>"),
-            "one\n\ntwo",
-            "paragraphs are separated by a blank line"
-        );
-    }
-
-    /// A mark whose content is padded must not lose the mark. `** bold **` is
-    /// literal asterisks in Markdown, not emphasis — the padding has to move
-    /// outside the markers.
-    #[test]
-    fn whitespace_inside_a_mark_moves_outside_it() {
-        assert_eq!(
-            rich_text_to_markdown("<p>a<strong> b </strong>c</p>"),
-            "a **b** c",
-            "the padding moved outside the markers, so the mark still applies"
-        );
-        assert_eq!(
-            rich_text_to_markdown("<p><strong>  </strong>after</p>"),
-            "after",
-            "an empty mark is not two stray markers"
-        );
-    }
-
-    #[test]
-    fn headings_carry_their_level_and_drop_when_empty() {
-        assert_eq!(rich_text_to_markdown("<h1>One</h1>"), "# One");
-        assert_eq!(rich_text_to_markdown("<h3>Three</h3>"), "### Three");
-        assert_eq!(rich_text_to_markdown("<h2></h2>"), "", "an empty heading is nothing");
-    }
-
-    #[test]
-    fn a_link_becomes_a_markdown_link() {
-        assert_eq!(
-            rich_text_to_markdown("<p><a href=\"https://ok.example/x\">ok</a></p>"),
-            "[ok](https://ok.example/x)"
-        );
-        // A URL with parentheses is wrapped, or the first `)` would close the
-        // destination and the rest would become prose.
-        assert_eq!(
-            rich_text_to_markdown("<p><a href=\"https://ok.example/a(b)\">x</a></p>"),
-            "[x](<https://ok.example/a(b)>)"
-        );
-        // A link with no text falls back to the URL rather than an empty label.
-        assert_eq!(
-            rich_text_to_markdown("<p><a href=\"https://ok.example/x\"></a></p>"),
-            "[https://ok.example/x](https://ok.example/x)"
-        );
-        // A scheme the sanitizer would have dropped is dropped here too, so a
-        // body that did not come from the sanitizer still cannot export one.
-        assert_eq!(
-            rich_text_to_markdown("<p><a href=\"javascript:alert(1)\">evil</a></p>"),
-            "evil"
-        );
-    }
-
-    #[test]
-    fn lists_become_markers_and_nest_by_indent() {
-        assert_eq!(
-            rich_text_to_markdown("<ul><li>one</li><li>two</li></ul>"),
-            "- one\n- two"
-        );
-        assert_eq!(
-            rich_text_to_markdown("<ol><li>first</li><li>second</li></ol>"),
-            "1. first\n2. second"
-        );
-        assert_eq!(
-            rich_text_to_markdown("<ul><li>outer<ul><li>inner</li></ul></li></ul>"),
-            "- outer\n  - inner",
-            "a nested list is indented under its item"
-        );
-        assert_eq!(
-            rich_text_to_markdown("<ul><li></li><li>x</li></ul>"),
-            "-\n- x",
-            "an empty item is a bare marker, not a stray space"
-        );
-    }
-
-    #[test]
-    fn a_blockquote_prefixes_every_line_it_contains() {
-        assert_eq!(
-            rich_text_to_markdown("<blockquote><p>one</p><p>two</p></blockquote>"),
-            "> one\n>\n> two",
-            "the blank line between paragraphs is quoted too"
-        );
-    }
-
-    #[test]
-    fn a_code_block_is_fenced_and_decodes_its_entities() {
-        // Nothing inside a fence is interpreted, so `&amp;` must arrive as `&`
-        // or the reader sees the entity.
-        assert_eq!(
-            rich_text_to_markdown("<pre>a &amp; b\nif x &lt; 1 {}</pre>"),
-            "```\na & b\nif x < 1 {}\n```"
-        );
-        // A body containing a fence must not end its own block.
-        assert_eq!(
-            rich_text_to_markdown("<pre>```\ninner\n```</pre>"),
-            "````\n```\ninner\n```\n````"
-        );
-        // The `<code>` wrapper the editor emits inside a `pre` is not a second
-        // fence.
-        assert_eq!(
-            rich_text_to_markdown("<pre><code>let x = 1;</code></pre>"),
-            "```\nlet x = 1;\n```"
-        );
-    }
-
-    #[test]
-    fn an_inline_code_span_escapes_a_backtick_inside_it() {
-        assert_eq!(rich_text_to_markdown("<p><code>x</code></p>"), "`x`");
-        assert_eq!(
-            rich_text_to_markdown("<p><code>a `tick` b</code></p>"),
-            "`` a `tick` b ``"
-        );
-        assert_eq!(
-            rich_text_to_markdown("<p><code>a &amp; b</code></p>"),
-            "`a & b`",
-            "a code span decodes, because Markdown will not"
-        );
-        assert_eq!(rich_text_to_markdown("<p><code>   </code></p>"), "");
-    }
-
-    #[test]
-    fn a_break_and_a_rule_have_their_own_lines() {
-        assert_eq!(
-            rich_text_to_markdown("<p>one<br>two</p>"),
-            "one  \ntwo",
-            "two spaces then a newline is Markdown's hard break"
-        );
-        assert_eq!(
-            rich_text_to_markdown("<p>a</p><hr><p>b</p>"),
-            "a\n\n---\n\nb"
-        );
-    }
-
-    /// The property the whole design rests on: the body is sanitized HTML, so
-    /// the only raw `<` in the output is one this function wrote. If the body
-    /// could contribute a `<`, the export would be a way to publish HTML under
-    /// a member's public identity.
-    #[test]
-    fn prose_never_contributes_a_raw_angle_bracket() {
-        let hostile = "<p>a &lt;script&gt;alert(1)&lt;/script&gt; b</p>";
-        let out = rich_text_to_markdown(hostile);
-        assert_eq!(out, "a &lt;script&gt;alert(1)&lt;/script&gt; b");
-        assert!(!out.contains('<'), "the body contributed no tag: {out}");
-    }
-
-    #[test]
-    fn an_unknown_tag_keeps_its_words_and_loses_its_markup() {
-        // The sanitizer strips these, so this is the defensive path: a body
-        // that did not come from it still exports readable text.
-        assert_eq!(
-            rich_text_to_markdown("<p>a <span class=\"x\">word</span> b</p>"),
-            "a word b"
-        );
-        assert_eq!(
-            rich_text_to_markdown("<!-- a comment --><p>after</p>"),
-            "after",
-            "a comment is not text"
-        );
-        // A `<` that begins no tag is text, not a lost character.
-        assert_eq!(rich_text_to_markdown("<p>2 < 3</p>"), "2 < 3");
-    }
-
     /// A truncated body — an unclosed tag — still exports its words rather than
     /// nothing, and a stray close tag does not swallow a paragraph.
     #[test]
     fn unclosed_and_stray_tags_still_export_the_words() {
-        assert_eq!(rich_text_to_markdown("<p>unclosed"), "unclosed");
-        assert_eq!(rich_text_to_markdown("<p>one</p></div><p>two</p>"), "one\n\ntwo");
+        assert_eq!(rich_text_to_text("<p>unclosed"), "unclosed");
+        assert_eq!(rich_text_to_text("<p>one</p></div><p>two</p>"), "one\n\ntwo");
         assert_eq!(
-            rich_text_to_markdown("<p><b>bold</p>"),
-            "**bold**",
+            rich_text_to_text("<p><b>bold</p>"),
+            "bold",
             "an unclosed inner element unwraps into its parent"
         );
     }
 
     #[test]
     fn an_empty_body_exports_nothing() {
-        assert_eq!(rich_text_to_markdown(""), "");
-        assert_eq!(rich_text_to_markdown("   "), "");
-        assert_eq!(rich_text_to_markdown("<p></p>"), "");
+        assert_eq!(rich_text_to_text(""), "");
+        assert_eq!(rich_text_to_text("   "), "");
+        assert_eq!(rich_text_to_text("<p></p>"), "");
     }
 
     /// The two halves of the format are one list. Everything the sanitizer can
-    /// keep must survive the export as words, and every tag the export knows
-    /// must be one the sanitizer would keep — a tag in one list and not the
-    /// other is a silent loss.
+    /// keep must survive the reduction as words — a tag the sanitizer keeps and
+    /// the reduction loses is a silent loss on the way to a public post.
     #[test]
     fn every_tag_the_sanitizer_keeps_survives_the_export() {
         for tag in RICH_TEXT_TAGS {
@@ -1798,33 +1016,76 @@ mod reads_tests {
                 clean.contains("sentinel"),
                 "the sanitizer dropped {tag}: {clean}"
             );
-            let markdown = rich_text_to_markdown(&clean);
+            let text = rich_text_to_text(&clean);
             assert!(
-                markdown.contains("sentinel"),
-                "the export lost the words of {tag}: {markdown:?}"
+                text.contains("sentinel"),
+                "the export lost the words of {tag}: {text:?}"
             );
         }
     }
 
     #[test]
-    fn a_realistic_body_round_trips_through_both_halves() {
+    fn a_realistic_body_reduces_to_plaintext() {
         let raw = "<h1>On relays</h1><p>Long-form, <strong>badged</strong>.</p>\
                    <ul><li>curated</li><li>gated</li></ul>\
                    <blockquote><p>Public is permanent.</p></blockquote>\
                    <pre>kind: 30023</pre>\
                    <p>See <a href=\"https://ok.example/x\">the spec</a>.</p>";
-        let markdown = rich_text_to_markdown(&sanitize_rich_text(raw));
+        let clean = sanitize_rich_text(raw);
+        // The words and the line breaks, and no marker anywhere: this is the
+        // field a public post carries, and it forbids markup.
         assert_eq!(
-            markdown,
+            rich_text_to_text(&clean),
             concat!(
-                "# On relays\n\n",
-                "Long-form, **badged**.\n\n",
-                "- curated\n- gated\n\n",
-                "> Public is permanent.\n\n",
-                "```\nkind: 30023\n```\n\n",
-                "See [the spec](https://ok.example/x)."
+                "On relays\n\n",
+                "Long-form, badged.\n\n",
+                "curated\ngated\n\n",
+                "Public is permanent.\n\n",
+                "kind: 30023\n\n",
+                "See the spec."
             )
         );
+    }
+
+    /// The plaintext reduction is what a public post carries, so what it drops
+    /// has to be deliberate: a marker would be read as prose, a link's
+    /// destination is not part of the sentence, and an image has nothing to say
+    /// in a field with no room for one.
+    #[test]
+    fn the_plaintext_reduction_keeps_words_and_drops_markup() {
+        assert_eq!(rich_text_to_text("<p>plain</p>"), "plain");
+        assert_eq!(
+            rich_text_to_text("<p><strong>bold</strong> and <em>em</em></p>"),
+            "bold and em",
+            "no marker survives into the text"
+        );
+        assert_eq!(
+            rich_text_to_text("<p><a href=\"https://ok.example/x\">ok</a></p>"),
+            "ok",
+            "the label is the sentence; the destination is not"
+        );
+        assert_eq!(
+            rich_text_to_text("<p>a<br>b</p>"),
+            "a\nb",
+            "a break is a line break here, not a marker"
+        );
+        assert_eq!(
+            rich_text_to_text("<ul><li>one</li><li>two</li></ul>"),
+            "one\ntwo",
+            "list items keep their lines and lose their markers"
+        );
+        assert_eq!(
+            rich_text_to_text("<p>a &amp; b &lt;c&gt;</p>"),
+            "a & b <c>",
+            "entities decode, because nothing downstream will"
+        );
+        assert_eq!(rich_text_to_text("<pre>if x &lt; 1 {}</pre>"), "if x < 1 {}");
+        assert_eq!(rich_text_to_text("<p><img alt=\"x\"></p>"), "");
+        assert_eq!(rich_text_to_text("<p>a <span>word</span> b</p>"), "a word b");
+        assert_eq!(rich_text_to_text(""), "");
+        assert_eq!(rich_text_to_text("<p>   </p>"), "");
+        // A stray `<` that begins no tag is a character, not a lost one.
+        assert_eq!(rich_text_to_text("<p>2 < 3</p>"), "2 < 3");
     }
 
     #[test]

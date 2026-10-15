@@ -1242,25 +1242,6 @@ impl Account {
         self.vault.pen_name_sign(msg)
     }
 
-    /// The public identity this vault publishes and comments under on the
-    /// public Nostr network, if it has one yet.
-    pub fn public_identity(&self) -> Option<crate::PublicIdentity> {
-        self.vault.public_identity()
-    }
-
-    /// Mint the public identity (refused when one already exists).
-    pub fn create_public_identity(&mut self) -> Result<crate::PublicIdentity, Error> {
-        self.vault.create_public_identity()
-    }
-
-    /// Sign a Nostr event id as the public identity.
-    ///
-    /// `None` when there is no public identity: an export must not be published
-    /// under a key that does not exist, and must not be the thing that mints it.
-    pub fn public_identity_sign(&self, msg: &[u8]) -> Option<Vec<u8>> {
-        self.vault.public_identity_sign(msg)
-    }
-
     /// Drain every drop slot this account still holds a key for.
     ///
     /// One pass: for each drain key — current first, then retired ones — fetch

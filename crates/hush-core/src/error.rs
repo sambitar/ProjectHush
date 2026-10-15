@@ -80,8 +80,6 @@ pub enum Error {
     PenNameMissing,
     #[error("this vault holds the most pen names it can")]
     PenNameCap,
-    #[error("a public identity already exists")]
-    PublicIdentityExists,
     #[error("a voice session is already open in this conclave")]
     VoiceSessionExists,
     #[error("no voice session is open in this conclave")]

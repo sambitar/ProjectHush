@@ -30,7 +30,7 @@ Censorship resistance is a benefit of the architecture, not the headline. The go
 
 ## 3. Original ideas, status
 
-- **Usenet-style modern discussions:** *Deferred.* Likely direction: a public, signed "follow a person" model (Nostr/Mastodon-like), where posts live in the author's own vault. Alternative: small private rooms as many one-to-one encrypted links. **I will decide later. Do not design this yet; just keep the architecture from blocking it.**
+- **Usenet-style modern discussions:** *Deferred.* Direction settled 2026-10-14: the public layer is the **AT Protocol / Standard.site** lane — a member's own account, posts in their own repo, pulled per-repo. Small private rooms (many one-to-one encrypted links) remain the alternative for group talk.
 - **Discord-like chatrooms:** *Deferred.* Must be calmer and lighter than Discord. Readable conversations are a design goal.
 - **File pool via Syncthing with moderator deletion:** *Dropped* in its original form (conflicts with the local-first, person-to-person model).
 - **Files shown by hash, unreadable without the producer key:** Compatible in spirit: files are encrypted, content-addressed in the vault, and shared by encrypting to the recipient. Keep for the vault design.

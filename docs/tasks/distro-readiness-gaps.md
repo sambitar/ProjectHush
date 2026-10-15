@@ -21,6 +21,7 @@
 | DR-15 | Received files may be opened/saved to **user Downloads** via browser (plaintext export) | Tauri uses native open/save | Task 5b.1 — **mitigated** (export is explicit user action) |
 | DR-16 | **Recovery / first-run backup** not implemented | — | Task 6 — **done** |
 | DR-17 | Chat history only in **UI memory** (not in data root encrypted store) | `chat.enc` + API | Task 5c.3 — **done** |
-| DR-18 | (Future) **Zines → Nostr export** adds **Nostr over Tor** as a second outbound path (native zines use only the existing relay bulletin) | Task **11** (reshaped export bridge) | Document in network inventory when starting 11 |
+| DR-18 | **Public lane** adds an outbound path: ATProto XRPC over HTTPS to the member's PDS and every followed PDS, through the relay's own proxy setting (native zines use only the existing relay bulletin) | Task **11** / **22** (public lane) | **Implemented 2026-10-14** — egress is lazy (Connect / Refresh / Publish only) and reuses the relay's Tor switch; record it in the network inventory |
+| DR-19 | **Public content is permanent** — a published document cannot be un-published from Hush | public lane | **Mitigated** — explicit per-post confirmation, plain disclosure in the dialog, the record lives in the member's own account where it can be edited or deleted |
 
 **Process:** Before implementing Tasks **1, 2, 5, 5c, 6, 7, 10**, read the distro checklist in the milestones file and check this table for conflicts.

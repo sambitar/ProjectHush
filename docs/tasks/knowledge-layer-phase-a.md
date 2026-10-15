@@ -33,7 +33,7 @@ Phase A is the first expansion after Task 11’s feed + editor: **sections, link
 
 ## Local data model (encrypted under data root)
 
-Extends `hush-articles` SQLite (same DB file or `library.db` — decide at implementation; one backup manifest entry).
+Extends the public-lane store (same DB file or `library.db` — decide at implementation; one backup manifest entry).
 
 | Table / concept | Purpose |
 |-----------------|--------|
@@ -96,7 +96,7 @@ Exact paths may merge with 11.x naming; keep **one articles subsystem** gate beh
 - [ ] Briefing reasons are **inspectable** (user can see rule that included an item).
 - [ ] Annotations and shelves never published by default.
 - [ ] Pen name keys still isolated from messaging identity.
-- [ ] No new first-party server beyond existing relay + Nostr relays.
+- [ ] No new first-party server beyond the existing relay and the member's own PDS.
 
 ---
 
@@ -113,4 +113,4 @@ Exact paths may merge with 11.x naming; keep **one articles subsystem** gate beh
 ## Out of scope for Phase A
 
 - Theses/debates (Task **13.x**), graph visualization ( **14.1** ), projects ( **14.2** ), audio/TTS ( **15.1** ), library AI ( **15.4** ).
-- Messaging group rooms ( **15.3** ) — separate from Nostr public layer.
+- Messaging group rooms ( **15.3** ) — separate from the public lane.

@@ -5,19 +5,16 @@
  * sections, one lead story, then everything else under section headings.
  *
  * The corpus is **mixed**: the members' private zines, and — when the reader has
- * turned public posts on — public neighborhoods read from Nostr. Which story
- * leads, how the strip is ordered, where a story is filed and what its byline
- * says are the same questions for either lane, so they are answered once, here,
- * over a normalized {@link FrontPageStory}. The page then asks the lane only one
- * thing: whether to print the `public post` badge.
+ * turned the public lane on — public documents read from the open social web
+ * (AT Protocol, the Standard.site lexicons). Which story leads, how the strip is
+ * ordered, where a story is filed and what its byline says are the same
+ * questions for either lane, so they are answered once, here, over a normalized
+ * {@link FrontPageStory}. The page then asks the lane only one thing: whether to
+ * print the `public post` badge.
  *
  * `app.ts` only paints what these return.
  */
-import type {
-  NeighborhoodCommentDto,
-  NeighborhoodSummaryDto,
-  ZineSummaryDto,
-} from "./api/types.ts";
+import type { AtprotoDocumentDto, ZineSummaryDto } from "./api/types.ts";
 
 /** Which lane a story came from. */
 export type StorySource = "zine" | "post";
@@ -25,30 +22,13 @@ export type StorySource = "zine" | "post";
 /** The badge every public post carries, on its card and on its own page. */
 export const PUBLIC_POST_BADGE = "public post";
 
-/** The badge a zine carries once its article is also public.
+/** The badge a zine carries once its record is also public.
  *
  *  A zine is the members' paper by default, and this is the one way one of them
  *  can also be readable by anyone. The reader is about to read something that
  *  left the membership, so the card says so — the same reason a public post is
  *  badged. */
 export const PUBLIC_ZINE_BADGE = "also public";
-
-/** The NIP-23 kind an exported zine is published as. */
-export const LONG_FORM_KIND = 30023;
-
-/**
- * The NIP-01 address of an exported zine: `30023:pubkey:d`.
- *
- * The one place this format is composed for a zine. It is the handle a NIP-22
- * comment references and what the article is looked up by, so it has to agree
- * with the daemon's `ExportPlan::address` exactly.
- */
-export function zineExportAddress(exported: {
-  pubkey: string;
-  d: string;
-}): string {
-  return `${LONG_FORM_KIND}:${exported.pubkey.trim()}:${exported.d}`;
-}
 
 /**
  * A story on the front page, normalized from either lane.
@@ -57,12 +37,12 @@ export function zineExportAddress(exported: {
  * public post and a private zine differ in where they come from and in what the
  * page must say about them, not in how a newspaper is laid out. The original
  * record is carried along so the page can print the lane-specific parts — a
- * zine's revision and comment count, a post's reading time — without the
+ * zine's revision and comment count, a post's publish date — without the
  * composition rules having to know about them.
  */
 export interface FrontPageStory {
   source: StorySource;
-  /** The stable id: a zine id, or a public `30023:pubkey:d` address. */
+  /** The stable id: a zine id, or a document's `at://` address. */
   id: string;
   title: string;
   /** Normalised section tags. */
@@ -72,9 +52,9 @@ export interface FrontPageStory {
   /**
    * Local mute. No wire effect: the story is still held and still counted.
    *
-   * A public post cannot be muted yet — the read lane holds no per-`pub` mute
-   * list — so it is always false. The field is here because the rule that reads
-   * it (the lead, the `Muted posts` control) is the same for both lanes.
+   * A public post cannot be muted yet — the lane holds no per-account mute list
+   * — so it is always false. The field is here because the rule that reads it
+   * (the lead, the `Muted posts` control) is the same for both lanes.
    */
   muted: boolean;
   /** Unix milliseconds, for the newest-first order. */
@@ -82,7 +62,7 @@ export interface FrontPageStory {
   /** The private record, when this is a zine. */
   zine: ZineSummaryDto | null;
   /** The public record, when this is a post. */
-  post: NeighborhoodSummaryDto | null;
+  post: AtprotoDocumentDto | null;
 }
 
 /** One entry in the section strip: a section, and how many stories carry it. */
@@ -114,31 +94,35 @@ export function zineStory(zine: ZineSummaryDto): FrontPageStory {
   };
 }
 
-/** A public post as a front-page story. */
-export function postStory(post: NeighborhoodSummaryDto): FrontPageStory {
+/** A public document as a front-page story. */
+export function postStory(post: AtprotoDocumentDto): FrontPageStory {
   return {
     source: "post",
-    id: post.address,
+    id: post.uri,
     title: post.title,
-    sections: post.sections,
-    byline: publicByline(post.pubkey),
+    sections: post.tags,
+    byline: publicByline(post.handle.trim() || post.did),
     muted: false,
-    // A post's clock is when its author published it, in milliseconds.
-    created_ms: post.created_at * 1000,
+    // A post's clock is when its author published it. The daemon parsed the
+    // author's own RFC3339 string into seconds at ingest, because the raw string
+    // is not sortable: the lexicon allows an offset and optional fractions.
+    created_ms: post.published_secs * 1000,
     zine: null,
     post,
   };
 }
 
 /**
- * How a public post's author is named, from the key alone.
+ * How a public post's author is named.
  *
- * The read lane has no display name to offer: a NIP-23 event carries a pubkey
- * and nothing else, and kind:0 metadata is not fetched. So the page names the key
- * it actually holds, shortened, rather than inventing a name for a stranger.
+ * The lane offers a handle when the member followed one, and a DID when they
+ * pasted one instead: a record carries neither, so the name comes from the
+ * follow. There is no display name to offer — Standard.site has no profile
+ * record — so the page names what it actually holds, shortened, rather than
+ * inventing a name for a stranger.
  */
-export function publicByline(pubkey: string): string {
-  const trimmed = pubkey.trim();
+export function publicByline(name: string): string {
+  const trimmed = name.trim();
   if (!trimmed) return "";
   return trimmed.length <= 12 ? trimmed : `${trimmed.slice(0, 8)}…`;
 }
@@ -177,12 +161,12 @@ export function leadOf(stories: FrontPageStory[]): FrontPageStory | null {
  * A private zine is the page's default and says nothing about itself. A public
  * post is the exception on the page and says so everywhere it appears, because
  * the reader is about to read something that left the membership. A zine that
- * has been exported is the other exception: its body is readable by anyone, so
+ * has been published is the other exception: its body is readable by anyone, so
  * the card says that rather than letting the reader assume otherwise.
  */
 export function badgeOf(story: FrontPageStory): string | null {
   if (story.source === "post") return PUBLIC_POST_BADGE;
-  return story.zine?.export ? PUBLIC_ZINE_BADGE : null;
+  return story.zine?.public ? PUBLIC_ZINE_BADGE : null;
 }
 
 /**
@@ -270,114 +254,4 @@ export function byByline(
   const wanted = pen.trim().toLowerCase();
   if (!wanted) return stories;
   return stories.filter((story) => bylineOf(story).toLowerCase() === wanted);
-}
-
-/** The depth a reply is indented to, at most. Deeper replies sit at this level
- *  rather than marching off the page. */
-export const THREAD_MAX_DEPTH = 2;
-
-/** One comment and the replies to it, in the order the thread is read. */
-export interface PublicCommentNode {
-  comment: NeighborhoodCommentDto;
-  /** 0 for a comment on the article, 1 for a reply, capped at
-   *  {@link THREAD_MAX_DEPTH}. */
-  depth: number;
-  children: PublicCommentNode[];
-}
-
-/**
- * A flat thread as a tree, oldest first at every level.
- *
- * The cache holds comments flat, because a comment knows only its root and its
- * parent — the shape is what the wire carries, and it is the shape a store should
- * keep. The tree is a fact about *drawing* a thread, so it is built here, once,
- * where the thread is drawn.
- *
- * A comment whose parent this vault does not hold is a top-level one rather than
- * a lost one. That happens for two honest reasons: the reply arrived before the
- * comment it answers, or the bounded cache dropped the older parent. In both
- * cases the words are real and worth showing; a thread that hides a stranger's
- * reply because of a local eviction would be the worse failure.
- *
- * A parent that is held but is itself unreachable — a cycle, which no honest
- * relay produces but a hand-written event can — is likewise treated as
- * top-level, so the page cannot hang building a thread.
- */
-export function publicThread(replies: NeighborhoodCommentDto[]): PublicCommentNode[] {
-  const oldest = (a: NeighborhoodCommentDto, b: NeighborhoodCommentDto): number =>
-    a.created_at - b.created_at || a.event_id.localeCompare(b.event_id);
-  const ordered = [...replies].sort(oldest);
-
-  const nodes = new Map<string, PublicCommentNode>();
-  for (const comment of ordered) {
-    nodes.set(comment.event_id, { comment, depth: 0, children: [] });
-  }
-
-  const roots: PublicCommentNode[] = [];
-  for (const comment of ordered) {
-    const node = nodes.get(comment.event_id)!;
-    const parent = comment.parent_id ? nodes.get(comment.parent_id) : undefined;
-    if (parent && !wouldCycle(comment.event_id, parent, nodes)) {
-      parent.children.push(node);
-    } else {
-      roots.push(node);
-    }
-  }
-
-  const setDepth = (node: PublicCommentNode, depth: number): void => {
-    node.depth = Math.min(depth, THREAD_MAX_DEPTH);
-    for (const child of node.children) setDepth(child, node.depth + 1);
-  };
-  for (const root of roots) setDepth(root, 0);
-  return roots;
-}
-
-/**
- * Whether making `child` a child of `parent` would close a loop.
- *
- * Walked up the parents already placed rather than down from the root: the
- * comments arrive in time order, so a loop can only be formed by an event that
- * claims a parent which is *later* than it, and a bounded walk finds it without
- * recursion over the whole thread.
- */
-function wouldCycle(
-  childId: string,
-  parent: PublicCommentNode,
-  nodes: Map<string, PublicCommentNode>,
-): boolean {
-  let walker: PublicCommentNode | undefined = parent;
-  for (let steps = 0; walker && steps <= nodes.size; steps += 1) {
-    if (walker.comment.event_id === childId) return true;
-    const next: string | null = walker.comment.parent_id;
-    walker = next ? nodes.get(next) : undefined;
-  }
-  return false;
-}
-
-/** How many comments a thread holds, at every depth. */
-export function threadSize(nodes: PublicCommentNode[]): number {
-  let total = 0;
-  for (const node of nodes) total += 1 + threadSize(node.children);
-  return total;
-}
-
-/**
- * A thread in reading order, one row per comment.
- *
- * The tree is how a thread is understood; a flat list with a depth on each row is
- * how it is drawn. Flattening here rather than nesting the elements in the page
- * keeps the DOM one level deep — a thread of strangers' words is not the place to
- * find out what a deeply nested flex container does — and it makes the depth the
- * renderer indents by the same number the tree computed.
- */
-export function flattenThread(nodes: PublicCommentNode[]): PublicCommentNode[] {
-  const out: PublicCommentNode[] = [];
-  const walk = (list: PublicCommentNode[]): void => {
-    for (const node of list) {
-      out.push(node);
-      walk(node.children);
-    }
-  };
-  walk(nodes);
-  return out;
 }

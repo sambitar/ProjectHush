@@ -1,3 +1,4 @@
+import { groupDirectory, isFollowing, rowSubtitle, toggleFollow } from "./lib/explorePage";
 import { api, AppError, getApiBase } from "./lib/api/daemon";
 import type {
   ContactDto,
@@ -12,20 +13,21 @@ import type {
   TorrentItemDto,
   TorrentLibraryEntryDto,
   TorrentsStateDto,
-  NeighborhoodArticleDto,
-  NeighborhoodCommentDto,
-  NeighborhoodsViewDto,
   NoteDto,
   NotesStateDto,
-  PublicIdentityDto,
   WalletChain,
   WalletChainDto,
   WalletNetworkMode,
   WalletStateDto,
   WalletTokenDto,
+  AtprotoAccountDto,
+  AtprotoDocumentFullDto,
+  AtprotoExploreDto,
+  AtprotoExploreEntryDto,
+  AtprotoViewDto,
   ZinePendingCommentDto,
-  ZineExportDto,
-  ZineExportViewDto,
+  ZinePublicDto,
+  ZinePublishViewDto,
   ZineSummaryDto,
   ZineViewDto,
   ZinesViewDto,
@@ -229,7 +231,6 @@ import {
 } from "./lib/zineStore";
 import type {
   FrontPageStory,
-  PublicCommentNode,
   StorySource,
   ZinesSectionCount,
 } from "./lib/zinesPage";
@@ -237,16 +238,13 @@ import {
   badgeOf,
   byByline,
   bylineOf,
-  flattenThread,
   groupBySection,
   leadOf,
   newestFirst,
   postStory,
   publicByline,
-  publicThread,
   sectionCounts,
   zineStory,
-  zineExportAddress,
   PUBLIC_POST_BADGE,
 } from "./lib/zinesPage";
 import {
@@ -279,7 +277,6 @@ import { RichTextEditor } from "./components/ui/RichTextEditor";
 import { ContactPicker } from "./components/ui/ContactPicker";
 import { OverflowMenu, type OverflowMenuItem } from "./components/ui/OverflowMenu";
 import { bodyToDisplayHtml, isBlankHtml, sanitizeHtml } from "./lib/richText";
-import { markdownToHtml } from "./lib/markdown";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
 import { IrcPane } from "./features/irc/ircPane";
 import {
@@ -809,60 +806,63 @@ export class App {
   private zinesMineOnly = false;
   private zinesShowMuted = true;
   /**
-   * The public read lane's cached index, or null before it has been read.
+   * The public lane: the AT Protocol index this vault has read, or null before
+   * it has been read.
    *
-   * Held even while `Public posts` is off: the switch is a view control over a
-   * corpus this vault already holds, and the pane has to know whether there is
+   * Held even while the lane is off: the switch is a view control over a corpus
+   * this vault already holds, and the pane has to know whether there is
    * anything to offer before it offers it.
    */
-  private neighborhoodsView: NeighborhoodsViewDto | null = null;
-  private neighborhoodsLoading = false;
-  private neighborhoodsError: string | null = null;
+  private atprotoView: AtprotoViewDto | null = null;
+  private atprotoLoading = false;
+  private atprotoError: string | null = null;
   /**
-   * The `Public posts` switch.
+   * Whether the public lane shows on the front page.
    *
-   * Off unless the saved default says otherwise. Turning it on is this lane's
-   * opt-in: it is the one action that lets the daemon pull from the relays, so
-   * nothing leaves for Nostr while it is off.
+   * A view control like `Mine only`, not an opt-in: the cache is already in the
+   * vault, so showing it reaches nothing. Reading the network is the Refresh
+   * button's own act, and publishing is the author's.
    */
-  private neighborhoodsShown = false;
-  /** Whether the saved default has been read, so a later load cannot clobber a
-   *  choice the reader has already made this session. */
-  private neighborhoodsDefaultRead = false;
-  /** The open public post, with its body. */
-  private neighborhoodsDetail: NeighborhoodArticleDto | null = null;
-  private neighborhoodsDetailError: string | null = null;
+  private atprotoShown = false;
+  /** The open public document, with its body. */
+  private atprotoDetail: AtprotoDocumentFullDto | null = null;
+  private atprotoDetailError: string | null = null;
   /**
-   * The public identity this vault publishes and comments under, and whether the
-   * daemon has been asked for it yet.
+   * The lane's setup dialog: the connection, the blog documents are filed
+   * under, and the publications this vault reads.
    *
-   * Read once, when a public post is opened, because it is a vault read and a
-   * post is opened far more often than an identity is minted. `null` *after* a
-   * read means the vault holds none — which is the state a comment cannot leave
-   * from, so the composer says so and offers the mint rather than letting the
-   * reader write and then fail.
+   * One dialog rather than three, because the three are one story — you sign
+   * in, you say where your posts live, you say who you read — and a member
+   * setting the lane up needs to see all of it to know what the lane is.
    */
-  private publicIdentity: PublicIdentityDto | null = null;
-  private publicIdentityRead = false;
-  private publicIdentityBusy = false;
-  private publicIdentityError: string | null = null;
-  /**
-   * The public comment being written on the open post, and the comment it
-   * answers.
-   *
-   * Held outside the DOM for the same reason the sealed comment box is: the pane
-   * re-renders on a poll, and a half-typed comment must not go with it. The two
-   * boxes are separate pieces of state on purpose — a public comment and a sealed
-   * one are different acts with different consequences, and one draft must never
-   * be posted as the other.
-   */
-  private postCommentDraft = "";
-  private postCommentBusy = false;
-  private postCommentError: string | null = null;
-  /** The comment being answered, or null for a comment on the article itself. */
-  private postCommentParent: string | null = null;
-  /** The stable host for the public comment box, built once per open post. */
-  private postCommentHost: HTMLTextAreaElement | null = null;
+  private atprotoSetupOpen = false;
+  private atprotoSetupError: string | null = null;
+  /** The sign-in form. The password is held here only until the connect
+   *  answers; it is never stored, never logged, and never re-read. */
+  private atprotoPds = "https://bsky.social";
+  private atprotoIdentifier = "";
+  private atprotoPassword = "";
+  private atprotoConnectBusy = false;
+  /** The publication form. */
+  private atprotoPubName = "";
+  private atprotoPubUrl = "";
+  private atprotoPublicationBusy = false;
+  /** The follow list, one entry per line: a handle, or a `did:` for a member
+   *  who pasted one rather than a name. */
+  private atprotoFollowsDraft = "";
+  private atprotoFollowsBusy = false;
+  /** The discovery directory: what the last crawl found, held so opening the
+   *  dialog costs no network. */
+  private atprotoExploreView: AtprotoExploreDto | null = null;
+  private atprotoExploreOpen = false;
+  private atprotoExploreBusy = false;
+  private atprotoExploreError: string | null = null;
+  /** The directory filter, held here so a re-render does not lose what was
+   *  typed into the search field. */
+  private atprotoExploreFilter = "";
+  /** The `did` of the row whose follow is in flight, so one row can say so
+   *  without the whole list going dead. */
+  private atprotoExploreBusyDid: string | null = null;
   /**
    * Where the front page was scrolled when a story was opened, so coming back
    * lands the reader where they left rather than at the masthead. Captured on
@@ -934,17 +934,17 @@ export class App {
    */
   private zinesCommentHost: HTMLTextAreaElement | null = null;
   /**
-   * The export dialog (Task 11): which zine is being published to the
-   * neighborhoods, and what came back.
+   * The publish dialog: which zine is being published to the open web, and what
+   * came back.
    *
    * The result is held rather than toasted because the address is the thing the
-   * author needs afterwards — it is what a comment references and what they
-   * paste to a reader — and a toast that has faded is not an address.
+   * author needs afterwards — it is what they paste to a reader — and a toast
+   * that has faded is not an address.
    */
-  private zinesExportId: string | null = null;
-  private zinesExportBusy = false;
-  private zinesExportError: string | null = null;
-  private zinesExportResult: ZineExportViewDto | null = null;
+  private zinesPublishId: string | null = null;
+  private zinesPublishBusy = false;
+  private zinesPublishError: string | null = null;
+  private zinesPublishResult: ZinePublishViewDto | null = null;
   private conclaveCreateOpen = false;
   /**
    * The in-progress create-conclave form.
@@ -1587,33 +1587,37 @@ export class App {
     this.zinesError = null;
     this.zinesDetailError = null;
     this.zinesPenNameOpen = false;
-    // The public lane. The switch itself goes back to off and its saved default
-    // is re-read on the next visit: a lock is not a reason to keep reading a
-    // public network the moment the vault opens again.
-    this.neighborhoodsView = null;
-    this.neighborhoodsDetail = null;
-    this.neighborhoodsDetailError = null;
-    this.neighborhoodsError = null;
-    this.neighborhoodsShown = false;
-    this.neighborhoodsDefaultRead = false;
-    // The public identity is key material, so a locked vault has none to show —
-    // and a comment drafted against the old one must not survive the lock.
-    this.publicIdentity = null;
-    this.publicIdentityRead = false;
-    this.publicIdentityError = null;
-    this.postCommentDraft = "";
-    this.postCommentParent = null;
-    this.postCommentError = null;
-    this.postCommentHost = null;
+    // The public lane. The switch goes back to off and the cached index is
+    // dropped: it is vault state, and a locked vault has none to show. The
+    // connection itself lives in the vault, so it is re-read on the next visit.
+    this.atprotoView = null;
+    this.atprotoDetail = null;
+    this.atprotoDetailError = null;
+    this.atprotoError = null;
+    this.atprotoShown = false;
+    // The setup dialog is about a vault that is now closed, and the password
+    // field on it must not outlive the session that would have used it.
+    this.atprotoSetupOpen = false;
+    this.atprotoSetupError = null;
+    this.atprotoPassword = "";
+    this.atprotoConnectBusy = false;
+    this.atprotoPublicationBusy = false;
+    this.atprotoFollowsBusy = false;
+    this.atprotoExploreView = null;
+    this.atprotoExploreOpen = false;
+    this.atprotoExploreBusy = false;
+    this.atprotoExploreError = null;
+    this.atprotoExploreFilter = "";
+    this.atprotoExploreBusyDid = null;
     this.zinesForgetId = null;
     this.zinesShareId = null;
     this.zinesShareContact = "";
     this.zinesShareError = null;
-    // The export dialog is about a vault that is now closed, and the address it
-    // was showing came out of it.
-    this.zinesExportId = null;
-    this.zinesExportResult = null;
-    this.zinesExportError = null;
+    // The publish dialog is about a vault that is now closed, and the address
+    // it was showing came out of it.
+    this.zinesPublishId = null;
+    this.zinesPublishResult = null;
+    this.zinesPublishError = null;
     this.zinesCommentDraft = "";
     this.zinesCommentError = null;
     clearReadsStore();
@@ -1833,7 +1837,10 @@ export class App {
     if (this.zinesPenNameOpen) this.root.appendChild(this.renderZinesPenNameModal());
     if (this.zinesForgetId) this.root.appendChild(this.renderZinesForgetModal());
     if (this.zinesShareId) this.root.appendChild(this.renderZinesShareModal());
-    if (this.zinesExportId) this.root.appendChild(this.renderZinesExportModal());
+    if (this.atprotoSetupOpen) this.root.appendChild(this.renderAtprotoModal());
+    if (this.atprotoExploreOpen)
+      this.root.appendChild(this.renderAtprotoExploreModal());
+    if (this.zinesPublishId) this.root.appendChild(this.renderZinesPublishModal());
     if (this.pendingUpdate) this.root.appendChild(this.renderUpdatePrompt());
   }
 
@@ -5850,7 +5857,7 @@ export class App {
   }
 
   /** Every external link routes through the confirm modal; never auto-open. */
-  private readsConfirmOpen(url: string): void {
+  private confirmExternalOpen(url: string): void {
     this.readsConfirmUrl = url;
     this.render();
   }
@@ -5895,72 +5902,365 @@ export class App {
     if (this.rail === "zines") this.render();
     // The public lane rides along: it is part of the same page, and reading its
     // cache is not egress, so the pane can know whether to offer the switch.
-    void this.neighborhoodsLoad();
+    void this.atprotoLoad();
   }
 
   /**
-   * Read the public lane's cached index, and the saved switch default once.
+   * Read the public lane's cached index.
    *
-   * Reading the cache is not egress: it is the daemon's own encrypted store. So
+   * Reading the cache is not egress: it is the daemon's own encrypted store, and
+   * the documents in it were fetched by an earlier Refresh or by publishing. So
    * this runs whether or not the switch is on — the pane needs to know whether
-   * there is anything to offer, and a reader who opted in last session should not
-   * have to flip a switch that already remembers them.
+   * there is anything to offer.
    */
-  private async neighborhoodsLoad(): Promise<void> {
-    if (this.neighborhoodsLoading) return;
-    this.neighborhoodsLoading = true;
+  private async atprotoLoad(): Promise<void> {
+    if (this.atprotoLoading) return;
+    this.atprotoLoading = true;
     try {
-      if (!this.neighborhoodsDefaultRead) {
-        const settings = await api.neighborhoodSettings();
-        this.neighborhoodsDefaultRead = true;
-        // A null answer is the daemon having nothing to report, which is the
-        // same as the default: off.
-        this.neighborhoodsShown = settings?.default_show ?? false;
-      }
-      this.neighborhoodsView = await api.neighborhoods();
-      this.neighborhoodsError = null;
+      this.atprotoView = await api.atproto();
+      this.atprotoError = null;
     } catch (e) {
-      this.neighborhoodsError =
+      this.atprotoError =
         e instanceof AppError
           ? e.message
-          : "Couldn't read the public posts this vault holds.";
+          : "Couldn't read the public documents this vault holds.";
     }
-    this.neighborhoodsLoading = false;
+    this.atprotoLoading = false;
     if (this.rail === "zines") this.render();
   }
 
   /**
-   * Pull from the allowlisted relays over Tor.
+   * Pull from every publication this vault reads.
    *
-   * The lane's only egress, and the only place it happens. A failure is reported
-   * beside the switch rather than replacing the page: the cache is still worth
-   * reading, so a reader whose Tor is down still gets what was pulled last time.
+   * The lane's only egress besides publishing, and the only place it happens
+   * without the author asking for it by name. A failure is reported beside the
+   * switch rather than replacing the page: the cache is still worth reading, so
+   * a reader whose network is down still gets what was pulled last time.
    */
-  private async neighborhoodsRefresh(): Promise<void> {
-    if (this.neighborhoodsLoading) return;
-    this.neighborhoodsLoading = true;
-    this.neighborhoodsError = null;
+  private async atprotoRefresh(): Promise<void> {
+    if (this.atprotoLoading) return;
+    this.atprotoLoading = true;
+    this.atprotoError = null;
     if (this.rail === "zines") this.render();
     try {
-      this.neighborhoodsView = await api.refreshNeighborhoods();
+      const out = await api.atprotoRefresh();
+      if (!out) throw new Error("The daemon sent no answer.");
+      this.atprotoView = out;
+      if (out.failed.length) {
+        this.atprotoError = `Couldn't read ${out.failed.length === 1 ? "one publication" : `${out.failed.length} publications`}: ${out.failed.join("; ")}`;
+      }
     } catch (e) {
-      this.neighborhoodsError =
-        e instanceof AppError ? e.message : "Couldn't reach the relays.";
+      this.atprotoError =
+        e instanceof AppError ? e.message : "Couldn't read the publications.";
     }
-    this.neighborhoodsLoading = false;
+    this.atprotoLoading = false;
     if (this.rail === "zines") this.render();
+  }
+
+  /**
+   * Open the discovery dialog.
+   *
+   * Loads the cached directory first, so the dialog opens instantly with
+   * whatever was found last time. A crawl runs only when the vault has never
+   * crawled — an empty dialog with a button is a worse first impression than a
+   * short wait, and the wait happens once per vault rather than once per open.
+   */
+  private atprotoExploreOpenDialog(): void {
+    this.atprotoExploreOpen = true;
+    this.atprotoExploreError = null;
+    this.render();
+    void this.atprotoExploreLoad().then(() => {
+      if (this.atprotoExploreView?.crawled_unix) return;
+      void this.atprotoExploreCrawl();
+    });
+  }
+
+  private atprotoExploreClose(): void {
+    if (this.atprotoExploreBusy) return;
+    this.atprotoExploreOpen = false;
+    this.render();
+  }
+
+  /** The cached directory. Reads the vault, never the network. */
+  private async atprotoExploreLoad(): Promise<void> {
+    try {
+      const out = await api.atprotoExplore();
+      if (!out) throw new Error("The daemon sent no answer.");
+      this.atprotoExploreView = out;
+      this.atprotoExploreError = null;
+    } catch (e) {
+      this.atprotoExploreError =
+        e instanceof AppError ? e.message : "Couldn't read the directory.";
+    }
+    this.render();
+  }
+
+  /** One hop from the seeds, replacing the directory with what it found. */
+  private async atprotoExploreCrawl(): Promise<void> {
+    if (this.atprotoExploreBusy) return;
+    this.atprotoExploreBusy = true;
+    this.atprotoExploreError = null;
+    this.render();
+    try {
+      const out = await api.atprotoExploreRefresh();
+      if (!out) throw new Error("The daemon sent no answer.");
+      this.atprotoExploreView = out;
+      if (out.failed?.length) {
+        this.atprotoExploreError = `Couldn't reach ${out.failed.length === 1 ? "one account" : `${out.failed.length} accounts`}: ${out.failed.join("; ")}`;
+      }
+    } catch (e) {
+      this.atprotoExploreError =
+        e instanceof AppError ? e.message : "Couldn't look for publications.";
+    }
+    this.atprotoExploreBusy = false;
+    this.render();
+  }
+
+  /**
+   * Follow or unfollow one publication, by DID.
+   *
+   * The DID is the whole point: it needs no resolver, so this works for a member
+   * with no account at all — which is who discovery is for. The list is sent
+   * whole because the lane is curated rather than subscribed: the daemon has no
+   * add-one route, and giving it one would let the list drift from the member's.
+   */
+  private async atprotoExploreToggleFollow(
+    entry: AtprotoExploreEntryDto,
+  ): Promise<void> {
+    if (this.atprotoExploreBusyDid) return;
+    const current = this.atprotoView?.follows ?? [];
+    const following = isFollowing(current, entry.did);
+    const next = toggleFollow(current, entry);
+
+    this.atprotoExploreBusyDid = entry.did;
+    this.atprotoExploreError = null;
+    this.render();
+    try {
+      const out = await api.atprotoSetFollows(next);
+      if (!out) throw new Error("The daemon sent no answer.");
+      this.atprotoView = out;
+    } catch (e) {
+      this.atprotoExploreError =
+        e instanceof AppError
+          ? e.message
+          : following
+            ? "Couldn't stop following that publication."
+            : "Couldn't follow that publication.";
+    }
+    this.atprotoExploreBusyDid = null;
+    this.render();
+  }
+
+  /**
+   * The discovery dialog.
+   *
+   * A browsing surface, so the layout is built around seeing many publications
+   * at once rather than around one row being informative. Measured against the
+   * first version: sixty-six rows averaging 269px tall meant **two** were visible
+   * at a time in a 19,000px scroll, and sixty-two of them carried a primary
+   * button. Hence the compact two-line row, the quiet `Follow`, and the filter —
+   * with sixty-six entries, scrolling is not a way to find anything.
+   *
+   * Two things it says rather than implies. Where the list came from: it is
+   * grouped by the seed each entry was reached through, because one hop from two
+   * accounts is a neighbourhood and not a survey, and a list that hid that would
+   * read as the whole network. And what following costs: nothing is read until
+   * `Refresh`, so following is a choice about a list and not a subscription.
+   */
+  private renderAtprotoExploreModal(): HTMLElement {
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal atproto-explore-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Explore publications");
+
+    const head = document.createElement("div");
+    head.className = "atproto-explore-head";
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Explore";
+    head.appendChild(h);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "atproto-explore-close pressable";
+    close.textContent = "×";
+    close.setAttribute("aria-label", "Close");
+    close.onclick = () => this.atprotoExploreClose();
+    head.appendChild(close);
+    modal.appendChild(head);
+
+    // One line, with the rest behind the title attribute. Three sentences of
+    // prose above a list is an essay where a caption belongs.
+    const intro = document.createElement("p");
+    intro.className = "muted text-13 atproto-explore-intro";
+    intro.textContent =
+      "One step out from two known accounts — not a survey of the network.";
+    intro.title =
+      "Found by reading who a few known accounts follow, then keeping the accounts that publish. Every entry says which account it was reached through. Following adds it to your reading list; nothing is read until you press Refresh on the Zines page.";
+    modal.appendChild(intro);
+
+    if (this.atprotoExploreError) {
+      const err = document.createElement("p");
+      err.className = "zines-note zine-error text-13";
+      err.textContent = this.atprotoExploreError;
+      modal.appendChild(err);
+    }
+
+    const view = this.atprotoExploreView;
+    const entries = view?.directory ?? [];
+    const busy = this.atprotoExploreBusy;
+
+    if (busy && !entries.length) {
+      const loading = document.createElement("p");
+      loading.className = "muted text-13 atproto-explore-empty";
+      loading.textContent = "Looking…";
+      modal.appendChild(loading);
+    } else if (!entries.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted text-13 atproto-explore-empty";
+      empty.textContent =
+        "Nothing found yet. Looking reads a few public accounts, needs no sign-in, and is the only thing here that touches the network.";
+      modal.appendChild(empty);
+    } else {
+      const bar = document.createElement("div");
+      bar.className = "atproto-explore-bar";
+      const search = document.createElement("input");
+      search.type = "search";
+      search.className = "atproto-explore-search";
+      search.placeholder = "Filter by name…";
+      search.value = this.atprotoExploreFilter;
+      search.setAttribute("aria-label", "Filter publications");
+      search.oninput = () => {
+        this.atprotoExploreFilter = search.value;
+        this.render();
+        // Re-render replaces the input, so focus and caret are put back by hand;
+        // without this the field drops the caret after one character.
+        const next = this.root.querySelector<HTMLInputElement>(
+          ".atproto-explore-search",
+        );
+        if (next) {
+          next.focus();
+          next.setSelectionRange(next.value.length, next.value.length);
+        }
+      };
+      bar.appendChild(search);
+
+      const meta = document.createElement("span");
+      meta.className = "muted text-12 atproto-explore-meta";
+      meta.textContent = `${entries.length} publication${entries.length === 1 ? "" : "s"}${view?.crawled_unix ? ` · found ${formatRelative(view.crawled_unix * 1000)}` : ""}`;
+      bar.appendChild(meta);
+      modal.appendChild(bar);
+
+      const groups = groupDirectory(entries, this.atprotoExploreFilter);
+      const list = document.createElement("div");
+      list.className = "atproto-explore-list";
+      if (!groups.length) {
+        const none = document.createElement("p");
+        none.className = "muted text-13 atproto-explore-empty";
+        none.textContent = `Nothing matches “${this.atprotoExploreFilter.trim()}”.`;
+        list.appendChild(none);
+      }
+      for (const group of groups) {
+        const heading = document.createElement("h3");
+        heading.className = "atproto-explore-group text-12 muted";
+        heading.textContent = `via ${group.via} · ${group.entries.length}`;
+        heading.title = `Reached by following ${group.via}.`;
+        list.appendChild(heading);
+        for (const entry of group.entries) {
+          list.appendChild(this.atprotoExploreRow(entry));
+        }
+      }
+      modal.appendChild(list);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const look = document.createElement("button");
+    look.type = "button";
+    look.className = "btn-secondary pressable atproto-explore-look";
+    look.textContent = busy ? "Looking…" : entries.length ? "Look again" : "Look for publications";
+    look.disabled = busy;
+    look.onclick = () => void this.atprotoExploreCrawl();
+    actions.appendChild(look);
+
+    const done = document.createElement("button");
+    done.type = "button";
+    done.className = "btn-primary pressable";
+    done.textContent = "Done";
+    done.onclick = () => this.atprotoExploreClose();
+    actions.appendChild(done);
+    modal.appendChild(actions);
+
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back) this.atprotoExploreClose();
+    };
+    return back;
+  }
+
+  /**
+   * One publication in the directory.
+   *
+   * Two lines and a fixed height, so the list scans as a list. The `Follow`
+   * control is deliberately quiet: this is a browsing surface, and the first
+   * version put a primary button on all sixty-six rows, which made every row
+   * shout and none of them readable.
+   */
+  private atprotoExploreRow(entry: AtprotoExploreEntryDto): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "atproto-explore-row";
+
+    const text = document.createElement("div");
+    text.className = "atproto-explore-text";
+
+    const name = document.createElement("div");
+    name.className = "text-15 atproto-explore-name";
+    name.textContent = entry.name;
+    name.title = entry.uri;
+    text.appendChild(name);
+
+    const subtitle = rowSubtitle(entry);
+    if (subtitle) {
+      const sub = document.createElement("div");
+      sub.className = "muted text-12 atproto-explore-sub";
+      sub.textContent = subtitle;
+      sub.title = entry.description;
+      text.appendChild(sub);
+    }
+    row.appendChild(text);
+
+    const follows = this.atprotoView?.follows ?? [];
+    const following = isFollowing(follows, entry.did);
+    const rowBusy = this.atprotoExploreBusyDid === entry.did;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `pressable atproto-explore-follow${following ? " is-following" : ""}`;
+    btn.textContent = rowBusy ? "…" : following ? "Following" : "Follow";
+    // The follow is per account, not per publication: one account can host
+    // several of these rows, and following any one of them reads all of them.
+    // Said in the title rather than hidden, because it is surprising otherwise.
+    btn.title = following
+      ? `Stop reading ${entry.handle || entry.did}. This account hosts every publication it has here.`
+      : `Read ${entry.handle || entry.did} on the next Refresh. This follows the account, so every publication it hosts here comes with it.`;
+    btn.disabled = rowBusy || this.atprotoExploreBusyDid !== null;
+    btn.onclick = () => void this.atprotoExploreToggleFollow(entry);
+    row.appendChild(btn);
+
+    return row;
   }
 
   /**
    * The `Public posts` switch.
    *
-   * Turning it on is the opt-in that lets this page read a public network, so it
-   * saves itself as the default and pulls once. Turning it off only hides the
-   * posts: hiding a story is not a reason to throw it away, and the cache stays
-   * for the next time the reader asks.
+   * Turning it on shows what is already held rather than reaching for anything:
+   * a display choice is not a reason to talk to a network, and the Refresh
+   * button is the one place that does. Turning it off only hides the posts —
+   * hiding a story is not a reason to throw it away.
    */
-  private async zinesSetPublicPosts(on: boolean): Promise<void> {
-    this.neighborhoodsShown = on;
+  private zinesSetPublicLane(on: boolean): void {
+    this.atprotoShown = on;
     // A new corpus is a new page: open it at the masthead, and drop a section
     // filter the new corpus may no longer carry.
     this.pendingZinesScroll = null;
@@ -5971,13 +6271,6 @@ export class App {
       this.zinesSection = null;
     }
     this.render();
-    try {
-      await api.setNeighborhoodSettings({ default_show: on });
-    } catch {
-      // A default that did not save is not worth a page-level error: the switch
-      // still works for this session, which is what the reader asked for.
-    }
-    if (on) await this.neighborhoodsRefresh();
   }
 
   /**
@@ -5996,8 +6289,8 @@ export class App {
     let held: FrontPageStory[] = this.zinesMineOnly
       ? this.zinesMine().map(zineStory)
       : (this.zinesView?.zines ?? []).map(zineStory);
-    if (!this.zinesMineOnly && this.neighborhoodsShown) {
-      held = held.concat((this.neighborhoodsView?.articles ?? []).map(postStory));
+    if (!this.zinesMineOnly && this.atprotoShown) {
+      held = held.concat((this.atprotoView?.documents ?? []).map(postStory));
     }
     if (!this.zinesShowMuted) held = held.filter((s) => !s.muted);
     // Both lanes in one newest-first order: the page is one newspaper, not two
@@ -6070,32 +6363,22 @@ export class App {
     this.zinesOpenSource = source;
     this.zinesDetail = null;
     this.zinesDetailError = null;
-    this.neighborhoodsDetail = null;
-    this.neighborhoodsDetailError = null;
+    this.atprotoDetail = null;
+    this.atprotoDetailError = null;
     // A comment belongs to the story it was typed on, so opening another story
     // starts a fresh box rather than carrying the text across.
     this.zinesCommentHost = null;
     this.zinesCommentDraft = "";
     this.zinesCommentError = null;
     this.zinesCommentBusyHash = null;
-    // The public box is a different box on a different page, so it is reset with
-    // the story too — including the comment it was answering.
-    this.postCommentHost = null;
-    this.postCommentDraft = "";
-    this.postCommentError = null;
-    this.postCommentParent = null;
     this.render();
     try {
       // A late reply must not paint over whatever the user is looking at now, so
       // every path below re-checks the selection before it stores anything.
       if (source === "post") {
-        // The identity is read alongside the article because the composer has to
-        // be able to say whether commenting is possible before the reader writes
-        // anything. It is one vault read, once per session.
-        void this.publicIdentityLoad();
-        const detail = await api.neighborhoodArticle(id);
+        const detail = await api.atprotoDocument(id);
         if (this.zinesOpenId !== id) return;
-        this.neighborhoodsDetail = detail;
+        this.atprotoDetail = detail;
       } else {
         const detail = await api.zinesGet(id);
         if (this.zinesOpenId !== id) return;
@@ -6109,7 +6392,7 @@ export class App {
           : source === "post"
             ? "Couldn't open that post."
             : "Couldn't open that zine.";
-      if (source === "post") this.neighborhoodsDetailError = message;
+      if (source === "post") this.atprotoDetailError = message;
       else this.zinesDetailError = message;
     }
     if (this.rail === "zines" && this.zinesOpenId === id) this.render();
@@ -6545,28 +6828,51 @@ export class App {
     );
 
     // The lane's own switch, below a rule: it is not a view control like the two
-    // above but the opt-in that lets this page read a public network.
+    // above but the door to another network's stories.
     const publicPosts = document.createElement("div");
     publicPosts.className = "zines-public";
     publicPosts.appendChild(
-      this.zinesToggle("Public posts", this.neighborhoodsShown, (on) =>
-        void this.zinesSetPublicPosts(on),
+      this.zinesToggle("Public posts", this.atprotoShown, (on) =>
+        this.zinesSetPublicLane(on),
       ),
     );
-    if (this.neighborhoodsShown) {
+    // Outside the `atprotoShown` branch on purpose: discovery is the way a
+    // member finds their first publication, and hiding it behind a switch they
+    // have no reason to have turned on yet would hide it from exactly the person
+    // it is for.
+    const explore = document.createElement("button");
+    explore.type = "button";
+    explore.className = "btn-secondary text-13 pressable zines-explore";
+    explore.textContent = "Explore publications";
+    explore.title =
+      "Find publications on the open web. Reads a few public accounts, needs no sign-in, and adds nothing to your list until you say so.";
+    explore.onclick = () => this.atprotoExploreOpenDialog();
+    publicPosts.appendChild(explore);
+    if (this.atprotoShown) {
       const note = document.createElement("p");
       note.className = "zines-public-note text-12 muted";
       note.textContent =
-        this.neighborhoodsError ??
-        "Read over Tor from your neighborhood relays. Public, permanent, and not yours to remove.";
+        this.atprotoError ??
+        "Published to the open social web and cached in your vault. Public, permanent, and not yours to remove. Showing them reads nothing; Refresh is what reaches the network.";
       publicPosts.appendChild(note);
+      const actions = document.createElement("div");
+      actions.className = "zines-public-actions";
       const refresh = document.createElement("button");
       refresh.type = "button";
       refresh.className = "btn-secondary text-13 pressable zines-public-refresh";
-      refresh.textContent = this.neighborhoodsLoading ? "Reading…" : "Refresh";
-      refresh.disabled = this.neighborhoodsLoading;
-      refresh.onclick = () => void this.neighborhoodsRefresh();
-      publicPosts.appendChild(refresh);
+      refresh.textContent = this.atprotoLoading ? "Reading…" : "Refresh";
+      refresh.disabled = this.atprotoLoading;
+      refresh.onclick = () => void this.atprotoRefresh();
+      actions.appendChild(refresh);
+      const setup = document.createElement("button");
+      setup.type = "button";
+      setup.className = "btn-secondary text-13 pressable zines-public-setup";
+      setup.textContent = "Public lane…";
+      setup.title =
+        "Connect an account, say where your own posts live, and choose who you read.";
+      setup.onclick = () => this.atprotoSetupOpenDialog();
+      actions.appendChild(setup);
+      publicPosts.appendChild(actions);
     }
     controls.appendChild(publicPosts);
 
@@ -6658,6 +6964,8 @@ export class App {
       page.appendChild(empty);
       const offer = this.renderZinesOfferPublic();
       if (offer) page.appendChild(offer);
+      const explore = this.renderZinesOfferExplore();
+      if (explore) page.appendChild(explore);
       return page;
     }
 
@@ -6687,8 +6995,8 @@ export class App {
     if (this.zinesPen) return `Nothing here is signed by ${this.zinesPen}.`;
     if (this.zinesSection) return `Nothing in ${this.zinesSection} yet.`;
     if (this.zinesMineOnly) return "You haven't published anything yet.";
-    if (this.neighborhoodsShown && !(this.neighborhoodsView?.articles.length ?? 0)) {
-      return "Nothing here yet, and nothing has been read from neighborhoods. Press Refresh to look.";
+    if (this.atprotoShown && !(this.atprotoView?.documents.length ?? 0)) {
+      return "Nothing here yet, and nothing has been read from the public lane. Press Refresh to look.";
     }
     return "Nothing here yet. Write the first one, or wait for one to arrive.";
   }
@@ -6699,17 +7007,38 @@ export class App {
    * A corpus of one or two zines is the state this page starts in, and a switch
    * buried in the pane is not an answer to "there is nothing here". Offered only
    * when there is something behind it and the switch is off, so it never invites
-   * a pull that would come back empty.
+   * a reader to show an empty lane.
    */
   private renderZinesOfferPublic(): HTMLElement | null {
-    if (this.neighborhoodsShown) return null;
-    const held = this.neighborhoodsView?.articles.length ?? 0;
+    if (this.atprotoShown) return null;
+    const held = this.atprotoView?.documents.length ?? 0;
     if (!held) return null;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "btn-secondary pressable zines-offer-public";
-    btn.textContent = `Show ${held} public post${held === 1 ? "" : "s"} from neighborhoods`;
-    btn.onclick = () => void this.zinesSetPublicPosts(true);
+    btn.textContent = `Show ${held} public post${held === 1 ? "" : "s"} from the open web`;
+    btn.onclick = () => this.zinesSetPublicLane(true);
+    return btn;
+  }
+
+  /**
+   * The way to find a first publication, offered where the page is emptiest.
+   *
+   * A vault with one zine and nothing followed is the state this page starts in,
+   * and "Explore" in the pane is a control a reader has no reason to go looking
+   * for yet. Offered only when the public lane holds nothing at all, so it never
+   * competes with the offer above: a page with public posts already held wants
+   * the switch, not a crawl.
+   */
+  private renderZinesOfferExplore(): HTMLElement | null {
+    if (this.atprotoView?.documents.length) return null;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-secondary pressable zines-offer-explore";
+    btn.textContent = "Find publications to read";
+    btn.title =
+      "Reads a few public accounts and lists what they follow. No sign-in, and nothing joins your list until you choose it.";
+    btn.onclick = () => this.atprotoExploreOpenDialog();
     return btn;
   }
 
@@ -6897,7 +7226,7 @@ export class App {
 
     // A zine's taste of the body is its own; a post's is the summary its author
     // wrote, which may be absent. Neither is ever the body itself.
-    const preview = zine?.preview || story.post?.summary || "";
+    const preview = zine?.preview || story.post?.preview || "";
     if (preview) {
       const p = document.createElement("p");
       p.className = "zine-card-preview";
@@ -6935,8 +7264,8 @@ export class App {
       if (zine.muted) bits.push("muted");
       if (zine.unreadable) bits.push("unreadable");
     } else if (story.post) {
-      bits.push(`${story.post.reading_minutes} min read`);
-      bits.push(readsTimeAgo(story.post.created_at));
+      bits.push(readsTimeAgo(story.post.published_secs));
+      if (story.post.path) bits.push(story.post.path);
     }
     if (bits.length) {
       const rest = document.createElement("span");
@@ -6969,13 +7298,13 @@ export class App {
     // not: a public post and a private zine are different things to be reading,
     // and this page says which one it is rather than dressing one as the other.
     if (this.zinesOpenSource === "post") {
-      if (this.neighborhoodsDetailError) {
+      if (this.atprotoDetailError) {
         const err = document.createElement("p");
         err.className = "zines-note muted text-13";
-        err.textContent = this.neighborhoodsDetailError;
+        err.textContent = this.atprotoDetailError;
         reader.appendChild(err);
-      } else if (this.neighborhoodsDetail?.address === id) {
-        reader.appendChild(this.renderNeighborhoodArticle(this.neighborhoodsDetail));
+      } else if (this.atprotoDetail?.uri === id) {
+        reader.appendChild(this.renderAtprotoDocument(this.atprotoDetail));
       } else {
         const loading = document.createElement("p");
         loading.className = "zines-note muted text-13";
@@ -7009,19 +7338,20 @@ export class App {
   }
 
   /**
-   * A public post on its own page.
+   * A public document on its own page.
    *
    * The badge and the honest copy are the point of this page. A reader arrives
    * from a page of members' zines, so the layout is familiar — and the one thing
    * a familiar layout must not imply is that the story in it is private. So the
-   * page says, before the body: this left the membership, it is on a public
-   * network, and it cannot be taken back.
+   * page says, before the body: this left the membership, it is on the open
+   * social web under the author's own account, and it cannot be taken back.
    *
-   * Replies are read-only here. Commenting publicly is a separate act with its
-   * own phase, and a composer that looked like the zine one would suggest this
-   * page writes to the same place. It does not.
+   * The body is plaintext, because the lexicon's field forbids markup: it is set
+   * as text, never parsed. There is no thread here — Standard.site has no
+   * comment record — and no composer, because this vault reads other people's
+   * publications rather than replying into them.
    */
-  private renderNeighborhoodArticle(post: NeighborhoodArticleDto): HTMLElement {
+  private renderAtprotoDocument(doc: AtprotoDocumentFullDto): HTMLElement {
     const article = document.createElement("article");
     article.className = "zine-article";
 
@@ -7032,11 +7362,11 @@ export class App {
     badge.textContent = PUBLIC_POST_BADGE;
     const h = document.createElement("h1");
     h.className = "text-22";
-    h.textContent = post.title || "Untitled";
+    h.textContent = doc.title || "Untitled";
 
     const byline = document.createElement("p");
     byline.className = "zine-article-byline text-13 muted";
-    const name = publicByline(post.pubkey);
+    const name = publicByline(doc.handle.trim() || doc.did);
     if (name) {
       const who = document.createElement("button");
       who.type = "button";
@@ -7048,14 +7378,14 @@ export class App {
     }
     const rest = document.createElement("span");
     rest.className = "zine-article-byline-rest";
-    rest.textContent = ` · ${[`${post.reading_minutes} min read`, readsTimeAgo(post.created_at)].join(" · ")}`;
+    rest.textContent = ` · published ${readsTimeAgo(doc.published_secs)}`;
     byline.appendChild(rest);
     head.append(badge, h, byline);
 
-    if (post.sections.length) {
+    if (doc.tags.length) {
       const tags = document.createElement("div");
       tags.className = "zine-article-tags";
-      for (const s of post.sections) {
+      for (const s of doc.tags) {
         const tag = document.createElement("button");
         tag.type = "button";
         tag.className = "zine-tag pressable";
@@ -7064,7 +7394,7 @@ export class App {
           this.zinesSection = s;
           this.zinesOpenId = null;
           this.zinesOpenSource = null;
-          this.neighborhoodsDetail = null;
+          this.atprotoDetail = null;
           // Landing on the front page under a new filter: it starts at the
           // masthead, not where this reader left the unfiltered page.
           this.pendingZinesScroll = null;
@@ -7079,210 +7409,95 @@ export class App {
     const copy = document.createElement("p");
     copy.className = "zines-public-copy text-13";
     copy.textContent =
-      "Public. This was published to the Nostr network, so it is permanent, it is not removable, and it is not part of the membership. Reading it here reads this vault's own copy: the daemon fetched it over Tor, and opening it makes no request.";
+      "Public. This was published to the open social web under the author's own account, so it is permanent, it is not removable, and it is not part of the membership. Reading it here reads your vault's own copy: the daemon fetched it when the lane was refreshed, and opening it makes no request.";
     article.appendChild(copy);
 
     const body = document.createElement("div");
-    body.className = "zine-article-body";
-    // Markdown written by a stranger, so it is rendered by a renderer that
-    // escapes before it does anything else, then put through the same sanitizer
-    // every other body in this app goes through. A link that survives both is
-    // still not navigable: `guardLinks` intercepts the click.
-    body.innerHTML = sanitizeHtml(markdownToHtml(post.content));
+    body.className = "zine-article-body atproto-body";
+    // Plaintext, by the lexicon, and rendered as text: the author's body is not
+    // markup, and a stranger's words are never parsed here.
+    body.textContent = doc.text;
     article.appendChild(body);
-    this.guardLinks(body);
 
-    article.appendChild(this.renderPostReplies(post.replies));
-    article.appendChild(this.renderPostComposer());
+    if (!doc.text.trim()) article.appendChild(this.renderAtprotoPointer(doc));
+
+    article.appendChild(this.renderAtprotoAddress(doc));
     return article;
   }
 
   /**
-   * The public thread under an article, read-only.
+   * What to show when a record carries no body.
    *
-   * Read-only is the honest description: a public comment is on a public network,
-   * and the only thing this page can do about one is stop showing it locally. The
-   * copy says so rather than offering a control that would not mean anything. And
-   * it is not the sealed thread a private zine keeps — different store, different
-   * key, different people able to read it — so the two are drawn as different
-   * things and never merged.
-   */
-  private renderPostReplies(replies: NeighborhoodCommentDto[]): HTMLElement {
-    const section = document.createElement("section");
-    section.className = "post-comments";
-    const h = document.createElement("h2");
-    h.className = "text-17";
-    h.textContent = replies.length ? `Replies (${replies.length})` : "Replies";
-    section.appendChild(h);
-
-    if (!replies.length) {
-      const none = document.createElement("p");
-      none.className = "zines-note muted text-13";
-      none.textContent =
-        "No replies are held. This vault reads the replies to the articles it published, over Tor, when Public posts is refreshed.";
-      section.appendChild(none);
-      return section;
-    }
-
-    // The tree is built from the flat cache, then flattened back for drawing:
-    // one row per comment, indented by the depth the tree gave it.
-    for (const node of flattenThread(publicThread(replies))) {
-      section.appendChild(this.renderPostComment(node));
-    }
-    return section;
-  }
-
-  private renderPostComment(node: PublicCommentNode): HTMLElement {
-    const { comment, depth } = node;
-    const row = document.createElement("div");
-    row.className = "post-comment";
-    // The indent is the depth, not a nesting of elements: a thread of strangers'
-    // words is not the place to find out what a deeply nested container does.
-    row.style.setProperty("--post-depth", String(depth));
-
-    const meta = document.createElement("div");
-    meta.className = "post-comment-meta text-12 muted";
-    const mine = this.publicIdentity?.pubkey === comment.pubkey;
-    meta.textContent = `${mine ? "you" : publicByline(comment.pubkey)} · ${readsTimeAgo(comment.created_at)}`;
-    const text = document.createElement("div");
-    text.className = "post-comment-body text-13";
-    // Plaintext, by the spec, and rendered as text: a comment is not Markdown,
-    // and a stranger's text is not markup here.
-    text.textContent = comment.content;
-    row.append(meta, text);
-
-    const answering = this.postCommentParent === comment.event_id;
-    const reply = document.createElement("button");
-    reply.type = "button";
-    reply.className = "post-comment-reply pressable text-12";
-    reply.textContent = answering ? "Cancel reply" : "Reply";
-    reply.onclick = () => {
-      this.postCommentParent = answering ? null : comment.event_id;
-      this.postCommentError = null;
-      this.render();
-    };
-    row.appendChild(reply);
-    return row;
-  }
-
-  /**
-   * The way to comment on a public article.
+   * Standard.site lets a document be a **pointer**: a title, a description and a
+   * `path` under the publication's `url`, with the words living on the author's
+   * own site. Measured live, 48 of the 105 documents in one vault's cache were
+   * this shape and every one opened as a title with nothing under it — which
+   * reads as a bug in Hush, because nothing said the article was somewhere else.
    *
-   * The composer is gated on the public identity, because a comment cannot leave
-   * without one: the key is what signs it. Rather than let the reader write and
-   * then fail, the box is replaced by the state — "checking", "you have none, here
-   * is how to get one", or the box itself.
+   * The author's own description is shown because it is the only prose the
+   * record carries, and it is theirs rather than a taste Hush cut.
    */
-  private renderPostComposer(): HTMLElement {
-    const box = document.createElement("section");
-    box.className = "post-composer";
-    const h = document.createElement("h2");
-    h.className = "text-17";
-    h.textContent = this.postCommentParent ? "Reply publicly" : "Comment publicly";
-    box.appendChild(h);
+  private renderAtprotoPointer(doc: AtprotoDocumentFullDto): HTMLElement {
+    const box = document.createElement("div");
+    box.className = "atproto-pointer";
+
+    if (doc.description.trim()) {
+      const summary = document.createElement("p");
+      summary.className = "atproto-pointer-summary text-14";
+      summary.textContent = doc.description;
+      box.appendChild(summary);
+    }
 
     const note = document.createElement("p");
-    note.className = "zines-note muted text-12";
-    note.textContent = this.postCommentParent
-      ? "Signed by your public identity, in the same thread as the article. Permanent, and linkable to that identity."
-      : "Signed by your public identity — not your pen name — and posted to the public relays over Tor. Permanent and not removable. This is not the sealed thread a private zine keeps.";
-    box.appendChild(note);
-
-    if (this.publicIdentityBusy && !this.publicIdentityRead) {
-      box.appendChild(this.postNote("Checking your public identity…"));
-      return box;
+    note.className = "muted text-13";
+    if (doc.url.trim()) {
+      note.textContent =
+        "This post keeps its text on the author's own site rather than in the public record. Hush has their summary and the address; the article itself is one click away.";
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "btn-secondary pressable atproto-pointer-open";
+      open.textContent = `Read it on ${this.readsHostOf(doc.url)}`;
+      open.title = doc.url;
+      // Through the same confirmation every other external link uses: the shell
+      // is never handed a URL to open without the member seeing where it goes.
+      open.onclick = () => this.confirmExternalOpen(doc.url);
+      box.append(note, open);
+    } else {
+      // No body and no resolvable link. Said plainly rather than left as a blank
+      // page, because a blank page is indistinguishable from a failure.
+      note.textContent =
+        "This post keeps its text on the author's own site, and Hush could not read the publication it belongs to, so it has no address to offer. The record itself is below.";
+      box.appendChild(note);
     }
-    if (this.publicIdentityError) {
-      box.appendChild(this.postNote(this.publicIdentityError, "zine-error"));
-      box.appendChild(this.postIdentityButton("Try again", () => void this.publicIdentityLoad()));
-      return box;
-    }
-    if (!this.publicIdentityRead) {
-      box.appendChild(this.postNote("Checking your public identity…"));
-      return box;
-    }
-    if (!this.publicIdentity) {
-      box.appendChild(
-        this.postNote(
-          "This vault has no public identity yet. Commenting and publishing both sign under one, kept separate from your pen name and your account.",
-        ),
-      );
-      box.appendChild(
-        this.postIdentityButton(
-          this.publicIdentityBusy ? "Creating…" : "Create a public identity",
-          () => void this.publicIdentityMint(),
-        ),
-      );
-      return box;
-    }
-
-    if (this.postCommentParent) {
-      const who = document.createElement("p");
-      who.className = "post-reply-to text-12 muted";
-      who.textContent = `Replying to ${this.postCommentParent.slice(0, 8)}…`;
-      box.appendChild(who);
-    }
-
-    // The host is built once per open post and re-parented, the same doctrine as
-    // the sealed comment box: a poll repaints the page under the reader.
-    if (!this.postCommentHost) {
-      const host = document.createElement("textarea");
-      host.className = "post-composer-input";
-      host.rows = 3;
-      host.maxLength = 2000;
-      host.placeholder = "Say something worth reading.";
-      host.value = this.postCommentDraft;
-      host.oninput = () => {
-        this.postCommentDraft = host.value;
-      };
-      this.postCommentHost = host;
-    }
-    box.appendChild(this.postCommentHost);
-
-    if (this.postCommentError) {
-      box.appendChild(this.postNote(this.postCommentError, "zine-error"));
-    }
-
-    const actions = document.createElement("div");
-    actions.className = "post-composer-actions";
-    const post = document.createElement("button");
-    post.type = "button";
-    post.className = "btn-primary pressable";
-    post.textContent = this.postCommentBusy ? "Posting…" : "Post comment";
-    post.disabled = this.postCommentBusy;
-    post.onclick = () => void this.postCommentPublish();
-    actions.appendChild(post);
-    if (this.postCommentParent) {
-      const cancel = document.createElement("button");
-      cancel.type = "button";
-      cancel.className = "btn-secondary pressable";
-      cancel.textContent = "Cancel";
-      cancel.onclick = () => {
-        this.postCommentParent = null;
-        this.postCommentError = null;
-        this.render();
-      };
-      actions.appendChild(cancel);
-    }
-    box.appendChild(actions);
     return box;
   }
 
-  private postNote(text: string, extra = ""): HTMLElement {
-    const p = document.createElement("p");
-    p.className = `zines-note text-13${extra ? ` ${extra}` : ""}`;
-    p.textContent = text;
-    return p;
-  }
-
-  private postIdentityButton(label: string, onclick: () => void): HTMLElement {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "btn-secondary pressable post-identity";
-    btn.textContent = label;
-    btn.disabled = this.publicIdentityBusy;
-    btn.onclick = onclick;
-    return btn;
+  /**
+   * Where a public document lives, in full.
+   *
+   * The address is the handle a reader needs — it is what identifies the record
+   * on the network, and it is what they would paste to find it — so it is shown
+   * rather than hidden behind the title.
+   */
+  private renderAtprotoAddress(doc: AtprotoDocumentFullDto): HTMLElement {
+    const row = document.createElement("p");
+    row.className = "zines-note zine-public-status text-13";
+    const label = document.createElement("span");
+    label.textContent = "Public at ";
+    const code = document.createElement("code");
+    code.className = "zine-public-address";
+    code.textContent = doc.uri;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "btn-secondary pressable zine-copy-address";
+    copy.textContent = "Copy address";
+    copy.title = "Copy the record's address on the open social web.";
+    copy.onclick = () => {
+      void navigator.clipboard.writeText(doc.uri);
+      showToast("Article address copied.", { kind: "success" });
+    };
+    row.append(label, code, copy);
+    return row;
   }
 
   /** Back to the front page, where the reader left it. */
@@ -7291,110 +7506,12 @@ export class App {
     this.zinesOpenSource = null;
     this.zinesDetail = null;
     this.zinesDetailError = null;
-    this.neighborhoodsDetail = null;
-    this.neighborhoodsDetailError = null;
+    this.atprotoDetail = null;
+    this.atprotoDetailError = null;
     this.zinesCommentHost = null;
     this.zinesCommentDraft = "";
     this.zinesCommentError = null;
-    this.postCommentHost = null;
-    this.postCommentDraft = "";
-    this.postCommentError = null;
-    this.postCommentParent = null;
     this.render();
-  }
-
-  /**
-   * Read the public identity, once.
-   *
-   * A read never mints one: the identity is key material, and a page that minted
-   * it on open would put a member's words under a key nobody chose. `null` is a
-   * real answer — "this vault has none" — and the composer answers it.
-   */
-  private async publicIdentityLoad(): Promise<void> {
-    if (this.publicIdentityRead || this.publicIdentityBusy) return;
-    this.publicIdentityBusy = true;
-    this.render();
-    try {
-      this.publicIdentity = await api.publicIdentity();
-      this.publicIdentityRead = true;
-      this.publicIdentityError = null;
-    } catch (e) {
-      this.publicIdentityError =
-        e instanceof AppError ? e.message : "Couldn't read your public identity.";
-    }
-    this.publicIdentityBusy = false;
-    this.render();
-  }
-
-  /**
-   * Mint the public identity.
-   *
-   * Offered where it is needed rather than buried in settings, because the state
-   * it unblocks is the one the reader is in: a comment cannot be posted without
-   * one, and telling them so without offering the way out is a dead end.
-   */
-  private async publicIdentityMint(): Promise<void> {
-    if (this.publicIdentityBusy) return;
-    this.publicIdentityBusy = true;
-    this.publicIdentityError = null;
-    this.render();
-    try {
-      this.publicIdentity = await api.createPublicIdentity();
-      this.publicIdentityRead = true;
-      showToast("Public identity created.", { kind: "success" });
-    } catch (e) {
-      this.publicIdentityError =
-        e instanceof AppError ? e.message : "Couldn't create a public identity.";
-    }
-    this.publicIdentityBusy = false;
-    this.render();
-  }
-
-  /**
-   * Post the public comment being written on the open post.
-   *
-   * The daemon answers with the whole thread rather than the one comment, so the
-   * page shows the comment where it belongs instead of splicing it in and hoping
-   * it matches what a relay will serve later. The draft is kept when nothing took
-   * it: unlike an export there is no address to retry, so the words are the only
-   * thing that would be lost.
-   */
-  private async postCommentPublish(): Promise<void> {
-    const address = this.zinesOpenId;
-    if (!address || this.postCommentBusy) return;
-    const body = this.postCommentDraft.trim();
-    if (!body) {
-      this.postCommentError = "An empty comment is not worth posting.";
-      this.render();
-      return;
-    }
-    this.postCommentBusy = true;
-    this.postCommentError = null;
-    this.render();
-    try {
-      const out = await api.neighborhoodComment(
-        address,
-        body,
-        this.postCommentParent ?? undefined,
-      );
-      if (this.zinesOpenId !== address) return;
-      if (!out) throw new Error("The daemon sent no answer.");
-      if (out.published) {
-        if (this.neighborhoodsDetail) this.neighborhoodsDetail.replies = out.replies;
-        this.postCommentDraft = "";
-        this.postCommentParent = null;
-        if (this.postCommentHost) this.postCommentHost.value = "";
-        showToast("Comment posted to the neighborhoods.", { kind: "success" });
-      } else {
-        this.postCommentError =
-          out.publish_error || "No relay took that comment. Nothing was published.";
-      }
-    } catch (e) {
-      this.postCommentError =
-        e instanceof AppError ? e.message : "Couldn't post that comment.";
-    }
-    this.postCommentBusy = false;
-    if (this.zinesOpenId === address) this.render();
   }
 
   private renderZineArticle(detail: ZineViewDto): HTMLElement {
@@ -7472,19 +7589,19 @@ export class App {
     }
     // The one-way door, offered only on a post this vault wrote: a held zine is
     // someone else's, and publishing it would sign their words under this
-    // vault's public identity. It is a separate act from revising, because
+    // vault's own public account. It is a separate act from revising, because
     // publishing to a public network is not the same decision as editing.
     if (authored && !unreadable) {
       const publish = document.createElement("button");
       publish.type = "button";
-      publish.className = "btn-secondary pressable zine-export";
-      publish.textContent = detail.zine.export
+      publish.className = "btn-secondary pressable zine-publish";
+      publish.textContent = detail.zine.public
         ? "Update public article"
-        : "Export to neighborhoods";
-      publish.title = detail.zine.export
-        ? "Replace the public article with this revision. Same address, so readers and comments follow."
-        : "Publish this article to the neighborhoods as a public post. Your thread, your history and your pen name stay in the vault.";
-      publish.onclick = () => this.zinesExportOpen(descriptor.zine_id);
+        : "Publish to the open web";
+      publish.title = detail.zine.public
+        ? "Replace the public article with this revision. Same address, so readers follow."
+        : "Publish this article to the open social web under your own account. Your thread, your history and your pen name stay in the vault.";
+      publish.onclick = () => this.zinesPublishOpen(descriptor.zine_id);
       actions.appendChild(publish);
     }
     if (authored) {
@@ -7544,12 +7661,11 @@ export class App {
     article.appendChild(actions);
 
     // What the public knows, when anything does. The address is shown in full
-    // because it is the handle a reader needs — it is what a comment references
-    // and what someone can look the article up by — and because an author who
-    // has published to a public network should be able to see exactly what they
-    // published under.
-    if (authored && detail.zine.export) {
-      article.appendChild(this.renderZinePublicStatus(detail.zine.export));
+    // because it is the handle a reader needs — it is what identifies the record
+    // on the network — and because an author who has published to a public
+    // network should be able to see exactly what they published under.
+    if (authored && detail.zine.public) {
+      article.appendChild(this.renderZinePublicStatus(detail.zine.public));
     }
 
     if (unreadable) {
@@ -7916,127 +8032,126 @@ export class App {
   /**
    * The line that says the article is public, and where.
    *
-   * An export is the one act in Zines that leaves the membership, so the state
+   * Publishing is the one act in Zines that leaves the membership, so the state
    * it leaves behind is stated plainly and permanently: the address, when it
    * first went public, and a way to copy the handle. A badge that only said
    * "published" would leave the author unable to find, or cite, what they
    * published.
    */
-  private renderZinePublicStatus(exported: ZineExportDto): HTMLElement {
-    const address = zineExportAddress(exported);
+  private renderZinePublicStatus(pub: ZinePublicDto): HTMLElement {
     const row = document.createElement("p");
     row.className = "zines-note zine-public-status text-13";
     const label = document.createElement("span");
-    label.textContent = exported.published_ms
-      ? `Public since ${readsTimeAgo(Math.floor(exported.published_at))} at `
+    label.textContent = pub.published_at_ms
+      ? `Public since ${readsTimeAgo(Math.floor(pub.published_at_ms / 1000))} at `
       : "Public at ";
     const code = document.createElement("code");
     code.className = "zine-public-address";
-    code.textContent = address;
+    code.textContent = pub.uri;
     const copy = document.createElement("button");
     copy.type = "button";
     copy.className = "btn-secondary pressable zine-copy-address";
     copy.textContent = "Copy address";
     copy.title =
-      "Copy the address a public comment references: 30023:pubkey:d. It stays the same across edits.";
+      "Copy the record's address on the open social web. It stays the same across edits.";
     copy.onclick = () => {
-      void navigator.clipboard.writeText(address);
+      void navigator.clipboard.writeText(pub.uri);
       showToast("Article address copied.", { kind: "success" });
     };
     row.append(label, code, copy);
     return row;
   }
 
-  /** Open the export confirmation for one zine. */
-  private zinesExportOpen(zineId: string): void {
-    this.zinesExportId = zineId;
-    this.zinesExportResult = null;
-    this.zinesExportError = null;
+  /** Open the publish confirmation for one zine. */
+  private zinesPublishOpen(zineId: string): void {
+    this.zinesPublishId = zineId;
+    this.zinesPublishResult = null;
+    this.zinesPublishError = null;
     this.render();
   }
 
-  private zinesExportClose(): void {
-    this.zinesExportId = null;
-    this.zinesExportResult = null;
-    this.zinesExportError = null;
+  private zinesPublishClose(): void {
+    this.zinesPublishId = null;
+    this.zinesPublishResult = null;
+    this.zinesPublishError = null;
     this.render();
   }
 
   /**
-   * Publish the open zine to the neighborhoods.
+   * Publish the open zine to the open social web.
    *
-   * The article is durable before the relay is asked: a `published: false`
-   * answer still leaves the address recorded and the same article on the next
-   * attempt, which is what makes a retry safe. So a refusal is shown as a
-   * status with the address, not as a failed export.
+   * The record is durable before the PDS is asked: a `published: false` answer
+   * still leaves the address recorded and the same article on the next attempt,
+   * which is what makes a retry safe. So a refusal is shown as a status with the
+   * address, not as a lost article.
    */
-  private async zinesExport(): Promise<void> {
-    const zineId = this.zinesExportId;
-    if (!zineId || this.zinesExportBusy) return;
-    this.zinesExportBusy = true;
-    this.zinesExportError = null;
+  private async zinesPublishToWeb(): Promise<void> {
+    const zineId = this.zinesPublishId;
+    if (!zineId || this.zinesPublishBusy) return;
+    this.zinesPublishBusy = true;
+    this.zinesPublishError = null;
     this.render();
     try {
-      const out = await api.zinesExport(zineId);
-      if (this.zinesExportId !== zineId) return;
+      const out = await api.zinesPublish(zineId);
+      if (this.zinesPublishId !== zineId) return;
       // An empty body would mean the route answered with nothing, which the
       // daemon never does; treating it as a failure is better than painting an
       // address out of undefined.
-      if (!out) throw new Error("The daemon returned no export.");
-      this.zinesExportResult = out;
-      // The index carries the export too, so a re-render of the front page
-      // shows the badge without a second round trip.
+      if (!out) throw new Error("The daemon returned no publish.");
+      this.zinesPublishResult = out;
+      // The index carries the public footprint too, so a re-render of the front
+      // page shows the badge without a second round trip.
       if (this.zinesView) {
         this.zinesView = {
           ...this.zinesView,
           zines: this.zinesView.zines.map((z) =>
-            z.zine_id === zineId ? { ...z, export: out.zine.export } : z,
+            z.zine_id === zineId ? { ...z, public: out.zine.public } : z,
           ),
         };
       }
       if (this.zinesOpenId === zineId) this.zinesDetail = { zine: out.zine };
     } catch (e) {
-      if (this.zinesExportId !== zineId) return;
-      this.zinesExportError = e instanceof Error ? e.message : String(e);
+      if (this.zinesPublishId !== zineId) return;
+      this.zinesPublishError = e instanceof Error ? e.message : String(e);
     } finally {
-      this.zinesExportBusy = false;
+      this.zinesPublishBusy = false;
       this.render();
     }
   }
 
   /**
-   * The export dialog: what leaves the vault, and then where it went.
+   * The publish dialog: what leaves the vault, and then where it went.
    *
-   * The confirmation is the point of it. An export is the one-way door in
+   * The confirmation is the point of it. Publishing is the one-way door in
    * Zines, and the honest version of "this cannot be undone" is a list of what
    * is being published — the title, the sections and the body — beside what is
    * not: the thread, the revision history, the read key and the pen name. The
    * author should not have to infer that from a button label.
    */
-  private renderZinesExportModal(): HTMLElement {
-    const zineId = this.zinesExportId!;
+  private renderZinesPublishModal(): HTMLElement {
+    const zineId = this.zinesPublishId!;
     const row = this.zinesView?.zines.find((z) => z.zine_id === zineId);
     const title = row?.title || "This zine";
-    const already = row?.export ?? null;
+    const already = row?.public ?? null;
 
     const back = document.createElement("div");
     back.className = "modal-backdrop";
     const modal = document.createElement("div");
-    modal.className = "modal zine-export-modal";
+    modal.className = "modal zine-publish-modal";
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
-    modal.setAttribute("aria-label", "Export this zine to the neighborhoods");
+    modal.setAttribute("aria-label", "Publish this zine to the open web");
 
-    const result = this.zinesExportResult;
+    const result = this.zinesPublishResult;
     const h = document.createElement("h2");
     h.className = "text-22";
     h.textContent = result
       ? result.published
-        ? "Published to the neighborhoods"
-        : "The article is ready, but no relay took it"
+        ? "Published to the open web"
+        : "The article is ready, but the server refused it"
       : already
         ? "Update the public article?"
-        : "Export to the neighborhoods?";
+        : "Publish to the open web?";
     modal.appendChild(h);
 
     const p = document.createElement("p");
@@ -8045,10 +8160,10 @@ export class App {
     if (result) {
       p.textContent = result.published
         ? `${title} is public at the address below. Anyone can read it, and it stays at this address when you edit it.`
-        : `${title} is recorded at the address below, and nothing left this machine. Exporting again publishes the same article rather than a second one.`;
+        : `${title} is recorded at the address below, and nothing left this machine. Publishing again sends the same article rather than a second one.`;
     } else {
       p.textContent = already
-        ? `${title} is already public. This replaces that article with the current revision — same address, so anyone reading it, and any comment on it, still finds it.`
+        ? `${title} is already public. This replaces that article with the current revision — same address, so anyone reading it still finds it.`
         : `${title} is published as a public article: its title, its sections and its body. Anyone can read it, and it cannot be recalled.`;
     }
     modal.appendChild(p);
@@ -8057,17 +8172,18 @@ export class App {
       // The list is the confirmation. Each line is a thing that leaves, or a
       // thing that does not, stated rather than implied.
       const leaves = document.createElement("ul");
-      leaves.className = "zine-export-list text-13";
+      leaves.className = "zine-publish-list text-13";
       const lines: Array<[boolean, string]> = [
         [true, "The title and the section tags"],
-        [true, "The body, converted to Markdown"],
+        [true, "The body, as plain text"],
+        [true, "When it was first published"],
         [false, "Your comment thread"],
         [false, "Your revision history"],
         [false, "Your pen name and your read key"],
       ];
       for (const [goes, text] of lines) {
         const li = document.createElement("li");
-        li.className = goes ? "zine-export-goes" : "zine-export-stays";
+        li.className = goes ? "zine-publish-goes" : "zine-publish-stays";
         li.textContent = text;
         leaves.appendChild(li);
       }
@@ -8076,35 +8192,47 @@ export class App {
       note.className = "muted text-13";
       note.style.marginTop = "var(--space-2)";
       note.textContent =
-        "Published over Tor, under your public identity — not your pen name and not your account. The relay stores the article; the vault keeps the link between the two.";
+        "Published under your own account on the open social web — not your pen name and not this membership. Your account is what can edit or remove it; the vault keeps the link between the two.";
       modal.appendChild(note);
     }
 
     if (result) {
       const box = document.createElement("div");
-      box.className = "zine-export-result";
+      box.className = "zine-publish-result";
       const label = document.createElement("span");
       label.className = "text-13 muted";
       label.textContent = "Address";
       const code = document.createElement("code");
       code.className = "zine-public-address";
-      code.textContent = result.address;
+      code.textContent = result.uri;
       const copy = document.createElement("button");
       copy.type = "button";
       copy.className = "btn-secondary pressable";
       copy.textContent = "Copy";
       copy.onclick = () => {
-        void navigator.clipboard.writeText(result.address);
+        void navigator.clipboard.writeText(result.uri);
         showToast("Article address copied.", { kind: "success" });
       };
       box.append(label, code, copy);
       modal.appendChild(box);
 
-      const handle = document.createElement("p");
-      handle.className = "muted text-13";
-      handle.style.marginTop = "var(--space-2)";
-      handle.textContent = `Shareable handle: ${result.naddr}`;
-      modal.appendChild(handle);
+      // The web address is the publication's own host combined with the post's
+      // path, and it exists only once a publication is set: a member who has not
+      // set one still has a record, just no page of their own to point at.
+      if (result.url) {
+        const handle = document.createElement("p");
+        handle.className = "muted text-13";
+        handle.style.marginTop = "var(--space-2)";
+        handle.textContent = `Readable at ${result.url}`;
+        modal.appendChild(handle);
+      } else {
+        const none = document.createElement("p");
+        none.className = "muted text-13";
+        none.style.marginTop = "var(--space-2)";
+        none.textContent =
+          "No publication is set, so there is no web address of your own yet. The record is still on the network; set a publication under Public lane to give it a page.";
+        modal.appendChild(none);
+      }
 
       if (!result.published && result.publish_error) {
         const err = document.createElement("p");
@@ -8114,10 +8242,10 @@ export class App {
       }
     }
 
-    if (this.zinesExportError) {
+    if (this.zinesPublishError) {
       const err = document.createElement("p");
       err.className = "zines-note zine-error text-13";
-      err.textContent = this.zinesExportError;
+      err.textContent = this.zinesPublishError;
       modal.appendChild(err);
     }
 
@@ -8128,40 +8256,409 @@ export class App {
       done.type = "button";
       done.className = "btn-primary pressable";
       done.textContent = "Done";
-      done.onclick = () => this.zinesExportClose();
+      done.onclick = () => this.zinesPublishClose();
       actions.appendChild(done);
       // A refused publish is worth another try: the address is fixed, so a
-      // second attempt publishes the same article rather than a second one.
+      // second attempt sends the same article rather than a second one.
       if (!result.published) {
         const retry = document.createElement("button");
         retry.type = "button";
         retry.className = "btn-secondary pressable";
         retry.textContent = "Try again";
-        retry.disabled = this.zinesExportBusy;
-        retry.onclick = () => void this.zinesExport();
+        retry.disabled = this.zinesPublishBusy;
+        retry.onclick = () => void this.zinesPublishToWeb();
         actions.appendChild(retry);
       }
     } else {
       const confirm = document.createElement("button");
       confirm.type = "button";
-      confirm.className = "btn-primary pressable zine-export-confirm";
+      confirm.className = "btn-primary pressable zine-publish-confirm";
       confirm.textContent = already ? "Update article" : "Publish article";
-      confirm.disabled = this.zinesExportBusy;
-      confirm.onclick = () => void this.zinesExport();
+      confirm.disabled = this.zinesPublishBusy;
+      confirm.onclick = () => void this.zinesPublishToWeb();
       const cancel = document.createElement("button");
       cancel.type = "button";
       cancel.className = "btn-secondary pressable";
       cancel.textContent = "Cancel";
-      cancel.onclick = () => this.zinesExportClose();
+      cancel.onclick = () => this.zinesPublishClose();
       actions.append(confirm, cancel);
     }
     modal.appendChild(actions);
 
     back.appendChild(modal);
     back.onclick = (e) => {
-      if (e.target === back && !this.zinesExportBusy) this.zinesExportClose();
+      if (e.target === back && !this.zinesPublishBusy) this.zinesPublishClose();
     };
     return back;
+  }
+
+  /** Open the public lane's setup dialog, seeded from what the vault holds. */
+  private atprotoSetupOpenDialog(): void {
+    const view = this.atprotoView;
+    this.atprotoSetupOpen = true;
+    this.atprotoSetupError = null;
+    this.atprotoPubName = view?.publication?.name ?? "";
+    this.atprotoPubUrl = view?.publication?.url ?? "";
+    // Seeded from the held list, so a member editing their follows sees the list
+    // rather than an empty box that would silently replace it.
+    this.atprotoFollowsDraft = (view?.follows ?? [])
+      .map((f) => f.handle || f.did)
+      .join("\n");
+    this.atprotoPassword = "";
+    this.render();
+  }
+
+  private atprotoSetupClose(): void {
+    this.atprotoSetupOpen = false;
+    this.atprotoSetupError = null;
+    this.atprotoPassword = "";
+    this.render();
+  }
+
+  /**
+   * The public lane's setup dialog: the connection, the blog, and the reading
+   * list.
+   *
+   * One dialog for the three because they are one story — you sign in, you say
+   * where your posts live, you say who you read — and a member setting the lane
+   * up needs all three to know what the lane is. Each part is gated on what the
+   * one above it made possible: there is no publication without an account, and
+   * a handle in the reading list needs an account to resolve it.
+   */
+  private renderAtprotoModal(): HTMLElement {
+    const view = this.atprotoView;
+    const account = view?.account ?? null;
+
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal atproto-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Public lane");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Public lane";
+    modal.appendChild(h);
+
+    const intro = document.createElement("p");
+    intro.className = "muted text-13";
+    intro.style.marginTop = "var(--space-2)";
+    intro.textContent =
+      "Zines stay private. This is the other direction: your own posts on the open social web, and the publications you choose to read there.";
+    modal.appendChild(intro);
+
+    if (this.atprotoSetupError) {
+      const err = document.createElement("p");
+      err.className = "zines-note zine-error text-13";
+      err.textContent = this.atprotoSetupError;
+      modal.appendChild(err);
+    }
+
+    modal.appendChild(account ? this.atprotoAccountCard(account) : this.atprotoConnectForm());
+    if (account) {
+      modal.appendChild(this.atprotoPublicationForm());
+      modal.appendChild(this.atprotoFollowsForm());
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const done = document.createElement("button");
+    done.type = "button";
+    done.className = "btn-secondary pressable";
+    done.textContent = "Close";
+    done.onclick = () => this.atprotoSetupClose();
+    actions.appendChild(done);
+    modal.appendChild(actions);
+
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back && !this.atprotoConnectBusy) this.atprotoSetupClose();
+    };
+    return back;
+  }
+
+  /** Who this vault is signed in as, with the way out. */
+  private atprotoAccountCard(account: AtprotoAccountDto): HTMLElement {
+    const box = document.createElement("section");
+    box.className = "atproto-card";
+    const head = document.createElement("h3");
+    head.className = "text-15";
+    head.textContent = "Signed in";
+    const who = document.createElement("p");
+    who.className = "muted text-13";
+    who.textContent = `${account.handle || account.did} · ${account.pds}`;
+    const out = document.createElement("button");
+    out.type = "button";
+    out.className = "btn-secondary pressable atproto-disconnect";
+    out.textContent = "Sign out";
+    out.title =
+      "Forget the session and revoke it. The reading list and what was read stay.";
+    out.onclick = () => void this.atprotoDisconnect();
+    box.append(head, who, out);
+    return box;
+  }
+
+  /**
+   * The sign-in form.
+   *
+   * The password field is the one place in this app that carries a credential,
+   * and the copy says what happens to it: it is handed to the daemon, exchanged
+   * for a session, and not kept here. An app password is asked for by name,
+   * because an account password would give the lane more than it needs.
+   */
+  private atprotoConnectForm(): HTMLElement {
+    const box = document.createElement("section");
+    box.className = "atproto-card";
+    const head = document.createElement("h3");
+    head.className = "text-15";
+    head.textContent = "Connect an account";
+    box.appendChild(head);
+
+    const note = document.createElement("p");
+    note.className = "muted text-12";
+    note.textContent =
+      "An app password from your own server, not your account password. It is used once to mint a session, and this window never keeps it.";
+    box.appendChild(note);
+
+    box.appendChild(
+      this.atprotoField("Server", this.atprotoPds, "https://bsky.social", (v) => {
+        this.atprotoPds = v;
+      }),
+    );
+    box.appendChild(
+      this.atprotoField("Handle or DID", this.atprotoIdentifier, "you.example", (v) => {
+        this.atprotoIdentifier = v;
+      }),
+    );
+    const pass = this.atprotoField("App password", "", "xxxx-xxxx-xxxx-xxxx", (v) => {
+      this.atprotoPassword = v;
+    });
+    pass.querySelector("input")!.type = "password";
+    pass.querySelector("input")!.autocomplete = "off";
+    box.appendChild(pass);
+
+    const connect = document.createElement("button");
+    connect.type = "button";
+    connect.className = "btn-primary pressable atproto-connect";
+    connect.textContent = this.atprotoConnectBusy ? "Connecting…" : "Connect";
+    connect.disabled = this.atprotoConnectBusy;
+    connect.onclick = () => void this.atprotoConnect();
+    box.appendChild(connect);
+    return box;
+  }
+
+  /** Where this vault's own documents are filed. */
+  private atprotoPublicationForm(): HTMLElement {
+    const box = document.createElement("section");
+    box.className = "atproto-card";
+    const head = document.createElement("h3");
+    head.className = "text-15";
+    head.textContent = "Your publication";
+    box.appendChild(head);
+
+    const note = document.createElement("p");
+    note.className = "muted text-12";
+    note.textContent =
+      "One blog your posts belong to. The name is its masthead; the address is your own web address, which the network combines with each post's path to build a reader's link.";
+    box.appendChild(note);
+
+    box.appendChild(
+      this.atprotoField("Name", this.atprotoPubName, "Ada's zine", (v) => {
+        this.atprotoPubName = v;
+      }),
+    );
+    box.appendChild(
+      this.atprotoField("Address", this.atprotoPubUrl, "https://ada.example/", (v) => {
+        this.atprotoPubUrl = v;
+      }),
+    );
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn-secondary pressable atproto-publication-save";
+    save.textContent = this.atprotoPublicationBusy ? "Saving…" : "Save publication";
+    save.disabled = this.atprotoPublicationBusy;
+    save.onclick = () => void this.atprotoSavePublication();
+    box.appendChild(save);
+    return box;
+  }
+
+  /**
+   * The reading list.
+   *
+   * A plain textarea rather than a picker, because the list is small and the
+   * names are what the member already knows: a handle they have seen, or a DID
+   * they were handed. One entry per line, and the whole list is replaced on
+   * save, because a curated lane is a list rather than a diff of a list.
+   */
+  private atprotoFollowsForm(): HTMLElement {
+    const box = document.createElement("section");
+    box.className = "atproto-card";
+    const head = document.createElement("h3");
+    head.className = "text-15";
+    head.textContent = "Who you read";
+    box.appendChild(head);
+
+    const note = document.createElement("p");
+    note.className = "muted text-12";
+    note.textContent =
+      "One handle or DID per line. A handle is looked up on your own server; a DID needs nobody's help, so it works even signed out.";
+    box.appendChild(note);
+
+    const host = document.createElement("textarea");
+    host.className = "atproto-follows";
+    host.rows = 5;
+    host.placeholder = "ada.example\nat://did:plc:someone";
+    host.value = this.atprotoFollowsDraft;
+    host.oninput = () => {
+      this.atprotoFollowsDraft = host.value;
+    };
+    box.appendChild(host);
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn-secondary pressable atproto-follows-save";
+    save.textContent = this.atprotoFollowsBusy ? "Saving…" : "Save reading list";
+    save.disabled = this.atprotoFollowsBusy;
+    save.onclick = () => void this.atprotoSaveFollows();
+    box.appendChild(save);
+    return box;
+  }
+
+  /** One labelled field, held in app state rather than read back out of the
+   *  DOM, because a re-render rebuilds the dialog. */
+  private atprotoField(
+    label: string,
+    value: string,
+    placeholder: string,
+    onInput: (v: string) => void,
+  ): HTMLElement {
+    const wrap = document.createElement("label");
+    wrap.className = "atproto-field text-13";
+    const span = document.createElement("span");
+    span.className = "atproto-field-label";
+    span.textContent = label;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "input-field";
+    input.placeholder = placeholder;
+    input.value = value;
+    input.oninput = () => onInput(input.value);
+    wrap.append(span, input);
+    return wrap;
+  }
+
+  /** Sign in, and read the lane's index back. */
+  private async atprotoConnect(): Promise<void> {
+    if (this.atprotoConnectBusy) return;
+    const pds = this.atprotoPds.trim();
+    const identifier = this.atprotoIdentifier.trim();
+    const password = this.atprotoPassword;
+    if (!pds || !identifier || !password) {
+      this.atprotoSetupError = "A server, a handle and an app password are all needed.";
+      this.render();
+      return;
+    }
+    this.atprotoConnectBusy = true;
+    this.atprotoSetupError = null;
+    this.render();
+    try {
+      const view = await api.atprotoConnect(pds, identifier, password);
+      this.atprotoView = view;
+      // The password has done its one job; the daemon holds the session, and
+      // this window holds nothing.
+      this.atprotoPassword = "";
+      showToast("Connected. The public lane is ready.", { kind: "success" });
+    } catch (e) {
+      this.atprotoSetupError =
+        e instanceof AppError ? e.message : "Couldn't sign in to that server.";
+    }
+    this.atprotoConnectBusy = false;
+    this.render();
+  }
+
+  /** Forget the session. The reading list and the cache stay. */
+  private async atprotoDisconnect(): Promise<void> {
+    if (this.atprotoConnectBusy) return;
+    this.atprotoConnectBusy = true;
+    this.atprotoSetupError = null;
+    this.render();
+    try {
+      const view = await api.atprotoDisconnect();
+      this.atprotoView = view;
+      this.atprotoPubName = "";
+      this.atprotoPubUrl = "";
+      showToast("Signed out of the public lane.", { kind: "success" });
+    } catch (e) {
+      this.atprotoSetupError =
+        e instanceof AppError ? e.message : "Couldn't sign out.";
+    }
+    this.atprotoConnectBusy = false;
+    this.render();
+  }
+
+  /** Write (or replace) the publication this vault's documents belong to. */
+  private async atprotoSavePublication(): Promise<void> {
+    if (this.atprotoPublicationBusy) return;
+    const name = this.atprotoPubName.trim();
+    const url = this.atprotoPubUrl.trim();
+    if (!name || !url) {
+      this.atprotoSetupError = "A publication needs a name and an address.";
+      this.render();
+      return;
+    }
+    this.atprotoPublicationBusy = true;
+    this.atprotoSetupError = null;
+    this.render();
+    try {
+      const view = await api.atprotoSetPublication(name, url);
+      this.atprotoView = view;
+      showToast("Publication saved.", { kind: "success" });
+    } catch (e) {
+      this.atprotoSetupError =
+        e instanceof AppError ? e.message : "Couldn't save that publication.";
+    }
+    this.atprotoPublicationBusy = false;
+    this.render();
+  }
+
+  /**
+   * Replace the reading list.
+   *
+   * A line is a DID when it starts with `did:`; anything else is taken as a
+   * handle, which the daemon resolves against this vault's own server. The
+   * `at://` prefix is tolerated because a member pasting an address off a page
+   * will bring it along.
+   */
+  private async atprotoSaveFollows(): Promise<void> {
+    if (this.atprotoFollowsBusy) return;
+    const follows = this.atprotoFollowsDraft
+      .split("\n")
+      .map((line) => line.trim().replace(/^at:\/\//, ""))
+      .filter(Boolean)
+      .map((entry) =>
+        entry.startsWith("did:") ? { did: entry } : { handle: entry },
+      );
+    this.atprotoFollowsBusy = true;
+    this.atprotoSetupError = null;
+    this.render();
+    try {
+      const view = await api.atprotoSetFollows(follows);
+      this.atprotoView = view;
+      showToast(
+        follows.length
+          ? `Reading ${follows.length} publication${follows.length === 1 ? "" : "s"}.`
+          : "Reading list cleared.",
+        { kind: "success" },
+      );
+    } catch (e) {
+      this.atprotoSetupError =
+        e instanceof AppError ? e.message : "Couldn't save that reading list.";
+    }
+    this.atprotoFollowsBusy = false;
+    this.render();
   }
 
   private renderZinesForgetModal(): HTMLElement {
@@ -8581,7 +9078,7 @@ export class App {
       const span = document.createElement("span");
       span.textContent = "Open original";
       open.appendChild(span);
-      open.onclick = () => this.readsConfirmOpen(s.url!);
+      open.onclick = () => this.confirmExternalOpen(s.url!);
       actions.appendChild(open);
     }
     head.appendChild(actions);
@@ -8666,7 +9163,7 @@ export class App {
       const span = document.createElement("span");
       span.textContent = "Open the original";
       open.appendChild(span);
-      open.onclick = () => this.readsConfirmOpen(url);
+      open.onclick = () => this.confirmExternalOpen(url);
       box.appendChild(open);
     }
     return box;
@@ -8686,7 +9183,7 @@ export class App {
       const a = target?.closest?.("a[href]") as HTMLAnchorElement | null;
       if (!a) return;
       ev.preventDefault();
-      this.readsConfirmOpen(a.href);
+      this.confirmExternalOpen(a.href);
     });
     return pane;
   }

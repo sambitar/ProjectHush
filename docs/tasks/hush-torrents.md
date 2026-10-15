@@ -8,7 +8,7 @@ the cloud via **TorBox**. The user pastes a magnet / `.torrent` URL (or drops a 
 file); TorBox fetches it, and when it is ready the daemon downloads the files into the vault.
 
 **Relationship to other docs:** follows the daemon-only-network and vault-blob posture of
-[`hush-articles.md`](hush-articles.md) and [`hush-reads.md`](hush-reads.md). Unlike Reads, the
+[`atproto.md`](atproto.md) and [`hush-reads.md`](hush-reads.md). Unlike Reads, the
 data here is **private** (the API key and the file names are user secrets), so all state is
 vault-encrypted.
 

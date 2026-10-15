@@ -34,15 +34,13 @@ import type {
   ZineDraftDto,
   ZinesViewDto,
   ZinesWriteDto,
-  ZineExportViewDto,
+  ZinePublishViewDto,
   ZineViewDto,
   PenNameDto,
-  PublicIdentityDto,
-  NeighborhoodsViewDto,
-  NeighborhoodArticleDto,
-  NeighborhoodCommentViewDto,
-  NeighborhoodSettingsDto,
-  NeighborhoodSettingsPatch,
+  AtprotoViewDto,
+  AtprotoExploreDto,
+  AtprotoRefreshDto,
+  AtprotoDocumentFullDto,
 } from "./types";
 
 type Transport =
@@ -692,56 +690,53 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ name }),
     }),
-  /** The public identity this vault publishes and comments under on the public
-   *  Nostr network, or null before one is minted. */
-  publicIdentity: () =>
-    request<PublicIdentityDto | null>("/api/neighborhoods/identity"),
-  /** Mint the public identity. Idempotent: a create when one exists returns it. */
-  createPublicIdentity: () =>
-    request<PublicIdentityDto>("/api/neighborhoods/identity", {
+  /** The whole public lane in one response: who this vault speaks as, where its
+   *  posts are filed, who it reads, and what it has read. */
+  atproto: () => request<AtprotoViewDto>("/api/atproto"),
+  /** Sign in with an app password. The only route on the lane that carries a
+   *  credential, and the one place it is ever sent. */
+  atprotoConnect: (pds: string, identifier: string, password: string) =>
+    request<AtprotoViewDto>("/api/atproto/connect", {
+      method: "POST",
+      body: JSON.stringify({ pds, identifier, password }),
+    }),
+  /** Forget the connection and revoke the session. The reading list is kept. */
+  atprotoDisconnect: () =>
+    request<AtprotoViewDto>("/api/atproto/disconnect", { method: "POST" }),
+  /** Write (or replace) the blog this vault's documents belong to. */
+  atprotoSetPublication: (name: string, url: string) =>
+    request<AtprotoViewDto>("/api/atproto/publication", {
+      method: "POST",
+      body: JSON.stringify({ name, url }),
+    }),
+  /** Replace the follow list: the whole list, because that is what a curated
+   *  lane is. A `did` needs nobody's help; a `handle` is resolved against the
+   *  connected account's PDS. */
+  atprotoSetFollows: (
+    follows: { did?: string; handle?: string; name?: string }[],
+  ) =>
+    request<AtprotoViewDto>("/api/atproto/follows", {
+      method: "POST",
+      body: JSON.stringify({ follows }),
+    }),
+  /** Read every followed publication and merge it into the cache. */
+  atprotoRefresh: () =>
+    request<AtprotoRefreshDto>("/api/atproto/refresh", { method: "POST" }),
+  /** The cached discovery directory. Costs no network, so it is safe to load a
+   *  page with. */
+  atprotoExplore: () =>
+    request<AtprotoExploreDto>("/api/atproto/explore"),
+  /** Crawl one hop from the shipped seeds and replace the directory. Needs no
+   *  account: discovery exists for the reader who will never sign up. */
+  atprotoExploreRefresh: () =>
+    request<AtprotoExploreDto>("/api/atproto/explore/refresh", {
       method: "POST",
     }),
-  // --- Neighborhoods: the public read lane (Task 22). The index is read from
-  // the daemon's encrypted cache; the UI never talks to a relay. ---
-  /** The cached public index. The filters are advisory. */
-  neighborhoods: (filter?: { section?: string; pub?: string }) => {
-    const query = new URLSearchParams();
-    if (filter?.section) query.set("section", filter.section);
-    if (filter?.pub) query.set("pub", filter.pub);
-    const suffix = query.toString();
-    return request<NeighborhoodsViewDto>(
-      `/api/neighborhoods${suffix ? `?${suffix}` : ""}`,
-    );
-  },
-  /** One public article with its body. 404 before it is held. */
-  neighborhoodArticle: (address: string) =>
-    request<NeighborhoodArticleDto>(
-      `/api/neighborhoods/${encodeURIComponent(address)}`,
+  /** One document with its body, served from the cache. 404 before it is held. */
+  atprotoDocument: (uri: string) =>
+    request<AtprotoDocumentFullDto>(
+      `/api/atproto/document?uri=${encodeURIComponent(uri)}`,
     ),
-  /** Force a pull from the allowlisted relays (the switch-on path). */
-  refreshNeighborhoods: () =>
-    request<NeighborhoodsViewDto>("/api/neighborhoods/refresh", {
-      method: "POST",
-    }),
-  /** Post a NIP-22 comment on a public article, signed by the public identity.
-   *
-   *  `parentId` answers a comment rather than the article. The article stays the
-   *  root either way, which is how NIP-22 threads without a second kind. */
-  neighborhoodComment: (address: string, body: string, parentId?: string) =>
-    request<NeighborhoodCommentViewDto>(
-      `/api/neighborhoods/${encodeURIComponent(address)}/comment`,
-      {
-        method: "POST",
-        body: JSON.stringify({ body, parent_id: parentId ?? null }),
-      },
-    ),
-  neighborhoodSettings: () =>
-    request<NeighborhoodSettingsDto>("/api/neighborhoods/settings"),
-  setNeighborhoodSettings: (patch: NeighborhoodSettingsPatch) =>
-    request<NeighborhoodSettingsDto>("/api/neighborhoods/settings", {
-      method: "POST",
-      body: JSON.stringify(patch),
-    }),
   // --- The wire: a grant hands the read key to one contact over the session
   // that already exists, and a comment is sealed to the author's pen name and
   // published to the bulletin lane. Both are queued by the worker, so a
@@ -769,15 +764,16 @@ export const api = {
       `/api/zines/${encodeURIComponent(zineId)}/discard-comment`,
       { method: "POST", body: JSON.stringify({ comment_hash: commentHash }) },
     ),
-  /** Publish this zine to the neighborhoods as a NIP-23 article (Task 11).
+  /** Publish this zine to the open social web as a `site.standard.document`
+   *  (Task 11).
    *
-   *  One-way: the article carries the title, the sections and the body as
-   *  Markdown, and nothing else — no thread, no history, no byline. Exporting
-   *  again after an edit replaces the article at the same address rather than
-   *  publishing a second one, which is why this is safe to retry. */
-  zinesExport: (zineId: string) =>
-    request<ZineExportViewDto>(
-      `/api/zines/${encodeURIComponent(zineId)}/export`,
+   *  One-way: the record carries the title, the sections as tags and the body as
+   *  plaintext, and nothing else — no thread, no history, no byline. Publishing
+   *  again after an edit replaces the record at the same derived key rather than
+   *  adding a second document, which is why this is safe to retry. */
+  zinesPublish: (zineId: string) =>
+    request<ZinePublishViewDto>(
+      `/api/zines/${encodeURIComponent(zineId)}/publish`,
       { method: "POST" },
     ),
 };

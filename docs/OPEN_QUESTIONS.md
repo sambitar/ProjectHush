@@ -20,11 +20,11 @@ Handoff list (section 9) is settled. See `DESIGN.md`.
 
 Tracked in [`docs/plans/knowledge-layer-roadmap.md`](plans/knowledge-layer-roadmap.md) and [`docs/tasks/knowledge-layer-phase-a.md`](tasks/knowledge-layer-phase-a.md):
 
-- NIP/kind for “thesis” vs tagged NIP-23 articles
-- Argument link tags (Hush-specific vs pure `a`/`e` tags only)
+- Document subtype for “thesis” vs tagged `site.standard.document` records
+- Argument link tags (Hush-specific vs AT-URI references only)
 - Whether any aggregate “changed my mind” signal may be published without becoming a popularity game
-- Project index on Nostr (kind?) vs local-only with optional publish
-- Private messaging rooms vs Nostr “circles” — **DESIGN** favors capsule rooms first (Task **15.3**)
+- Project index published to the public lane vs local-only with an optional record
+- Private messaging rooms vs a public “circle” — **DESIGN** favors capsule rooms first (Task **15.3**)
 - Library AI: on-device model vs user API key vs defer
 
 ## Not blocking v1 spec
