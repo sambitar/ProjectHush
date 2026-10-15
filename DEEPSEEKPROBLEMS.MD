@@ -7,9 +7,42 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
-## 2026-10-15 — Posts that opened as a title with nothing under them
+## 2026-10-15 — The app work was sitting on the marketing-site branch [FIXED]
 
-### The reported symptom had three causes, and the loudest one was not a bug in the parser [FIXED]
+### "Merge it to master" would have dragged the marketing site onto the app trunk [FIXED]
+
+- Attempted: commit the working tree and, per "if not on master merge it to master", merge the
+  current branch into `master`.
+- Symptom: the branch was **`website`**, which is not a feature branch for this work — it is
+  `master` plus **8 marketing-site commits** (`Website: full feature grid…`, `…placeholder marketing
+  site, separate from the app`). `master` is the **app** trunk (its tip is Conclave work), and it is
+  a direct ancestor of `website`, so the merge would have been a clean fast-forward that carried all
+  8 marketing commits onto master alongside the app changes. Nothing was *broken* — the two sets
+  touch disjoint paths and would not have conflicted — but the history would have been wrong in a
+  way that is annoying to unpick later, and `website/` would have become part of the app repo's
+  trunk permanently. Worth noting the working tree was also carrying ~9,100 lines of deletions
+  staged from an earlier session, so "commit changes" was never going to be a small commit.
+- Resolution: stopped before touching trunk and asked, which is what the standing rule requires.
+  The answer was to give the marketing site its own repository, which is also what its own README
+  had said all along ("Deliberately separate from `apps/hush-tauri`… this repo directory is only its
+  storefront") — the separation was intended, just never carried out in git.
+  - `git subtree split -P website -b website-standalone` → the 8 website commits with the paths
+    rewritten to the repo root, full history intact.
+  - `git clone --no-hardlinks` that branch to `/home/sam/hush-website`, remote removed, branch
+    renamed `master` → an independent repo.
+  - Verified before deleting anything: the 4 unchanged files are **byte-identical** (`cmp`) and only
+    `README.md` differs, by the intentional edit.
+  - On the app repo, `git cherry-pick 459f0dd` onto `master` and deleted `website` /
+    `website-standalone`. Checked with `git diff --name-only 459f0dd master` that the **only**
+    difference is the 5 `website/` paths — the app work is intact.
+- Lesson: `git log --oneline -1` and `git rev-parse --abbrev-ref HEAD` cost nothing and should be
+  the first thing run for *any* commit or merge request. The branch name (`website`) was the whole
+  answer, and it was visible before a single file was staged. The deeper point is that a directory
+  in the wrong repo is a **history** problem, not a file-layout one: `website/` looked fine as a
+  subdirectory, and only the branch topology showed it had been quietly coupling two projects'
+  commit histories.
+
+## 2026-10-15 — Posts that opened as a title with nothing under them### The reported symptom had three causes, and the loudest one was not a bug in the parser [FIXED]
 
 - Attempted: "im opening some posts and it shows no content just the title" reads like a parsing
   fault, so the first move was to go looking in `reads::rich_text_to_text` / `standard::body_text`
