@@ -108,17 +108,24 @@ fi
 # was compiled against, so a stale daemon (from before a rebuild) silently
 # serves old responses — e.g. a /api/relay without fields the new UI reads.
 # State lives in the vault on disk, so a restart is free.
-if daemon_ready "$SOCK"; then
-  echo "Stopping the stale daemon on $SOCK…"
-  # Match the vault dir in both absolute and relative form: a daemon started by
-  # hand with a relative --dir or binary path (e.g. `./target/debug/hush-daemon
-  # --dir instances/peer-a`) does not match the absolute path, so an exact
-  # command-line match misses it. With the vault lock in place a second daemon
-  # now refuses to start, so missing the stale one would fail this script.
-  VAULT_DIR_REL="${VAULT_DIR#"$ROOT"/}"
-  pkill -f "hush-daemon.*--dir ($VAULT_DIR|$VAULT_DIR_REL)( |$)" 2>/dev/null || true
+#
+# Match on the vault dir, not on our own socket. The vault lock is per directory,
+# so a daemon serving this vault on some *other* socket blocks the run exactly as
+# hard as a stale one on ours — and a socket check cannot see it: the daemon then
+# dies at startup with "another hush-daemon is already running on <dir>", three
+# minutes into the build. Match the dir in both absolute and relative form too: a
+# daemon started by hand with a relative --dir or binary path (e.g.
+# `./target/debug/hush-daemon --dir instances/peer-a`) does not match the
+# absolute path, so an exact command-line match misses it.
+VAULT_DIR_REL="${VAULT_DIR#"$ROOT"/}"
+DAEMON_MATCH="hush-daemon.*--dir ($VAULT_DIR|$VAULT_DIR_REL)( |\$)"
+if pgrep -f "$DAEMON_MATCH" >/dev/null 2>&1; then
+  echo "Stopping the daemon holding $VAULT_DIR…"
+  pkill -f "$DAEMON_MATCH" 2>/dev/null || true
+  # Wait for the vault lock to be released. Polling our socket would not do it:
+  # the daemon just stopped may never have served it.
   for _ in $(seq 1 50); do
-    daemon_ready "$SOCK" || break
+    pgrep -f "$DAEMON_MATCH" >/dev/null 2>&1 || break
     sleep 0.1
   done
 fi

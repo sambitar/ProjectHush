@@ -56,6 +56,12 @@ unit of revocation: deleting a contact burns that contact's queue and touches no
   trustworthy on a channel anyone can write to.
 - **Delivery:** a send is one ciphertext to one queue: the recipient's per-contact queue for this
   account when a grant has arrived, and its inbox until then.
+- **Readiness is derived, never stored (2026-10-15).** A contact is *inbound-ready* when it holds a
+  delivery queue **or** something has been heard from it — a filed chat, file or mail — which is the
+  fallback for a grant that was dropped in transit. The UI says "waiting for them to add you" on that
+  derivation, so nothing has to keep a flag in sync with the grant: the vault's own `heard_from` bit
+  and the presence of `delivery_queue_id` are the whole truth, and a vault that predates the rename
+  reads back through a serde alias.
 - **Revocation:** deleting a contact burns the per-contact queue for them and records the account id
   in a local blocklist. The blocklist is not what makes the revocation happen — the burn is — but it
   still drops a revoked contact's stragglers from the shared inbox (the only shape it can attribute
@@ -177,6 +183,35 @@ two-party chat, just repeated. Nothing on the relay changes.
 Relay view of a conclave message is unchanged from any other message: an opaque ciphertext blob. The
 conclave name, trustee list, and body are inside the Signal envelope and never appear in relay storage.
 
+### Trustee reach — mail only or full (2026-10-15)
+
+Which surfaces a relationship may use is a property of the **circle relationship**, not of any one
+message: a trustee is either reachable by **mail alone** or by **everything** (mail, 1:1 chat, and
+conclaves). Mail is the floor and is never gated.
+
+- **Wire payload:** `MessagePayload::Reach { scope }` where `scope` is `"mail_only"` or `"full"`.
+  Sent when a contact is added with a narrowed reach and whenever the choice changes; store-and-forward,
+  so an away peer learns it on their next drain. It is a **control** payload — never rendered as an
+  inbox item — and is applied only from a known contact, because the 1:1 session is the authentication.
+  Forged, it can only *narrow*, so the worst case is hiding a surface the sender was not going to use.
+- **Both sides hold a choice.** Each contact record carries `reach` (this vault's own choice) and
+  `peer_reach` (the peer's announced one, `full` until they say otherwise). The **effective** reach is
+  `reach.narrow(peer_reach)`: a surface works only when both sides allow it, so `mail_only` on either
+  side makes the relationship mail-only. Neither side can force a surface the other excluded.
+- **Enforced at the boundary, not just hidden in the UI.** A `mail_only` relationship refuses
+  `send_text` / `send_file` (`Error::ReachMailOnly`), refuses `create_conclave` and
+  `invite_conclave_trustee` for that trustee, drops an inbound chat or file at `recv` with a warning,
+  and refuses an inbound conclave invite before it becomes a pending invite.
+- **No transport change.** Mail, chat and conclaves already ride the same 1:1 Signal session, so this is
+  a **policy** gate on deliverable bytes: the app chooses not to offer or accept the surface. The relay
+  sees nothing new.
+- **Existing conclave membership is grandfathered.** Narrowing to mail-only stops *new* chats and new
+  conclave joins; it does not retroactively remove a trustee from a conclave they are already in — a
+  kick is the removal path. Documented rather than silent, because a fan-out that silently dropped a
+  member would be worse.
+
+Design and decisions: [`tasks/trustee-reach.md`](tasks/trustee-reach.md) (Task **24**).
+
 ### Paper
 
 One shared, live, encrypted collaborative document per conclave — the "Paper" — owned by the daemon
@@ -297,6 +332,28 @@ that **some** member published at a time (it must authorize the publish) and not
 tell an article from a comment, and the pen name, title, sections, and body never appear in its
 storage.
 
+### What the UI is allowed to call "end-to-end encrypted" (2026-10-15)
+
+The chat header has said **End-to-end encrypted** since v1, and that mark is now shared
+(`apps/hush-tauri/src/components/ui/E2eMark.ts`) by every surface where the same claim holds. It is a
+claim about the transport, so the list is derived from the sections above rather than chosen per
+screen — a surface may only show it when the relay holds ciphertext it has no key for:
+
+| Surface | Why the claim holds |
+|---|---|
+| 1:1 chat and its files | The Signal session itself. |
+| Mail, with attachments | A payload kind on that same session; subject, body and file names are inside the envelope. |
+| Conclaves, with files | Sender-side fan-out: one encrypted copy per joined trustee over that trustee's own 1:1 session. |
+| Paper | Relay fan-out over the same sessions; the DataChannel fast path is a direct peer connection. |
+| Voice | DTLS-SRTP between the two daemons, with the SDP fingerprints authenticated by the Signal session. No Hush server carries media. |
+| Drops | Sealed to the recipient's published drop key before they are parked, so the relay cannot open them or name the sender. |
+| Zines | The body is encrypted to a per-post read key, and that key is handed over inside a 1:1 session — never through the bulletin. |
+
+**Surfaces that must not use it.** Reads, Torrents and IRC talk to services outside the members-only
+envelope, so their content is not ours to promise anything about. Notes never leave the vault, which
+is a stronger property than end-to-end, not the same one. And on the Zines reader the mark belongs to
+the member zine branch only: the ATProto document branch is a **public** post, which is precisely the
+confusion `renderAtprotoDocument` exists to prevent.
 
 ## What the relay HTTP API looks like (shape)
 

@@ -23,6 +23,7 @@ import type {
   ReadsStoryDto,
   TorboxUserDto,
   TorrentsStateDto,
+  TrusteeReach,
   WalletAddressDto,
   WalletChain,
   WalletCreateDto,
@@ -161,10 +162,17 @@ export const api = {
   invite: () =>
     request<InviteResponse>("/api/invite", { method: "POST" }),
   contacts: () => request<ContactDto[]>("/api/contacts"),
-  addContact: (nickname: string, invite: string) =>
+  addContact: (nickname: string, invite: string, reach?: TrusteeReach) =>
     request<null>("/api/contacts/add", {
       method: "POST",
-      body: JSON.stringify({ nickname, invite }),
+      // `full` is the daemon's default, so it is omitted rather than sent: an
+      // absent reach and an explicit `full` mean the same thing.
+      body: JSON.stringify({ nickname, invite, reach: reach ?? "full" }),
+    }),
+  setContactReach: (nickname: string, reach: TrusteeReach) =>
+    request<null>("/api/contacts/reach", {
+      method: "POST",
+      body: JSON.stringify({ nickname, reach }),
     }),
   removeContact: (nickname: string) =>
     request<null>("/api/contacts/remove", {

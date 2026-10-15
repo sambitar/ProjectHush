@@ -20,6 +20,11 @@
 //! they are run against a funded testnet account, which no unattended check can
 //! do — a test that spends real value is not a test that can run on a whim.
 
+// The module under test is behind the `ethereum` feature, so this file has to
+// be too: without the gate, a plain `cargo test -p hush-wallet` fails to compile
+// the test target instead of skipping it.
+#![cfg(feature = "ethereum")]
+
 use hush_wallet::ethereum::{
     EthereumConfig, EthereumWallet, DEFAULT_RPC_MAINNET, DEFAULT_RPC_SEPOLIA,
 };

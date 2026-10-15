@@ -4,6 +4,7 @@ import type {
   ContactDto,
   DropsKeyDto,
   StatusResponse,
+  TrusteeReach,
   ReadsCommentDto,
   ReadsSourceDto,
   ReadsStateDto,
@@ -275,6 +276,7 @@ import { icon, type IconName } from "./lib/icons";
 import { avatarWithPresence, createAvatarEl, initialsFor } from "./components/ui/Avatar";
 import { RichTextEditor } from "./components/ui/RichTextEditor";
 import { ContactPicker } from "./components/ui/ContactPicker";
+import { e2eMark } from "./components/ui/E2eMark";
 import { OverflowMenu, type OverflowMenuItem } from "./components/ui/OverflowMenu";
 import { bodyToDisplayHtml, isBlankHtml, sanitizeHtml } from "./lib/richText";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
@@ -1404,8 +1406,11 @@ export class App {
     try {
       this.contacts = (await api.contacts()) ?? [];
       setKnownContacts(this.contacts.map((c) => c.nickname));
-      if (!this.selectedNick && this.contacts[0]) {
-        this.selectedNick = this.contacts[0].nickname;
+      // Open on a conversation that exists: a mail-only trust has no chat, so
+      // defaulting to one would paint an empty pane over a rail that has rows.
+      const firstChat = this.chatContacts()[0];
+      if (!this.selectedNick && firstChat) {
+        this.selectedNick = firstChat.nickname;
       }
       // The unlock screen is not the only door into a running vault: a page
       // reload (or a dev hot reload) lands here with the daemon already
@@ -1717,6 +1722,16 @@ export class App {
       setTorrentsPaneOpen(false);
       this.root.appendChild(this.renderUnlock());
       return;
+    }
+    // A conversation the rail cannot list cannot stay open. Reach narrows from
+    // the peer's side too, and the rail is the only way back into a chat, so a
+    // selection left pointing at a mail-only trust would be a thread with no
+    // row to return to. Dropping it paints the empty pane instead.
+    if (
+      this.selectedNick &&
+      !this.chatContacts().some((c) => c.nickname === this.selectedNick)
+    ) {
+      this.selectedNick = null;
     }
     // An open conversation is a conversation being read: whatever unread
     // count it carried goes away the moment its pane paints, however the pane
@@ -2188,14 +2203,24 @@ export class App {
     const rows = document.createElement("div");
     rows.className = "conv-rows";
     const q = this.search.toLowerCase();
-    const list = this.contacts.filter((c) =>
+    // Only the trusts with a live chat are listed (Task 24): a mail-only one
+    // has no chat to open, so a row for it would reach nothing but a composer
+    // notice saying so. It keeps its place in Trusts and in Mail, and widening
+    // the reach puts the row — and its history — back.
+    const list = this.chatContacts().filter((c) =>
       displayNick(c.nickname).toLowerCase().includes(q),
     );
     if (!list.length) {
       const empty = document.createElement("p");
       empty.className = "muted";
       empty.style.padding = "var(--space-4)";
-      empty.textContent = "No chats yet";
+      // Three different nothings, told apart: no trusts at all, a search that
+      // matched no chat, and trusts that are all mail only.
+      empty.textContent = !this.contacts.length
+        ? "No chats yet"
+        : this.chatContacts().length
+          ? "No chats match your search"
+          : "Everyone you know is mail only.";
       rows.appendChild(empty);
     }
     for (const c of list) {
@@ -2203,7 +2228,9 @@ export class App {
       row.className = `conv-row pressable${this.selectedNick === c.nickname ? " selected" : ""}`;
       const av = avatarWithPresence(
         c.protocol_name,
-        c.online,
+        // Same rule as the Trusts row (Task 24): a mail-only trust has no live
+        // chat, so an online dot would promise a surface that is off.
+        c.online && c.reach === "full",
         "sm",
         hasUnread(c.nickname),
         displayNick(c.nickname),
@@ -2275,7 +2302,14 @@ export class App {
       t.textContent = "Quiet in here";
       const p = document.createElement("p");
       p.className = "muted";
-      p.textContent = "Invite someone to start your first chat";
+      // Three different nothings: no trusts at all, trusts that are all mail
+      // only, and chats that exist but are not open — a selection dropped when
+      // its reach narrowed, or a trust that was just deleted.
+      p.textContent = !this.contacts.length
+        ? "Invite someone to start your first chat"
+        : this.chatContacts().length
+          ? "Pick a conversation on the left, or start a new one."
+          : "Everyone you know is mail only. Chat needs a full trust.";
       const b = document.createElement("button");
       b.className = "btn-primary pressable";
       b.textContent = "Add a trust";
@@ -2303,21 +2337,11 @@ export class App {
     n.style.fontWeight = "500";
     n.textContent = displayNick(nick);
     const sub = document.createElement("div");
-    sub.className = "text-13 muted";
-    sub.style.display = "flex";
-    sub.style.alignItems = "center";
-    sub.style.gap = "6px";
-    sub.style.flexWrap = "wrap";
+    sub.className = "text-13 muted e2e-row";
     const presence = document.createElement("span");
     presence.className = contact.online ? "presence-label online" : "presence-label";
     presence.textContent = contact.online ? "Online" : "Offline";
-    sub.append(presence, document.createTextNode("·"));
-    const lockLine = document.createElement("span");
-    lockLine.style.display = "inline-flex";
-    lockLine.style.alignItems = "center";
-    lockLine.style.gap = "4px";
-    lockLine.append(icon("lock"), document.createTextNode("End-to-end encrypted"));
-    sub.append(lockLine);
+    sub.append(presence, document.createTextNode("·"), e2eMark());
     titles.append(n, sub);
     left.append(titles);
     // The conversation's actions, in one place: who this is, whether it is
@@ -2465,7 +2489,7 @@ export class App {
       this.pendingChatScroll = { nick, mode: "restore", top: prev.top };
     }
 
-    const composer = this.renderComposer(nick, contact.online);
+    const composer = this.renderComposer(nick, contact.online, contact.reach === "full");
     pane.append(header, scroll, composer);
 
     pane.ondragover = (e) => {
@@ -2480,9 +2504,25 @@ export class App {
     return pane;
   }
 
-  private renderComposer(nick: string, contactOnline: boolean): HTMLElement {
+  private renderComposer(
+    nick: string,
+    contactOnline: boolean,
+    canChat: boolean,
+  ): HTMLElement {
     const wrap = document.createElement("div");
     wrap.className = "composer";
+    // A mail-only trust has no chat at all (Task 24): the composer is not shown
+    // disabled, it is replaced by the reason and the way out. A disabled field
+    // invites the user to look for the switch that enables it; there is none
+    // here — the switch is in the trust's menu, and the hint says so.
+    if (!canChat) {
+      const hint = document.createElement("p");
+      hint.className = "text-13 muted composer-offline-hint";
+      hint.textContent =
+        `${displayNick(nick)} is mail only — chat and conclaves are off for this trust. Use Mail, or change this in their menu in Trusts.`;
+      wrap.appendChild(hint);
+      return wrap;
+    }
     if (!contactOnline) {
       const hint = document.createElement("p");
       hint.className = "text-13 muted composer-offline-hint";
@@ -2538,6 +2578,13 @@ export class App {
   private async sendText(nick: string, text: string, ta: HTMLTextAreaElement, send: HTMLButtonElement): Promise<void> {
     if (!text) return;
     const contact = this.contacts.find((c) => c.nickname === nick);
+    // The composer is not rendered for a mail-only trust, but a drop, a
+    // keyboard path, or a stale pane could still reach here; the daemon would
+    // refuse it, and this is the same answer with copy instead of an error.
+    if (contact && contact.reach !== "full") {
+      this.announce(`${displayNick(nick)} is mail only. Use Mail to reach them.`);
+      return;
+    }
     if (!contact?.online) {
       this.announce(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`);
       return;
@@ -2557,6 +2604,12 @@ export class App {
 
   private async sendFile(nick: string, file: File): Promise<void> {
     const contact = this.contacts.find((c) => c.nickname === nick);
+    // Same guard as `sendText`: a file is a live surface, and a mail-only trust
+    // has none. A dropped file must not look like it sent.
+    if (contact && contact.reach !== "full") {
+      this.announce(`${displayNick(nick)} is mail only. Use Mail to reach them.`);
+      return;
+    }
     if (!contact?.online) {
       this.announce(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`);
       return;
@@ -3215,15 +3268,46 @@ export class App {
     row.dataset.trustName = displayNick(c.nickname);
 
     row.appendChild(
-      avatarWithPresence(c.protocol_name, c.online, "sm", false, displayNick(c.nickname)),
+      avatarWithPresence(
+        c.protocol_name,
+        // Presence is a live-chat affordance (Task 24): a mail-only trust has
+        // no chat to be online for, so the dot would be a promise we cannot keep.
+        c.online && c.reach === "full",
+        "sm",
+        false,
+        displayNick(c.nickname),
+      ),
     );
 
     const main = document.createElement("div");
     main.className = "trust-row-main";
+    const titleRow = document.createElement("div");
+    titleRow.className = "trust-row-title";
     const name = document.createElement("div");
     name.className = "text-15 trust-row-name";
     name.textContent = displayNick(c.nickname);
-    main.appendChild(name);
+    titleRow.appendChild(name);
+    if (c.reach === "mail_only") {
+      const badge = document.createElement("span");
+      badge.className = "trust-reach-badge";
+      // Only our own choice is named. The badge reads the *effective* reach, so
+      // a peer who narrowed the trust would otherwise be announced to us as
+      // having done so — being restricted is not ours to be told. Their choice
+      // is shown as the thing we can actually observe instead: no live chat,
+      // which is also what the row's presence dot already says, because a
+      // mail-only trust has no chat to be online for.
+      //
+      // "Mail only" stays the wording of our own choice — the Add Trust picker
+      // and the row's toggle both use it — so a reader who allowed chat is never
+      // told that their own setting is the one holding the trust back.
+      const mine = c.my_reach === "mail_only";
+      badge.textContent = mine ? "Mail only" : "Offline";
+      badge.title = mine
+        ? "You chose mail only for this trust."
+        : "Not available for live chat.";
+      titleRow.appendChild(badge);
+    }
+    main.appendChild(titleRow);
     if (c.mail_handle) {
       const mail = document.createElement("div");
       mail.className = "muted text-13 trust-row-mail";
@@ -3238,40 +3322,72 @@ export class App {
     // delete that gets hit by accident. The row is the menu's surface, so a
     // second press on the row closes what the first one opened; clicks that
     // begin inside the menu toggle on their own and are not re-toggled here.
+    // A mail-only trust has no chat to open (Task 24), so the entry is omitted
+    // rather than shown disabled: there is nothing to change here to make it
+    // work, and the reach entry below is the control that would.
+    const items: OverflowMenuItem[] = [];
+    if (c.reach === "full") {
+      items.push({
+        id: "chat",
+        label: "Chat",
+        icon: "chats",
+        onSelect: () => this.openChat(c.nickname),
+      });
+    }
+    items.push(
+      {
+        id: "email",
+        label: "Email",
+        icon: "mail",
+        onSelect: () => this.emailContact(c.nickname),
+      },
+      {
+        // The toggle edits *our* choice, so its label follows `my_reach`, not
+        // the effective `reach` — the peer may be the one holding the
+        // relationship at mail-only, and offering to "allow" what we already
+        // allowed would be a lie.
+        //
+        // Both labels are imperatives naming what the click does. A bare state
+        // name reads as a status report here, and "Mail only" is already the
+        // badge three words above: the same words meaning two things in one
+        // row is what made the narrowing action look like a label rather than
+        // a command. The lock, not the mail icon, because the mail icon
+        // belongs to the Email entry directly above and would merge the two.
+        id: "reach",
+        label:
+          c.my_reach === "mail_only"
+            ? "Allow chat and conclaves"
+            : "Restrict to mail only",
+        icon: c.my_reach === "mail_only" ? "chats" : "lock",
+        onSelect: () =>
+          void this.setTrustReach(
+            c,
+            c.my_reach === "mail_only" ? "full" : "mail_only",
+          ),
+      },
+      {
+        id: "rename",
+        label: "Change nickname",
+        icon: "pencil",
+        onSelect: () => {
+          this.profileNick = c.nickname;
+          this.render();
+        },
+      },
+      {
+        id: "delete",
+        label: "Delete",
+        icon: "trash",
+        danger: true,
+        separatorBefore: true,
+        onSelect: () => this.openTrustDelete(c.nickname),
+      },
+    );
+
     const menu = new OverflowMenu({
       label: `Contact options for ${displayNick(c.nickname)}`,
       surface: row,
-      items: [
-        {
-          id: "chat",
-          label: "Chat",
-          icon: "chats",
-          onSelect: () => this.openChat(c.nickname),
-        },
-        {
-          id: "email",
-          label: "Email",
-          icon: "mail",
-          onSelect: () => this.emailContact(c.nickname),
-        },
-        {
-          id: "rename",
-          label: "Change nickname",
-          icon: "pencil",
-          onSelect: () => {
-            this.profileNick = c.nickname;
-            this.render();
-          },
-        },
-        {
-          id: "delete",
-          label: "Delete",
-          icon: "trash",
-          danger: true,
-          separatorBefore: true,
-          onSelect: () => this.openTrustDelete(c.nickname),
-        },
-      ],
+      items,
     });
     row.appendChild(menu.element);
     row.onclick = (e) => {
@@ -3279,6 +3395,22 @@ export class App {
       menu.toggleMenu();
     };
     return row;
+  }
+
+  /**
+   * The contacts this vault can chat with.
+   *
+   * A mail-only trust has no live chat (Task 24): the boundary refuses it in
+   * both directions, so it is not a chat target and has no place in the chat
+   * rail. It keeps its place in Trusts and in Mail. Reach can be narrowed by
+   * either side, so this reads the *effective* reach, not our own choice.
+   *
+   * Every "open a chat" entry point reads this rather than filtering contacts
+   * for itself, so the rail, the command palette and the file cards agree on
+   * who can be chatted with.
+   */
+  private chatContacts(): ContactDto[] {
+    return this.contacts.filter((c) => c.reach === "full");
   }
 
   /** Open the chat thread with a contact, from any rail. */
@@ -3293,6 +3425,33 @@ export class App {
   private emailContact(nick: string): void {
     this.rail = "mail";
     this.openCompose({ to: nick });
+  }
+
+  /**
+   * Change how this vault reaches a trustee (Task 24).
+   *
+   * The choice is announced to the peer so both sides converge; the effective
+   * reach is the narrower of the two, so narrowing takes effect at once and
+   * widening may still be capped by the other side. The list is re-read rather
+   * than the row patched in place, so the badge, the presence dot and the
+   * daemon's own view cannot disagree.
+   */
+  private async setTrustReach(c: ContactDto, reach: TrusteeReach): Promise<void> {
+    try {
+      await api.setContactReach(c.nickname, reach);
+      this.contacts = (await api.contacts()) ?? [];
+      setKnownContacts(this.contacts.map((x) => x.nickname));
+      this.announce(
+        reach === "mail_only"
+          ? `${displayNick(c.nickname)} is now mail only.`
+          : `${displayNick(c.nickname)} can chat and join conclaves.`,
+      );
+      this.render();
+    } catch (e) {
+      this.announce(
+        e instanceof AppError ? e.message : "Couldn't change how you reach them.",
+      );
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -3503,12 +3662,17 @@ export class App {
     n.style.fontWeight = "500";
     n.textContent = conclave.name;
     const sub = document.createElement("div");
-    sub.className = "text-13 muted";
-    sub.textContent = conclave.ended
+    sub.className = "text-13 muted e2e-row";
+    const facts = document.createElement("span");
+    facts.textContent = conclave.ended
       ? "Ended — read only"
       : `${joinedCount} ${joinedCount === 1 ? "trustee" : "trustees"}${
           invitedCount ? ` · ${invitedCount} invited` : ""
         }`;
+    // The mark is not decoration here: every message in a conclave is fanned out
+    // as one encrypted copy per trustee over their own 1:1 session, so the relay
+    // holds ciphertext for each of them and nothing that names the conclave.
+    sub.append(facts, document.createTextNode("·"), e2eMark());
     titles.append(n, sub);
 
     const actions = document.createElement("div");
@@ -3622,13 +3786,20 @@ export class App {
       // to mail — offering either would dead-end, so they are contact-only.
       const isMyContact =
         !isMe && !!trustee.nick && this.contacts.some((c) => c.nickname === trustee.nick);
-      if (isMyContact) {
+      // A mail-only trust has no 1:1 chat (Task 24): the chip offers mail, but
+      // not a chat that the boundary would refuse.
+      const canChat =
+        isMyContact &&
+        this.contacts.find((c) => c.nickname === trustee.nick)?.reach === "full";
+      if (canChat) {
         items.push({
           id: "chat",
           label: "Chat directly",
           icon: "chats",
           onSelect: () => this.openChat(trustee.nick),
         });
+      }
+      if (isMyContact) {
         items.push({
           id: "email",
           label: "Send mail",
@@ -4595,20 +4766,30 @@ export class App {
     };
 
     const picker = new ContactPicker({
-      items: this.contacts.map((c) => ({
-        nickname: c.nickname,
-        label: c.mail_handle
-          ? `${displayNick(c.nickname)} (${this.contactAddress(c)})`
-          : displayNick(c.nickname),
-        keywords: c.nickname,
-      })),
+      // A mail-only trust cannot join a conclave (Task 24), so the picker does
+      // not offer one. The core refuses it too, so this is the courtesy, not
+      // the rule.
+      items: this.contacts
+        .filter((c) => c.reach === "full")
+        .map((c) => ({
+          nickname: c.nickname,
+          label: c.mail_handle
+            ? `${displayNick(c.nickname)} (${this.contactAddress(c)})`
+            : displayNick(c.nickname),
+          keywords: c.nickname,
+        })),
       multiple: true,
       values: this.conclaveCreateTrustees,
-      // Opens above the field so the list cannot cover the Create button below.
-      dropUp: true,
+      // The dialog's own scrolling box would clip a list opened above the field
+      // and the action row sits below it, so the list grows the dialog instead.
+      expand: true,
       label: "Trustees",
       placeholder: "Type a name…",
-      emptyMessage: "No contacts yet. Add someone in Trusts first.",
+      // The list is already filtered to reach-"full" contacts, so "no contacts
+      // yet" would be a lie when every trust is mail only.
+      emptyMessage: this.contacts.length
+        ? "Everyone you know is mail only. Chat and conclaves need a full trust."
+        : "No contacts yet. Add someone in Trusts first.",
       noMatchMessage: "No contacts match that name.",
       onChangeMulti: (nicks) => {
         this.conclaveCreateTrustees = nicks;
@@ -4675,9 +4856,12 @@ export class App {
       invite.disabled = this.conclaveInviteTrustees.length === 0;
     };
 
-    const remaining = conclave
-      ? candidatesToInvite(conclave, this.contacts.map((c) => c.nickname))
-      : [];
+    // A mail-only trust cannot join a conclave (Task 24), so it is not offered
+    // here either; the core refuses the invite as the actual rule.
+    const invitable = this.contacts
+      .filter((c) => c.reach === "full")
+      .map((c) => c.nickname);
+    const remaining = conclave ? candidatesToInvite(conclave, invitable) : [];
     const picker = new ContactPicker({
       items: remaining.map((nick) => {
         const c = this.contacts.find((x) => x.nickname === nick);
@@ -4691,11 +4875,12 @@ export class App {
       }),
       multiple: true,
       values: this.conclaveInviteTrustees,
-      // Opens above the field so the list cannot cover the Invite button below.
-      dropUp: true,
+      // Same as the creator: the dialog would clip an upward list and the
+      // action row sits below the field, so the list grows the dialog.
+      expand: true,
       label: "Trustees to invite",
       placeholder: "Type a name…",
-      emptyMessage: "Everyone you know is already in this conclave.",
+      emptyMessage: "Everyone you know is already here, or is mail only.",
       noMatchMessage: "No contacts match that name.",
       onChangeMulti: (nicks) => {
         this.conclaveInviteTrustees = nicks;
@@ -5554,6 +5739,11 @@ export class App {
       link.style.marginTop = "var(--space-2)";
       link.style.color = "var(--accent)";
       const mail = f.mail;
+      // A chat file has no chat to return to once the trust is mail only
+      // (Task 24): the rail cannot list that contact, so the link would open a
+      // pane with no row behind it.
+      const chatTarget =
+        !mail && this.chatContacts().some((c) => c.nickname === nick);
       if (mail) {
         link.textContent = "View in mail";
         link.onclick = () => {
@@ -5562,7 +5752,7 @@ export class App {
           this.filesContactNick = null;
           this.openMessage(mail);
         };
-      } else {
+      } else if (chatTarget) {
         link.textContent = "View in chat";
         link.onclick = () => {
           this.rail = "chats";
@@ -5572,7 +5762,7 @@ export class App {
           this.render();
         };
       }
-      card.appendChild(link);
+      if (mail || chatTarget) card.appendChild(link);
       list.appendChild(card);
     }
 
@@ -7547,6 +7737,15 @@ export class App {
     rest.textContent = ` · ${bits.join(" · ")}`;
     byline.appendChild(rest);
     head.append(h, byline);
+    // A post's body is ciphertext to the relay: its read key reaches a reader
+    // inside a 1:1 session, never through the bulletin. Said only on this
+    // branch — the ATProto document in `renderAtprotoDocument` is a public post,
+    // and marking that one as encrypted is the exact confusion that page exists
+    // to prevent.
+    const seal = document.createElement("p");
+    seal.className = "zine-article-seal text-13 muted e2e-row";
+    seal.appendChild(e2eMark());
+    head.appendChild(seal);
 
     if (descriptor.sections.length) {
       const tags = document.createElement("div");
@@ -8752,8 +8951,8 @@ export class App {
         keywords: c.nickname,
       })),
       value: this.zinesShareContact,
-      // Above the field, so the list cannot cover the Send button below it.
-      dropUp: true,
+      // Same as the conclave dialogs: grow the dialog rather than clip.
+      expand: true,
       label: "Contact",
       placeholder: "Type a name…",
       emptyMessage: "No contacts yet. Add someone in Trusts first.",
@@ -9658,8 +9857,10 @@ export class App {
     h.className = "text-17";
     h.textContent = subject;
     const sub = document.createElement("div");
-    sub.className = "muted text-13";
-    sub.textContent = `With ${displayNick(contact)} · ${msgs.length} message${msgs.length === 1 ? "" : "s"}`;
+    sub.className = "muted text-13 e2e-row";
+    const who = document.createElement("span");
+    who.textContent = `With ${displayNick(contact)} · ${msgs.length} message${msgs.length === 1 ? "" : "s"}`;
+    sub.append(who, document.createTextNode("·"), e2eMark());
     titles.append(h, sub);
 
     const actions = document.createElement("div");
@@ -10082,7 +10283,14 @@ export class App {
     const h = document.createElement("h1");
     h.className = "text-17";
     h.textContent = drop.subject || "(no subject)";
-    titles.appendChild(h);
+    const sub = document.createElement("div");
+    sub.className = "muted text-13 e2e-row";
+    const from = document.createElement("span");
+    from.textContent = "Anonymous";
+    // A drop is sealed to this vault's published drop key before the relay ever
+    // sees it, so the relay cannot open it and cannot tell who sent it.
+    sub.append(from, document.createTextNode("·"), e2eMark());
+    titles.append(h, sub);
 
     // The same actions a mail thread has, minus Reply — there is no sender to
     // reply to. Filing (star, archive, trash) rides the same per-record flag
@@ -14279,13 +14487,22 @@ export class App {
     const inp = document.createElement("input");
     inp.placeholder = "Type a command or contact…";
     const actions: { label: string; run: () => void }[] = [
-      ...this.contacts.map((c) => ({
-        label: `Open ${displayNick(c.nickname)}`,
-        run: () => {
-          this.selectedNick = c.nickname;
-          this.rail = "chats";
-        },
-      })),
+      // A mail-only trust has no chat to open (Task 24), so its entry offers
+      // the surface it does have rather than a chat the boundary would refuse.
+      ...this.contacts.map((c) =>
+        c.reach === "full"
+          ? {
+              label: `Open ${displayNick(c.nickname)}`,
+              run: () => {
+                this.selectedNick = c.nickname;
+                this.rail = "chats";
+              },
+            }
+          : {
+              label: `Email ${displayNick(c.nickname)}`,
+              run: () => this.emailContact(c.nickname),
+            },
+      ),
       {
         label: "Add a trust",
         run: () => {
@@ -14455,6 +14672,47 @@ export class App {
         inv.spellcheck = false;
         invField.append(invText, inv);
 
+        // Reach (Task 24): two options, and the choice is announced to the peer
+        // so both ends agree. `Full` is the default, so the common case is the
+        // pre-selected one; mail-only is for the trustee you would rather not
+        // have a live channel with.
+        const reachField = document.createElement("fieldset");
+        reachField.className = "reach-picker";
+        const reachLegend = document.createElement("legend");
+        reachLegend.className = "text-13";
+        reachLegend.textContent = "How can they reach you?";
+        const reachOption = (value: TrusteeReach, label: string, hint: string) => {
+          const opt = document.createElement("label");
+          opt.className = "reach-option";
+          const input = document.createElement("input");
+          input.type = "radio";
+          input.name = "add-trust-reach";
+          input.value = value;
+          input.checked = value === "full";
+          const text = document.createElement("span");
+          text.className = "reach-option-text";
+          const strong = document.createElement("span");
+          strong.className = "text-13";
+          strong.textContent = label;
+          const sub = document.createElement("span");
+          sub.className = "text-13 muted";
+          sub.textContent = hint;
+          text.append(strong, sub);
+          opt.append(input, text);
+          return { opt, input };
+        };
+        const fullReach = reachOption(
+          "full",
+          "Mail, chat and conclaves",
+          "Everything Hush offers.",
+        );
+        const mailReach = reachOption(
+          "mail_only",
+          "Mail only",
+          "They can write, but there is no live chat or conclave.",
+        );
+        reachField.append(reachLegend, fullReach.opt, mailReach.opt);
+
         const err = document.createElement("p");
         err.className = "field-error text-13";
         err.hidden = true;
@@ -14480,8 +14738,9 @@ export class App {
         };
         btn.onclick = async () => {
           err.hidden = true;
+          const reach: TrusteeReach = mailReach.input.checked ? "mail_only" : "full";
           try {
-            await api.addContact(nick.value.trim(), inv.value.trim());
+            await api.addContact(nick.value.trim(), inv.value.trim(), reach);
             this.contacts = (await api.contacts()) ?? [];
             setKnownContacts(this.contacts.map((c) => c.nickname));
             this.addFriendOpen = false;
@@ -14497,7 +14756,7 @@ export class App {
         const hint = document.createElement("p");
         hint.className = "text-13 muted";
         hint.textContent = "Names live only on your device.";
-        body.append(nickField, invField, err, btn, hint);
+        body.append(nickField, invField, reachField, err, btn, hint);
       }
     };
     // A tablist is expected to answer the arrow keys.

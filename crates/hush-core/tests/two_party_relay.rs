@@ -67,6 +67,55 @@ async fn two_accounts_exchange_encrypted_text() {
     );
 }
 
+/// `add_contact` sends the new contact a queue grant, and a grant that verifies
+/// against the identity key their invite pinned is proof they added our invite.
+/// Draining it has to leave the trust established rather than pending until the
+/// first message happens to arrive: readiness is read off the stored grant, so
+/// nothing has to record it separately.
+#[tokio::test]
+async fn a_verified_queue_grant_marks_the_contact_inbound_ready() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    let alice_invite = alice.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+
+    // Each side has added the other, and neither has drained yet.
+    assert!(!alice.contacts()[0].inbound_ready());
+    assert!(!bob.contacts()[0].inbound_ready());
+
+    // Draining Alice's inbox consumes Bob's grant. It is not a message...
+    let inbox = alice.recv().await.unwrap();
+    assert!(inbox.messages.is_empty(), "a queue grant is not a message");
+
+    // ...but it is the moment Alice learns Bob added her invite.
+    assert!(
+        alice.contacts()[0].inbound_ready(),
+        "a verified queue grant means the peer added our invite"
+    );
+    assert!(
+        !alice.contacts()[0].heard_from,
+        "nothing has been filed from Bob, so the fallback is untouched: the \
+         stored grant is what carries readiness here"
+    );
+    // And it has to survive a reopen, or the UI flips back to pending.
+    drop(alice);
+    let reopened = Account::open(alice_dir.path(), "alice-pass").await.unwrap();
+    assert!(reopened.contacts()[0].inbound_ready());
+    assert!(!reopened.contacts()[0].heard_from);
+}
+
 #[tokio::test]
 async fn relay_blob_has_no_cleartext_sender_json() {
     let (relay, _relay_dir) = spawn_relay().await;

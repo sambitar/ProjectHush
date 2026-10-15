@@ -3,7 +3,7 @@ use std::thread;
 
 use hush_core::{
   Account, ChatRecord, ChatRetention, ConclaveRecord, InboxResult, MessagePayload,
-  PaperDescriptor, PendingInvite, PendingIntroRequest, VoiceDescriptor,
+  PaperDescriptor, PendingInvite, PendingIntroRequest, TrusteeReach, VoiceDescriptor,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -136,6 +136,13 @@ enum Work {
     AddContact {
         nickname: String,
         invite: String,
+        /// The reach this vault wants with the new trustee (Task 24).
+        reach: TrusteeReach,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SetContactReach {
+        nickname: String,
+        reach: TrusteeReach,
         reply: oneshot::Sender<WorkResult>,
     },
     RemoveContact {
@@ -594,6 +601,9 @@ pub struct ContactDto {
     /// for no behavioural gain. Multi-device made it the *account* identifier
     /// rather than a single device's, which is what it effectively already was.
     pub protocol_name: String,
+    /// Whether this contact has proven they added our invite, so the trust is
+    /// established rather than pending. Derived in `hush-core` from the grant we
+    /// hold, not stored.
     pub inbound_ready: bool,
     pub online: bool,
     /// This contact's mail handle (local part only), if they published one in
@@ -602,6 +612,14 @@ pub struct ContactDto {
     /// The contact's vault name, from their invite — the suffix of their mail
     /// address. `None` when their invite predates vault naming.
     pub mail_vault: Option<String>,
+    /// The **effective** reach for this relationship (Task 24): the narrower of
+    /// this vault's choice and the peer's announced one. `mail_only` hides the
+    /// chat and conclave affordances, because a surface works only when both
+    /// sides allow it.
+    pub reach: TrusteeReach,
+    /// This vault's **own** choice of reach, independent of the peer's. What the
+    /// reach toggle edits; `reach` above is what the pair actually gets.
+    pub my_reach: TrusteeReach,
 }
 
 /// The zines pen name, as the UI sees it: a byline and two public keys. No
@@ -824,10 +842,14 @@ impl AccountWorker {
                                         list.push(ContactDto {
                                             nickname: c.nickname.clone(),
                                             protocol_name: c.account_id.clone(),
-                                            inbound_ready: c.inbound_ready,
+                                            inbound_ready: c.inbound_ready(),
                                             online,
                                             mail_handle: c.mail_handle.clone(),
                                             mail_vault: c.mail_vault.clone(),
+                                            // Effective = the narrower of the two
+                                            // sides' choices (Task 24).
+                                            reach: c.reach.narrow(c.peer_reach),
+                                            my_reach: c.reach,
                                         });
                                     }
                                     WorkResult::Contacts(list)
@@ -858,11 +880,34 @@ impl AccountWorker {
                         Work::AddContact {
                             nickname,
                             invite,
+                            reach,
                             reply,
                         } => {
                             let result = match account.as_mut() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => match a.add_contact(&nickname, &invite).await {
+                                    // The reach is set after the contact exists,
+                                    // because it is announced over the session the
+                                    // add just opened. `Full` is the default and
+                                    // needs no announcement (Task 24).
+                                    Ok(()) if reach == TrusteeReach::Full => WorkResult::Ok,
+                                    Ok(()) => match a.set_contact_reach(&nickname, reach).await {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    },
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SetContactReach {
+                            nickname,
+                            reach,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.set_contact_reach(&nickname, reach).await {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
@@ -2045,10 +2090,20 @@ impl AccountWorker {
         self.call(|reply| Work::Contacts { reply }).await
     }
 
-    pub async fn add_contact(&self, nickname: &str, invite: &str) -> WorkResult {
+    pub async fn add_contact(&self, nickname: &str, invite: &str, reach: TrusteeReach) -> WorkResult {
         self.call(|reply| Work::AddContact {
             nickname: nickname.to_string(),
             invite: invite.to_string(),
+            reach,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_contact_reach(&self, nickname: &str, reach: TrusteeReach) -> WorkResult {
+        self.call(|reply| Work::SetContactReach {
+            nickname: nickname.to_string(),
+            reach,
             reply,
         })
         .await
