@@ -53,8 +53,8 @@ pub use message::{
     InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper, ReceivedZineGrant,
 };
 pub use payload::{
-    ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeState,
-    VoiceDescriptor, MailAttachment, DEFAULT_PAPER_TITLE, MAX_INLINE_FILE_BYTES,
+    ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeReach,
+    TrusteeState, VoiceDescriptor, MailAttachment, DEFAULT_PAPER_TITLE, MAX_INLINE_FILE_BYTES,
     MAX_MAIL_ATTACHMENTS,
 };
 pub use voice::{VoiceEffect, VoiceManager, VoiceMember, VoiceSession, MAX_VOICE_SPEAKERS};

@@ -35,7 +35,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
 use hush_core::{
     ChatRecord, ConclaveRecord, Error, MessagePayload, PaperDescriptor, PendingInvite,
-    ReceivedMessage, VoiceEffect, VoiceManager, VoiceSession,
+    ReceivedMessage, TrusteeReach, VoiceEffect, VoiceManager, VoiceSession,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -157,6 +157,16 @@ struct ChangePassphraseRequest {
 struct AddContactRequest {
     nickname: String,
     invite: String,
+    /// The reach to use with the new trustee (Task 24). Absent means `Full`,
+    /// which is the default and needs no announcement.
+    #[serde(default)]
+    reach: Option<TrusteeReach>,
+}
+
+#[derive(Deserialize)]
+struct SetContactReachRequest {
+    nickname: String,
+    reach: TrusteeReach,
 }
 
 #[derive(Deserialize)]
@@ -390,6 +400,7 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/contacts", get(contacts))
         .route("/api/contacts/add", post(add_contact))
         .route("/api/contacts/remove", post(remove_contact))
+        .route("/api/contacts/reach", post(set_contact_reach))
         .route("/api/send", post(send_text))
         .route("/api/send-file", post(send_file))
         .route("/api/send-file-data", post(send_file_data))
@@ -1762,7 +1773,31 @@ async fn add_contact(
     Json(body): Json<AddContactRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    map_err(state.worker.add_contact(&body.nickname, &body.invite).await)?;
+    let reach = body.reach.unwrap_or_default();
+    map_err(
+        state
+            .worker
+            .add_contact(&body.nickname, &body.invite, reach)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Set how this vault reaches a trustee, and announce it (Task 24).
+///
+/// The choice is this vault's own; the effective reach for the pair is the
+/// narrower of the two sides' choices, so this can only ever remove surfaces.
+async fn set_contact_reach(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SetContactReachRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .set_contact_reach(&body.nickname, body.reach)
+            .await,
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2228,6 +2263,7 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         // items.
         MessagePayload::QueueGrant { .. }
         | MessagePayload::ZineGrant { .. }
+        | MessagePayload::Reach { .. }
         | MessagePayload::ConclaveInvite { .. }
         | MessagePayload::ConclaveAccept { .. }
         | MessagePayload::ConclaveDecline { .. }
@@ -8687,7 +8723,9 @@ mod paper_api_tests {
             .unwrap();
         let invite = peer.invite().await.unwrap();
         assert!(matches!(
-            app.worker.add_contact("peer", &invite).await,
+            app.worker
+                .add_contact("peer", &invite, TrusteeReach::Full)
+                .await,
             WorkResult::Ok
         ));
 
@@ -9406,23 +9444,20 @@ async fn a_zine_survives_a_restart() {
 }
 }
 
-/// Zines over the wire, with two daemons and a real relay.
+/// Shared harness for daemon API tests: a real relay on a port and members
+/// whose routes run over a real vault and worker.
 ///
-/// The bulletin lane is the one part of zines that exists only on the wire, so
-/// a stub would test nothing: what has to hold is that two vaults converge
-/// through the relay, that a blob nobody can open yet is held rather than
-/// dropped, and that the relay's own database holds no plaintext. The contact
-/// dance is real too (invite and accept, both ways) because a grant rides a 1:1
-/// session and a session needs the recipient's queue, which is in their invite.
+/// Extracted so more than one API suite can drive the same two-vault setup
+/// without a second copy of it.
 #[cfg(test)]
-mod zines_bulletin_tests {
+mod api_test_harness {
     use super::*;
     use crate::notes_api_tests::{build_app, request};
     use hush_relay::RelayConfig;
     use tempfile::{NamedTempFile, TempDir};
 
     /// A real relay, on a real port, with its own database on disk.
-    async fn relay_on_a_port() -> (String, NamedTempFile) {
+    pub(crate) async fn relay_on_a_port() -> (String, NamedTempFile) {
         let db = NamedTempFile::new().unwrap();
         let app =
             hush_relay::router(db.path().to_str().unwrap(), RelayConfig::default()).unwrap();
@@ -9435,14 +9470,14 @@ mod zines_bulletin_tests {
     }
 
     /// One member: a vault, its worker, and the routes over them.
-    struct Member {
+    pub(crate) struct Member {
         /// Held only so the vault directory outlives the test.
         _dir: TempDir,
-        app: Arc<App>,
+        pub(crate) app: Arc<App>,
     }
 
     impl Member {
-        async fn new(relay: &str) -> Self {
+        pub(crate) async fn new(relay: &str) -> Self {
             let dir = TempDir::new().unwrap();
             hush_core::Account::create(dir.path(), "pw", relay)
                 .await
@@ -9456,16 +9491,20 @@ mod zines_bulletin_tests {
             Self { _dir: dir, app }
         }
 
-        async fn post(&self, uri: &str, body: Option<&str>) -> (StatusCode, serde_json::Value) {
+        pub(crate) async fn post(
+            &self,
+            uri: &str,
+            body: Option<&str>,
+        ) -> (StatusCode, serde_json::Value) {
             request(&api_router(self.app.clone()), "POST", uri, body).await
         }
 
-        async fn get(&self, uri: &str) -> (StatusCode, serde_json::Value) {
+        pub(crate) async fn get(&self, uri: &str) -> (StatusCode, serde_json::Value) {
             request(&api_router(self.app.clone()), "GET", uri, None).await
         }
 
         /// Poll, the way the UI does: the bulletin drain rides on it.
-        async fn poll(&self) -> serde_json::Value {
+        pub(crate) async fn poll(&self) -> serde_json::Value {
             let (status, view) = self.post("/api/recv", None).await;
             assert_eq!(status, StatusCode::OK, "recv failed: {view}");
             view
@@ -9476,7 +9515,7 @@ mod zines_bulletin_tests {
     ///
     /// Both directions, because a session needs the *recipient's* queue and the
     /// only place it travels is their invite.
-    async fn connect(a: &Member, b: &Member, a_nick: &str, b_nick: &str) {
+    pub(crate) async fn connect(a: &Member, b: &Member, a_nick: &str, b_nick: &str) {
         for (me, other, nick) in [(a, b, b_nick), (b, a, a_nick)] {
             let (status, invite) = other.post("/api/invite", None).await;
             assert_eq!(status, StatusCode::OK, "{invite}");
@@ -9491,13 +9530,180 @@ mod zines_bulletin_tests {
     }
 
     /// Two members on one relay, each holding the other's invite.
-    async fn pair() -> (String, NamedTempFile, Member, Member) {
+    pub(crate) async fn pair() -> (String, NamedTempFile, Member, Member) {
         let (relay, db) = relay_on_a_port().await;
         let a = Member::new(&relay).await;
         let b = Member::new(&relay).await;
         connect(&a, &b, "ada", "bo").await;
         (relay, db, a, b)
     }
+}
+
+/// Contact readiness over the daemon API, which is what the Chats list renders.
+///
+/// Adding each other is the ordinary way a trust starts, and it leaves neither
+/// side having sent a message. The list must still report the relationship as
+/// established, or a mutual, working trust reads as "Waiting for them to add
+/// you" in the UI.
+#[cfg(test)]
+mod contacts_api_tests {
+    use super::api_test_harness::pair;
+    use super::*;
+
+    #[tokio::test]
+    async fn a_mutual_add_reads_ready_without_any_message() {
+        let (_relay, _db, a, b) = pair().await;
+
+        // Both sides hold the other's invite; nothing has been sent either way.
+        let (status, before) = a.get("/api/contacts").await;
+        assert_eq!(status, StatusCode::OK, "{before}");
+        assert_eq!(before[0]["nickname"], "bo", "{before}");
+        assert_eq!(
+            before[0]["inbound_ready"], false,
+            "nothing has been drained yet: {before}"
+        );
+
+        // Draining consumes the peer's queue grant, which is their proof of
+        // having added our invite.
+        a.poll().await;
+        b.poll().await;
+
+        for (who, member) in [("ada", &a), ("bo", &b)] {
+            let (status, list) = member.get("/api/contacts").await;
+            assert_eq!(status, StatusCode::OK, "{list}");
+            assert_eq!(
+                list[0]["inbound_ready"], true,
+                "{who} must read ready after draining the peer's grant: {list}"
+            );
+        }
+    }
+}
+
+/// Reach over the daemon API (Task 24): the choice is set, announced, and
+/// enforced at the routes the UI actually calls.
+#[cfg(test)]
+mod reach_api_tests {
+    use super::api_test_harness::{pair, Member};
+    use super::*;
+
+    /// Adding with `mail_only` records the choice, and the chat route refuses
+    /// it with a 400 rather than a 500 — this is a user error, not a crash.
+    #[tokio::test]
+    async fn add_with_mail_only_refuses_the_chat_route() {
+        let (relay, _db) = super::api_test_harness::relay_on_a_port().await;
+        let a = Member::new(&relay).await;
+        let b = Member::new(&relay).await;
+        let (status, invite) = b.post("/api/invite", None).await;
+        assert_eq!(status, StatusCode::OK, "{invite}");
+
+        let body = serde_json::json!({
+            "nickname": "bo",
+            "invite": invite["invite"].as_str().unwrap(),
+            "reach": "mail_only",
+        })
+        .to_string();
+        let (status, err) = a.post("/api/contacts/add", Some(&body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+
+        let (status, list) = a.get("/api/contacts").await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list[0]["reach"], "mail_only");
+        assert_eq!(list[0]["my_reach"], "mail_only");
+
+        // Bob must heartbeat for chat to even be attempted, but the reach gate
+        // runs first, so the refusal does not depend on presence.
+        let (status, err) = a
+            .post("/api/send", Some(r#"{"to":"bo","text":"hi"}"#))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(
+            err["error"].as_str().unwrap().contains("mail-only"),
+            "got {err}"
+        );
+    }
+
+    /// The reach route flips a relationship both ways and the gate follows it:
+    /// mail-only refuses chat, full allows it again.
+    #[tokio::test]
+    async fn the_reach_route_opens_and_closes_chat() {
+        let (_relay, _db, a, b) = pair().await;
+        b.poll().await; // drain the grant, so chat has somewhere to go
+
+        let (status, err) = a
+            .post(
+                "/api/contacts/reach",
+                Some(r#"{"nickname":"bo","reach":"mail_only"}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let (status, err) = a
+            .post("/api/send", Some(r#"{"to":"bo","text":"hi"}"#))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+
+        let (status, err) = a
+            .post(
+                "/api/contacts/reach",
+                Some(r#"{"nickname":"bo","reach":"full"}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+
+        // Full again: the send is no longer refused for reach. Bob is offline,
+        // so it fails on presence instead — a different error, which is the
+        // point: reach is no longer what stands in the way.
+        let (status, err) = a
+            .post("/api/send", Some(r#"{"to":"bo","text":"hi"}"#))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(
+            err["error"].as_str().unwrap().contains("offline"),
+            "reach must not be the blocker once full, got {err}"
+        );
+    }
+
+    /// The announcement reaches the peer's contact list, so the UI on both
+    /// sides shows the same effective reach.
+    #[tokio::test]
+    async fn the_announcement_reaches_the_peers_contact_list() {
+        let (_relay, _db, a, b) = pair().await;
+        let (status, err) = a
+            .post(
+                "/api/contacts/reach",
+                Some(r#"{"nickname":"bo","reach":"mail_only"}"#),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+
+        b.poll().await;
+        let (status, list) = b.get("/api/contacts").await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(
+            list[0]["reach"], "mail_only",
+            "the peer's effective reach narrows to match"
+        );
+        assert_eq!(
+            list[0]["my_reach"], "full",
+            "the peer's own choice is untouched"
+        );
+    }
+}
+
+/// Zines over the wire, with two daemons and a real relay.
+///
+/// The bulletin lane is the one part of zines that exists only on the wire, so
+/// a stub would test nothing: what has to hold is that two vaults converge
+/// through the relay, that a blob nobody can open yet is held rather than
+/// dropped, and that the relay's own database holds no plaintext. The contact
+/// dance is real too (invite and accept, both ways) because a grant rides a 1:1
+/// session and a session needs the recipient's queue, which is in their invite.
+#[cfg(test)]
+mod zines_bulletin_tests {
+    use super::*;
+    use crate::notes_api_tests::request;
+    // The two-vault harness is shared with the reach API suite.
+    use super::api_test_harness::{connect, pair, Member};
+    use tempfile::TempDir;
 
     /// A raw byte scan, so the claim covers the whole file: a marker in a freed
     /// page or a WAL frame is still plaintext on the relay's disk.

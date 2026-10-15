@@ -33,7 +33,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **O — Zines** | After **19**'s spine (reused) + a relay bulletin lane; independent of **17**/**18** media | **21** members-only long-form blogs ("zines") with comments, broadcast on a relay bulletin | Spec resolved 2026-10-12 by grilling; planning only |
 | **P — The public lane** | After **21** (front page) | **22** public long-form over **AT Protocol / Standard.site**, badged on the zines front page behind a control | ✅ **Implemented 2026-10-14** (replaces the 2026-10-13 Nostr spec) |
 | **Q — Conclave voice** | After **C** stabilizes (same gate as **17**); engine spike shared with **17** Phase 2 | **23** group voice inside a conclave | Forks resolved 2026-10-13 — decisions **delegated to agent judgment, user review pending**; planning only, Phase 1 not approved |
-| **R — Trustee reach** | After **D** (mail) lands; independent of the media tasks | **24** per-trustee surface scope — **mail only** or **mail + chat + conclave** | Idea captured 2026-10-14; planning only, not grilled |
+| **R — Trustee reach** | After **D** (mail) lands; independent of the media tasks | **24** per-trustee surface scope — **mail only** or **mail + chat + conclave** | ✅ **Built 2026-10-15** |
 | **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
 
 **Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane. **Zines** (O) is the members-only long-form commons: also a data feature, reusing **19**'s spine, and it is the one task that adds a relay ability (a broadcast bulletin) — also independent of the media plane. It reshapes **Articles** (G) from a native build into an optional publish. **The public lane** (P) is the counterpart to zines: it publishes a zine to the **open social web** and reads other people's documents back onto the same page, badged and behind a control. It uses the member's **own AT Protocol account** — no key minted, no separate identity, no second network to curate — which is what replaced the Nostr lane (relays, `npub`, a per-vault public identity, NIP-23/NIP-22) on 2026-10-14. **Trustee reach** (R) is a small contact-policy change on top of **mail** (D): when you add a trustee you choose whether they may reach you by **mail only** or by **mail + chat + conclave**, so a member can add someone they only want to correspond with by mail.
@@ -740,10 +740,10 @@ unit's documented exceptions and the dependency list. Media is never on disk.
 
 ---
 
-### Task 24: Trustee reach — mail-only or full (planning only)
+### Task 24: Trustee reach — mail-only or full (built 2026-10-15)
 
-**Status:** **Phase R** — idea captured **2026-10-14**; **planning only**, not grilled to decision
-level. No code until a phase is approved.
+**Status:** **Phase R** — built **2026-10-15**. Idea captured **2026-10-14**; the open questions were
+decided during implementation and are recorded in the task doc, not left dangling.
 
 **Goal:** When you add a **trustee** (a person in your circle — the Trusts pane), you choose which
 surfaces they may use with you. Two options: **Mail only** (mail both ways; no live 1:1 chat, no
@@ -752,18 +752,23 @@ the floor: every trustee can always reach you by mail.
 
 **Why:** some members want to add people they only want to correspond with by mail — a professional
 contact, a one-off introduction — without opening a live chat thread or pulling them into a conclave.
-The app currently offers all three surfaces to every trustee the moment they are added.
+The app previously offered all three surfaces to every trustee the moment they were added.
 
-→ **[`docs/tasks/trustee-reach.md`](../tasks/trustee-reach.md)**
+→ **[`docs/tasks/trustee-reach.md`](../tasks/trustee-reach.md)** · wire:
+**[`docs/PROTOCOL.md`](../PROTOCOL.md)** → "Trustee reach"
 
-**Key decisions captured:** the scope lives on the trustee record and is **announced to the peer**,
-so both ends agree; **effective reach is the narrower of the two sides** (if either chose mail-only,
-the relationship is mail-only for both); enforced at the **daemon boundary** (refusals, not just a
-hidden button), the way the convener-only invite rule already is; mail rides the same 1:1 Signal
-session as chat, so this is a **policy** gate, not a transport one.
+**Key decisions:** the reach lives on the contact record and is **announced to the peer** as
+`MessagePayload::Reach`; **effective reach is the narrower of the two sides** (if either chose
+mail-only, the relationship is mail-only for both); enforced at the **core boundary** — `send_text` /
+`send_file` / `create_conclave` / `invite_conclave_trustee` refuse with `Error::ReachMailOnly`, and
+inbound chat and conclave invites are refused at `recv` with a warning — the way the convener-only
+invite rule already is; mail rides the same 1:1 Signal session as chat, so this is a **policy** gate,
+not a transport one. Existing conclave membership is **grandfathered**: narrowing stops new joins, and
+a kick is the removal path.
 
-**Open questions:** intersection vs one-way; whether mail-only gates attachments or only the live
-surfaces; changing the scope mid-relationship; the two options' copy and name.
+**Decided (was open):** intersection, not one-way; mail-only does not gate mail attachments;
+mid-relationship changes are allowed both ways and announced; copy and naming settled (see the task
+doc §5).
 
 **Depends on:** Task **5** (daemon), **5d** (mail), **5h** (presence), conclave fan-out (done),
 **5c** encrypted store (done). **Independent of** the **17** / **18** / **19** / **23** media work —
@@ -771,6 +776,32 @@ no new transport, no new egress. Outsiders / drops (**5e** / **5f**) are out of 
 
 **Distro-readiness:** no new runtime deps and no new egress; a field in the existing encrypted store
 plus an announcement on the existing session.
+
+---
+
+### Task 25: Invite code shortening — binary serialization (planning only)
+
+**Status:** **Phase S** — idea captured **2026-10-15** from the owner; **planning only**, no
+phase approved.
+
+**Goal:** Shrink the invite string. Today `InvitePayload::encode` is base64(JSON), and the JSON
+writes every key/signature field as a comma-separated decimal array, so the pasted string is
+~19–20 KB of mostly digits (estimate — the task's first item is to measure). A binary format
+(MessagePack / CBOR / protobuf) stores the byte fields as raw bytes instead, for roughly a
+quarter of the size; base64 stays only as the outer paste-safe skin. Compression is in scope
+only if measurement justifies it — key material is high-entropy and will not compress.
+
+**Why:** the invite travels out-of-band as a pasted string or QR; a 19 KB string is an unwieldy
+paste and far past reliable QR range.
+
+→ **[`docs/tasks/invite-code-shortening.md`](../tasks/invite-code-shortening.md)**
+
+**Key constraints:** old builds must fail clearly, never wrongly — the new encoding needs a
+recognisable prefix/version envelope (`INVITE_VERSION` discipline); invites are minted on demand
+and consumed once, so the migration window is strings already in flight; the relay is untouched.
+
+**Depends on:** nothing new. **Independent of** the media and publishing tasks. One small
+serializer crate is the only runtime-dep question.
 
 ---
 

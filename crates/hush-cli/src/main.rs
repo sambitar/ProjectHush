@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf as StdPathBuf;
 
-use hush_core::{config, resolve_data_dir, Account, MessagePayload};
+use hush_core::{config, resolve_data_dir, Account, MessagePayload, TrusteeReach};
 
 #[derive(Parser)]
 #[command(name = "hush-cli", about = "Dogfood client for Hush")]
@@ -42,6 +42,18 @@ enum Commands {
     AddContact {
         nickname: String,
         invite: String,
+        /// Reach this contact by mail only: mail flows, but there is no live
+        /// chat and no conclave. The choice is announced to them, and either
+        /// side narrowing makes the relationship mail-only.
+        #[arg(long)]
+        mail_only: bool,
+    },
+    /// Change how this vault reaches an existing contact (Task 24).
+    SetReach {
+        nickname: String,
+        /// `full` or `mail-only`.
+        #[arg(long, default_value = "full")]
+        reach: String,
     },
     Send {
         to: String,
@@ -179,10 +191,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::AddContact { nickname, invite } => {
+        Commands::AddContact {
+            nickname,
+            invite,
+            mail_only,
+        } => {
             let mut account = open(&dir, &passphrase).await?;
             account.add_contact(&nickname, &invite).await?;
-            println!("added contact {}", nickname);
+            if mail_only {
+                account
+                    .set_contact_reach(&nickname, TrusteeReach::MailOnly)
+                    .await?;
+            }
+            println!(
+                "added contact {nickname}{}",
+                if mail_only { " (mail only)" } else { "" }
+            );
+        }
+        Commands::SetReach { nickname, reach } => {
+            let reach = parse_reach(&reach)?;
+            let mut account = open(&dir, &passphrase).await?;
+            account.set_contact_reach(&nickname, reach).await?;
+            println!(
+                "{nickname} is now {}",
+                match reach {
+                    TrusteeReach::MailOnly => "mail only",
+                    TrusteeReach::Full => "full: mail, chat and conclaves",
+                }
+            );
         }
         Commands::Send { to, text } => {
             let mut account = open(&dir, &passphrase).await?;
@@ -259,6 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // surface as inbox items.
                     MessagePayload::QueueGrant { .. }
                     | MessagePayload::ZineGrant { .. }
+                    | MessagePayload::Reach { .. }
                     | MessagePayload::ConclaveInvite { .. }
                     | MessagePayload::ConclaveAccept { .. }
                     | MessagePayload::ConclaveDecline { .. }
@@ -361,6 +398,17 @@ fn normalize_optional(v: &str) -> Option<String> {
         None
     } else {
         Some(t.to_string())
+    }
+}
+
+/// Parse the `--reach` spelling, accepting both the CLI's hyphenated form and
+/// the wire's snake_case one, because the wire name is what a user copying from
+/// the API docs will have in hand.
+fn parse_reach(v: &str) -> Result<TrusteeReach, hush_core::Error> {
+    match v.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "full" => Ok(TrusteeReach::Full),
+        "mail-only" => Ok(TrusteeReach::MailOnly),
+        other => Err(hush_core::Error::InvalidReach(other.to_string())),
     }
 }
 

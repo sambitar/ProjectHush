@@ -13,7 +13,7 @@ use crate::backup::{export_vault, import_vault};
 use crate::chat_log::{
     ChatLog, ChatRecordPayload, ChatRetention, ConclaveRecord, MailAttachmentRecord, MailState,
 };
-use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeState};
+use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeReach, TrusteeState};
 use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
 use crate::prekey::PreKeyRecord;
 use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_files_exist, unwrap_master_with_recovery};
@@ -173,8 +173,37 @@ pub struct Contact {
     /// naming; the UI falls back to [`DEFAULT_VAULT_NAME`].
     #[serde(default)]
     pub mail_vault: Option<String>,
-    /// True after we successfully received at least one message from them (they added our invite).
-    pub inbound_ready: bool,
+    /// True once a filed message — chat, file or mail — has arrived from this
+    /// contact.
+    ///
+    /// This is **not** readiness; that is [`Contact::inbound_ready`], derived
+    /// from the grant we hold. This is only the fallback for the one case the
+    /// grant cannot cover: `add_contact` sends a grant once, best effort, with
+    /// no retry, so a relay outage at add time can leave us without their queue
+    /// while they remain perfectly able to write to us.
+    ///
+    /// The stored key used to be `inbound_ready`, which a verified grant also
+    /// set. The alias carries that value over: this is one OR term of the
+    /// derivation, and the grant term now answers the same way wherever a grant
+    /// had been stored, so an inherited `true` cannot contradict it.
+    #[serde(default, alias = "inbound_ready")]
+    pub heard_from: bool,
+    /// How this vault chose to reach this trustee (Task 24).
+    ///
+    /// The vault's **own** choice, not the peer's: it says which surfaces this
+    /// account will use with them. `Full` unless the user narrowed it, and
+    /// narrowed only by the daemon's reach route.
+    #[serde(default)]
+    pub reach: TrusteeReach,
+    /// The reach this trustee announced for us, learned from a `Reach`
+    /// payload.
+    ///
+    /// `Full` until they announce otherwise, so a peer that predates this
+    /// setting — or has simply not announced one yet — is never mistaken for
+    /// mail-only. The effective reach is the narrower of this and
+    /// [`Contact::reach`]: a surface is usable only when both sides allow it.
+    #[serde(default)]
+    pub peer_reach: TrusteeReach,
 }
 
 impl<'de> Deserialize<'de> for Contact {
@@ -219,8 +248,12 @@ impl<'de> Deserialize<'de> for Contact {
                 mail_handle: Option<String>,
                 #[serde(default)]
                 mail_vault: Option<String>,
+                #[serde(default, alias = "inbound_ready")]
+                heard_from: bool,
                 #[serde(default)]
-                inbound_ready: bool,
+                reach: TrusteeReach,
+                #[serde(default)]
+                peer_reach: TrusteeReach,
             },
             Devices {
                 nickname: String,
@@ -230,8 +263,8 @@ impl<'de> Deserialize<'de> for Contact {
                 mail_handle: Option<String>,
                 #[serde(default)]
                 mail_vault: Option<String>,
-                #[serde(default)]
-                inbound_ready: bool,
+                #[serde(default, alias = "inbound_ready")]
+                heard_from: bool,
             },
             Legacy {
                 nickname: String,
@@ -240,8 +273,8 @@ impl<'de> Deserialize<'de> for Contact {
                 queue_token: String,
                 #[serde(default)]
                 mail_handle: Option<String>,
-                #[serde(default)]
-                inbound_ready: bool,
+                #[serde(default, alias = "inbound_ready")]
+                heard_from: bool,
             },
         }
 
@@ -256,7 +289,9 @@ impl<'de> Deserialize<'de> for Contact {
                 delivery_queue_token,
                 mail_handle,
                 mail_vault,
-                inbound_ready,
+                heard_from,
+                reach,
+                peer_reach,
             } => Contact {
                 nickname,
                 account_id,
@@ -267,7 +302,9 @@ impl<'de> Deserialize<'de> for Contact {
                 delivery_queue_token,
                 mail_handle,
                 mail_vault,
-                inbound_ready,
+                heard_from,
+                reach,
+                peer_reach,
             },
             Repr::Devices {
                 nickname,
@@ -275,7 +312,7 @@ impl<'de> Deserialize<'de> for Contact {
                 devices,
                 mail_handle,
                 mail_vault,
-                inbound_ready,
+                heard_from,
             } => {
                 // Keep the entry that used to be device 1 (or the first), so the
                 // queue the contact is actually reachable on is not dropped.
@@ -293,7 +330,9 @@ impl<'de> Deserialize<'de> for Contact {
                     delivery_queue_token: primary.delivery_queue_token,
                     mail_handle,
                     mail_vault,
-                    inbound_ready,
+                    heard_from,
+                    reach: TrusteeReach::Full,
+                    peer_reach: TrusteeReach::Full,
                 }
             }
             Repr::Legacy {
@@ -302,7 +341,7 @@ impl<'de> Deserialize<'de> for Contact {
                 queue_id,
                 queue_token,
                 mail_handle,
-                inbound_ready,
+                heard_from,
             } => {
                 let identity_key = hex::decode(&protocol_name).unwrap_or_default();
                 Contact {
@@ -315,10 +354,29 @@ impl<'de> Deserialize<'de> for Contact {
                     delivery_queue_token: None,
                     mail_handle,
                     mail_vault: None,
-                    inbound_ready,
+                    heard_from,
+                    reach: TrusteeReach::Full,
+                    peer_reach: TrusteeReach::Full,
                 }
             }
         })
+    }
+}
+
+impl Contact {
+    /// Whether this contact has proven they added our invite.
+    ///
+    /// Derived, never stored. The grant we hold *is* the proof — only the holder
+    /// of their identity key can produce one, and `add_contact` is the only
+    /// thing that sends one — so keeping a second copy of that fact only let the
+    /// two disagree, which is how a mutual, working trust came to read as
+    /// pending while the grant sat in `delivery_queue_id` all along.
+    ///
+    /// It must not wait on them having written first: a mutual trust where
+    /// neither side has sent anything is established, not pending. That is what
+    /// [`Contact::heard_from`] is a fallback *for*, not a precondition of.
+    pub fn inbound_ready(&self) -> bool {
+        self.delivery_queue_id.is_some() || self.heard_from
     }
 }
 
@@ -947,8 +1005,9 @@ impl Account {
         .await?;
         self.finish_contact(nickname, payload).await?;
         // Hand this account's per-contact queue to the contact, which is what
-        // makes deleting them revocable. Best effort: the next drain re-grants
-        // if the relay was down.
+        // makes deleting them revocable. Best effort and one-shot: nothing
+        // re-sends this, so a relay that is down here leaves the peer
+        // delivering to our inbox until it drains a message from us.
         if let Err(e) = self.grant_queues_to(nickname).await {
             eprintln!("hush: could not grant a queue to {nickname}: {e}");
         }
@@ -1015,13 +1074,61 @@ impl Account {
             delivery_queue_token: None,
             mail_handle: payload.handle.clone(),
             mail_vault: payload.vault.clone(),
-            inbound_ready: false,
+            heard_from: false,
+            reach: TrusteeReach::Full,
+            peer_reach: TrusteeReach::Full,
         });
         // Adding a contact clears any revocation left from a previous delete, so
         // a re-added contact is granted a queue again instead of being treated
         // as still blocked.
         self.state.revoked.retain(|a| a != &payload.protocol_name);
         self.save().await?;
+        Ok(())
+    }
+
+    /// Set how this vault reaches a trustee, and tell them (Task 24).
+    ///
+    /// The choice is this vault's own: it narrows what this account will use
+    /// with them. It is announced so the peer's UI can mirror it, but the
+    /// effective reach for the pair is the narrower of the two sides' choices,
+    /// so a `MailOnly` here can only ever remove surfaces, never grant them.
+    ///
+    /// The announcement is best effort. The local choice stands even if the
+    /// relay is down, and there is nothing to roll back: a `Reach` the peer
+    /// never received just leaves them assuming `Full`, which is the safe
+    /// direction — they may try a chat, and this vault refuses it at the
+    /// boundary.
+    pub async fn set_contact_reach(
+        &mut self,
+        nickname: &str,
+        reach: TrusteeReach,
+    ) -> Result<(), Error> {
+        let changed = {
+            let contact = self
+                .state
+                .contacts
+                .iter_mut()
+                .find(|c| c.nickname == nickname)
+                .ok_or(Error::ContactNotFound)?;
+            if contact.reach == reach {
+                false
+            } else {
+                contact.reach = reach;
+                true
+            }
+        };
+        if !changed {
+            return Ok(());
+        }
+        self.save().await?;
+        // Store-and-forward: the peer may be away, and a reach change is not
+        // live-only the way a chat line is.
+        if let Err(e) = self
+            .send_payload_inner(nickname, MessagePayload::Reach { scope: reach }, false)
+            .await
+        {
+            eprintln!("hush: reach announcement to {nickname} failed: {e}");
+        }
         Ok(())
     }
 
@@ -1695,6 +1802,12 @@ impl Account {
             if contact.account_id == me {
                 continue;
             }
+            // A mail-only relationship has no conclaves (Task 24). The picker
+            // already filters these out; this is the boundary that makes it a
+            // rule rather than a hidden button.
+            if !self.effective_reach(nickname).allows_live() {
+                return Err(Error::ReachMailOnly);
+            }
             if roster.iter().any(|m| m.account_id == contact.account_id) {
                 continue;
             }
@@ -2216,6 +2329,11 @@ impl Account {
             .clone();
         if conclave.trustee(&contact.account_id).is_some() {
             return Err(Error::AlreadyConclaveTrustee);
+        }
+        // A mail-only relationship has no conclaves (Task 24). Checked here so
+        // the rule holds for the CLI and the daemon, not just the picker.
+        if !self.effective_reach(nickname).allows_live() {
+            return Err(Error::ReachMailOnly);
         }
         let master = *self.vault.master_key();
         let invited = ConclaveTrustee {
@@ -3294,7 +3412,16 @@ impl Account {
             .await
     }
 
+    /// Send a live-only payload — a chat line or a file — to a contact.
+    ///
+    /// This is the chat surface's one gate (Task 24): a mail-only relationship
+    /// has no chat, so the send is refused here rather than merely hidden in
+    /// the UI. Mail and the other store-and-forward payloads ride
+    /// [`Self::send_payload_inner`] directly and are unaffected.
     async fn send_payload(&mut self, nickname: &str, payload: MessagePayload) -> Result<(), Error> {
+        if !self.effective_reach(nickname).allows_live() {
+            return Err(Error::ReachMailOnly);
+        }
         self.send_payload_inner(nickname, payload, true).await
     }
 
@@ -3717,12 +3844,44 @@ impl Account {
                     continue;
                 }
 
+                // A reach announcement: the sender tells us which surfaces they
+                // will use with us (Task 24). Applied only from a known contact
+                // — the session is the authentication — and it can only ever
+                // narrow, because the effective reach is the narrower of the
+                // two sides' choices. A stranger's announcement is dropped.
+                if let MessagePayload::Reach { scope } = &payload {
+                    if let Some(contact) = self
+                        .state
+                        .contacts
+                        .iter_mut()
+                        .find(|c| c.account_id == from_account)
+                    {
+                        if contact.peer_reach != *scope {
+                            contact.peer_reach = *scope;
+                            dirty = true;
+                        }
+                    }
+                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    continue;
+                }
+
                 // Conclave control payloads. Membership is consensual, so an
                 // invite, accept, decline, leave, update or end changes local
                 // state and is never surfaced as a chat message. Only an
                 // explicit accept ever materialises a conclave.
                 match &payload {
                     MessagePayload::ConclaveInvite { descriptor } => {
+                        // A mail-only relationship has no conclaves (Task 24).
+                        // Refused before a pending invite is materialised, so a
+                        // peer that ignored the reach cannot pull us in.
+                        if !self.effective_reach_for_account(&from_account).allows_live() {
+                            warnings.push(format!(
+                                "An invite from {nick} was refused — this is a mail-only relationship."
+                            ));
+                            relay.delete(&queue_id, &read_token, &blob_id).await?;
+                            dirty = true;
+                            continue;
+                        }
                         if self.receive_conclave_invite(descriptor, &from_account, &nick)? {
                             dirty = true;
                         }
@@ -3811,6 +3970,24 @@ impl Account {
                         continue;
                     }
                     _ => {}
+                }
+
+                // A live chat line or file from a mail-only relationship is
+                // refused at the boundary (Task 24), not merely hidden in the
+                // sender's UI: a peer that has not yet learned the reach, or
+                // ignored it, must not get through. Mail is the floor and is
+                // never gated.
+                if matches!(
+                    &payload,
+                    MessagePayload::Text { .. } | MessagePayload::File { .. }
+                ) && !self.effective_reach_for_account(&from_account).allows_live()
+                {
+                    warnings.push(format!(
+                        "A chat from {nick} was refused — this is a mail-only relationship."
+                    ));
+                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    dirty = true;
+                    continue;
                 }
 
                 let (file_blob_id, mail_attachments) = match &payload {
@@ -3919,7 +4096,10 @@ impl Account {
                     | MessagePayload::ConclaveIntro { .. }
                     // Handed over above, into `zine_grants`: a read key is not
                     // a chat message and must never be rendered as one.
-                    | MessagePayload::ZineGrant { .. } => {
+                    | MessagePayload::ZineGrant { .. }
+                    // Applied above, into `peer_reach`: a reach announcement is
+                    // not a chat message either.
+                    | MessagePayload::Reach { .. } => {
                         unreachable!("control payload handled above")
                     }
                     // A paper payload is not a chat message, so it must not
@@ -4030,13 +4210,17 @@ impl Account {
                         continue;
                     }
                 };
+                // A message we filed is proof they added us. Readiness itself is
+                // read off the grant we hold, but `add_contact` sends a grant
+                // once, best effort, so a grant lost at add time would otherwise
+                // leave a working trust reading as pending forever.
                 if let Some(c) = self
                     .state
                     .contacts
                     .iter_mut()
                     .find(|c| c.account_id == from_account)
                 {
-                    c.inbound_ready = true;
+                    c.heard_from = true;
                 }
                 out.push(ReceivedMessage {
                     from_nick: nick,
@@ -4105,6 +4289,13 @@ impl Account {
     /// the public grant channel safe: anyone can write to it, but only the
     /// holder of the identity private key can name a queue the recipient will
     /// use.
+    ///
+    /// Storing the queue is also the whole of the contact's readiness: a
+    /// verified grant is exactly the proof that they added our invite, and
+    /// [`Contact::inbound_ready`] reads it straight off this field, so there is
+    /// no separate flag to write back. Waiting for their first message instead
+    /// would leave a mutual, working trust reading as pending, because both
+    /// sides grant on add and a grant is not a message.
     fn apply_queue_grant(
         &mut self,
         from_account: &str,
@@ -4127,6 +4318,8 @@ impl Account {
         if contact.delivery_queue_id.as_deref() == Some(queue_id)
             && contact.delivery_queue_token.as_deref() == Some(delivery_token)
         {
+            // The same grant again: the queue is already recorded, and there is
+            // no readiness flag left to write back, so nothing changed.
             return Ok(false);
         }
         contact.delivery_queue_id = Some(queue_id.to_string());
@@ -4140,6 +4333,23 @@ impl Account {
 
     fn contact_by_account(&self, account_id: &str) -> Option<&Contact> {
         self.state.contacts.iter().find(|c| c.account_id == account_id)
+    }
+
+    /// The reach this vault uses with a contact: the narrower of this vault's
+    /// choice and the peer's announced one (Task 24). `Full` when there is no
+    /// such contact, so an unknown name is never silently restricted.
+    fn effective_reach(&self, nickname: &str) -> TrusteeReach {
+        self.find_contact(nickname)
+            .map(|c| c.reach.narrow(c.peer_reach))
+            .unwrap_or(TrusteeReach::Full)
+    }
+
+    /// [`Self::effective_reach`] keyed on the stable account id, for the
+    /// receive path where only the sender's account is in hand.
+    fn effective_reach_for_account(&self, account_id: &str) -> TrusteeReach {
+        self.contact_by_account(account_id)
+            .map(|c| c.reach.narrow(c.peer_reach))
+            .unwrap_or(TrusteeReach::Full)
     }
 
     fn contact_nick_for_protocol(&self, account_id: &str) -> Option<String> {
@@ -4487,7 +4697,13 @@ mod tests {
             contact.identity_key, remote_identity,
             "the identity key is recoverable from the old protocol_name"
         );
-        assert!(contact.inbound_ready);
+        assert!(
+            contact.heard_from,
+            "the legacy `inbound_ready` key must carry over as the message-seen \
+             fallback — this record holds no grant, so it is the only thing that \
+             can keep it reading as ready"
+        );
+        assert!(contact.inbound_ready());
 
         // The upgrade has to be written back, or the next open redoes it from a
         // shape that no longer exists.
@@ -4552,7 +4768,10 @@ mod tests {
             contact.delivery_queue_token.as_deref(),
             Some("carol-granted-token")
         );
-        assert!(contact.inbound_ready);
+        assert!(
+            contact.inbound_ready(),
+            "the grant device 1 carried over is itself the proof of readiness"
+        );
     }
 
     #[tokio::test]
@@ -4676,7 +4895,9 @@ mod tests {
             delivery_queue_token: None,
             mail_handle: None,
             mail_vault: None,
-            inbound_ready: false,
+            heard_from: false,
+            reach: TrusteeReach::Full,
+            peer_reach: TrusteeReach::Full,
         });
     }
 

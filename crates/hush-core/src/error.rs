@@ -30,6 +30,8 @@ pub enum Error {
     ContactNotFound,
     #[error("contact is offline — chat is live only; use mail when available")]
     ContactOffline,
+    #[error("this is a mail-only relationship — chat and conclaves are off")]
+    ReachMailOnly,
     #[error("contact already exists")]
     ContactExists,
     #[error("unsupported invite version")]
@@ -48,6 +50,8 @@ pub enum Error {
     ConclaveNotFound,
     #[error("a conclave needs a name and at least one trustee")]
     InvalidConclave,
+    #[error("unknown reach {0:?}; use full or mail-only")]
+    InvalidReach(String),
     #[error("only the conclave's convener can do that")]
     NotConclaveConvener,
     #[error("this conclave has ended")]

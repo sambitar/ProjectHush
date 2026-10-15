@@ -7,6 +7,401 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-15 — UI pass: the reach badge, the conclave picker, and the E2E marks
+
+### The contact list inside a dialog was clipped by the dialog's own scroll box [FIXED]
+
+- Reported: "in new conclave .. the popup to create a new conclave is kind of poorly designed .. the
+  trustee menu opens the menu upwards .. should be maybe downwards?"
+- Attempted: measure before changing. The list was an absolute overlay opened *above* the field
+  (`dropUp`), and that had a stated reason: dropping downwards would cover the action buttons.
+- Symptom (live bounding boxes from `.modal` and `.contact-picker-popup`): the field sat 253px below
+  the dialog's top edge while the list could be 260px tall, and `.modal` is `overflow: auto`. So the
+  one direction that avoided the buttons was the direction the dialog clipped — with a full list the
+  top option was cut off at the dialog's edge and the dialog itself became scrollable. `dropUp` had
+  traded a covered button for a clipped list without the measurement to know it.
+- Resolution: an `expand` option replaces `dropUp`. Inside a dialog the list is `position: static`, so
+  it takes layout space and the dialog grows to fit it. Verified in the live app by cloning options to
+  the worst case: with 13 options the list caps at 260px and scrolls internally, the dialog grows
+  388 -> 652px, `modalScrolls` is false, `clippedTop`/`clippedBottom` are false, and the action row
+  moves to 687..727px — on screen and not covered.
+- Lesson: an overlay inside a scrolling container is a bug waiting for enough rows to fill it. "Which
+  direction should it open" was the wrong question; "what is allowed to grow" was the right one.
+
+### The E2E mark on a member zine is the one claim worth re-reading [FIXED]
+
+- Attempted: show "End-to-end encrypted" on every surface whose content the relay cannot read, as
+  asked, and keep the claim honest per surface rather than pasting it everywhere.
+- Symptom: none broke, but a zine is the one surface where "end to end" is not a pair. The body is
+  encrypted to a per-post read key and the key is handed over inside a 1:1 session, so the relay holds
+  only ciphertext — but any holder may re-share that key and the post is readable by every member, so
+  the mark can read as "private to you and the author" when what it means is "not readable by the
+  relay".
+- Resolution: raised it as a product call rather than settling it alone; the user kept the wording, on
+  the grounds that the relay genuinely cannot read the body. The mark is on the member-zine branch
+  only — the ATProto document branch is a **public** post and stays unmarked, which is the exact
+  confusion `renderAtprotoDocument` exists to prevent. The tooltip ("The relay only ever holds
+  ciphertext it cannot read.") is the precise half of the claim, so the precise reading is one hover
+  away.
+- Lesson: one shared component makes the wording consistent, which is exactly why a surface where the
+  claim means something slightly different has to be argued for explicitly instead of inherited — and
+  why the argument belongs to the person who owns the promise, not to the code that renders it.
+
+### Verifying a dialog header needed real state, and left a trace on the peer [WORKED AROUND]
+
+- Attempted: confirm the new mark renders in the conclave header, not only in the mail one, rather
+  than assuming it from the shared component.
+- Symptom: the preview vault had no conclave, and `POST /api/conclaves` refuses an empty trustee list
+  ("a conclave needs a name and at least one trustee"), so the header could not be rendered without
+  inviting a real contact. The invite is store-and-forward, so it lands on the peer's queue.
+- Resolution: created the conclave with the peer invited, read the header ("1 trustee · 1 invited ·
+  End-to-end encrypted"), then ended it (which sends `ConclaveEnd`) and deleted the local record. The
+  peer may still show a pending invite until it polls; the end payload follows it. Mail was verified
+  the same way with one real message.
+- Lesson: a header cannot be verified from an empty vault. When a surface needs two parties to render,
+  either budget for a peer-visible side effect or say plainly that it was not verified.
+
+### A wait loop that matched its own command line [FIXED — tooling, not the repo]
+
+- Attempted: wait for a background `cargo build --release` to finish.
+- Symptom: `while pgrep -f "cargo build --release" >/dev/null; do sleep 5; done` never exited, because
+  the waiter shell's own argv contains the pattern, so `pgrep` found the waiter itself. The build had
+  finished 2m43s in ("Finished `release` profile" in the log) while the loop kept reporting "still
+  building" — several rounds of polling, and a second waiter doing the same. The same trap then bit
+  `pkill -f 'while pgrep -f "cargo build'`, which killed its own shell before printing anything.
+- Resolution: `[c]argo build --release`, or check the log and the binary's mtime, instead of the bare
+  pattern.
+- Lesson: `pgrep -f` matches the searcher. Anchor the pattern with a character class whenever the
+  pattern text appears in the command that runs it.
+
+## 2026-10-15 — Opening the desktop window on a vault another daemon holds
+
+### `run-one-ui.sh` only stopped a stale daemon when its own socket answered [FIXED]
+
+- Attempted: open the real desktop window on `instances/reach-a` with
+  `VAULT_DIR=instances/reach-a ./scripts/run-one-ui.sh`, passing a separate
+  `HUSH_RUNTIME_DIR=/run/user/1000/hush-reach-one` so the run would not disturb the `instances/peer-a`
+  daemon already sitting on the script's default socket (`/run/user/1000/hush-one/hush.sock`).
+- Symptom: the run built the dist and all three binaries — 2m45s of release build — and then died with
+  `Error: "another hush-daemon is already running on /home/sam/ProjectHush/instances/reach-a
+  (Resource temporarily unavailable (os error 11)); stop it before starting a new one"`. The script's
+  stale-daemon cleanup is gated behind `if daemon_ready "$SOCK"`, and with a fresh runtime dir nothing
+  answered on its socket, so the `pkill` never ran — while the daemon left over from the earlier
+  browser preview still held the vault lock on `/run/user/1000/hush-reach/a.sock`. The guard could not
+  see the conflict it exists to prevent, and the cost was the whole build.
+- Resolution: the cleanup now matches on the vault directory rather than on the socket — `pgrep`/`pkill`
+  on `hush-daemon.*--dir (<abs>|<rel>)` — and waits for that process to exit instead of waiting for the
+  socket to stop answering. `bash -n` is clean, and `pgrep -af` against the three live daemons matched
+  exactly the one for the requested vault and nothing else. Re-run then started the window cleanly.
+- Lesson: a guard keyed to your own endpoint misses a conflict keyed to a shared resource. The vault
+  lock is per directory, so the check has to be per directory — and the failure surfaced only after the
+  expensive part of the run, which is the worst place for a cheap check to be missing.
+
+### The desktop binary's embedded UI copy cannot be verified by grepping it [OPEN]
+
+- Attempted: confirm that the freshly built `target/debug/hush-tauri` carries the new "Restrict to mail
+  only" label. The script bakes `ui/dist` into the binary at compile time, so a binary that was not
+  rebuilt would silently serve the old interface while the dist on disk looked correct.
+- Symptom: `grep -c "Restrict to mail only" target/debug/hush-tauri` → `0`, which reads as a stale
+  binary — but `grep -c "Change nickname"` → `0` as well, and that string has been in the UI all along.
+  The embedded assets are compressed, so a byte grep cannot distinguish "not embedded" from "embedded
+  and compressed". The check proves nothing in either direction, and without the control string I would
+  have reported a false negative.
+- Needed to resolve: not closed. The indirect evidence is that the dist was written at 16:46:12 and the
+  binary linked at 16:46:25, and the window came up with a live `WebKitWebProcess` under the Tauri pid —
+  but neither confirms the *content*. Driving the desktop window, or adding a way to read the embedded
+  asset list, is what would close it.
+- Lesson: before trusting a "the string is not in the file" result on a binary, run the negative control
+  — search for a string that must be present. If that also comes back empty, the method is broken, not
+  the artefact.
+
+## 2026-10-15 — Reach toggle copy in the trust row menu
+
+### The narrowing row of the reach toggle read as a state, not a command [FIXED]
+
+- Attempted: ship the reach toggle as a single trust-row menu item whose label names the destination
+  state — "Allow chat and conclaves" to widen, "Mail only" to narrow.
+- Symptom: the user flagged it: "the allow chat looks fine .. but the mail only dont". Three things
+  were wrong with the narrowing row, and they compounded. (1) "Mail only" was the *badge's* exact
+  wording, three words above it in the same row, so the same phrase meant two things 30px apart and
+  the menu entry read as a status report rather than a click target. (2) Its icon was `mail` — the same
+  icon as the Email entry directly above it — so the toggle merged visually into Email. (3) The two
+  labels did not name the same object: one named what turns *on*, the other named what is left over,
+  which is why the widening label felt right and its counterpart did not.
+- Resolution: the narrowing row is now "Restrict to mail only" with the `lock` icon (`trustRow` in
+  `apps/hush-tauri/src/app.ts`); both directions are imperatives naming what the click does. The badge
+  and the Add Trust radio keep "Mail only" — those are states, and a state label should read like one.
+  Verified in the dev run against the live `reach-a` pair, whose `my_reach`/`reach` split
+  (`my: full`, `reach: mail_only`) is exactly the case the changed branch renders: the menu read
+  Email / Restrict to mail only / Change nickname / Delete with the lock glyph, and the round trip
+  through "Allow chat and conclaves" returned the daemon to `my_reach: full`. State left as found.
+- Lesson: a menu row is a command, so its label has to be an imperative. Reusing a state's wording for
+  the action that produces that state makes one phrase mean two things in a single row, and sharing an
+  icon with a neighbouring row merges two unrelated controls. Neither shows up in a type-checker or a
+  unit test — the user's eye was the test.
+
+### `browser_fill` wrote the literal string `undefined` into the passphrase field [WORKED AROUND]
+
+- Attempted: fill alice's vault passphrase into the unlock field with `browser_fill`.
+- Symptom: the call failed with `Error: Cannot read properties of undefined (reading 'substring')`,
+  and a read-back of the field showed `undefinedpw-a` — the failing call had already written the
+  string `undefined` before it threw. The `browser_type` that followed appended to that text rather
+  than replacing it, so the unlock attempt failed with "That passphrase didn't work. Try again." A
+  tooling artefact that presented as a wrong passphrase, which is a plausible-looking app failure.
+  Tooling-related, not a repo problem.
+- Workaround: set the field through `browser_cdp` `Runtime.evaluate` using the native value setter plus
+  a dispatched `input` event, so the app's listener sees the change. `browser_type` does not replace a
+  selection either — typing over a `select()`ed field appended instead.
+- Lesson: a tool that fails can still have side effects. After any tool error that touched a form
+  field, read the field back before concluding anything about the app — otherwise the tool's debris
+  looks like an application defect.
+
+## 2026-10-15 — Mail-only trusts leave the Chats rail
+
+### `browser_press_key` silently ignores a `modifiers` argument [WORKED AROUND]
+
+- Attempted: press Ctrl+K to open the command palette and read its contact entry, to verify the
+  label change for a mail-only trust.
+- Symptom: the call answered `Successfully pressed key: k (code: KeyK)` and the palette never opened.
+  `browser_press_key`'s schema declares only `key` and `viewId` — there is no `modifiers` parameter —
+  so the `modifiers: ["Control"]` I passed was dropped without an error, and the app's handler
+  (`(e.ctrlKey || e.metaKey) && e.key === "k"`) never matched. Tooling-related, not a repo problem.
+- Workaround: dispatched the event through `browser_cdp` `Runtime.evaluate`
+  (`document.dispatchEvent(new KeyboardEvent('keydown', {key:'k', ctrlKey:true, bubbles:true}))`),
+  which the app's document-level listener accepts, and read the rendered palette items in the same
+  call.
+- Lesson: a tool that accepts an argument it does not declare fails silently and looks like a UI bug.
+  Read the tool schema before trusting a "success" that changed nothing.
+
+### Stale element refs after a render the click itself caused [WORKED AROUND]
+
+- Attempted: after toggling a trust's reach, click the Chats rail button using the ref from the last
+  snapshot.
+- Symptom: `Error: Element not found: e1. Take a snapshot to get updated refs.` twice, once per reach
+  toggle. The reach change re-renders the whole shell, so every ref taken before the toggle is dead
+  even though the new snapshot reuses the same ref names.
+- Workaround: re-snapshot immediately before clicking anything that follows a state change.
+- Lesson: refs are bound to the snapshot that produced them, and this app re-renders on nearly every
+  action. Budget one snapshot after each mutating click rather than reusing refs across it.
+
+## 2026-10-15 — Contact readiness in the Chats list (found testing Task 24 by hand)
+
+### `inbound_ready` was only set by a message, so a mutual add read as pending [FIXED]
+
+- Reported: in the Chats list a contact that had been added in both directions still carried
+  "Waiting for them to add you" underneath its name.
+- Attempted: trace what drives that subtitle.
+- Symptom: `apps/hush-tauri/src/app.ts` renders
+  `c.inbound_ready ? "Ready to chat" : "Waiting for them to add you"`, and `inbound_ready` was set in
+  exactly one place — the fall-through in `Account::recv` that files a `ReceivedMessage`
+  (`crates/hush-core/src/account.rs`). `MessagePayload::QueueGrant` is matched earlier in the same
+  loop and `continue`s before that line, and a grant is the *only* thing `add_contact` sends to the
+  peer. So the one payload that always accompanies "they added my invite" was the one payload that
+  did not count, and the flag stayed false until someone happened to send chat or mail. Seen on the
+  live pair too: `inbound_ready: false` on both sides while both had added the other, both vaults
+  online, and both relay inboxes drained empty.
+- Resolution: a grant that verifies against the identity key the peer pinned in their invite is proof
+  they added us, so `apply_queue_grant` now sets `inbound_ready` at the point the signature checks
+  out, and reports "changed" when that flip still needs persisting. The field's doc comment already
+  said "they added our invite"; the implementation had approximated it with "we received a message".
+- Evidence: `a_verified_queue_grant_marks_the_contact_inbound_ready`
+  (`crates/hush-core/tests/two_party_relay.rs`) failed before the change and passes after;
+  `a_mutual_add_reads_ready_without_any_message` (`contacts_api_tests` in `crates/hush-daemon`) pins
+  the same thing over `/api/contacts`, the DTO the UI actually reads.
+- Lesson: the field's name and doc described the peer's action while its implementation described a
+  different event that usually coincided with it. Because the only consumer is a UI label, nothing in
+  the repo asserted the transition at all — the flag could be permanently wrong and every test passed.
+
+### The `add_contact` comment promised a re-grant that does not exist [FIXED]
+
+- Attempted: find the "next drain re-grants if the relay was down" path the comment on `add_contact`
+  referred to, to work out whether a grant missed at add time ever recovers.
+- Symptom: `grant_queues_to` has exactly one caller (`add_contact`), and `deliver_to` is a single
+  `relay.put` with no outbox — a failed grant is logged and dropped, nothing re-sends it. The comment
+  sent me looking for retry logic that was never there.
+- Resolution: rewrote the comment to describe the code (one-shot and best effort; the peer keeps
+  delivering to our inbox until it drains a message from us). No behaviour change.
+- Lesson: an aspirational comment reads exactly like a description of the code. Cost: one wasted
+  search of `hush-daemon` for a re-grant loop.
+
+### `inbound_ready` was stored, so a vault whose grant predated the fix stayed wrong forever [FIXED]
+
+- Reported: asked whether restricting a trust's reach to mail-only is what makes a contact read
+  "Waiting for them to add you". Traced it: it is not. `MessagePayload::Reach` is a control payload,
+  matched and `continue`d in `Account::recv` well before the fall-through that set
+  `c.inbound_ready = true`, so the toggle could not move the flag in either direction. The two are
+  unrelated code paths.
+- Symptom: the flag was `false` on the live `reach-a`/`reach-b` pair while both had added the other, so
+  both UIs said "Waiting for them to add you" for an established trust. The earlier fix covered only
+  grants drained *after* it landed; these grants were drained by a daemon built before
+  `apply_queue_grant` learned to set the flag, so `delivery_queue_id` was stored and `inbound_ready`
+  was not. Nothing since could flip it — no chat, no mail, and no new grant, because `grant_queues_to`
+  only runs at add time.
+- Resolution (user's call: derive in code, not heal on load): the stored boolean is gone. The field is
+  now `heard_from` — strictly "a filed chat, file or mail arrived from them", the fallback for a
+  dropped grant — and readiness is a method, `Contact::inbound_ready()` =
+  `delivery_queue_id.is_some() || heard_from`, with `#[serde(default, alias = "inbound_ready")]` so a
+  vault written under the old name reads back. `ContactDto` maps through the method, so the UI reads
+  the derivation and no vault is rewritten.
+- Evidence: `cargo test -p hush-core` (137) and `cargo test -p hush-daemon` (216) pass. Live, over the
+  daemon the UI actually talks to: `reach-a` — the vault this entry was opened for, whose stored flag
+  was `false` — now answers `inbound_ready: true`, as does `reach-b`. `strings` on
+  `target/release/hush-daemon` finds `heard_from`, so the running daemon is the rebuilt one.
+- Lesson: fixing the write path does not repair data the old path already wrote. When a boolean
+  duplicates a fact that is already stored elsewhere, the duplicate is what goes stale — and the only
+  consumer here is a UI label, so nothing in the repo could notice.
+
+### `cargo test -p hush-wallet` could not compile its own test target [FIXED]
+
+- Attempted: run the wallet crate's tests on their own while checking the workspace after the
+  `hush-core` change.
+- Symptom: `error[E0432]: unresolved import hush_wallet::ethereum` in `tests/live_ethereum.rs`. The
+  module is `#[cfg(feature = "ethereum")]` and the file's own doc comment says it needs
+  `--features ethereum`, but the file had no `#![cfg]` gate — so the target was compiled and failed
+  instead of being skipped. Pre-existing and unrelated to the change above. It does not show up under
+  `cargo test --workspace`, because feature unification turns `ethereum` on for the whole build (the
+  daemon enables it), which is why it went unnoticed.
+- Resolution: added `#![cfg(feature = "ethereum")]` to the test file. Verified both ways:
+  `cargo test -p hush-wallet` now builds and skips it (0 tests, no error), and
+  `cargo test --workspace` still compiles the target and registers its six `#[ignore]`d live tests
+  (`6 ignored`), so nothing was silently dropped.
+- Lesson: a test that is only ever run through `cargo test --workspace` hides its own feature gating.
+
+## 2026-10-15 — Trustee reach, Task 24 (mail-only or full)
+
+### Adding a `MessagePayload` variant broke exhaustive matches in two other crates [FIXED]
+
+- Attempted: add `MessagePayload::Reach { scope }` in `hush-core`, then build the workspace.
+- Symptom: `cargo check -p hush-daemon` failed with
+  `error[E0004]: non-exhaustive patterns: MessagePayload::Reach { .. } not covered` at
+  `crates/hush-daemon/src/main.rs:2187` (`to_dto`), and the later `--workspace` check found the same
+  at `crates/hush-cli/src/main.rs:204` (the `recv` printer). Both are long `match msg.payload` blocks
+  with an explicit arm per variant and no wildcard, so every new tag is a compile break in every
+  consumer — by design, but it cost two build cycles because the consumers were not found up front.
+- Resolution: added a `Reach { .. } => None` / `=> {}` ignore arm next to `ZineGrant` in both, with
+  the same "control payload handled inside `recv`" comment. `cargo check --workspace --all-targets`
+  is now clean.
+- Lesson: before adding a payload variant, grep for the existing variants' names
+  (`MessagePayload::ZineGrant`) rather than for the enum — that finds every exhaustive match, including
+  the ones in `hush-cli` and the daemon's `to_dto`, which are not near the payload definition.
+
+### An over-broad `old_string` consumed a doc-comment blank line [FIXED]
+
+- Attempted: insert the `Reach` variant after `QueueGrant` in `payload.rs` with a `StrReplace` whose
+  `old_string` ended at the `QueueGrant` closing brace.
+- Symptom: the replacement text I supplied omitted the bare `///` separator line that had followed
+  "A grant of the sender's per-contact receive queue.", so the doc comment merged its summary into the
+  next paragraph ("...receive queue. Delivered into the recipient's inbox..."). Nothing failed to
+  compile; it was a silent doc regression.
+- Resolution: caught it on the immediate re-read of the region and restored the blank doc line in the
+  next edit, which is also where the `Reach` variant went.
+- Lesson: when editing next to a doc comment, anchor on the whole comment block or on a line that is
+  not a bare `///`, and re-read the region after any edit whose `old_string` ended on a brace.
+
+### Extracting the daemon test harness duplicated `holds` [FIXED]
+
+- Attempted: move the shared two-vault harness (`relay_on_a_port`, `Member`, `connect`, `pair`) out of
+  `zines_bulletin_tests` into a new `api_test_harness` module so the reach API tests could reuse it
+  instead of copying ~70 lines.
+- Symptom: the replacement text I wrote for the zines module included the `holds` helper, but `holds`
+  already sat immediately after the block I was replacing — so the file briefly held two identical
+  `fn holds` definitions (E0428).
+- Resolution: deleted the duplicate before building.
+- Lesson: when moving a block, write the replacement as the *remainder* of the region, not as the
+  remainder plus the next helper; check the text on both sides of the `old_string` boundary.
+
+### Grandfathered conclave membership had no test [FIXED]
+
+- Attempted: decide what narrowing a relationship does to a conclave the trustee is already in.
+- Symptom: the decision taken is "grandfather it" — `send_conclave_message` fans out to the joined set
+  regardless of reach, and only *new* joins are refused, because silently dropping a member from a
+  fan-out would be worse than the inconsistency. That decision was written into `docs/PROTOCOL.md` and
+  the task doc, but **no test asserted it** — a documented rule with no evidence behind it.
+- Resolution: added `narrowing_does_not_evict_an_existing_conclave_trustee` to
+  `crates/hush-core/tests/reach.rs`: join a trustee, narrow the reach to mail-only, send in the
+  conclave, assert the fan-out still reaches them, and assert a fresh `invite_conclave_trustee` for a
+  mail-only contact is still refused. `cargo test -p hush-core --test reach` → 7 passed.
+- Lesson: a deliberate behaviour with a documented rationale is still an unverified claim until a test
+  pins it; "we decided it on purpose" is not evidence.
+
+### The UI reach flow is verified by the type-checker and unit tests only, not by driving the app [FIXED]
+
+- Attempted: change the add-trust modal (reach picker), the trust row (badge, toggle, hidden Chat),
+  and the two conclave pickers (filter mail-only), then verify.
+- Symptom: `npx tsc --noEmit` is clean and the 78 UI unit tests pass, but none of them render the
+  modal or the picker — `app.ts` has no DOM test harness, and no dev-mode run was done. So the
+  behaviour that is actually asserted is "it compiles and nothing else broke"; the reach picker
+  defaulting to Full, the badge appearing only for mail-only, the toggle round-tripping, and the
+  picker filtering are **not** covered by evidence.
+- Resolution: ran the app per `~/.cursor/rules/preview-protocol.mdc`. `scripts/run-two-ui.sh --dev`
+  is the existing two-peer recipe, but it wants to own `instances/peer-a|peer-b` (and
+  `setup-two-peers.sh` does `rm -rf` on them), so rather than disturb the instances already there
+  this run used fresh vaults in `/tmp/hush-reach-preview` with two debug daemons on TCP 9886/9887,
+  reusing the already-running relay (127.0.0.1:8787) and Vite dev server (127.0.0.1:5173). Clicked
+  through in one browser tab on `?api=http://127.0.0.1:9886`, with `fetch` patched in-page to record
+  request bodies:
+  - Add Trust modal: two radios, `full` ("Mail, chat and conclaves / Everything Hush offers.")
+    checked by default, `mail_only` ("Mail only") unchecked.
+  - Added carol with Mail only: the recorded request was
+    `{"nickname":"carol","invite":"…","reach":"mail_only"}`, and `GET /api/contacts` then reported
+    `reach: mail_only, my_reach: mail_only`.
+  - Trusts view: carol's row carried the badge (`querySelectorAll('.trust-reach-badge')` →
+    `["Mail only"]`).
+  - Row menu: carol (mail only) → Email / Allow chat and conclaves / Change nickname / Delete, with
+    **no** Chat entry; bob (full) → Chat / Email / Mail only / Change nickname / Delete.
+  - Toggling bob from that menu recorded `{"nickname":"bob","reach":"mail_only"}`, showed the toast
+    "bob is now mail only.", badged both rows, and the daemon agreed (`reach=mail_only`). Toggling
+    back with "Allow chat and conclaves" returned the daemon to `reach=full` and the Chat entry.
+  - Chats view with a mail-only trust: the composer is gone, replaced by "carol is mail only — chat
+    and conclaves are off for this trust. Use Mail, or change this in their menu in Trusts."
+  - Conclaves: the create picker offered bob (full) and not carol — typing "carol" gave "No contacts
+    match that name." After creating a conclave with bob, the invite picker behaved the same way.
+- Severity: was an honest gap, not a known defect. The core and daemon layers were already covered
+  end-to-end (10 tests), so a failure here would have been presentation, not policy.
+- Still not covered: only Alice's side was driven. The peer's UI was never unlocked, so nothing here
+  exercises what bob's client renders when it receives the `Reach` control payload — only that the
+  sending daemon and the core agree.
+- Lesson: the type-checker plus unit tests do not cover a UI slice that has no DOM harness; for
+  presentation work the dev run is the test. Patching `fetch` in the page is a cheap way to assert
+  what the UI actually sends, which no amount of source reading proves.
+
+### A truncated invitation paste surfaced as `signal session error` [WORKED AROUND, product half OPEN]
+
+- Attempted: drive the Add Trust modal from the browser by typing carol's invite — a 9,199-character
+  base64 bundle — into "Their invitation code", then click "Add contact".
+- Symptom: the modal showed `signal session error` and no contact was added. The textarea held
+  **9,198** characters: the paste was one short. The bug was the retyping, not the app.
+- Resolution (worked around): copied the invite to `apps/hush-tauri/invite-c.txt`, fetched it from
+  the page itself (`/invite-c.txt`, same origin as the Vite dev server), assigned it to the textarea,
+  dispatched `input`, and deleted the file afterwards. The re-run added carol and the recorded body
+  was `{"nickname":"carol","invite":"…","reach":"mail_only"}`.
+- Still open, and this is a product observation rather than a tooling one: a code that is one
+  character short is reported as `signal session error`, which says nothing about the paste being
+  incomplete. Nothing validates the invite envelope before it reaches Signal, so an operator whose
+  clipboard lost a character gets a crypto error. A pre-check (base64 decode, then the `v` / `relay` /
+  `protocol_name` fields) with "that invitation code looks incomplete" would turn a dead end into a
+  fixable message.
+- Lesson: never retype a long opaque string across a tool boundary. Put it somewhere the browser can
+  fetch it and compare the length before submitting — a 1-in-9,199 difference is invisible, and the
+  error it produces points at the wrong layer entirely.
+
+### The New conclave picker said "No contacts yet" when every trust was mail only [FIXED]
+
+- Attempted: with two contacts, both narrowed to mail-only, open Conclaves → New conclave.
+- Symptom: the member picker showed "No contacts yet. Add someone in Trusts first." — false, and it
+  sends the user to do something they have already done. The list *is* filtered to
+  `c.reach === "full"` (`apps/hush-tauri/src/app.ts:4712`); the empty message was just written for the
+  unfiltered case. The sibling invite picker in the same file already had honest wording
+  ("Everyone you know is already here, or is mail only."), so two dialogs doing the same job
+  disagreed.
+- Resolution: made the message depend on whether the account has any contacts at all —
+  `this.contacts.length ? "Everyone you know is mail only. Chat and conclaves need a full trust." :
+  "No contacts yet. Add someone in Trusts first."`. Re-ran the flow: with both trusts mail-only the
+  dialog reads the new line; with bob restored to Full the picker offers bob again.
+- Lesson: an empty state belongs to the *filtered* list, not the collection behind it. When a picker
+  filters its items, re-read the empty copy against the filter, and keep it consistent with the
+  wording of sibling pickers doing the same job.
+
 ## 2026-10-15 — The app work was sitting on the marketing-site branch [FIXED]
 
 ### "Merge it to master" would have dragged the marketing site onto the app trunk [FIXED]

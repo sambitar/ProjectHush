@@ -48,11 +48,16 @@ export interface ContactPickerOptions {
   /** Shown when the typed query matches no contact. */
   noMatchMessage?: string;
   /**
-   * Open the list above the field instead of below it. Needed inside a dialog,
-   * where the picker sits directly above the action buttons: a list dropping
-   * downwards would cover them and swallow the click.
+   * Render the list in flow below the field, growing the control, instead of
+   * overlaying whatever sits below it. For a dialog: the dialog is its own
+   * scrolling box, so an overlay opening upwards is clipped at the dialog's top
+   * edge — measured, not assumed: in the conclave creator the field sits 253px
+   * below the dialog's top while the list can be 260px tall — and one opening
+   * downwards would cover the action buttons and swallow the click. Growing
+   * pushes the buttons down instead, so the options and the buttons both stay
+   * whole.
    */
-  dropUp?: boolean;
+  expand?: boolean;
   /** Fired only when the user commits a single selection. */
   onChange?: (nickname: string) => void;
   /** Fired whenever the set changes in multiple mode. */
@@ -119,7 +124,7 @@ export class ContactPicker {
     this.element = document.createElement("div");
     this.element.className = "contact-picker";
     if (this.multiple) this.element.classList.add("contact-picker-multi");
-    if (opts.dropUp) this.element.classList.add("contact-picker-drop-up");
+    if (opts.expand) this.element.classList.add("contact-picker-expand");
 
     this.input = document.createElement("input");
     this.input.type = "text";

@@ -32,6 +32,15 @@ export interface RelayConfigResponse {
   reachable: boolean | null;
 }
 
+/**
+ * How far a trustee may reach this vault (Task 24).
+ *
+ * `full` is mail plus 1:1 chat and conclaves; `mail_only` is mail alone. A
+ * relationship gets the narrower of the two sides' choices, so `reach` on a
+ * contact is the effective value while `my_reach` is this vault's own.
+ */
+export type TrusteeReach = "mail_only" | "full";
+
 export interface ContactDto {
   nickname: string;
   protocol_name: string;
@@ -41,6 +50,14 @@ export interface ContactDto {
   mail_handle?: string | null;
   /** The vault suffix of the contact's address, learned from their invite. */
   mail_vault?: string | null;
+  /**
+   * The effective reach for this relationship: the narrower of my choice and
+   * theirs. When `mail_only`, chat and conclaves are hidden because they
+   * cannot work — the other side (or we) excluded them.
+   */
+  reach: TrusteeReach;
+  /** This vault's own choice of reach. What the toggle edits. */
+  my_reach: TrusteeReach;
 }
 
 export interface MailAttachmentDto {

@@ -44,6 +44,44 @@ pub enum TrusteeState {
     Kicked,
 }
 
+/// How far a trustee may reach this vault (Task 24).
+///
+/// A relationship has two of these — one chosen by each side — and a surface is
+/// usable only when both sides allow it, so the effective reach is the narrower
+/// of the two (see [`TrusteeReach::narrow`]). `Full` is the default, so a
+/// relationship that predates this setting, or a peer that has not announced
+/// one, behaves exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrusteeReach {
+    /// Mail only: mail both ways, but no live 1:1 chat and no conclaves.
+    MailOnly,
+    /// Everything the capsule offers: mail, 1:1 chat and conclaves.
+    #[default]
+    Full,
+}
+
+impl TrusteeReach {
+    /// The narrower of two reaches.
+    ///
+    /// A surface is usable only if both sides allow it, so `MailOnly` on either
+    /// side makes the whole relationship mail-only. This is the consent-shaped
+    /// default: neither side can force a surface the other excluded.
+    pub fn narrow(self, other: TrusteeReach) -> TrusteeReach {
+        if self == TrusteeReach::MailOnly || other == TrusteeReach::MailOnly {
+            TrusteeReach::MailOnly
+        } else {
+            TrusteeReach::Full
+        }
+    }
+
+    /// Whether the live surfaces — 1:1 chat and conclaves — are allowed. Mail is
+    /// always allowed, so only `Full` opens them.
+    pub fn allows_live(self) -> bool {
+        self == TrusteeReach::Full
+    }
+}
+
 /// One trustee in a conclave descriptor.
 ///
 /// `account_id` is the stable identity: it is what lets a membership change
@@ -344,6 +382,16 @@ pub enum MessagePayload {
         /// identity key.
         signature: Vec<u8>,
     },
+    /// The sender's reach preference for the recipient (Task 24).
+    ///
+    /// A consent announcement, not authority: it says which surfaces the sender
+    /// will use with the recipient, so the recipient's UI can mirror it and the
+    /// pair never dead-ends on a chat or a conclave the sender would refuse. It
+    /// only ever narrows — the receiver's own choice is never widened by it —
+    /// and it is applied only from a known contact, because the session is the
+    /// authentication. Forged, the worst it can do is hide a surface the sender
+    /// was not going to use anyway, so there is no signature.
+    Reach { scope: TrusteeReach },
     /// A paper's descriptor, sent when a paper is created or adopted.
     ///
     /// Creator-authoritative at creation: the creator names themselves as hub.
@@ -954,5 +1002,45 @@ mod tests {
     fn an_unknown_voice_tag_decodes_to_unknown() {
         let json = br#"{"t":"voice_ice","session_id":"v-1","candidate":"x"}"#;
         assert_eq!(MessagePayload::decode(json).unwrap(), MessagePayload::Unknown);
+    }
+
+    /// A reach announcement round-trips, and the tag is the snake_case one the
+    /// tolerant-decode discipline implies.
+    #[test]
+    fn a_reach_payload_round_trips() {
+        for scope in [TrusteeReach::MailOnly, TrusteeReach::Full] {
+            let p = MessagePayload::Reach { scope };
+            assert_eq!(MessagePayload::decode(&p.encode().unwrap()).unwrap(), p);
+        }
+        let json = String::from_utf8(
+            MessagePayload::Reach {
+                scope: TrusteeReach::MailOnly,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(json.contains(r#""t":"reach""#), "json was {json}");
+        assert!(json.contains(r#""scope":"mail_only""#), "json was {json}");
+    }
+
+    /// A surface is usable only if both sides allow it, so the narrower reach
+    /// wins, and only `Full` opens the live surfaces.
+    #[test]
+    fn reach_narrows_to_mail_only_when_either_side_says_so() {
+        use TrusteeReach::{Full, MailOnly};
+        assert_eq!(Full.narrow(Full), Full);
+        assert_eq!(Full.narrow(MailOnly), MailOnly);
+        assert_eq!(MailOnly.narrow(Full), MailOnly);
+        assert_eq!(MailOnly.narrow(MailOnly), MailOnly);
+        assert!(Full.allows_live());
+        assert!(!MailOnly.allows_live());
+    }
+
+    /// `Full` is the default, so a relationship that predates this setting — or
+    /// a peer that has not announced one — behaves exactly as before.
+    #[test]
+    fn reach_defaults_to_full() {
+        assert_eq!(TrusteeReach::default(), TrusteeReach::Full);
     }
 }

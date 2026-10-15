@@ -1336,6 +1336,24 @@
   min-width: 0;
 }
 
+/* The "End-to-end encrypted" mark, in the header of every surface that carries
+   member-to-member content. One class so the claim is styled identically
+   wherever it is made. */
+.e2e-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* A header line that mixes plain facts with the mark, so the two share a row
+   and wrap together rather than the mark dropping to a line of its own. */
+.e2e-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 /* --------------------------------------- keyboard-typeable contact picker */
 
 /*
@@ -1375,12 +1393,14 @@
   box-shadow: var(--shadow-2);
 }
 
-/* Inside a dialog the picker sits directly above the action buttons, so a list
-   dropping downwards would cover them and swallow the click. Opening upwards
-   keeps the options and the buttons apart in either direction. */
-.contact-picker-drop-up .contact-picker-popup {
-  top: auto;
-  bottom: calc(100% + var(--space-1));
+/* Inside a dialog the list expands in flow instead of overlaying. The dialog is
+   its own scrolling box, so an overlay opening upwards is clipped at the
+   dialog's top edge, and one opening downwards would cover the action buttons
+   and swallow the click. Growing pushes the buttons down instead, which keeps
+   the options and the buttons both whole. */
+.contact-picker-expand .contact-picker-popup {
+  position: static;
+  margin-top: var(--space-1);
 }
 
 .contact-picker-option {
@@ -1643,7 +1663,11 @@
 }
 
 .trusts-filter {
-  margin: var(--space-4) var(--space-5) 0;
+  /* Sides are wider than the base pill's, and the list below keeps a gap: the
+     row's hover fill and the pill are both `--surface-2`, so flush edges read
+     as a single control. The base pill's own bottom margin is `--space-3`, but a
+     shorthand cannot leave one side alone, so the gap is restated here. */
+  margin: var(--space-4) var(--space-5) var(--space-2);
 }
 
 /* A row's own display would beat [hidden]; restate it so the filter works. */
@@ -1687,6 +1711,75 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The name and the reach badge share a row so the badge cannot be clipped by
+   the name's ellipsis. */
+.trust-row-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.trust-row-title .trust-row-name {
+  min-width: 0;
+}
+
+/* A trust reached by mail alone (Task 24): chat and conclaves are hidden for
+   them, so the row says something rather than leaving the actions mysteriously
+   gone. It names our own choice when it was ours, and reads as offline when the
+   peer made it — being restricted is not ours to be told. */
+.trust-reach-badge {
+  flex: none;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text-dim);
+}
+
+/* The reach choice in the add-trust modal: two options, the second worded as a
+   restriction rather than a feature, because that is what it is. */
+.reach-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.reach-picker legend {
+  margin-bottom: var(--space-2);
+  color: var(--text-dim);
+}
+
+.reach-option {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.reach-option:hover {
+  background: var(--surface-2);
+}
+
+.reach-option input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.reach-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 /* ----------------------------------------------------------- delete modal */
