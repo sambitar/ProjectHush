@@ -14,7 +14,8 @@
 #   HUSH_RELAY_URL=http://137.184.129.205:8790 ./scripts/smoke-relay-lab.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export PROTOC="${PROTOC:-${ROOT}/.tools/protoc-dist/bin/protoc}"
+source "${ROOT}/scripts/lib/hush.sh"
+hush_require_protoc || exit 1
 RELAY_URL="${HUSH_RELAY_URL:-http://137.184.129.205:8790}"
 
 T="${ROOT}/.tmp-relay-lab"

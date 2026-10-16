@@ -2,7 +2,8 @@
 # Create two local vaults, exchange invites, smoke-test send/recv.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export PROTOC="${PROTOC:-${ROOT}/.tools/protoc-dist/bin/protoc}"
+source "${ROOT}/scripts/lib/hush.sh"
+hush_require_protoc || exit 1
 RELAY_URL="${HUSH_RELAY_URL:-http://127.0.0.1:8787}"
 PEER_A="${ROOT}/instances/peer-a"
 PEER_B="${ROOT}/instances/peer-b"
@@ -16,10 +17,16 @@ cargo build -p hush-cli --quiet
 
 export HUSH_PASSPHRASE="$PASS_A"
 cargo run -p hush-cli --quiet -- --dir "$PEER_A" init --passphrase "$PASS_A" --relay "$RELAY_URL"
+# Record the relay in client-config.json as well. The vault keeps its own copy, but
+# that one is encrypted and cannot be read without the passphrase, so this plaintext
+# copy is what a later run reads to see which relay the vault is on — and therefore
+# which daemon profile that relay needs. See DEEPSEEKPROBLEMS.MD.
+cargo run -p hush-cli --quiet -- --dir "$PEER_A" config set --relay "$RELAY_URL"
 INVITE_A=$(cargo run -p hush-cli --quiet -- --dir "$PEER_A" invite)
 
 export HUSH_PASSPHRASE="$PASS_B"
 cargo run -p hush-cli --quiet -- --dir "$PEER_B" init --passphrase "$PASS_B" --relay "$RELAY_URL"
+cargo run -p hush-cli --quiet -- --dir "$PEER_B" config set --relay "$RELAY_URL"
 INVITE_B=$(cargo run -p hush-cli --quiet -- --dir "$PEER_B" invite)
 
 cargo run -p hush-cli --quiet -- --dir "$PEER_B" add-contact alice "$INVITE_A"

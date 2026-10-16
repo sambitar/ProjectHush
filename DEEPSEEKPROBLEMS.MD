@@ -7,6 +7,154 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-15 — Handoff readiness: what a teammate gets from a clone
+
+### `protoc` was a hard build requirement and named nowhere [FIXED]
+
+- Attempted: answer "if I send this repo to my team, can they use it out of the box?" from the code
+  rather than from the docs.
+- Symptom: nothing in the repository provides `protoc`, and nothing named it. `crates/hush-core`'s
+  build script only did `std::env::set_var("PROTOC", ...)` for the vendored copy under `.tools/`,
+  which `.gitignore` excludes — and that assignment could not have worked anyway: cargo runs each
+  build script in its own process, so `PROTOC` set there never reaches the crate that needs it.
+  `libsignal-rust`'s build script is the one calling
+  `prost_build::compile_protos(&["protos/WhisperTextProtocol.proto"], ..)`, so a machine without
+  protoc fails with a prost error raised from a crate nobody typed, naming neither protoc nor where
+  to get one.
+- Resolution: `crates/hush-core/build.rs` resolves protoc (explicit `PROTOC` -> `.tools/protoc-dist`
+  -> `PATH`) and panics with the install lines when there is none. Verified by hiding `.tools/` and
+  dropping protoc from `PATH`: `cargo build -p hush-core` prints "protoc not found." with the
+  apt/dnf/brew lines and exits 101 instead of the prost error, and a normal build still succeeds.
+- Lesson: a prerequisite that exists only on the author's machine is invisible until someone else
+  clones. `build.rs` is the earliest place a plain `cargo build` can name it.
+
+### Every internal script overrode a working protoc with a machine-local path [FIXED]
+
+- Symptom: `export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc"` in 11 scripts. On this machine that
+  path exists; anywhere else it does not, and because the assignment is unconditional it *replaces* a
+  protoc that is on `PATH` — turning a working build into the prost failure above.
+- Resolution: one resolver, `hush_require_protoc` in `scripts/lib/prereqs.sh`, preferring an explicit
+  `PROTOC`, then the vendored copy, then `PATH`, and printing install lines when it finds none. Both
+  run scripts and all 11 internal scripts source it. Verified: with `PROTOC=/nope/protoc` it falls
+  through to the vendored copy with a note; with no protoc anywhere it prints the message and returns
+  1; `bash -n` is clean on every script in `scripts/`.
+- Lesson: an environment variable exported "just in case" can override the correct value.
+
+### The run scripts assumed `node_modules` already existed [FIXED]
+
+- Symptom: `run-one-ui.sh` and `run-two-ui.sh` call `npm run build` and `npm run dev` directly, and
+  `.gitignore` excludes `apps/hush-tauri/node_modules/`. On a fresh clone the first run dies at
+  "vite: not found" before anything starts.
+- Resolution: `hush_ensure_node_modules` runs `npm ci` against the committed lockfile when the
+  directory is absent and does nothing when it is present. Verified on a materialized fresh tree (no
+  `node_modules`, no `target`, no `.tools`): `npm ci` plus `npm run build` finished in 22s and wrote
+  `ui/dist`. A stub `npm` confirmed the guard runs exactly once, only when the directory is missing.
+- Method note: a real `git clone` cannot test uncommitted changes, so the fresh tree was materialized
+  with `git ls-files -co --exclude-standard | tar -cf - -T -`, which is exactly the file set a commit
+  would carry.
+- Lesson: a build step that depends on an ignored directory needs the install step in front of it, or
+  the first clone is the only one that ever fails.
+
+### There was no entry point at the repository root [FIXED]
+
+- Symptom: no `README.md`. The root held a design handoff document, `RELEASING.md`, and
+  `docs/WORKSPACE.md`, which is stale in the direction that matters most: it opens with "do not
+  scaffold until implementation is approved" while the workspace it describes is built. Nothing said
+  which script to run, or that `protoc` and `npm ci` come first.
+- Resolution: `README.md` with prerequisites and their install lines, the run scripts and their
+  options, relay and Tor behaviour, the test commands, the crate layout, and pointers into `docs/`.
+- Lesson: "the docs are in `docs/`" is not a substitute for telling a reader where to start.
+
+### A display artifact in tool output nearly became a false bug report [WORKED AROUND]
+
+- Attempted: read the `PROTOC` lines in the scripts before replacing them.
+- Symptom: `Read` and `grep -n` both rendered the line as
+  `export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc}"` — a stray `}` inside the quotes. That would
+  be a real bug (a `PROTOC` path with a trailing brace), and it was reported to the user as one before
+  being checked. `grep ... | cat -A` showed the actual bytes with no brace: the `}` was an artifact of
+  the line rendering in the tool output.
+- Resolution: read raw bytes (`cat -A`) before claiming a file contains something surprising. This is
+  a tooling artifact, not a repository problem, and nothing in the repository changed because of it.
+- Lesson: tool output that quotes file content is still a rendering. One `cat -A` beats a retraction.
+
+### The two-peer run created its vaults before the relay they needed was up [FIXED]
+
+- Attempted: run `run-two-ui.sh` on a tree with no `instances/` at all, the shape a teammate gets.
+- Symptom: the script called `setup-two-peers.sh` before building and starting the local relay, and
+  `setup-two-peers.sh` probes `${RELAY_URL}/health` while creating the vaults. Nothing answered, so the
+  run died at vault creation — before the relay that was about to be started, and before anything the
+  operator could see. The order was fine only for a tree whose relay was already running.
+- Resolution: the relay is built and started before the vaults are created. Verified today in the
+  materialized fresh tree, twice: with a local relay (`--relay http://127.0.0.1:8798`, relay built and
+  started, vaults created against it) and with the cloud relay (`--relay
+  http://137.184.129.205:8790`, no local relay started, vaults created against the remote one).
+- Lesson: a setup script that probes the service it is about to need has to run after that service, and
+  "the relay is already up on my machine" hides the ordering bug from the person most likely to run it.
+
+### The relay a vault is on cannot be read back from the vault [FIXED]
+
+- Attempted: pick the daemon profile in `run-one-ui.sh` (release normally, debug when the relay is
+  plaintext HTTP off-loopback, because `hush-core`'s `HttpPolicy::LoopbackOnly` refuses the latter) by
+  reading the relay the vault is on — the way `run-two-ui.sh` already reads
+  `instances/<vault>/client-config.json`.
+- Symptom: for vaults created with `hush-cli init --relay <url>`, `client-config.json` does not exist at
+  all, and the running daemon reports the relay as coming from somewhere else:
+  `{"locked":true,...,"relay":"http://127.0.0.1:8787","relay_source":"default"}` before unlock and
+  `{"locked":false,...,"relay":"http://137.184.129.205:8790","relay_source":"vault"}` after. The
+  authoritative relay is inside the encrypted vault, so a script cannot read it without the passphrase,
+  and the plaintext file is only the override channel. Reading only that file would have chosen a
+  **release** daemon for a plaintext remote relay — on the teammate's *second* run, after the first one
+  worked, and the failure would have arrived as a relay error rather than as a profile choice.
+- Resolution: `create_vault` also records the relay in `client-config.json` with
+  `hush-cli --dir <vault> config set --relay <url>` (debug binary: a release build refuses to write a
+  plaintext non-loopback relay, which is the point). Verified: the new vault's file reads
+  `{"v": 1, "relay_url": "http://137.184.129.205:8790"}`, and `HUSH_PROFILE` still overrides the
+  automatic choice in both run scripts.
+- Lesson: `/api/status` is the only place the *effective* relay is visible, and only after unlock. A
+  value the daemon resolves from encrypted state has to be written down somewhere plaintext if a script
+  needs it before the daemon starts.
+
+### The shared relay has no HTTPS origin, so a release daemon cannot use it [OPEN]
+
+- Symptom: the shared relay is `http://137.184.129.205:8790` — plain HTTP on a public address, which a
+  release daemon refuses by policy (the refusal itself is verified, and it is what
+  `scripts/smoke-relay-lab.sh` documents and works around by using debug binaries). The HTTPS
+  quick-tunnel origin recorded earlier is dead: the hostname no longer resolves, so it is not a way out.
+- Resolution so far: both run scripts now detect the plaintext-remote case and build and run the daemon
+  in **debug**, saying why in one line. The relay path itself works: today's run of the repository's own
+  cross-machine smoke against the lab relay reported
+  `ok: invite/contact exchange completed through the remote relay`,
+  `ok: mail accepted from B and queued on the remote relay`,
+  `ok: A received the mail that travelled through the remote relay`,
+  `ok: reply travelled back through the remote relay`, `cross-machine relay smoke ok`.
+- Still open: a **release** daemon — what a packaged app runs — needs TLS in front of the relay or the
+  onion address with Tor. Neither is in place on the lab box, so "test together" currently means a
+  debug daemon on both sides. `docs/ops/relay-lab-vps.md` has the deploy steps for both.
+- Lesson: "plaintext off-loopback is refused" is a good default that turns the shared lab box into
+  something the shipped binary cannot use. That trade needs to be made explicitly, in the open, not
+  discovered by a teammate whose invite silently goes nowhere.
+
+### `pkill -f` and `pgrep -f` matched the shell running them, three more times [WORKED AROUND]
+
+- Attempted: (1) stop the previous fresh-tree run with
+  `pkill -f "/tmp/hush-ootb/scripts/run-two-ui.sh"`; (2) stop a test daemon with
+  `for p in $(pgrep -f "hush-daemon --dir /tmp/hush-handmade"); do kill "$p"; done`.
+- Symptom: exit 0, no output, and the command returned in half a second — it had killed its own
+  `/bin/bash -c` wrapper, so everything chained after it never ran (the tree refresh, the vault
+  removal, the next run, the test itself). The next command's log was then empty or missing an expected
+  line, which read as "the code did not do what it should" until the cause was clear. In (2) the pattern
+  was unbracketed inside a `pgrep` substitution, so the bracket fix applied to the neighbouring `pkill`
+  did not help. This is the same trap already logged three times in this file, once as `OPEN`/recurrence,
+  and it landed three times in this one session: a pattern copied into a command that also runs the
+  search is self-matching, bracketed or not, whenever the *unbracketed* text of it appears elsewhere in
+  the same command line.
+- Resolution: bracket every pattern (`[r]un-two-ui.sh`, `[h]ush-daemon --dir …`), never leave a bare
+  pattern anywhere in the command being run, and prefer PIDs captured at launch over patterns.
+- Lesson: the logged fix has not stuck, and the failure mode is silence rather than an error — which
+  makes it expensive, because it looks like a result. One of the three occurrences caused a test to be
+  reported as run when it had not run at all; it was caught only because the expected output was
+  missing.
+
 ## 2026-10-15 — UI pass: the reach badge, the conclave picker, and the E2E marks
 
 ### The contact list inside a dialog was clipped by the dialog's own scroll box [FIXED]

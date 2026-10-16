@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc"
+source "${ROOT}/scripts/lib/hush.sh"
+hush_require_protoc || exit 1
 RELAY_ADDR="127.0.0.1:8799"
 export HUSH_RELAY_ADDR="$RELAY_ADDR"
 export HUSH_RELAY_DB="${ROOT}/.tmp-relay-smoke.db"

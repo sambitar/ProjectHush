@@ -1,0 +1,172 @@
+# Hush
+
+Local-first, end-to-end encrypted communication. A vault on your own disk, a
+daemon that is the only process holding the keys, a relay that only ever holds
+ciphertext it cannot read, plus a CLI and a Tauri desktop UI.
+
+## Prerequisites
+
+| Tool | Why | Install |
+|---|---|---|
+| Rust (stable) | every crate in the workspace | https://rustup.rs |
+| Node.js LTS + npm | the UI in `apps/hush-tauri` | https://nodejs.org |
+| `protoc` | libsignal's build script compiles `protos/WhisperTextProtocol.proto`, so nothing depending on `hush-core` builds without it | `sudo apt install protobuf-compiler`, `brew install protobuf`, or see below |
+
+On Linux the desktop shell and the voice path also need development packages:
+
+```
+sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev libappindicator3-dev libayatana-appindicator3-dev \
+  librsvg2-dev libxdo-dev libssl-dev libasound2-dev patchelf build-essential
+```
+
+That is the list the release workflow installs (`.github/workflows/release.yml`)
+plus `libasound2-dev`, which the daemon's audio capture needs and the release
+build does not.
+
+`protoc` alternatives, in the order `crates/hush-core/build.rs` looks: an
+explicit `PROTOC=/path/to/protoc`, then a release unzipped into
+`.tools/protoc-dist/`, then whatever is on `PATH`. `.tools/` is not in the
+repository, so a fresh clone relies on the system copy. When `protoc` is missing,
+`cargo build` and the run scripts print the install lines instead of failing
+inside prost-build.
+
+## Run it
+
+One vault, one daemon, one window. With no vault yet, this creates one: a new
+identity, new keys, and a passphrase you choose, on the shared relay. A fresh
+clone plus this command is a new user's first run, not a pre-built vault.
+
+```
+./scripts/run-one-ui.sh
+```
+
+```
+./scripts/run-one-ui.sh --name alice                  # vault name, which becomes your mail address
+./scripts/run-one-ui.sh --relay http://host:8790      # relay for a vault being created
+./scripts/run-one-ui.sh --vault instances/me          # keep the vault somewhere else
+./scripts/run-one-ui.sh --no-relay                    # never start a local relay
+HUSH_PASSPHRASE=... ./scripts/run-one-ui.sh           # no prompt, when creating a vault
+```
+
+An existing vault is reused as it is, relay included, so the passphrase is asked
+for once and later runs go straight to the window. Add a contact with the invite
+the other person sends you; send yours back with **Copy my invite**.
+
+Two peers on one machine, one local relay, both vaults created for you:
+
+```
+./scripts/run-two-ui.sh
+```
+
+It creates `instances/peer-a` and `instances/peer-b` (passphrases `peer-a-pass`
+and `peer-b-pass`), starts a relay on `127.0.0.1:8787`, builds, and opens both
+windows. It is safe to re-run: a relay or daemon that is already up is reused.
+
+```
+./scripts/run-two-ui.sh --dev     # Vite dev server, hot reload, one browser URL per peer
+./scripts/run-two-ui.sh --relay http://relay.example:8787   # use a relay elsewhere; none is started
+```
+
+Both scripts install the UI's npm dependencies (`npm ci`) when `node_modules` is
+missing, and stop with install lines when cargo, node, npm or protoc is absent.
+
+The desktop window needs a graphical session. On a headless machine use `--dev`
+and open the browser URL, or use the CLI.
+
+### Without the UI
+
+```
+cargo build -p hush-cli
+cargo run -p hush-cli -- --dir instances/peer-a init --passphrase peer-a-pass --relay http://127.0.0.1:8787
+cargo run -p hush-cli -- --dir instances/peer-a invite
+cargo run -p hush-cli -- --help
+```
+
+## Test together, on two machines
+
+Both sides point at the same relay, and the relay carries the mail; the two vaults
+never talk to each other directly. Each side runs one command, and the first run
+creates the vault it needs:
+
+```
+# one side: a new vault on the shared relay, then the window
+./scripts/run-one-ui.sh --relay http://137.184.129.205:8790
+
+# the other side: two vaults, both on the same relay
+./scripts/run-two-ui.sh --relay http://137.184.129.205:8790
+```
+
+Then exchange invites inside the app: **Copy my invite** on one side, **Add
+contact** on the other. The relay address in the vault is what makes that work, so
+the two runs have to name the same one.
+
+The shared relay is `http://137.184.129.205:8790` — the lab VPS, plain HTTP with
+no TLS, deliberately open for this. A **release** daemon refuses a plain-HTTP
+relay that is not loopback or a v3 onion (`hush-core`'s `HttpPolicy`), so when the
+relay is plain HTTP on a public host the run scripts build and run the daemon in
+**debug** and say so. To run a release daemon against a remote relay, terminate
+TLS in front of it or use its onion address: both are in
+`docs/ops/relay-lab-vps.md`. Set `HUSH_CLOUD_RELAY_URL` to move the default the
+scripts fall back to.
+
+## Relays
+
+Each vault stores the relay it was created against and the daemon dials that one;
+a loopback URL means a relay on this machine, which the run scripts start from
+`crates/hush-relay`. A relay on another host is used as-is:
+
+```
+HUSH_RELAY_URL=http://relay.example:8787 ./scripts/setup-two-peers.sh
+```
+
+An existing vault keeps its stored relay: `--relay` on a run warns when the two
+disagree rather than moving the vault, because the mailbox lives on the old one.
+To move a vault deliberately:
+
+```
+cargo run -p hush-cli -- --dir instances/me relay set --url http://relay.example:8787
+```
+
+The lab relay (`http://137.184.129.205:8790`) and its onion address, with the
+deploy steps, are in `docs/ops/relay-lab-vps.md`.
+
+## Tor
+
+Packaged Linux builds bundle Tor
+(`apps/hush-tauri/src-tauri/resources/tor/`, x86_64). On macOS and Windows,
+install Tor or point `HUSH_TOR_BIN` at one. The Relay panel reports which copy is
+in use, and onion mail waits until there is one.
+
+## Tests
+
+```
+cargo test --workspace
+(cd apps/hush-tauri && npm test)
+```
+
+`scripts/` also holds smoke harnesses for single subsystems (`smoke-mail.sh`,
+`smoke-tor-relay.sh`, `smoke-relay-lab.sh`, `voice-dogfood.sh`, `paper-dogfood.sh`)
+and they assume the same prerequisites as the run scripts.
+
+## Layout
+
+```
+crates/hush-core      keys, vault, Signal sessions, payloads
+crates/hush-daemon    the only process that unlocks the vault; local API for the UI
+crates/hush-relay     the relay: ciphertext queues, no user names
+crates/hush-cli       dogfood client, no UI required
+crates/hush-wallet    BTC and ETH
+crates/hush-atproto   the public lane
+crates/hush-audio     Opus capture and playback for calls
+apps/hush-tauri       desktop UI; talks only to the daemon
+scripts/              run and smoke harnesses
+docs/                 protocol, threat model, design, tasks, ops
+```
+
+## Documentation
+
+- `docs/PROTOCOL.md` — wire protocol, and what the UI is allowed to call end-to-end encrypted
+- `docs/THREAT_MODEL.md` — what the relay sees, what a compromised host sees
+- `docs/DESIGN.md`, `docs/OPEN_QUESTIONS.md` — design decisions and what is still open
+- `RELEASING.md` — bundles, updater manifest, signing
