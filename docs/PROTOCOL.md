@@ -218,7 +218,9 @@ conclaves). Mail is the floor and is never gated.
 
 - **Wire payload:** `MessagePayload::Reach { scope }` where `scope` is `"mail_only"` or `"full"`.
   Sent when a contact is added with a narrowed reach and whenever the choice changes; store-and-forward,
-  so an away peer learns it on their next drain. It is a **control** payload — never rendered as an
+  so an away peer learns it on their next drain. The sender queues the announcement in the vault
+  (`pending_reach`) and delivers it from the outbox timer, so the user's own request never waits on
+  a slow relay. It is a **control** payload — never rendered as an
   inbox item — and is applied only from a known contact, because the 1:1 session is the authentication.
   Forged, it can only *narrow*, so the worst case is hiding a surface the sender was not going to use.
 - **Both sides hold a choice.** Each contact record carries `reach` (this vault's own choice) and

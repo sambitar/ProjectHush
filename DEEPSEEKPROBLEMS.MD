@@ -7,6 +7,71 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — Reach announcement outbox drain
+
+### Reach toggle blocked the user on up to three 15-second relay attempts [FIXED]
+
+- Attempted: toggling a trust's reach in the UI took 10–60 s. `setTrustReach` (app.ts) awaited
+  `setContactReach` and then `contacts()` before repainting; the daemon's `set_contact_reach`
+  saved locally and then **inline-awaited** the `MessagePayload::Reach` announcement, which is
+  `send_payload_inner` = up to 3 delivery attempts × the 15 s `REQUEST_TIMEOUT` with 400/800 ms
+  backoffs, over Tor where configured. Its own doc comment called the announcement best-effort,
+  but the await was still paid before the HTTP reply — and the single sequential account worker
+  was blocked the whole time, head-of-line behind heartbeats/outbox/recv besides.
+- Symptom: UI badge froze for the full announce; every other account op queued behind it.
+- Resolution: `set_contact_reach` now records the announcement in a persisted `pending_reach`
+  queue (vault state, one entry per contact, latest scope wins) and returns after the save. The
+  daemon's `outbox_loop` drains it (`Account::retry_pending_reach`, `Work::RetryPendingReach`)
+  on the same 30 s tick as queued mail, and a new `POST /api/outbox/retry` route triggers a
+  drain explicitly (tests now; an Outbox "send now" button later). The CLI, a one-shot process,
+  drains inline before exiting and prints a note when the announcement stayed queued.
+  `remove_contact`/`revoke_contact` drop pending entries for the contact, since a burned queue
+  would otherwise refuse delivery forever. Verified: hush-core 210/210 (lib + all integration
+  suites), hush-daemon 216/216, new test `a_reach_change_queues_and_delivers_when_the_relay_returns`
+  pins the queue-then-deliver behavior.
+- Lesson: "best-effort" must describe the *await*, not just the error handling — swallowing the
+  error while still awaiting the network gives the caller all of the latency and none of the
+  guarantee. Store-and-forward work belongs in the store-and-forward queue.
+
+### Pointer-invite commit left four tests decoding hush1 codes as full invites [FIXED]
+
+- Attempted: the first full `cargo test -p hush-core` run after the reach fix showed
+  `internal_mail` 3/8 failing (`a_handle_round_trips_through_an_invite`,
+  `setting_a_handle_invalidates_a_cached_invite`,
+  `mail_queues_while_the_relay_is_down_and_goes_out_on_retry`); running the suite to completion
+  surfaced `revocation` 1/2 (`a_revoked_contact_cannot_deliver_into_the_shared_inbox`) too.
+- Symptom: `Err(Corrupt)` at `InvitePayload::decode(<hush1…>)` — commit 3d426b9 replaced inline
+  v2 invites with short pointer codes, so `Account::invite()` now returns a `hush1…` string that
+  only `ShortInvite::decode` reads. Two of the tests also paired against a dead relay
+  (`127.0.0.1:1`, a `free_port()` helper), which pointer invites cannot do: the accept fetches
+  the prekey record from the relay directory, so pairing itself now needs a live relay.
+- Resolution: the two decode tests read `ShortInvite::decode` (the handle/vault fields they
+  assert are still carried in the clear); the handle-round-trip test spawns a live relay for
+  its add-contact step; the outbox test pairs live and simulates the outage with
+  `set_relay_clearnet` to a dead port, then back — same queue/retry mechanics, reachable
+  premises. All four pass.
+- Lesson: two compounding ones. (1) A commit that changes a wire format must sweep tests that
+  decode it, and "tests that never run" hide the sweep — cargo's fail-fast stopped the first
+  full run at `internal_mail`, masking that `revocation` was broken too; use `--no-fail-fast`
+  when auditing a whole suite tree. (2) Pairing is no longer offline-capable by design; any
+  test (or doc) assuming offline pairing predates pointer invites.
+
+### Bare `cargo fmt` reformatted 35 untouched files on a repo with no rustfmt.toml [WORKED AROUND]
+
+- Attempted: `cargo fmt -p hush-core -p hush-daemon -p hush-cli` as a hygiene step after the
+  reach fix.
+- Symptom: `git status` jumped from 6 modified files to 42 — the committed code is not
+  rustfmt-clean (no `rustfmt.toml` exists, and the 2026-10-16 pointer-invites commit shows no
+  formatting pass), so fmt rewrote ~2,500 lines across files this task never touched, including
+  a 439-line diff in `zine_store.rs`.
+- Resolution: reverted every file without a functional edit (`git checkout --` on the 35), then
+  reverted the 5 functionally-edited files too and re-applied those edits surgically, because
+  fmt noise had mixed into their diffs (main.rs showed 1,555 changed lines for ~30 real ones).
+  Final diff: 6 files, 206 insertions, 14 deletions.
+- Lesson: check for `rustfmt.toml` before running any formatter; on a repo that isn't
+  format-clean, a bare fmt run is a whole-tree rewrite that drowns the real change in review
+  noise. If formatting is wanted, it is its own commit with its own justification.
+
 ## 2026-10-16 — Pointer invites (v3, address-shaped codes)
 
 ### Edit tool replaced a three-line block with two lines, silently deleting a field [FIXED]
