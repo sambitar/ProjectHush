@@ -60,6 +60,12 @@ jobs:
           # when both are named ("libayatana-appindicator3-dev : Conflicts:
           # libappindicator3-dev"). Ayatana is the maintained fork and the one
           # Tauri v2 documents.
+          #
+          # libasound2-dev is here for the daemon, not the app: hush-daemon →
+          # cpal → alsa → alsa-sys, and without it the build dies in alsa-sys's
+          # build script ("The system library `alsa` required by crate
+          # `alsa-sys` was not found"). libdbus-1-dev covers the app's GTK stack
+          # (tao → dbus → libdbus-sys), which Tauri's own list does not name.
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             librsvg2-dev \
@@ -71,6 +77,8 @@ jobs:
             libxdo-dev \
             libssl-dev \
             libayatana-appindicator3-dev \
+            libasound2-dev \
+            libdbus-1-dev \
             protobuf-compiler
 
       # The app itself does not link hush-core, so it has never needed protoc.
