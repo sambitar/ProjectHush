@@ -7,6 +7,21 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+### Re-exporting a cfg-gated constant broke debug builds with E0432 [FIXED]
+
+- Attempted: added `DEFAULT_RELAY_ONION_URL` (exists only under
+  `#[cfg(not(debug_assertions))]`) to the unconditional `pub use config::{…}` list in
+  `crates/hush-core/src/lib.rs` while wiring the production relay defaults.
+- Symptom: `cargo check --release` passed, but `cargo test -p hush-core` (a debug build)
+  failed to compile — `error[E0432]`: unresolved import. The constant does not exist in
+  debug builds, so the unconditional re-export names nothing.
+- Resolution: split it out as its own re-export under the same
+  `#[cfg(not(debug_assertions))]`. Debug tests then pass (137 unit tests + integration
+  suites) and the release check still passes.
+- Lesson: when touching cfg-split defaults, run the debug tests **and** a release check in
+  the same round trip — either alone gives a false green, because each cfg sees only half
+  the surface.
+
 ## 2026-10-16 — Production relay VPS setup (37.27.150.250, Hetzner)
 
 ### Deployed the workstation-built binary to an ARM VPS — systemd 203/EXEC crash loop [FIXED]

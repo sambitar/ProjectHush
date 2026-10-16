@@ -12,11 +12,21 @@
 
 HUSH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# The shared lab relay, for testing across machines (README: "Test together").
-# Plain HTTP on a public host, which a release daemon refuses — see
-# hush_relay_needs_debug_daemon. Address, onion service and deploy steps:
-# docs/ops/relay-lab-vps.md.
-HUSH_CLOUD_RELAY_URL="${HUSH_CLOUD_RELAY_URL:-http://137.184.129.205:8790}"
+# The shared relay, for runs that reach beyond this machine (README: "Test
+# together") and as the relay a new vault is pointed at. This is the production
+# relay: HTTPS with a publicly trusted certificate, so a release daemon dials it
+# as-is. The onion twin and the deploy steps: docs/ops/relay-prod-vps.md. The
+# old lab relay (http://137.184.129.205:8790, plain HTTP, debug-only) still
+# exists for lab testing — pass it explicitly or via HUSH_CLOUD_RELAY_URL.
+HUSH_CLOUD_RELAY_URL="${HUSH_CLOUD_RELAY_URL:-https://hushrelay.space}"
+
+# The production relay's onion twin, exported so a daemon started by a run
+# script can switch a vault to Tor relay mode without hand-configuring the
+# address. The daemon launches Tor itself and carries its SOCKS port; this is
+# only the address half. Tor mode is a per-vault switch (off by default), so a
+# local-relay dev run is unaffected until the switch is flipped on purpose.
+HUSH_RELAY_ONION_URL="${HUSH_RELAY_ONION_URL:-http://qvo7toe6urizihhbj7tp4ibsf2rhkilsrwvnkdk5jlwubjm3e7rnrlad.onion}"
+export HUSH_RELAY_ONION_URL
 
 hush_prereq_note() { printf '%s\n' "$@" >&2; }
 
