@@ -7,6 +7,69 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — Update hosting on hushrelay.space
+
+### Three wrong guesses about the minisign format, found by testing against a real release [FIXED]
+
+- Attempted: verify that a published artifact matches the public key compiled into the app
+  (`plugins.updater.pubkey`), as a check that the signing secret and the shipped pubkey are
+  still the same pair. No `minisign`/`rsign`/`signify` on this machine, so it was written
+  against `cryptography` from the format as remembered.
+- Symptom: all four signed 0.1.0 artifacts failed with `InvalidSignature`, and every
+  reconstruction of the global signature failed too. Three separate assumptions were wrong:
+  1. The release `.sig` file is not a minisign file — it is the **base64 of** one. Reading it
+     as text produced a one-line file and `IndexError: list index out of range` on line 1.
+  2. The algorithm bytes `ED` mean **prehashed** (Ed25519 over the artifact's BLAKE2b-512
+     digest), not legacy-raw. Tauri's tooling labels its output `ED`, so assuming the
+     opposite failed every main signature.
+  3. The trailing global signature covers `signature || trusted_comment` with the literal
+     `trusted comment: ` prefix **stripped**. Keeping the prefix failed; eight variants were
+     tried before the right one matched.
+- Resolution: `scripts/verify-update-signature.py`, with the three format notes written into
+  its docstring as findings rather than as spec. Verified 2026-10-16: all four artifacts of
+  v0.1.0 verify against the app's pubkey, and both controls (a signature checked against the
+  wrong artifact, and one artifact with a single flipped byte) are rejected.
+- Lesson: for a wire format with no reference implementation on the box, the artifact itself
+  is the specification. Decode it and print the structure before writing the parser, and keep
+  a negative control in the test — a verifier that always fails and one that always passes
+  look identical until something is supposed to fail.
+
+### The rewritten manifest was uploaded as if it were a bundle [FIXED]
+
+- Attempted: publish v0.1.0 to the relay with `scripts/publish-updates-to-relay.sh`, after a
+  `--dry-run` against the same `--assets-dir`.
+- Symptom: the upload list contained 10 files where the release has 9 bundles, including
+  `latest.json.relay` — the script's own rewritten manifest. It had been left in the assets
+  directory by the dry run, and the bundle scan was "everything except `latest.json`".
+- Resolution: internal files now live in their own `mktemp` directory that is never scanned,
+  and the scan also excludes `latest.json.*`. Re-run with the stale file still present: 10
+  bundles, no manifest copy, and the stray name 404s on the origin.
+- Lesson: a directory that is both input and scratch space will eventually publish its
+  scratch. Give generated files their own directory, and make the exclusion pattern match the
+  family of names rather than the one name known at the time.
+
+### `ssh` to the relay box refused mid-test — ufw `limit 22/tcp` [WORKED AROUND]
+
+- Attempted: a burst of five SSH/rsync connections within a few seconds to exercise the new
+  deploy key (shell access, rsync upload, rsync into a forbidden directory, no-pty,
+  no-port-forwarding).
+- Symptom: the first connection succeeded; every connection after it failed with
+  `ssh: connect to host 37.27.150.250 port 22: Connection refused`, while ICMP answered and
+  80/443 stayed open with the relay still serving `/health` at 200. Looked like a fail2ban
+  ban, a dead sshd, or a provider-side block.
+- Cause: the box's firewall rule is `22/tcp LIMIT`. ufw rejects the source IP after six new
+  connections to port 22 inside a 30-second window, with `REJECT --reject-with
+  icmp-port-unreachable`, which surfaces client-side as "Connection refused" rather than a
+  timeout. Nothing was actually broken.
+- Resolution: space remote calls out and batch work into one SSH invocation. The limit is
+  already written down in `docs/ops/relay-prod-vps.md` and
+  `packaging/cloud-init/relay-vps.yaml`; I did not read either before looping connections at
+  the box.
+- Lesson: one refused port with every other port healthy and the service answering is a rate
+  limit or a source ban, not a downed host. Read the repo's own ops notes for firewall rules
+  before hammering a box with a test loop. The publish workflow is unaffected: it opens a
+  single rsync connection per release.
+
 ### Re-exporting a cfg-gated constant broke debug builds with E0432 [FIXED]
 
 - Attempted: added `DEFAULT_RELAY_ONION_URL` (exists only under

@@ -90,7 +90,100 @@ is needed — only the architecture differs. First deployment needed
   `ssl_verify_result=0` (publicly trusted, so release clients accept it with no
   configuration). External `:8787` probe times out; relay remains loopback-only.
 
-## Vault relay URL
+## Done 2026-10-16: release artifacts and the updater manifest are served from this box
+
+Installed copies of Hush update from `https://hushrelay.space/updates/latest.json`. The
+GitHub release cannot serve that: the repository is private and GitHub 404s unauthenticated
+release downloads, which is exactly what the updater makes. The same directory is also the
+public download location for the installers, which the private release page cannot be.
+
+**Caddy route.** One block ahead of the proxy in `/etc/caddy/Caddyfile`. `handle_path`
+strips the `/updates` prefix, so `latest.json` lives at the root of the served directory:
+
+```caddyfile
+hushrelay.space {
+	handle_path /updates/* {
+		root * /var/www/hush-updates
+		# The manifest must never be served stale; artifacts revalidate via ETag.
+		header Cache-Control "no-cache"
+		file_server
+	}
+
+	reverse_proxy 127.0.0.1:8787
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	request_body {
+		max_size 2MB
+	}
+	log {
+		output discard
+	}
+}
+```
+
+The live file is **not** in version control; the block above is the copy to restore from.
+Validate before installing — `sudo caddy validate --config /tmp/Caddyfile.new --adapter
+caddyfile` — then `sudo install -m644 /tmp/Caddyfile.new /etc/caddy/Caddyfile && sudo
+systemctl reload caddy`, which is zero-downtime.
+
+**Served directory.** `/var/www/hush-updates`, owner `relay-updates:relay-updates`, mode
+755, files 0644. Caddy runs as `caddy`, which is not in that group, so the world-readable
+bit is what makes the files servable — `rsync --chmod=D755,F644` is not cosmetic.
+
+**Upload account.** `relay-updates` is a system user with **no sudo** (`sudo -l -U
+relay-updates` → "not allowed to run sudo"). Its key is installed as:
+
+```sh
+sudo install -d -o relay-updates -g relay-updates -m 700 /home/relay-updates/.ssh
+printf 'restrict %s\n' "$(cat deploy_key.pub)" \
+  | sudo -u relay-updates tee /home/relay-updates/.ssh/authorized_keys
+```
+
+`restrict` covers `no-pty`, `no-port-forwarding`, `no-agent-forwarding`, `no-X11-forwarding`
+and `no-user-rc`, so the CI key cannot open a tunnel or a shell for interactive use — it can
+only run commands as this unprivileged account. Verified 2026-10-16: a `-L` tunnel dies with
+`channel 2: open failed: administratively prohibited`, `ssh -tt` reports `PTY allocation
+request failed`, `rsync` into `/etc` fails with code 23, and `rsync` into
+`/var/www/hush-updates` succeeds. There is deliberately **no forced command**: rsync needs
+to exec `rsync --server` on the far side.
+
+The private half lives on the workstation at `~/.ssh/hush-updates-deploy` (mode 600) and in
+the repository secrets `RELAY_UPDATES_SSH_KEY` and `RELAY_UPDATES_KNOWN_HOSTS` (the pinned
+ed25519 host key, so an upload cannot be redirected to another host).
+
+**Publishing.** `scripts/publish-updates-to-relay.sh` does the work, and
+`.github/workflows/publish-updates.yml` runs it on `release: published` (or by hand:
+`gh workflow run publish-updates.yml -f tag=v0.1.1`). It downloads the release assets,
+rewrites every URL in `latest.json` onto this origin, uploads the bundles, HEADs each one
+over HTTPS, and uploads the manifest **last** — a client that has just read a manifest
+always finds its artifact in place. It then re-fetches the public manifest and checks every
+platform URL resolves, so a green run means the origin is actually serving.
+
+By hand, from the workstation:
+
+```sh
+scripts/publish-updates-to-relay.sh --tag v0.1.1                 # downloads, uploads, verifies
+scripts/publish-updates-to-relay.sh --tag v0.1.1 --dry-run       # uploads nothing
+```
+
+Check the origin directly:
+
+```sh
+curl -sS https://hushrelay.space/updates/latest.json | jq '{version, platforms: (.platforms | keys)}'
+curl -sSI https://hushrelay.space/updates/Hush_aarch64.app.tar.gz | head -1
+```
+
+**Names and accumulation.** The Linux bundles carry the version
+(`Hush_0.1.0_amd64.AppImage`), so releases accumulate; the macOS updater artifacts do not
+(`Hush_aarch64.app.tar.gz`), so each release overwrites the last. `v0.1.0` is 210 MB in
+total against 34 GB free, so pruning is not needed yet — revisit after roughly a hundred
+releases, and keep at least the previous release's files when doing it, since a client that
+has read an older manifest still needs them.
+
+**Note for automation:** ufw rate-limits port 22 (`22/tcp LIMIT`). A loop of ssh/rsync
+connections to this box starts getting `Connection refused` after six new connections in 30
+seconds, with every other port still healthy. Space remote calls out; the publish workflow
+opens one rsync connection per run and is unaffected.
+
 
 Create vaults against **`https://hushrelay.space`**. A vault stores the relay it was
 created against; repoint existing ones with `hush-cli relay set --url https://hushrelay.space`.

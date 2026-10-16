@@ -6,8 +6,11 @@
 # through `projectPath`, the npm steps, and the cache key.
 #
 # The release is created as a draft on purpose. Nothing reaches an installed
-# copy until the draft is published, because the updater endpoint is
-# `releases/latest`, which skips drafts.
+# copy until the draft is published, and publishing is what triggers
+# publish-updates.yml, which mirrors the release to the relay that installed
+# copies actually read: https://hushrelay.space/updates/latest.json. This
+# repository is private, and GitHub 404s unauthenticated release downloads on a
+# private repo, so the updater can never be pointed here.
 name: Release
 
 on:

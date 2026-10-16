@@ -140,6 +140,14 @@ The **production relay** is `https://hushrelay.space`, with the onion twin
 fails closed when either half is missing). Deploy steps, the reboot-test record
 and the onion key backup are in `docs/ops/relay-prod-vps.md`.
 
+The same origin serves the releases: `https://hushrelay.space/updates/` holds the
+installers and the updater manifest (`latest.json`) that installed copies poll.
+That is not a convenience — this repository is private, and GitHub 404s
+unauthenticated release downloads, so a private repo cannot serve its own
+updates or hand an installer to someone without a GitHub account. Publishing is
+automatic when a release is published, via
+`.github/workflows/publish-updates.yml`; the whole path is in `RELEASING.md`.
+
 Each vault stores the relay it was created against and the daemon dials that one;
 a loopback URL means a relay on this machine, which the run scripts start from
 `crates/hush-relay`. A relay on another host is used as-is:
