@@ -1,0 +1,192 @@
+#cloud-config
+# Production hush-relay VPS provisioning (Ubuntu 24.04, amd64).
+#
+# Produces the shape documented in docs/ops/relay-https-checklist.md:
+#   - hush-relay systemd unit (verbatim copy of
+#     packaging/systemd/system/hush-relay.service), loopback-only, enabled but
+#     not started: the binary itself is built on the workstation and scp'd over
+#   - Caddy terminating TLS with a publicly trusted certificate. The client
+#     bundles webpki-roots and refuses self-signed certs, so Let's Encrypt via
+#     Caddy is the path that ships.
+#   - Tor onion service (full three-hop, like the lab box) for clients that
+#     route through Tor. Optional: delete the tor package line and the tor
+#     runcmd block to run without it.
+#   - ufw: only 22 (rate-limited), 80 (ACME + redirect), 443 open.
+#
+# Edit before use:
+#   - relay.example.com in the Caddyfile below -> your DNS name
+#   - ssh_authorized_keys -> the public key whose private half you keep
+#     (currently sam's hush_relay_vps key)
+#
+# On redeploy, the repo files are the source of truth: diff against
+# packaging/systemd/system/hush-relay.service and
+# docs/ops/relay-https-checklist.md before overwriting.
+
+hostname: hush-relay
+manage_etc_hosts: true
+disable_root: true
+ssh_pwauth: false
+
+users:
+  - name: deploy
+    gecos: Hush relay deploy
+    shell: /bin/bash
+    groups: [adm, systemd-journal]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINvlOgt3dMBb8LyF8aHRbHhnZWXlOyiNnU1zHty39o8p sam@hush-relay-vps
+
+swap:
+  filename: /swapfile
+  size: 2G
+
+package_update: true
+package_upgrade: true
+packages:
+  - caddy
+  - tor
+  - ufw
+  - unattended-upgrades
+
+write_files:
+  # Verbatim copy of packaging/systemd/system/hush-relay.service. The unit binds
+  # 127.0.0.1:8787 on purpose and expects TLS in front; StateDirectory creates
+  # /var/lib/hush-relay (mode 0700) on first start.
+  - path: /etc/systemd/system/hush-relay.service
+    content: |
+      # System unit for a VPS relay. Install:
+      #   cargo build --release --locked -p hush-relay
+      #   install -Dm755 target/release/hush-relay /usr/local/bin/hush-relay
+      #   useradd --system --no-create-home --shell /usr/sbin/nologin hush-relay
+      #   install -Dm644 packaging/systemd/system/hush-relay.service /etc/systemd/system/
+      #   systemctl daemon-reload && systemctl enable --now hush-relay
+      #
+      # The relay is a dumb store-and-forward: it holds queue IDs and ciphertext, never
+      # keys or plaintext. It therefore gets no mlock and no secret handling, and it
+      # binds loopback on purpose — terminate TLS in front of it and expose only 443.
+      # See docs/ops/relay-https-checklist.md.
+
+      [Unit]
+      Description=Hush relay (store-and-forward)
+      Documentation=https://github.com/your-org/hush
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=hush-relay
+      Group=hush-relay
+      ExecStart=/usr/local/bin/hush-relay
+      # Loopback only. Put Caddy or nginx in front for TLS; never bind a public
+      # interface here, or clients will happily send plaintext HTTP to it.
+      Environment=HUSH_RELAY_ADDR=127.0.0.1:8787
+      # Relay DB lands at /var/lib/hush-relay/relay/relay.db.
+      Environment=HUSH_DATA_DIR=/var/lib/hush-relay
+      # Creates the state dir owned by the service user, mode 0700, and makes it
+      # writable under ProtectSystem=strict.
+      StateDirectory=hush-relay
+      StateDirectoryMode=0700
+      Restart=always
+      RestartSec=2
+      UMask=0077
+
+      # --- sandbox ----------------------------------------------------------------
+      NoNewPrivileges=true
+      CapabilityBoundingSet=
+      AmbientCapabilities=
+      PrivateTmp=true
+      PrivateDevices=true
+      ProtectSystem=strict
+      ProtectHome=true
+      ProtectKernelTunables=true
+      ProtectKernelModules=true
+      ProtectKernelLogs=true
+      ProtectControlGroups=true
+      ProtectClock=true
+      ProtectHostname=true
+      ProtectProc=invisible
+      RestrictNamespaces=true
+      RestrictRealtime=true
+      RestrictSUIDSGID=true
+      LockPersonality=true
+      MemoryDenyWriteExecute=true
+      SystemCallArchitectures=native
+      SystemCallFilter=@system-service
+      SystemCallFilter=~@privileged @resources @obsolete
+      RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+      # --- resource bounds --------------------------------------------------------
+      # Publicly reachable, so bound it: blobs are capped at 1 MiB by RelayConfig and
+      # the queue count is small, so this is generous.
+      MemoryMax=512M
+      TasksMax=256
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # sshd_config.d drop-ins are included at the top of sshd_config and sshd uses
+  # the first value it sees, so these win over the shipped defaults.
+  - path: /etc/ssh/sshd_config.d/99-hush-hardening.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+      X11Forwarding no
+      MaxAuthTries 3
+
+  - path: /etc/sysctl.d/70-hush-relay.conf
+    content: |
+      # The relay keeps its SQLite DB hot; the swapfile is for emergencies only.
+      vm.swappiness=10
+
+runcmd:
+  # Relay system user, same shape as the deploy doc's useradd. The unit needs it
+  # to exist before first start.
+  - id -u hush-relay >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin hush-relay
+  # Pick up the hardening drop-in (Ubuntu 24.04 may run ssh under socket
+  # activation; restarting the unit covers both shapes).
+  - systemctl restart ssh
+  # Caddy terminates TLS and forwards paths verbatim: the client builds URLs as
+  # {relay_base}/q/{queue_id}, so no rewriting anywhere. Access logs record
+  # request URIs, which carry queue IDs — keep them off. request_body max_size
+  # mirrors the checklist's nginx client_max_body_size 2m (default 1m would
+  # 413 a maximum-size blob plus headers).
+  - |
+    cat > /etc/caddy/Caddyfile <<'EOF'
+    relay.example.com {
+    	reverse_proxy 127.0.0.1:8787
+    	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    	request_body {
+    		max_size 2MB
+    	}
+    	log {
+    		output discard
+    	}
+    }
+    EOF
+  # Tor onion service, three-hop (no SingleHopMode) so the VPS location stays
+  # hidden. The .onion address is minted on first start of tor:
+  #   cat /var/lib/tor/hush-relay/hostname
+  - mkdir -p /var/lib/tor/hush-relay && chown debian-tor:debian-tor /var/lib/tor/hush-relay && chmod 700 /var/lib/tor/hush-relay
+  - |
+    cat > /etc/tor/torrc.d/hush-relay.torrc <<'EOF'
+    HiddenServiceDir /var/lib/tor/hush-relay/
+    HiddenServicePort 80 127.0.0.1:8787
+    EOF
+    grep -q '%include /etc/tor/torrc.d' /etc/tor/torrc || printf '\n%%include /etc/tor/torrc.d\n' >> /etc/tor/torrc
+  # Firewall. 80 stays open so Caddy can answer the ACME challenge and redirect;
+  # 8787 is loopback-only and must never be reachable from outside.
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw limit 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+  - systemctl enable --now unattended-upgrades
+  - systemctl enable --now caddy
+  - systemctl enable --now tor
+  # Enabled, not started: /usr/local/bin/hush-relay arrives with the scp deploy.
+  - systemctl enable hush-relay
+
+final_message: "Hush relay VPS cloud-init done after $UPTIME seconds. Remaining: DNS record, Caddyfile domain, binary deploy."
