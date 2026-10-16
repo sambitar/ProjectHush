@@ -18,7 +18,8 @@
 # this moves the bytes the webview would move rather than a stand-in.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc"
+source "${ROOT}/scripts/lib/hush.sh"
+hush_require_protoc || exit 1
 T="${ROOT}/.tmp-paper-dogfood"
 R="${ROOT}/.tmp-paper-dogfood-rt"
 rm -rf "$T" "$R"

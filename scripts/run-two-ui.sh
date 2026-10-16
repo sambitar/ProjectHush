@@ -46,7 +46,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-export PROTOC="${PROTOC:-${ROOT}/.tools/protoc-dist/bin/protoc}"
+# Shared checks: cargo, node/npm, and protoc (needed by libsignal's build script,
+# and not provided by the repository). Fails here with install lines rather than
+# inside prost-build three crates deep.
+source "$ROOT/scripts/lib/hush.sh"
+hush_check_prereqs
 PEER_A="${ROOT}/instances/peer-a"
 PEER_B="${ROOT}/instances/peer-b"
 RELAY_URL="${RELAY_ARG:-${HUSH_RELAY_URL:-http://127.0.0.1:8787}}"
@@ -107,6 +111,36 @@ else
   echo "Unknown HUSH_PROFILE '$PROFILE' (expected debug or release)." >&2
   exit 2
 fi
+
+# A loopback RELAY_URL with both vaults already present usually means "the
+# operator did not pass --relay", not "start a relay nobody will use": the
+# daemons read the relay stored in their vault, so a local one would come up and
+# carry no traffic. Follow the vaults instead. This runs before the build because
+# the relay it settles on decides which profile the daemon needs.
+if [[ "$RELAY_IS_LOCAL" == 1 && -z "$RELAY_ARG" && -z "${HUSH_RELAY_URL:-}" ]] \
+     && [[ -d "$PEER_A" && -d "$PEER_B" ]]; then
+  STORED="$(hush_vault_relay "$PEER_A")"
+  STORED_B="$(hush_vault_relay "$PEER_B")"
+  if [[ -n "$STORED" && "$STORED" == "$STORED_B" ]] && ! relay_is_local "$STORED"; then
+    RELAY_URL="$STORED"
+    RELAY_IS_LOCAL=0
+    echo "Vaults point at $RELAY_URL (from client-config.json); no local relay."
+  fi
+fi
+
+# A release daemon refuses plain HTTP to a relay that is not loopback or a v3
+# onion (hush-core HttpPolicy::LoopbackOnly), so the shared lab relay — plain HTTP
+# on a public host — needs a debug daemon. Applied here so the failure does not
+# arrive later as an unexplained relay error. An explicit HUSH_PROFILE still wins.
+if [[ -z "${HUSH_PROFILE:-}" ]] && hush_relay_needs_debug_daemon "$RELAY_URL"; then
+  PROFILE=debug
+  DAEMON_BIN="${ROOT}/target/debug/hush-daemon"
+  DAEMON_CARGO_FLAGS=()
+  echo "Relay $RELAY_URL is plain HTTP and not loopback: a release daemon refuses it, so"
+  echo "the daemon runs in debug. For a release daemon, terminate TLS in front of the relay"
+  echo "or use its onion address — see docs/ops/relay-lab-vps.md."
+fi
+
 TAURI_BIN="${BIN}/hush-tauri"
 
 # The bundled Tor sidecar, for the reason spelled out in run-one-ui.sh: a dev run
@@ -138,28 +172,26 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [[ ! -d "$PEER_A" || ! -d "$PEER_B" ]]; then
-  echo "Creating peer vaults (./scripts/setup-two-peers.sh)…"
-  HUSH_RELAY_URL="$RELAY_URL" "$ROOT/scripts/setup-two-peers.sh"
+# Both branches below need the UI's dependencies: the full run builds the dist
+# from apps/hush-tauri, and dev mode runs the Vite server there.
+hush_ensure_node_modules "${ROOT}/apps/hush-tauri"
+
+# The relay first, before anything that needs one to be up: the vaults are
+# created further down, and setup-two-peers.sh registers the first contacts
+# through the relay, so a fresh clone fails there if this comes later.
+if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
+  echo "Building the relay…"
+  cargo build -p hush-relay
 fi
 
 if [[ "$DEV" == 1 ]]; then
-  if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
-    echo "Dev mode: building the local relay and the daemon (no UI or desktop build)."
-    cargo build -p hush-relay
-  else
-    echo "Dev mode: building the daemon only (remote relay; no UI or desktop build)."
-  fi
+  echo "Dev mode: building the daemon (no UI or desktop build)."
   cargo build "${DAEMON_CARGO_FLAGS[@]}" -p hush-daemon
 else
   echo "Building UI (Vite)…"
   (cd "${ROOT}/apps/hush-tauri" && npm run build)
-  echo "Building Rust binaries…"
-  if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
-    cargo build -p hush-relay -p hush-tauri
-  else
-    cargo build -p hush-tauri
-  fi
+  echo "Building the desktop binary and the daemon…"
+  cargo build -p hush-tauri
   cargo build "${DAEMON_CARGO_FLAGS[@]}" -p hush-daemon
 fi
 
@@ -204,36 +236,6 @@ relay_health() {
   [[ "$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 "${1%/}/health" 2>/dev/null)" == "200" ]]
 }
 
-# The relay a vault's config file carries (empty when the file is absent or
-# sets none). This is plaintext client config, not vault state, so it reads
-# without unlocking; the vault's own stored relay still wins at runtime, and
-# for existing vaults the two agree by construction (see DEEPSEEKPROBLEMS.MD).
-vault_config_relay() {
-  local cfg="$1/client-config.json"
-  [[ -f "$cfg" ]] || return 0
-  node -e '
-    try {
-      const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-      if (typeof c.relay_url === "string") process.stdout.write(c.relay_url);
-    } catch {}
-  ' "$cfg" 2>/dev/null
-}
-
-# A loopback RELAY_URL with both vaults already present usually means "the
-# operator did not pass --relay", not "start a relay nobody will use": the
-# daemons read the relay stored in their vault, so a local one would come up
-# and carry no traffic. Follow the vaults instead.
-if [[ "$RELAY_IS_LOCAL" == 1 && -z "$RELAY_ARG" && -z "${HUSH_RELAY_URL:-}" ]] \
-     && [[ -d "$PEER_A" && -d "$PEER_B" ]]; then
-  STORED="$(vault_config_relay "$PEER_A")"
-  STORED_B="$(vault_config_relay "$PEER_B")"
-  if [[ -n "$STORED" && "$STORED" == "$STORED_B" ]] && ! relay_is_local "$STORED"; then
-    RELAY_URL="$STORED"
-    RELAY_IS_LOCAL=0
-    echo "Vaults point at $RELAY_URL (from client-config.json); no local relay."
-  fi
-fi
-
 if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
   if relay_ready; then
     echo "Local relay already up at $RELAY_URL"
@@ -267,6 +269,14 @@ else
   else
     echo "  warning: $RELAY_URL/health did not answer 200; daemons will retry and sends will queue." >&2
   fi
+fi
+
+# Vaults come last of the setup steps, once the relay they are registered
+# against is up: setup-two-peers.sh adds the first contacts through that relay
+# and fails with "relay did not answer /health" when it is not running yet.
+if [[ ! -d "$PEER_A" || ! -d "$PEER_B" ]]; then
+  echo "Creating peer vaults (./scripts/setup-two-peers.sh)…"
+  HUSH_RELAY_URL="$RELAY_URL" "$ROOT/scripts/setup-two-peers.sh"
 fi
 
 # Daemons this run started, as "name:socket:pid", to wait on below.

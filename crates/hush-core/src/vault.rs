@@ -23,6 +23,16 @@ pub struct BlobId(pub [u8; 32]);
 
 const LOCK_FILE_NAME: &str = "vault.lock.json";
 
+/// Whether `dir` already holds a vault, without opening or unlocking it.
+///
+/// The lock file is the first thing `Vault::create` writes and the file it
+/// refuses to overwrite, so this is the existence check the daemon and the CLI
+/// can agree on: the first-run screen creates a vault only where there is none,
+/// and a directory that has one is never a candidate for creation.
+pub fn vault_exists(dir: &Path) -> bool {
+    dir.join(LOCK_FILE_NAME).exists()
+}
+
 /// Read and parse the vault unlock header.
 fn read_lock(dir: &Path) -> Result<LockFile, Error> {
     let path = dir.join(LOCK_FILE_NAME);
@@ -765,11 +775,8 @@ impl DropDrainKey {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("hush-vault-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn scratch(name: &str) -> crate::testutil::ScratchDir {
+        crate::testutil::ScratchDir::new(&format!("vault-{name}"))
     }
 
     fn lock_json(vault_dir: &Path) -> serde_json::Value {

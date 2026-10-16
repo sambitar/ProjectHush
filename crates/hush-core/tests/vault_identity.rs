@@ -1,56 +1,48 @@
 use std::fs;
-use std::path::PathBuf;
 
 use hush_core::{Error, Vault};
+use tempfile::TempDir;
 
-fn temp_vault_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "hush-core-test-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn rand_suffix() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
+/// A vault directory that deletes itself when the test ends: a vault holds an
+/// `identity.secret`, so leaving one in the system temp dir leaves a private key
+/// there for as long as the machine lives.
+fn temp_vault_dir() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("hush-core-test-")
+        .tempdir()
+        .expect("a scratch directory under the system temp dir")
 }
 
 #[test]
 fn create_refuses_empty_passphrase() {
     let dir = temp_vault_dir();
-    let err = Vault::create(&dir, "").unwrap_err();
+    let err = Vault::create(dir.path(), "").unwrap_err();
     assert!(matches!(err, Error::EmptyPassphrase));
 }
 
 #[test]
 fn create_and_reopen_same_identity() {
     let dir = temp_vault_dir();
-    let created = Vault::create(&dir, "correct-horse").unwrap();
+    let created = Vault::create(dir.path(), "correct-horse").unwrap();
     let pub_a = created.identity_public();
     drop(created);
 
-    let opened = Vault::open(&dir, "correct-horse").unwrap();
+    let opened = Vault::open(dir.path(), "correct-horse").unwrap();
     assert_eq!(pub_a, opened.identity_public());
 }
 
 #[test]
 fn wrong_passphrase_fails() {
     let dir = temp_vault_dir();
-    Vault::create(&dir, "correct-horse").unwrap();
-    let err = Vault::open(&dir, "wrong-passphrase").unwrap_err();
+    Vault::create(dir.path(), "correct-horse").unwrap();
+    let err = Vault::open(dir.path(), "wrong-passphrase").unwrap_err();
     assert!(matches!(err, Error::WrongPassphrase));
 }
 
 #[test]
 fn blob_roundtrip() {
     let dir = temp_vault_dir();
-    let vault = Vault::create(&dir, "correct-horse").unwrap();
+    let vault = Vault::create(dir.path(), "correct-horse").unwrap();
     let id = vault.put_blob(b"hello").unwrap();
     assert_eq!(vault.get_blob(&id).unwrap(), b"hello");
 }
@@ -58,7 +50,7 @@ fn blob_roundtrip() {
 #[test]
 fn blob_not_plaintext_on_disk() {
     let dir = temp_vault_dir();
-    let vault = Vault::create(&dir, "correct-horse").unwrap();
+    let vault = Vault::create(dir.path(), "correct-horse").unwrap();
     let marker = b"hello-unique-marker";
     vault.put_blob(marker).unwrap();
 
@@ -78,7 +70,7 @@ fn blob_not_plaintext_on_disk() {
     }
 
     assert!(
-        !any_file_contains(&dir, marker),
+        !any_file_contains(dir.path(), marker),
         "plaintext marker found under vault dir"
     );
 }

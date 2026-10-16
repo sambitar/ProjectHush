@@ -7,6 +7,305 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — The sweep for the clinic's real hostname answered with 8075 license URLs
+
+### A repo-wide URL grep was read as "no app hostnames here" [FIXED]
+
+- Attempted: find out whether the clinic app on the box has a real public hostname
+  configured, to judge whether nginx's catch-all is serving anything that matters.
+  Grepped `/opt /home/alhakim /root /etc/systemd/system /etc/cloudflared` for
+  `https?://<host>.<tld>` with a vendor blocklist.
+- Symptom: the top 25 hits were `openpgpjs.org` (8075), `slsa.dev` (7686),
+  `openssl.org` (4670), eleven variants of the ECMA-262 spec, and nextjs docs. The
+  sweep walked `node_modules` and build output, so the output was noise at the top and
+  the real answer was not in the visible list at all. It reads as "no app hostnames
+  here", which is not what it demonstrated — anything further down was simply cut off
+  by `head -25`. No `node_modules` exclusion, no `-prune`, no bound to config surfaces.
+- Resolution: re-ran bounded — `find -maxdepth 4` pruning `node_modules`, `.next`,
+  `dist`, `.git`, then grepping only `.env*`, `next.config.*` and `*.service`. That
+  answered it: the clinic app configures no domain (it is reached by IP), and the only
+  app URL on the box is cricket's `CRICKET_PUBLIC_BASE`, still pointing at the dead
+  `sources-baghdad-sullivan-olive.trycloudflare.com`.
+- Lesson: a repo-wide URL grep is not evidence about configuration. Name the files that
+  can hold the answer and grep those; an unbounded grep plus `head` reports "none" for
+  "not in the first 25".
+
+## 2026-10-16 — Cloudflare quick-tunnel hostnames die, and a live connector hides it
+
+### Three trycloudflare hostnames were NXDOMAIN while their connectors reported healthy [WORKED AROUND]
+
+- Attempted: answer "can we use the Cloudflare HTTPS tunnel instead of the plain-HTTP lab
+  relay, so teammates can run release builds?" by checking the box rather than the doc.
+- Symptom: every `trycloudflare.com` hostname this repo names was gone — `ban-therapeutic-
+  daughter-organic` (nginx/relay via path ingress), `sources-baghdad-sullivan-olive` (the
+  cricket app's `CRICKET_PUBLIC_BASE`), `remedy-relief-patricia-main` (the relay-facing
+  quick tunnel) — while `systemctl is-active cloudflared-*.service` said `active` for all of
+  them and the journal still showed the old hostname. NXDOMAIN at 1.1.1.1 and 8.8.8.8, so it
+  was not local resolver cache. Same failure as 2026-10-10, now for the third hostname on
+  this box: Cloudflare reclaims account-less tunnel names and the connector does not notice.
+- Resolution (workaround): restarting `cloudflared-hush-quick.service` mints a new hostname,
+  and that one works — `/health` 200 with `ssl_verify_result=0`, `/drop` 200 at 53837 bytes,
+  `smoke-relay-lab.sh` green end to end through it, and a **release** `hush-cli` accepts it
+  where it refuses `http://137.184.129.205:8790` with `insecure relay URL`. Recorded in
+  `docs/ops/relay-lab-vps.md` along with the three durable alternatives.
+- Lesson: "the connector is active" is not evidence a hostname resolves. A quick tunnel needs
+  the hostname fetched from the log and a live request against it, every time; anything that
+  outlives a session needs a named tunnel with a real DNS record.
+
+### The `hush` named tunnel has been up for days and can serve nothing [OPEN]
+
+- Attempted: use the purpose-built named tunnel instead of a quick one.
+- Symptom: account `75743fae14d6c875d63ca54494668df8`, tunnel
+  `e8c187f1-e516-4371-ab7d-18053dcf5b11`, connector `cloudflared-hush.service` `active` with
+  four QUIC connections — and no public hostname, so the connector logs `No ingress rules were
+  defined … cloudflared will return 503 for all incoming HTTP requests`. The box has no
+  `cert.pem` and no Cloudflare API token, so `cloudflared tunnel list` / `route dns` cannot
+  even enumerate it from there.
+- Needed: a Public Hostname added in the dashboard for that tunnel (service HTTP →
+  `localhost:8790`, pointed at the relay rather than nginx), on a zone in that account. This
+  is a dashboard action with no CLI path available from this machine, so it stays OPEN until
+  someone with dashboard access adds it.
+
+## 2026-10-15 — Test scratch directories: 1576 vaults' worth of private keys left in /tmp
+
+### A test vault's private keys were left in the system temp dir, 2027 directories of them [FIXED]
+
+- Attempted: tidy up after the onboarding slice and looked at `/tmp`.
+- Symptom: 2027 `hush-*` directories, 1576 of them holding an `identity.secret`, spanning two
+  days of runs, 215 MB, directories mode 0775 and files 0664 — readable by group and other.
+  `fn scratch` in `vault.rs`, `account.rs`, and `device.rs` built a path from `temp_dir()` plus
+  the process id and never removed it. The id changes every run, so the `remove_dir_all` at the
+  *start* of the function never matched anything the previous run had made, and the count grew by
+  one directory per test per run, without limit.
+- Resolution: `crates/hush-core/src/testutil.rs` (test-only) with `ScratchDir`, a
+  `tempfile::TempDir` that derefs to its path and deletes itself when the test ends, a panicking
+  test included. Used by `vault.rs`, `account.rs`, `device.rs`, and the 13 sites in `chat_log.rs`;
+  `tests/vault_identity.rs` holds a `TempDir` directly. Verified: `cargo test -p hush-core` leaves
+  the `/tmp` count unchanged (2027 before, 2027 after) with all 202 tests passing. The existing
+  2064 entries were deleted, 215 MB.
+- Lesson: `temp_dir().join(pid)` is not a scratch directory, it is a directory that happens to
+  have a unique name. Cleanup that only runs at the start of the next process never runs.
+
+### A self-deleting scratch directory cannot be created inside a helper that returns the account [FIXED]
+
+- Attempted: swap the three `scratch` helpers over to `ScratchDir` and move on.
+- Symptom: `cargo test -p hush-core` went from 137 passing to 5 failing, all in `account::tests`,
+  all panicking at `account.rs:4879` inside `create_conclave`. `intro_vault(name)` created the
+  directory, built the account, and returned only the account — so the guard dropped at the end of
+  the helper and deleted the vault out from under an account that still writes to it. The
+  directory had survived before precisely because nothing owned it.
+- Resolution: `intro_vault` returns `(ScratchDir, Account)` and the nine call sites bind it as
+  `let (_dir, mut x) = ...`, so the test body owns the directory for as long as the account lives.
+  All 202 tests pass.
+- Lesson: turning a leak into an owned guard moves the question from "when does this get deleted"
+  to "who holds it". A helper that returns something outliving the directory is the case that
+  breaks.
+
+### The same pattern is still in three other crates [OPEN]
+
+- `crates/hush-daemon/src/reads.rs` (a reader cache), `apps/hush-tauri/src-tauri/src/tor.rs` (five
+  Tor data dirs) and `daemon_client.rs` (a proxy test dir) still build `temp_dir()` paths from the
+  process id and never remove them. None of them holds a vault or a key — the 2064 entries I
+  deleted included 14 `hush-proxy-test` and a handful of `hush-tor-*`, all disposable state — so
+  the harm is clutter rather than secrets.
+- Not fixed here because `testutil` is `#[cfg(test)]` and private to `hush-core`, so each crate
+  would need its own guard, and that is a change to three crates' test scaffolding rather than to
+  the thing that was leaking keys. Recorded so the next run does not rediscover it as a surprise.
+
+## 2026-10-15 — First run in the product: create the vault from the window
+
+### The daemon could not tell "no vault" from "locked", and could not create one [FIXED]
+
+- Attempted: make a teammate's first run create a brand new vault in the app, the way a packaged
+  build would, instead of pre-creating one from a script before the UI starts.
+- Symptom: `GET /api/status` reported only lock state. A window with no vault on disk was
+  indistinguishable from one with a locked vault, and `app.ts` always rendered the unlock screen.
+  There was no route that created a vault at all: `Account::create` was reachable only from the CLI
+  and from the test helpers.
+- Resolution: `hush_core::vault_exists(dir)` (the `vault.lock.json` marker that `Account::create`
+  already writes) is surfaced as `vault_present` in `/api/status`, and `POST /api/vault/create`
+  creates, names, and configures the vault in one call, returning 409 if one already exists. The
+  window renders a Welcome screen while `!vault_present` and unlocks into the recovery-code modal
+  after creating. Verified end to end in a headless browser against a fresh directory: filled the
+  Welcome form, got `vault.lock.json` and `client-config.json` on disk, unlocked, and saw the
+  recovery code.
+- Lesson: "locked" and "absent" are different states and the UI needs both; a boolean that only
+  covers one of them will silently render the wrong screen.
+
+### A create route cannot be served straight from the axum handler [FIXED]
+
+- Attempted: call `Account::create` inside the `vault_create` handler, next to the unlock handler.
+- Symptom: `error[E0277]: the trait bound Account: Send is not satisfied` / "future cannot be sent
+  between threads" / "required by a bound in `Handler`". `Account` holds state that is not `Send`, so
+  holding it across an `await` in a handler is a compile error — the unlock path never hit this
+  because it goes through `AccountWorker` and only sends a reply over a channel.
+- Resolution: creation follows the existing worker pattern. `Work::Create` carries the directory,
+  passphrase, name, and relay; the worker runs `Account::create` on its own thread and answers with
+  `WorkResult::Created { recovery_code, vault_name, relay }`. The handler only awaits the reply.
+- Lesson: in this daemon, nothing that owns an `Account` may be held across an `await` in a handler.
+  The worker channel is the boundary, not an optimization.
+
+### The recovery code is only obtainable at creation, and the UI must say so [FIXED]
+
+- Attempted: rely on the existing post-unlock recovery-code prompt to show the code after creating.
+- Symptom: reading `Account::create` and the unlock path showed the code is returned by `create` and
+  is not re-derivable from a later unlock — `maybeShowRecoveryCode` shows a stored code only when the
+  client already holds it. Without wiring the create response into the modal, a new user would have
+  created a vault and never seen the one thing they must keep.
+- Resolution: the create response's `recovery_code` is handed straight to the existing modal
+  (`this.recoveryModalCode = created.recovery_code`), so the code is shown immediately after
+  creation, once, and the client is never left without it.
+- Lesson: a secret that exists only in one response has to be displayed by the screen that receives
+  it; a later screen cannot recover it.
+
+## 2026-10-15 — Handoff readiness: what a teammate gets from a clone
+
+### `protoc` was a hard build requirement and named nowhere [FIXED]
+
+- Attempted: answer "if I send this repo to my team, can they use it out of the box?" from the code
+  rather than from the docs.
+- Symptom: nothing in the repository provides `protoc`, and nothing named it. `crates/hush-core`'s
+  build script only did `std::env::set_var("PROTOC", ...)` for the vendored copy under `.tools/`,
+  which `.gitignore` excludes — and that assignment could not have worked anyway: cargo runs each
+  build script in its own process, so `PROTOC` set there never reaches the crate that needs it.
+  `libsignal-rust`'s build script is the one calling
+  `prost_build::compile_protos(&["protos/WhisperTextProtocol.proto"], ..)`, so a machine without
+  protoc fails with a prost error raised from a crate nobody typed, naming neither protoc nor where
+  to get one.
+- Resolution: `crates/hush-core/build.rs` resolves protoc (explicit `PROTOC` -> `.tools/protoc-dist`
+  -> `PATH`) and panics with the install lines when there is none. Verified by hiding `.tools/` and
+  dropping protoc from `PATH`: `cargo build -p hush-core` prints "protoc not found." with the
+  apt/dnf/brew lines and exits 101 instead of the prost error, and a normal build still succeeds.
+- Lesson: a prerequisite that exists only on the author's machine is invisible until someone else
+  clones. `build.rs` is the earliest place a plain `cargo build` can name it.
+
+### Every internal script overrode a working protoc with a machine-local path [FIXED]
+
+- Symptom: `export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc"` in 11 scripts. On this machine that
+  path exists; anywhere else it does not, and because the assignment is unconditional it *replaces* a
+  protoc that is on `PATH` — turning a working build into the prost failure above.
+- Resolution: one resolver, `hush_require_protoc` in `scripts/lib/prereqs.sh`, preferring an explicit
+  `PROTOC`, then the vendored copy, then `PATH`, and printing install lines when it finds none. Both
+  run scripts and all 11 internal scripts source it. Verified: with `PROTOC=/nope/protoc` it falls
+  through to the vendored copy with a note; with no protoc anywhere it prints the message and returns
+  1; `bash -n` is clean on every script in `scripts/`.
+- Lesson: an environment variable exported "just in case" can override the correct value.
+
+### The run scripts assumed `node_modules` already existed [FIXED]
+
+- Symptom: `run-one-ui.sh` and `run-two-ui.sh` call `npm run build` and `npm run dev` directly, and
+  `.gitignore` excludes `apps/hush-tauri/node_modules/`. On a fresh clone the first run dies at
+  "vite: not found" before anything starts.
+- Resolution: `hush_ensure_node_modules` runs `npm ci` against the committed lockfile when the
+  directory is absent and does nothing when it is present. Verified on a materialized fresh tree (no
+  `node_modules`, no `target`, no `.tools`): `npm ci` plus `npm run build` finished in 22s and wrote
+  `ui/dist`. A stub `npm` confirmed the guard runs exactly once, only when the directory is missing.
+- Method note: a real `git clone` cannot test uncommitted changes, so the fresh tree was materialized
+  with `git ls-files -co --exclude-standard | tar -cf - -T -`, which is exactly the file set a commit
+  would carry.
+- Lesson: a build step that depends on an ignored directory needs the install step in front of it, or
+  the first clone is the only one that ever fails.
+
+### There was no entry point at the repository root [FIXED]
+
+- Symptom: no `README.md`. The root held a design handoff document, `RELEASING.md`, and
+  `docs/WORKSPACE.md`, which is stale in the direction that matters most: it opens with "do not
+  scaffold until implementation is approved" while the workspace it describes is built. Nothing said
+  which script to run, or that `protoc` and `npm ci` come first.
+- Resolution: `README.md` with prerequisites and their install lines, the run scripts and their
+  options, relay and Tor behaviour, the test commands, the crate layout, and pointers into `docs/`.
+- Lesson: "the docs are in `docs/`" is not a substitute for telling a reader where to start.
+
+### A display artifact in tool output nearly became a false bug report [WORKED AROUND]
+
+- Attempted: read the `PROTOC` lines in the scripts before replacing them.
+- Symptom: `Read` and `grep -n` both rendered the line as
+  `export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc}"` — a stray `}` inside the quotes. That would
+  be a real bug (a `PROTOC` path with a trailing brace), and it was reported to the user as one before
+  being checked. `grep ... | cat -A` showed the actual bytes with no brace: the `}` was an artifact of
+  the line rendering in the tool output.
+- Resolution: read raw bytes (`cat -A`) before claiming a file contains something surprising. This is
+  a tooling artifact, not a repository problem, and nothing in the repository changed because of it.
+- Lesson: tool output that quotes file content is still a rendering. One `cat -A` beats a retraction.
+
+### The two-peer run created its vaults before the relay they needed was up [FIXED]
+
+- Attempted: run `run-two-ui.sh` on a tree with no `instances/` at all, the shape a teammate gets.
+- Symptom: the script called `setup-two-peers.sh` before building and starting the local relay, and
+  `setup-two-peers.sh` probes `${RELAY_URL}/health` while creating the vaults. Nothing answered, so the
+  run died at vault creation — before the relay that was about to be started, and before anything the
+  operator could see. The order was fine only for a tree whose relay was already running.
+- Resolution: the relay is built and started before the vaults are created. Verified today in the
+  materialized fresh tree, twice: with a local relay (`--relay http://127.0.0.1:8798`, relay built and
+  started, vaults created against it) and with the cloud relay (`--relay
+  http://137.184.129.205:8790`, no local relay started, vaults created against the remote one).
+- Lesson: a setup script that probes the service it is about to need has to run after that service, and
+  "the relay is already up on my machine" hides the ordering bug from the person most likely to run it.
+
+### The relay a vault is on cannot be read back from the vault [FIXED]
+
+- Attempted: pick the daemon profile in `run-one-ui.sh` (release normally, debug when the relay is
+  plaintext HTTP off-loopback, because `hush-core`'s `HttpPolicy::LoopbackOnly` refuses the latter) by
+  reading the relay the vault is on — the way `run-two-ui.sh` already reads
+  `instances/<vault>/client-config.json`.
+- Symptom: for vaults created with `hush-cli init --relay <url>`, `client-config.json` does not exist at
+  all, and the running daemon reports the relay as coming from somewhere else:
+  `{"locked":true,...,"relay":"http://127.0.0.1:8787","relay_source":"default"}` before unlock and
+  `{"locked":false,...,"relay":"http://137.184.129.205:8790","relay_source":"vault"}` after. The
+  authoritative relay is inside the encrypted vault, so a script cannot read it without the passphrase,
+  and the plaintext file is only the override channel. Reading only that file would have chosen a
+  **release** daemon for a plaintext remote relay — on the teammate's *second* run, after the first one
+  worked, and the failure would have arrived as a relay error rather than as a profile choice.
+- Resolution: `create_vault` also records the relay in `client-config.json` with
+  `hush-cli --dir <vault> config set --relay <url>` (debug binary: a release build refuses to write a
+  plaintext non-loopback relay, which is the point). Verified: the new vault's file reads
+  `{"v": 1, "relay_url": "http://137.184.129.205:8790"}`, and `HUSH_PROFILE` still overrides the
+  automatic choice in both run scripts.
+- Lesson: `/api/status` is the only place the *effective* relay is visible, and only after unlock. A
+  value the daemon resolves from encrypted state has to be written down somewhere plaintext if a script
+  needs it before the daemon starts.
+
+### The shared relay has no HTTPS origin, so a release daemon cannot use it [OPEN]
+
+- Symptom: the shared relay is `http://137.184.129.205:8790` — plain HTTP on a public address, which a
+  release daemon refuses by policy (the refusal itself is verified, and it is what
+  `scripts/smoke-relay-lab.sh` documents and works around by using debug binaries). The HTTPS
+  quick-tunnel origin recorded earlier is dead: the hostname no longer resolves, so it is not a way out.
+- Resolution so far: both run scripts now detect the plaintext-remote case and build and run the daemon
+  in **debug**, saying why in one line. The relay path itself works: today's run of the repository's own
+  cross-machine smoke against the lab relay reported
+  `ok: invite/contact exchange completed through the remote relay`,
+  `ok: mail accepted from B and queued on the remote relay`,
+  `ok: A received the mail that travelled through the remote relay`,
+  `ok: reply travelled back through the remote relay`, `cross-machine relay smoke ok`.
+- Still open: a **release** daemon — what a packaged app runs — needs TLS in front of the relay or the
+  onion address with Tor. Neither is in place on the lab box, so "test together" currently means a
+  debug daemon on both sides. `docs/ops/relay-lab-vps.md` has the deploy steps for both.
+- Lesson: "plaintext off-loopback is refused" is a good default that turns the shared lab box into
+  something the shipped binary cannot use. That trade needs to be made explicitly, in the open, not
+  discovered by a teammate whose invite silently goes nowhere.
+
+### `pkill -f` and `pgrep -f` matched the shell running them, three more times [WORKED AROUND]
+
+- Attempted: (1) stop the previous fresh-tree run with
+  `pkill -f "/tmp/hush-ootb/scripts/run-two-ui.sh"`; (2) stop a test daemon with
+  `for p in $(pgrep -f "hush-daemon --dir /tmp/hush-handmade"); do kill "$p"; done`.
+- Symptom: exit 0, no output, and the command returned in half a second — it had killed its own
+  `/bin/bash -c` wrapper, so everything chained after it never ran (the tree refresh, the vault
+  removal, the next run, the test itself). The next command's log was then empty or missing an expected
+  line, which read as "the code did not do what it should" until the cause was clear. In (2) the pattern
+  was unbracketed inside a `pgrep` substitution, so the bracket fix applied to the neighbouring `pkill`
+  did not help. This is the same trap already logged three times in this file, once as `OPEN`/recurrence,
+  and it landed three times in this one session: a pattern copied into a command that also runs the
+  search is self-matching, bracketed or not, whenever the *unbracketed* text of it appears elsewhere in
+  the same command line.
+- Resolution: bracket every pattern (`[r]un-two-ui.sh`, `[h]ush-daemon --dir …`), never leave a bare
+  pattern anywhere in the command being run, and prefer PIDs captured at launch over patterns.
+- Lesson: the logged fix has not stuck, and the failure mode is silence rather than an error — which
+  makes it expensive, because it looks like a result. One of the three occurrences caused a test to be
+  reported as run when it had not run at all; it was caught only because the expected output was
+  missing.
+
 ## 2026-10-15 — UI pass: the reach badge, the conclave picker, and the E2E marks
 
 ### The contact list inside a dialog was clipped by the dialog's own scroll box [FIXED]

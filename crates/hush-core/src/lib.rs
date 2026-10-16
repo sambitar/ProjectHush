@@ -17,6 +17,8 @@ mod recovery;
 mod relay_client;
 mod signal;
 mod signal_persist;
+#[cfg(test)]
+mod testutil;
 mod vault;
 mod voice;
 mod wire;
@@ -63,7 +65,7 @@ pub use relay_client::{
     is_v3_onion_host, normalize_relay_base, normalize_relay_base_with, validate_onion_relay,
     validate_socks_proxy, BulletinBlob, HttpPolicy, RelayClient,
 };
-pub use vault::{verify_pen_signature, BlobId, DropDrainKey, IdentityPub, PenName, Vault};
+pub use vault::{verify_pen_signature, vault_exists, BlobId, DropDrainKey, IdentityPub, PenName, Vault};
 
 /// Queue credential derivation, shared by the client and the relay.
 ///

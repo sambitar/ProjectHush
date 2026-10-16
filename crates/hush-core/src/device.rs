@@ -301,11 +301,8 @@ mod tests {
     use super::*;
     use crate::vault::Vault;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("hush-device-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
+    fn scratch(name: &str) -> crate::testutil::ScratchDir {
+        crate::testutil::ScratchDir::new(&format!("device-{name}"))
     }
 
     #[tokio::test]

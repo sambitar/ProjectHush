@@ -14,7 +14,8 @@
 # negative control into a false pass.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc"
+source "${ROOT}/scripts/lib/hush.sh"
+hush_require_protoc || exit 1
 cd "$ROOT"
 
 TOR="$ROOT/apps/hush-tauri/src-tauri/resources/tor/tor"

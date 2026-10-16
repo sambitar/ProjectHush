@@ -2,7 +2,8 @@
 # 5c.4 acceptance: release builds refuse non-loopback HTTP relays, debug allows them.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export PROTOC="${ROOT}/.tools/protoc-dist/bin/protoc"
+source "${ROOT}/scripts/lib/hush.sh"
+hush_require_protoc || exit 1
 cd "$ROOT"
 REL=./target/release/hush-cli
 DBG=./target/debug/hush-cli

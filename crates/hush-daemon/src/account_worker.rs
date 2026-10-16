@@ -124,6 +124,14 @@ enum Work {
         passphrase: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// First run: create the vault in `dir`. Refused when one is already there.
+    Create {
+        dir: PathBuf,
+        passphrase: String,
+        name: Option<String>,
+        relay: Option<String>,
+        reply: oneshot::Sender<WorkResult>,
+    },
     Lock {
         reply: oneshot::Sender<WorkResult>,
     },
@@ -669,6 +677,14 @@ pub struct IntroLists {
 
 pub enum WorkResult {
     Ok,
+    /// A vault was created: its recovery code (shown once), name, and relay.
+    Created {
+        recovery_code: Option<String>,
+        vault_name: String,
+        relay: String,
+    },
+    /// Creation was refused because the directory already holds a vault.
+    Exists,
     Invite(String),
     Contacts(Vec<ContactDto>),
     Inbox(InboxResult),
@@ -811,6 +827,66 @@ impl AccountWorker {
                                     WorkResult::Ok
                                 }
                                 Err(e) => WorkResult::Err(e.to_string()),
+                            };
+                            (reply, result)
+                        }
+                        Work::Create {
+                            dir,
+                            passphrase,
+                            name,
+                            relay,
+                            reply,
+                        } => {
+                            // The existence check is repeated here, where the
+                            // worker is the only writer of this directory, so a
+                            // caller that believes it is on first run still cannot
+                            // reach a vault that exists.
+                            let result = if hush_core::vault_exists(&dir) {
+                                WorkResult::Exists
+                            } else {
+                                let relay =
+                                    hush_core::config::resolve_relay_url(&dir, relay.as_deref());
+                                match Account::create(&dir, &passphrase, &relay).await {
+                                    Ok(mut a) => {
+                                        let named =
+                                            match name.as_deref().map(str::trim).filter(|n| !n.is_empty())
+                                            {
+                                                None => Ok(()),
+                                                Some(n) => a.set_vault_name(n).await,
+                                            };
+                                        match named {
+                                            Ok(()) => {
+                                                // Keep the plaintext copy of the
+                                                // relay in step. The vault's own
+                                                // copy is encrypted, so this is what
+                                                // a later run reads to know which
+                                                // relay the vault is on. A failure
+                                                // here costs that knowledge, not the
+                                                // vault, so it does not fail the
+                                                // creation.
+                                                let mut cfg = hush_core::config::load(&dir);
+                                                cfg.relay_url = Some(a.relay().to_string());
+                                                if let Err(e) = hush_core::config::save(&dir, &cfg)
+                                                {
+                                                    eprintln!(
+                                                        "hush-daemon: vault created but client-config.json was not written: {e}"
+                                                    );
+                                                }
+                                                // Deliberately left locked: the
+                                                // caller holds the passphrase and
+                                                // unlocks next, so creation does not
+                                                // become a second unlock path.
+                                                WorkResult::Created {
+                                                    recovery_code: a.take_pending_recovery_code(),
+                                                    vault_name: a.vault_name().to_string(),
+                                                    relay: a.relay().to_string(),
+                                                }
+                                            }
+                                            Err(e) => WorkResult::Err(e.to_string()),
+                                        }
+                                    }
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                }
                             };
                             (reply, result)
                         }
@@ -2073,6 +2149,27 @@ impl AccountWorker {
         self.call(|reply| Work::Unlock {
             dir,
             passphrase,
+            reply,
+        })
+        .await
+    }
+
+    /// Create a vault in `dir` for a first run. `WorkResult::Exists` when one is
+    /// already there, which is a refusal rather than a failure.
+    pub async fn create(
+        &self,
+        dir: &PathBuf,
+        passphrase: &str,
+        name: Option<String>,
+        relay: Option<String>,
+    ) -> WorkResult {
+        let dir = dir.clone();
+        let passphrase = passphrase.to_string();
+        self.call(|reply| Work::Create {
+            dir,
+            passphrase,
+            name,
+            relay,
             reply,
         })
         .await

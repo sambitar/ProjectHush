@@ -16,6 +16,19 @@ export interface StatusResponse {
   vault_name: string | null;
   /** Whether the relay path is switched to Tor (onion + SOCKS). */
   relay_tor: boolean;
+  /** Whether this device holds a vault at all. False is a first run: there is
+   * nothing to unlock yet, so the UI creates a vault instead. */
+  vault_present: boolean;
+}
+
+/** `POST /api/vault/create` — a vault created on this device.
+ *
+ * `recovery_code` is shown once and only here: the vault keeps a hash of it, so
+ * no later unlock can produce it again. `null` when the core had none to give. */
+export interface VaultCreateResponse {
+  recovery_code: string | null;
+  vault_name: string;
+  relay: string;
 }
 
 /** `GET /api/relay` — the relay switch's state, readable while locked.

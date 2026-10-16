@@ -140,11 +140,32 @@ struct StatusResponse {
     /// proxy). The prefs value while locked, the vault's applied value when
     /// unlocked.
     relay_tor: bool,
+    /// Whether this directory holds a vault at all. False means first run: the
+    /// UI offers to create one instead of asking for a passphrase that cannot
+    /// exist yet. Read from the directory, so it is known while locked.
+    vault_present: bool,
 }
 
 #[derive(Deserialize)]
 struct UnlockRequest {
     passphrase: String,
+}
+
+#[derive(Deserialize)]
+struct VaultCreateRequest {
+    passphrase: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    relay: Option<String>,
+}
+
+#[derive(Serialize)]
+struct VaultCreateResponse {
+    /// The recovery code, shown once. `None` when the core had none to hand over.
+    recovery_code: Option<String>,
+    vault_name: String,
+    relay: String,
 }
 
 #[derive(Deserialize)]
@@ -268,6 +289,7 @@ fn api_router(state: Arc<App>) -> Router {
     let mut router = Router::new()
         .route("/api/status", get(status))
         .route("/api/unlock", post(unlock))
+        .route("/api/vault/create", post(vault_create))
         .route("/api/lock", post(lock))
         .route("/api/change-passphrase", post(change_passphrase))
         .route("/api/mail/handle", post(set_mail_handle))
@@ -916,6 +938,7 @@ async fn status(State(state): State<Arc<App>>) -> Json<StatusResponse> {
         tcp_addr: state.tcp_addr.clone(),
         mail_handle,
         vault_name: vault_name.unwrap_or_else(|| hush_core::DEFAULT_VAULT_NAME.to_string()),
+        vault_present: hush_core::vault_exists(&state.dir),
     })
 }
 
@@ -931,6 +954,56 @@ async fn unlock(
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// First run: create this directory's vault.
+///
+/// A directory that already holds a vault is refused (409) rather than reopened
+/// or replaced, so a running app cannot be talked into overwriting an identity.
+/// The relay is the request's, else the effective one for this directory
+/// (`HUSH_RELAY_URL`, then client-config.json, then the default). It is written
+/// into client-config.json too: the vault's own copy is encrypted, so this
+/// plaintext one is what a later run reads to see which relay the vault is on.
+///
+/// Creating does not unlock. The caller still has the passphrase it just sent
+/// and calls `/api/unlock`, so there is one unlock path rather than two.
+async fn vault_create(
+    State(state): State<Arc<App>>,
+    Json(body): Json<VaultCreateRequest>,
+) -> Result<Json<VaultCreateResponse>, (StatusCode, String)> {
+    if hush_core::vault_exists(&state.dir) {
+        return Err((
+            StatusCode::CONFLICT,
+            "This device already has a vault. Unlock it instead.".into(),
+        ));
+    }
+    if body.passphrase.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "A vault needs a passphrase.".into()));
+    }
+    match state
+        .worker
+        .create(&state.dir, &body.passphrase, body.name.clone(), body.relay.clone())
+        .await
+    {
+        WorkResult::Created {
+            recovery_code,
+            vault_name,
+            relay,
+        } => Ok(Json(VaultCreateResponse {
+            recovery_code,
+            vault_name,
+            relay,
+        })),
+        WorkResult::Exists => Err((
+            StatusCode::CONFLICT,
+            "This device already has a vault. Unlock it instead.".into(),
+        )),
+        WorkResult::Err(message) => Err((StatusCode::BAD_REQUEST, message)),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The vault could not be created.".into(),
+        )),
     }
 }
 

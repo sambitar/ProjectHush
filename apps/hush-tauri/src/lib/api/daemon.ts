@@ -42,6 +42,7 @@ import type {
   AtprotoExploreDto,
   AtprotoRefreshDto,
   AtprotoDocumentFullDto,
+  VaultCreateResponse,
 } from "./types";
 
 type Transport =
@@ -152,6 +153,13 @@ export const api = {
     request<null>("/api/unlock", {
       method: "POST",
       body: JSON.stringify({ passphrase }),
+    }),
+  /** First run: create this device's vault. The daemon refuses (409) when a
+   * vault is already there, so this can never overwrite one. */
+  vaultCreate: (passphrase: string, name: string, relay: string) =>
+    request<VaultCreateResponse>("/api/vault/create", {
+      method: "POST",
+      body: JSON.stringify({ passphrase, name, relay }),
     }),
   lock: () => request<null>("/api/lock", { method: "POST" }),
   changePassphrase: (current_passphrase: string, new_passphrase: string) =>
