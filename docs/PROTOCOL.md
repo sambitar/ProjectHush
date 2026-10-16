@@ -19,6 +19,30 @@ Not a crypto paper. We use **Signal protocol (`libsignal`)** for 1:1 sessions. T
   - a receive **queue id** + **queue authorization secret** (so only the invited person can put blobs on that queue)
   - an optional **mail handle** (local part only, e.g. `sandy`) and **vault name** (e.g. `quiet-harbor`) — the label and suffix of this member's mail address, carried inside the invite
   - app/version so old clients fail clearly
+- **Invite encoding (v3 pointer, 2026-10-16).** The shared invite is a short
+  address-shaped code — `hush1…`, ~175 characters — that **names** the account
+  instead of carrying the bundle inline. bech32 (BIP-173 charset and checksum,
+  hand-rolled because the standard 90-character address cap does not fit a
+  ~100-byte payload) encodes: a version byte, a presence-flags byte, the
+  33-byte identity key (the code's "address" is its hex — the account id),
+  the 16-byte inbox queue id, the 32-byte delivery token, and optionally the
+  relay (omitted when it is the build's default relay), mail handle and vault
+  name. The peer accepting the code fetches the signed prekey record from the
+  relay's directory (`GET /k/{account_id}`) and verifies it against the
+  identity key the code pinned, so the relay can refuse to serve but cannot
+  forge or swap keys; the out-of-band channel that carried the code still
+  pins the identity. The delivery token travels in the code because it must
+  not be learnable from the name alone, or anyone who guessed a name could
+  write to that inbox. Publishing happens at vault creation and on every
+  unlock (64 one-time prekeys per publish, which also tops the pool back up);
+  an invite is therefore reusable — every holder can start a session, and the
+  directory hands each fetcher a different one-time prekey. Legacy invites
+  are still accepted by `add_contact`: a v2 string is plain JSON with
+  URL-safe base64 byte fields (~2,950 characters; v1 wrapped byte-array JSON
+  in base64 at ~9,200), and intro cards still carry a full v2 payload inline
+  because they ride an already-encrypted session and must not depend on the
+  directory at accept time. A string starting with `hush1` decodes as a
+  pointer first and falls back to the legacy readers.
 - Display names are local only.
 - The mail address is **not** a relay directory entry. `handle@vault-name` (`sandy@quiet-harbor`) is a human label exchanged out-of-band inside the invite; the relay never learns or resolves it, and there is no "look up a person by address" API. The suffix is the vault's own name, chosen when the vault is created (default `hush`); it is deliberately not a domain, because mail is members-only and nothing resolves it.
 
@@ -91,9 +115,12 @@ to (`account_id` *is* the hex of that key). Knowing a public account id therefor
 replace an account's prekeys. The route is per account rather than per `(account, device)` because
 there is only one device.
 
-This is not a multi-device feature: an invite already carries a prekey bundle inline, and the relay
-record is the same thing for a peer that has an account id but no invite. In the normal flow a
-session is established from the invite and the relay record is never fetched.
+This is not a multi-device feature: it is how a **pointer invite** (v3) works —
+the code names the account, and the directory record is the bundle. Vault
+creation and every unlock publish a fresh record (the publish also tops the
+one-time prekey pool up), so a peer that accepts a `hush1…` code always finds
+keys to fetch. A peer holding only an account id — no invite — can still fetch
+the same record, which is why the route is public.
 
 ### Migration limit (2026-10-08)
 

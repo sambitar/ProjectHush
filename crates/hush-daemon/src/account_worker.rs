@@ -798,13 +798,33 @@ impl AccountWorker {
                         } => {
                             let result = match Account::open(&dir, &passphrase).await {
                                 Ok(a) => {
-                                    // Nothing to publish on unlock: peers learn
-                                    // this account's inbox from its invite, and
-                                    // there is no device list to refresh. A
-                                    // rotated inbox cleared the cached invite in
-                                    // `finish_open`, so the next invite mints a
-                                    // fresh one.
                                     let mut a = a;
+                                    // Refresh this account's prekey directory
+                                    // record: the pointer invite names the
+                                    // account only, so a peer accepting it
+                                    // fetches the bundle from the relay. Each
+                                    // unlock mints a fresh pool of one-time
+                                    // prekeys (64), which is also what tops
+                                    // the pool back up after it drains.
+                                    //
+                                    // Best effort with a cap: a slow or dead
+                                    // relay must not hold the unlock reply,
+                                    // and failure only costs new contacts the
+                                    // one-time prekey half of the session.
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(20),
+                                        a.publish_prekeys(64),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(e)) => eprintln!(
+                                            "hush: prekey publish skipped: {e}"
+                                        ),
+                                        Err(_) => {
+                                            eprintln!("hush: prekey publish timed out")
+                                        }
+                                    }
                                     // Chat auto-delete: install the policy the
                                     // prefs file states and run it once — unlock
                                     // is when a daily rule catches up with the
@@ -871,6 +891,27 @@ impl AccountWorker {
                                                     eprintln!(
                                                         "hush-daemon: vault created but client-config.json was not written: {e}"
                                                     );
+                                                }
+                                                // First prekey publish: a brand new
+                                                // vault's pointer invite is only
+                                                // addable once the relay directory
+                                                // holds its record. Best effort —
+                                                // the caller can retry by unlocking
+                                                // (publish also runs there) or by
+                                                // re-adding the contact later.
+                                                match tokio::time::timeout(
+                                                    std::time::Duration::from_secs(20),
+                                                    a.publish_prekeys(64),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Ok(())) => {}
+                                                    Ok(Err(e)) => eprintln!(
+                                                        "hush: prekey publish skipped: {e}"
+                                                    ),
+                                                    Err(_) => {
+                                                        eprintln!("hush: prekey publish timed out")
+                                                    }
                                                 }
                                                 // Deliberately left locked: the
                                                 // caller holds the passphrase and

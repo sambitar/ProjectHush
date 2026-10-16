@@ -273,6 +273,7 @@ import {
 } from "./lib/drops/tauri";
 import { hueFromKey } from "./lib/hash";
 import { icon, type IconName } from "./lib/icons";
+import { relayMark } from "./lib/logo";
 import { avatarWithPresence, createAvatarEl, initialsFor } from "./components/ui/Avatar";
 import { RichTextEditor } from "./components/ui/RichTextEditor";
 import { ContactPicker } from "./components/ui/ContactPicker";
@@ -414,12 +415,34 @@ function torrentFileIcon(f: { mimetype: string | null; name: string }): IconName
   return "file";
 }
 
-/** An inline "working…" marker, shown while a vault blob is decrypted. */
-function spinner(): HTMLElement {
+/**
+ * The universal "working" markers.
+ *
+ * `busyMark` is the Relay Bridge running its signal wave — the inline form
+ * that sits where a static icon would (a torrent row decrypting a blob). It
+ * replaces the old generic ring spinner so every busy state carries the brand.
+ */
+function busyMark(sizePx = 18): HTMLElement {
   const el = document.createElement("span");
-  el.className = "spinner";
+  el.className = "busy-mark";
   el.setAttribute("aria-hidden", "true");
+  el.appendChild(relayMark(sizePx, "busy"));
   return el;
+}
+
+/**
+ * The centered pane-level form: the busy mark beside one line saying what is
+ * happening. Pane loading used to be bare muted text, which read as a glitch
+ * on a slow round trip; this is the app's answer everywhere.
+ */
+function busyNote(text: string): HTMLElement {
+  const note = document.createElement("div");
+  note.className = "busy-note";
+  note.appendChild(busyMark(22));
+  const label = document.createElement("span");
+  label.textContent = text;
+  note.appendChild(label);
+  return note;
 }
 
 /** Human wording for the Tor state. Accurate, not reassuring. */
@@ -657,7 +680,7 @@ export class App {
   /**
    * Blob id of the Library file currently being decrypted out of the vault for
    * an open or export. Decrypting a multi-GB file is not instant, so the row
-   * shows a spinner and its actions are disabled rather than looking inert.
+   * shows the busy mark and its actions are disabled rather than looking inert.
    */
   private torrentsBusyBlob: string | null = null;
   /** Dismisses the "Decrypting…" toast when the busy action settles. */
@@ -906,6 +929,9 @@ export class App {
   private zinesPenNameOpen = false;
   private zinesPenNameDraft = "";
   private zinesPenNameError: string | null = null;
+  /** True while the pen-name save is in flight: the modal's controls sit out
+   *  and the save button runs the busy mark instead of looking dead. */
+  private zinesPenNameBusy = false;
   private zinesForgetId: string | null = null;
   /**
    * The share dialog: which post's read key is being handed out, and to whom.
@@ -1915,7 +1941,7 @@ export class App {
     ring.className = "logo-ring breathe";
     const mark = document.createElement("div");
     mark.className = "logo-mark";
-    mark.appendChild(icon("vault"));
+    mark.appendChild(relayMark(64));
     logoWrap.append(ring, mark);
     const title = document.createElement("h1");
     title.className = "text-28";
@@ -2003,7 +2029,12 @@ export class App {
         const history = await api.messages();
         if (history) loadHistory(history);
         await this.maybeShowRecoveryCode();
+        // Snapshot the mark's place while the lock card is still mounted;
+        // after the main screen takes over, it flies to the rail.
+        const markEl = logoWrap.querySelector("svg") ?? logoWrap;
+        const from = markEl.getBoundingClientRect();
         this.render();
+        if (!this.recoveryModalCode) this.flyMarkToRail(from);
       } catch (e) {
         card.classList.add("shake");
         setTimeout(() => card.classList.remove("shake"), 300);
@@ -2012,11 +2043,13 @@ export class App {
           e instanceof AppError ? e.message : "That passphrase didn't work. Try again.";
       }
     };
-    const daemon = document.createElement("p");
-    daemon.className = "faint text-12";
-    daemon.style.marginTop = "var(--space-4)";
-    daemon.textContent = getApiBase();
-    card.append(logoWrap, title, hint, pass, showRow, torRow, err, btn, daemon);
+    // Enter in the passphrase field presses Unlock — the lock screen is a
+    // single field, so the keyboard path is the whole form.
+    pass.onkeydown = (e) => {
+      if (e.key === "Enter") btn.click();
+    };
+    pass.focus();
+    card.append(logoWrap, title, hint, pass, showRow, torRow, err, btn);
     wrap.appendChild(card);
     return wrap;
   }
@@ -2046,7 +2079,7 @@ export class App {
     ring.className = "logo-ring breathe";
     const mark = document.createElement("div");
     mark.className = "logo-mark";
-    mark.appendChild(icon("vault"));
+    mark.appendChild(relayMark(64));
     logoWrap.append(ring, mark);
     const title = document.createElement("h1");
     title.className = "text-28";
@@ -2061,7 +2094,6 @@ export class App {
     name.placeholder = "Vault name";
     name.autocomplete = "off";
     name.spellcheck = false;
-    name.value = this.status?.vault_name ?? "";
     name.style.marginTop = "var(--space-4)";
     const nameHint = document.createElement("p");
     nameHint.className = "faint text-12";
@@ -2094,18 +2126,29 @@ export class App {
     };
     showRow.append(showCb, document.createTextNode("Show passphrase"));
 
-    const relay = document.createElement("input");
-    relay.className = "input-field";
-    relay.placeholder = "Relay";
-    relay.autocomplete = "off";
-    relay.spellcheck = false;
-    relay.value = this.status?.relay ?? "";
-    relay.style.marginTop = "var(--space-4)";
-    const relayHint = document.createElement("p");
-    relayHint.className = "faint text-12";
-    relayHint.style.marginTop = "6px";
-    relayHint.textContent =
-      "Mail travels through this relay, and both sides have to name the same one.";
+    // The nickname: the local part of this member's address, chosen here so
+    // the address is complete the moment the vault exists. Optional — the
+    // Settings "Address" panel can set it later.
+    const mail = document.createElement("input");
+    mail.className = "input-field";
+    mail.placeholder = "Nickname";
+    mail.autocomplete = "off";
+    mail.spellcheck = false;
+    mail.maxLength = 64;
+    mail.style.marginTop = "var(--space-4)";
+    const mailHint = document.createElement("p");
+    mailHint.className = "faint text-12";
+    mailHint.style.marginTop = "6px";
+    mailHint.textContent = "You'll be reachable at this nickname @ your vault name.";
+    const mailPreview = () => {
+      const local = mail.value.trim().toLowerCase();
+      const vault = name.value.trim().toLowerCase() || "vault";
+      mailHint.textContent = local
+        ? `Your address: ${local}@${vault}`
+        : "You'll be reachable at this nickname @ your vault name.";
+    };
+    mail.oninput = mailPreview;
+    name.oninput = mailPreview;
 
     const err = document.createElement("p");
     err.className = "text-13";
@@ -2128,16 +2171,24 @@ export class App {
         err.textContent = "The two passphrases don't match.";
         return;
       }
+      // Same rule the Settings "Address" panel enforces, so a handle accepted
+      // here can never be rejected there later.
+      const mailName = mail.value.trim().toLowerCase();
+      if (mailName && !/^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/.test(mailName)) {
+        err.hidden = false;
+        err.textContent =
+          "That nickname won't work: use 1–64 lowercase letters, digits, dot, dash, or underscore; no leading or trailing separator.";
+        return;
+      }
       btn.disabled = true;
       try {
-        const created = await api.vaultCreate(
-          phrase,
-          name.value.trim(),
-          relay.value.trim(),
-        );
+        const created = await api.vaultCreate(phrase, name.value.trim());
         // Creation leaves the vault locked and the passphrase is already in hand,
         // so unlocking follows rather than being asked for a second time.
         await api.unlock(phrase);
+        // The address is completed while the vault is unlocked: the handle is
+        // a separate daemon setting, not part of vault creation.
+        if (mailName) await api.setMailHandle(mailName);
         pass.value = "";
         confirm.value = "";
         this.unlockedAt = Date.now();
@@ -2151,7 +2202,12 @@ export class App {
         // hash of it, so a later unlock cannot show it again. Setting it before
         // the render is what puts the modal on screen.
         if (created?.recovery_code) this.recoveryModalCode = created.recovery_code;
+        // Same unlock transformation as the returning-user flow; skipped when
+        // the recovery code takes the stage instead (first run shows it once).
+        const markEl = logoWrap.querySelector("svg") ?? logoWrap;
+        const from = markEl.getBoundingClientRect();
         this.render();
+        if (!this.recoveryModalCode) this.flyMarkToRail(from);
       } catch (e) {
         card.classList.add("shake");
         setTimeout(() => card.classList.remove("shake"), 300);
@@ -2161,25 +2217,28 @@ export class App {
         btn.disabled = false;
       }
     };
+    // Enter submits from any field: the create screen is a form even without
+    // a <form> element.
+    for (const el of [name, mail, pass, confirm]) {
+      el.onkeydown = (e) => {
+        if (e.key === "Enter") btn.click();
+      };
+    }
+    name.focus();
 
-    const daemon = document.createElement("p");
-    daemon.className = "faint text-12";
-    daemon.style.marginTop = "var(--space-4)";
-    daemon.textContent = getApiBase();
     card.append(
       logoWrap,
       title,
       hint,
       name,
       nameHint,
+      mail,
+      mailHint,
       pass,
       confirm,
       showRow,
-      relay,
-      relayHint,
       err,
       btn,
-      daemon,
     );
     wrap.appendChild(card);
     return wrap;
@@ -2290,7 +2349,7 @@ export class App {
       this.settingsSection = "relay";
       this.render();
     };
-    shield.appendChild(icon("vault"));
+    shield.appendChild(relayMark(26, "state"));
     this.updateTorPillInto(shield);
     rail.appendChild(shield);
     // Rail order: the everyday conversation surfaces first — chats, then
@@ -2960,6 +3019,58 @@ export class App {
     // tooltip.
     el.setAttribute("aria-label", alt);
     el.title = alt;
+  }
+
+  /**
+   * The unlock transformation: the Relay Bridge mark lifts out of the lock
+   * card and flies to its post at the top of the rail, landing as the
+   * connection light with one green pulse. The rail mark is already lit
+   * underneath — the flying copy just hands the story over.
+   *
+   * `from` is the lock-card mark's rect, captured while that card is still
+   * mounted. Skipped under reduced motion (the render is its own answer) or
+   * when the rail mark is not on screen.
+   */
+  private flyMarkToRail(from: DOMRect | null): void {
+    const to = this.root.querySelector<SVGElement>(".relay-shield svg");
+    if (!from || !to || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      return;
+    }
+    const toRect = to.getBoundingClientRect();
+    if (toRect.width === 0 || from.width === 0) return;
+
+    const flyer = relayMark(Math.round(from.width), "brand");
+    flyer.style.position = "fixed";
+    flyer.style.left = `${from.left}px`;
+    flyer.style.top = `${from.top}px`;
+    flyer.style.zIndex = "999";
+    flyer.style.pointerEvents = "none";
+    document.body.appendChild(flyer);
+
+    // Translate between the two centres and shrink onto the rail mark;
+    // transform-origin is the centre, so centre-to-centre is the whole sum.
+    const dx = toRect.left + toRect.width / 2 - (from.left + from.width / 2);
+    const dy = toRect.top + toRect.height / 2 - (from.top + from.height / 2);
+    const scale = toRect.width / from.width;
+    const flight = flyer.animate(
+      [
+        { transform: "translate(0, 0) scale(1)", opacity: 1 },
+        {
+          transform: `translate(${dx}px, ${dy}px) scale(${scale})`,
+          opacity: 1,
+          offset: 0.75,
+        },
+        { transform: `translate(${dx}px, ${dy}px) scale(${scale})`, opacity: 0 },
+      ],
+      { duration: 650, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" },
+    );
+    flight.onfinish = () => {
+      flyer.remove();
+      const shield = this.root.querySelector<HTMLElement>(".relay-shield");
+      if (!shield || shield.classList.contains("relay-land")) return;
+      shield.classList.add("relay-land");
+      window.setTimeout(() => shield.classList.remove("relay-land"), 700);
+    };
   }
 
   /** Flip the relay switch. The onion address is not asked for here — it is
@@ -4741,9 +4852,8 @@ export class App {
     if (!s || s.conclaveId !== conclaveId) {
       // (Re)entering the tab: open the paper. Until it resolves the surface
       // shows a quiet placeholder, then one re-render swaps in the editor.
-      const loading = document.createElement("div");
-      loading.className = "paper-pane paper-pane-loading muted text-13";
-      loading.textContent = "Opening paper…";
+      const loading = busyNote("Opening paper…");
+      loading.classList.add("paper-pane", "paper-pane-loading");
       void openPaper(conclaveId)
         .then(() => {
           if (this.conclaveTab === "paper" && this.conclaveId === conclaveId) {
@@ -6474,9 +6584,8 @@ export class App {
     const busy = this.atprotoExploreBusy;
 
     if (busy && !entries.length) {
-      const loading = document.createElement("p");
-      loading.className = "muted text-13 atproto-explore-empty";
-      loading.textContent = "Looking…";
+      const loading = busyNote("Looking…");
+      loading.classList.add("atproto-explore-empty");
       modal.appendChild(loading);
     } else if (!entries.length) {
       const empty = document.createElement("p");
@@ -7074,12 +7183,17 @@ export class App {
   }
 
   private async zinesSavePenName(): Promise<void> {
+    if (this.zinesPenNameBusy) return;
     const name = this.zinesPenNameDraft.trim();
     if (!name) {
       this.zinesPenNameError = "A pen name needs a byline.";
       this.render();
       return;
     }
+    // Minting the pen name's key and sealing it into the vault takes a moment;
+    // the modal says so instead of sitting there looking frozen.
+    this.zinesPenNameBusy = true;
+    this.render();
     try {
       const view = await api.zinesSetPenName(name);
       if (view) this.zinesView = view;
@@ -7094,6 +7208,8 @@ export class App {
     } catch (e) {
       this.zinesPenNameError =
         e instanceof AppError ? e.message : "Couldn't set that pen name.";
+    } finally {
+      this.zinesPenNameBusy = false;
     }
     if (this.rail === "zines") this.render();
   }
@@ -7304,9 +7420,8 @@ export class App {
       return page;
     }
     if (this.zinesLoading && !this.zinesView) {
-      const loading = document.createElement("p");
-      loading.className = "zines-note muted text-13";
-      loading.textContent = "Loading…";
+      const loading = busyNote("Loading…");
+      loading.classList.add("zines-note");
       page.appendChild(loading);
       return page;
     }
@@ -7667,9 +7782,8 @@ export class App {
       } else if (this.atprotoDetail?.uri === id) {
         reader.appendChild(this.renderAtprotoDocument(this.atprotoDetail));
       } else {
-        const loading = document.createElement("p");
-        loading.className = "zines-note muted text-13";
-        loading.textContent = "Opening…";
+        const loading = busyNote("Opening…");
+        loading.classList.add("zines-note");
         reader.appendChild(loading);
       }
       page.appendChild(reader);
@@ -7686,9 +7800,8 @@ export class App {
     }
     const detail = this.zinesDetail;
     if (!detail || detail.zine.descriptor.zine_id !== id) {
-      const loading = document.createElement("p");
-      loading.className = "zines-note muted text-13";
-      loading.textContent = "Opening…";
+      const loading = busyNote("Opening…");
+      loading.classList.add("zines-note");
       reader.appendChild(loading);
       page.appendChild(reader);
       return page;
@@ -8349,6 +8462,7 @@ export class App {
     input.className = "zine-pen-input";
     input.placeholder = "How you sign your work";
     input.value = this.zinesPenNameDraft;
+    input.disabled = this.zinesPenNameBusy;
     input.oninput = () => {
       this.zinesPenNameDraft = input.value;
       this.zinesPenNameError = null;
@@ -8374,13 +8488,21 @@ export class App {
     const save = document.createElement("button");
     save.type = "button";
     save.className = "btn-primary pressable";
-    save.textContent = "Save";
+    if (this.zinesPenNameBusy) {
+      save.disabled = true;
+      save.appendChild(busyMark(14));
+      save.appendChild(document.createTextNode("Saving…"));
+    } else {
+      save.textContent = "Save";
+    }
     save.onclick = () => void this.zinesSavePenName();
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn-secondary pressable";
     cancel.textContent = "Cancel";
+    cancel.disabled = this.zinesPenNameBusy;
     cancel.onclick = () => {
+      if (this.zinesPenNameBusy) return;
       this.zinesPenNameOpen = false;
       this.zinesPenNameError = null;
       this.render();
@@ -8390,7 +8512,7 @@ export class App {
 
     back.appendChild(modal);
     back.onclick = (e) => {
-      if (e.target === back) {
+      if (e.target === back && !this.zinesPenNameBusy) {
         this.zinesPenNameOpen = false;
         this.zinesPenNameError = null;
         this.render();
@@ -9267,9 +9389,8 @@ export class App {
       col.appendChild(err);
     }
     if (this.readsLoading && !this.readsStories.length) {
-      const loading = document.createElement("p");
-      loading.className = "reads-status muted text-13";
-      loading.textContent = "Loading…";
+      const loading = busyNote("Loading…");
+      loading.classList.add("reads-status");
       col.appendChild(loading);
       return col;
     }
@@ -9297,9 +9418,8 @@ export class App {
       col.appendChild(more);
     }
     if (this.readsLoading && this.readsStories.length) {
-      const loading = document.createElement("p");
-      loading.className = "reads-status muted text-13";
-      loading.textContent = "Loading…";
+      const loading = busyNote("Loading…");
+      loading.classList.add("reads-status");
       col.appendChild(loading);
     }
     return col;
@@ -9381,9 +9501,8 @@ export class App {
     const s = detail?.story ?? this.readsStories.find((x) => x.id === id);
     if (!s) {
       if (this.readsDetailLoading) {
-        const loading = document.createElement("p");
-        loading.className = "reads-status muted text-13";
-        loading.textContent = "Loading…";
+        const loading = busyNote("Loading…");
+        loading.classList.add("reads-status");
         main.appendChild(loading);
         return main;
       }
@@ -9472,9 +9591,8 @@ export class App {
 
     // Discussion view: the story's own text (Ask HN) above the comment tree.
     if (!detail) {
-      const loading = document.createElement("p");
-      loading.className = "reads-status muted text-13";
-      loading.textContent = "Loading…";
+      const loading = busyNote("Loading…");
+      loading.classList.add("reads-status");
       main.appendChild(loading);
       return main;
     }
@@ -12696,7 +12814,7 @@ export class App {
     // No onOpen: the file row is not a control. Opening is one of the two
     // buttons below, so a click on the name does nothing surprising.
     const el = this.libraryItemShell(
-      busy ? spinner() : torrentFileIcon(f),
+      busy ? busyMark() : torrentFileIcon(f),
       f.name,
       busy ? "Decrypting…" : formatBytes(f.size),
     );
@@ -13753,9 +13871,8 @@ export class App {
     }
 
     if (this.notesLoading && !this.notesState) {
-      const loading = document.createElement("div");
-      loading.className = "muted text-13 notes-loading";
-      loading.textContent = "Loading notes…";
+      const loading = busyNote("Loading notes…");
+      loading.classList.add("notes-loading");
       pane.appendChild(loading);
       return pane;
     }
@@ -14478,9 +14595,7 @@ export class App {
         this.dropInboxKey = k;
         if (this.settingsSection === "drops") this.render();
       });
-      const loading = document.createElement("p");
-      loading.className = "muted text-13";
-      loading.textContent = "Loading…";
+      const loading = busyNote("Loading…");
       body.appendChild(loading);
       return;
     }
@@ -14778,10 +14893,11 @@ export class App {
         try {
           const inv = await api.invite();
           if (!inv?.invite) throw new Error("empty invite");
-          // The invite carries a Kyber1024 prekey, so it encodes to ~9 kB of
-          // base64 — well past the ~3 kB a QR code holds at its lowest error
-          // correction. A QR is therefore never drawn for it: the code itself is
-          // the artefact, shown in full so it can be read or copied by hand.
+          // The pointer invite names the account only (~175 characters,
+          // `hush1…` like an address): the prekey bundle is fetched from the
+          // relay's directory when the peer accepts it. Short enough to read
+          // in full, so the code itself is the artefact — a QR would fit it
+          // easily, but needs a rendering library the app does not carry yet.
           const label = document.createElement("p");
           label.className = "text-13 muted";
           label.style.marginBottom = "var(--space-2)";
@@ -14789,11 +14905,11 @@ export class App {
           const code = document.createElement("textarea");
           code.className = "input-field invite-code";
           code.readOnly = true;
-          code.rows = 4;
+          code.rows = 2;
           code.value = inv.invite;
           code.setAttribute("aria-label", "Your invitation code");
-          // Selecting on focus is the only practical way to grab a string this
-          // long; the copy button is the fast path.
+          // Selecting on focus is the only practical way to grab the whole
+          // string; the copy button is the fast path.
           code.onfocus = () => code.select();
           const copy = document.createElement("button");
           copy.className = "btn-secondary pressable";
@@ -14809,7 +14925,7 @@ export class App {
           const note = document.createElement("p");
           note.className = "text-13 muted";
           note.textContent =
-            "Anyone with this code can start a chat with you. Single use.";
+            "Anyone with this code can start a chat with you. It keeps working for everyone you share it with.";
           inner.append(label, code, copy, note);
         } catch {
           inner.textContent = "Couldn't load invite";
@@ -14838,8 +14954,8 @@ export class App {
         invText.textContent = "Their invitation code";
         const inv = document.createElement("textarea");
         inv.className = "input-field invite-code";
-        inv.rows = 3;
-        inv.placeholder = "Paste the code they sent you";
+        inv.rows = 2;
+        inv.placeholder = "Paste their code — starts with hush1";
         inv.spellcheck = false;
         invField.append(invText, inv);
 

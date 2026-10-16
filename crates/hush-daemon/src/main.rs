@@ -8794,7 +8794,11 @@ mod paper_api_tests {
         let mut peer = hush_core::Account::create(peer_dir.path(), "pw", "http://127.0.0.1:9")
             .await
             .unwrap();
-        let invite = peer.invite().await.unwrap();
+        // A full v2 invite, not the pointer: this test's relay is a dead
+        // address on purpose, and a pointer add resolves the bundle from the
+        // relay's directory, which needs the network. The full payload carries
+        // everything inline, so the add stays offline.
+        let invite = peer.fresh_invite().await.unwrap();
         assert!(matches!(
             app.worker
                 .add_contact("peer", &invite, TrusteeReach::Full)
