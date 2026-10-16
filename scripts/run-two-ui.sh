@@ -191,6 +191,12 @@ else
   echo "Building UI (Vite)…"
   (cd "${ROOT}/apps/hush-tauri" && npm run build)
   echo "Building the desktop binary and the daemon…"
+  # Tauri resolves `bundle.externalBin` to a triple-named file beside the
+  # frontend and refuses to compile the app without it, so the daemon is staged
+  # first — in the profile this run already builds, so the copy costs no extra
+  # build. Dev mode runs `tauri dev`, which compiles the app too, so it stages
+  # as well.
+  "${ROOT}/scripts/stage-daemon-sidecar.sh" --profile "$PROFILE"
   cargo build -p hush-tauri
   cargo build "${DAEMON_CARGO_FLAGS[@]}" -p hush-daemon
 fi

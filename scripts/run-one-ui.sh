@@ -153,6 +153,10 @@ fi
 echo "Building UI (Vite) and desktop binary…"
 hush_ensure_node_modules "$ROOT/apps/hush-tauri"
 (cd apps/hush-tauri && npm run build)
+# Tauri resolves `bundle.externalBin` to a triple-named file beside the frontend
+# and refuses to compile the app without it, so the daemon is staged first — in
+# the profile this run already builds, so the copy costs no extra build.
+"$ROOT/scripts/stage-daemon-sidecar.sh" --profile "$DAEMON_PROFILE"
 cargo build -p hush-relay -p hush-tauri -p hush-cli
 # The daemon runs in release. Its vault store encrypts multi-GB torrent files
 # chunk by chunk, and AEAD is ~40x slower in a debug build (measured 1.7 MiB/s

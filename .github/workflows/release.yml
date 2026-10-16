@@ -29,15 +29,19 @@ jobs:
         include:
           - platform: macos-latest
             # Apple Silicon.
+            target: aarch64-apple-darwin
             args: "--target aarch64-apple-darwin"
           - platform: macos-latest
             # Intel.
+            target: x86_64-apple-darwin
             args: "--target x86_64-apple-darwin"
           - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
             # The AppImage is the only Linux bundle the updater can replace in
             # place; the deb is published alongside it for a first install.
             args: "--bundles appimage,deb"
           - platform: windows-latest
+            target: x86_64-pc-windows-msvc
             # One Windows installer type only, so the updater manifest cannot
             # disagree with how a copy was installed. See RELEASING.md.
             args: "--bundles nsis"
@@ -62,7 +66,19 @@ jobs:
             file \
             libxdo-dev \
             libssl-dev \
-            libayatana-appindicator3-dev
+            libayatana-appindicator3-dev \
+            protobuf-compiler
+
+      # The app itself does not link hush-core, so it has never needed protoc.
+      # The daemon does, through libsignal's build script, and the bundle now
+      # carries the daemon — so every leg needs protoc before it builds anything.
+      - name: install protoc (macOS)
+        if: startsWith(matrix.platform, 'macos')
+        run: brew install protobuf
+
+      - name: install protoc (Windows)
+        if: matrix.platform == 'windows-latest'
+        run: choco install protoc --no-progress -y
 
       - name: setup Node
         uses: actions/setup-node@v4
@@ -89,6 +105,15 @@ jobs:
       - name: install frontend dependencies
         working-directory: apps/hush-tauri
         run: npm ci
+
+      # `bundle.externalBin` is what puts the daemon inside the bundle, and
+      # `tauri-build` refuses to compile the app without the triple-named file it
+      # resolves to, so the daemon is staged before the build rather than beside
+      # it. `shell: bash` because the script is bash on every platform; the
+      # Windows leg gets the `.exe` suffix from the script, not from here.
+      - name: stage the daemon sidecar
+        shell: bash
+        run: ./scripts/stage-daemon-sidecar.sh --target ${{ matrix.target }} --profile release
 
       - name: build and publish
         uses: tauri-apps/tauri-action@v0

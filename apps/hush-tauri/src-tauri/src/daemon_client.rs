@@ -35,31 +35,45 @@ pub enum Transport {
     Tcp { base: String },
 }
 
-/// Resolve the transport from the environment, matching `hush_core::config`
-/// precedence for the socket path: `HUSH_API_URL` > `HUSH_DAEMON_SOCKET` >
-/// runtime-dir default.
-pub fn transport_from_env() -> Transport {
+/// The transport named by the environment, if any.
+///
+/// The run scripts set one, and so does anyone who starts a daemon by hand. A
+/// bundled copy of the app has neither, and starts its own daemon instead — see
+/// `daemon_supervisor`, which uses this to keep one owner per socket.
+pub fn env_transport() -> Option<Transport> {
     if let Ok(url) = std::env::var("HUSH_API_URL") {
         let url = url.trim().to_string();
         if let Some(path) = url.strip_prefix("unix://") {
-            return Transport::Unix {
+            return Some(Transport::Unix {
                 path: path.to_string(),
-            };
+            });
         }
         if !url.is_empty() {
-            return Transport::Tcp { base: url };
+            return Some(Transport::Tcp { base: url });
         }
     }
     if let Ok(path) = std::env::var("HUSH_DAEMON_SOCKET") {
         if !path.trim().is_empty() {
-            return Transport::Unix {
+            return Some(Transport::Unix {
                 path: path.trim().to_string(),
-            };
+            });
         }
     }
+    None
+}
+
+/// Where a daemon on this machine is reached when nothing says otherwise.
+pub fn default_transport() -> Transport {
     Transport::Unix {
         path: default_socket_path().display().to_string(),
     }
+}
+
+/// Resolve the transport from the environment, matching `hush_core::config`
+/// precedence for the socket path: `HUSH_API_URL` > `HUSH_DAEMON_SOCKET` >
+/// runtime-dir default.
+pub fn transport_from_env() -> Transport {
+    env_transport().unwrap_or_else(default_transport)
 }
 
 /// Mirror of `hush_core::paths::default_runtime_dir` — kept in sync deliberately

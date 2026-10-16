@@ -7,6 +7,39 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — Bundling the daemon as a Tauri sidecar: one rejected flag, one build-time coupling
+
+### `cargo build --profile debug` is rejected, and the stager's first version used it [FIXED]
+
+- Attempted: a staging script that runs `cargo build --profile "$PROFILE"` with
+  `PROFILE=debug`, so one flag shape covered both profiles.
+- Symptom: `error: profile name 'debug' is reserved / To configure the default
+  development profile, use the name 'dev' as in [profile.dev]`. The output directory
+  is `target/debug` regardless, so the flag and the directory disagree by design.
+- Resolution: the flag is built from the profile — empty for `debug`, `--profile
+  release` for `release` — and the copy still reads `target/debug`. The script
+  writes the decision down where the next reader will hit it.
+- Lesson: cargo's profile *flag* and profile *directory* are not the same name.
+  Tooling-related, not a repo problem.
+
+### `bundle.externalBin` makes the daemon a build-time dependency of the app [WORKED AROUND]
+
+- Attempted: add the daemon to the bundle by naming it in `bundle.externalBin` and
+  spawn it from the app, expecting the file to be needed only when a bundle is
+  packaged.
+- Symptom: `cargo check -p hush-tauri` fails outright —
+  `resource path 'binaries/hush-daemon-x86_64-unknown-linux-gnu' doesn't exist` —
+  because `tauri-build` resolves and validates the entry during compilation. That
+  silently makes `cargo test --workspace`, a fresh clone, every run script and every
+  CI leg depend on a built daemon first. The message names the file but not the fix.
+- Resolution: `scripts/stage-daemon-sidecar.sh` builds the daemon and copies it
+  under the triple-name Tauri looks for; the run scripts call it with the profile
+  they already build, the release workflow calls it per matrix leg (and now installs
+  `protoc` on all three platforms, because the daemon links `hush-core` and the app
+  does not), and the README's test section says to run it once after cloning.
+- Lesson: a Tauri sidecar is a compile-time dependency, not a packaging step. Check
+  what `tauri-build` validates before assuming a config entry only affects bundling.
+
 ## 2026-10-16 — The sweep for the clinic's real hostname answered with 8075 license URLs
 
 ### A repo-wide URL grep was read as "no app hostnames here" [FIXED]
