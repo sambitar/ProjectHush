@@ -76,6 +76,25 @@ button {
   color: var(--text-faint);
 }
 
+/* The universal busy note: the Relay Bridge with its signal wave
+ * (`relayMark(n, "busy")`) plus one line saying what is happening. Every pane
+ * that used to print bare "Loading…" text shows this instead, so a slow step
+ * reads as the relay working rather than the app having frozen. */
+.busy-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-6) var(--space-4);
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.busy-mark {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
 .sr-only {
   position: absolute;
   width: 1px;

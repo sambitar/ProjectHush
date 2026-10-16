@@ -24,8 +24,8 @@
 
 .logo-wrap {
   position: relative;
-  width: 72px;
-  height: 72px;
+  width: 104px;
+  height: 104px;
   margin: 0 auto var(--space-4);
 }
 
@@ -38,8 +38,8 @@
 }
 
 .logo-mark {
-  width: 72px;
-  height: 72px;
+  width: 104px;
+  height: 104px;
   border-radius: 50%;
   background: var(--accent-soft);
   display: flex;
