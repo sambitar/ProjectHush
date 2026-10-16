@@ -90,15 +90,20 @@ cargo run -p hush-cli -- --help
 
 Both sides point at the same relay, and the relay carries the mail; the two vaults
 never talk to each other directly. Each side runs one command, and the first run
-creates the vault it needs:
+creates the vault it needs. The relay URL is printed by the first of these:
 
 ```
+./scripts/relay-tunnel-url.sh              # prints the HTTPS relay that is live now
+
 # one side: a new vault on the shared relay, then the window
 ./scripts/run-one-ui.sh --relay https://<tunnel-host>
 
 # the other side: two vaults, both on the same relay
 ./scripts/run-two-ui.sh --relay https://<tunnel-host>
 ```
+
+The second person needs the URL, not the script: `relay-tunnel-url.sh` reaches the
+lab box over SSH, so whoever hands the URL out runs it.
 
 Then exchange invites inside the app: **Copy my invite** on one side, **Add
 contact** on the other. The relay address in the vault is what makes that work, so
@@ -119,11 +124,12 @@ the way it ships.
 
 `<tunnel-host>` is a `trycloudflare.com` name minted when
 `cloudflared-hush-quick.service` on the box last restarted, so it changes and it
-expires: read the current one with the command in `docs/ops/relay-lab-vps.md`, which
-also has the durable alternatives (a Public Hostname on the named `hush` tunnel, or
-TLS on the box itself). A vault stores the relay it was created against, so a vault
-made against a dead hostname has to be repointed. Set `HUSH_CLOUD_RELAY_URL` to move
-the default the scripts fall back to.
+expires. `./scripts/relay-tunnel-url.sh` prints the one that is live now and checks
+it; `--refresh` re-mints it if it has died. The durable alternatives — a Public
+Hostname on the named `hush` tunnel, or TLS on the box — are in
+`docs/ops/relay-lab-vps.md`. A vault stores the relay it was created against, so a
+vault made against a dead hostname has to be repointed. Set `HUSH_CLOUD_RELAY_URL` to
+move the default the scripts fall back to.
 
 ## Relays
 

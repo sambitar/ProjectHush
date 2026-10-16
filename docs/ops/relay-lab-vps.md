@@ -132,7 +132,9 @@ ssh -i /home/sam/.ssh/alhakim_deploy root@137.184.129.205 \
    | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1"
 ```
 
-Verified 2026-10-16 with `https://bolt-heroes-mailed-grass.trycloudflare.com`:
+Verified 2026-10-16 against the then-current hostname
+`bolt-heroes-mailed-grass.trycloudflare.com` (now itself dead — it was superseded
+by a later restart):
 
 ```
 /health        200, ssl_verify_result=0 (publicly trusted, so webpki-roots accepts it)
@@ -143,6 +145,27 @@ Verified 2026-10-16 with `https://bolt-heroes-mailed-grass.trycloudflare.com`:
 `HUSH_RELAY_URL=https://<hostname> ./scripts/smoke-relay-lab.sh` passes end to end
 through it: both vaults record the relay, invite/contact exchange completes, a mail
 is queued and received, and the reply comes back.
+
+**`scripts/relay-tunnel-url.sh` reports the live URL** and checks it, so nobody has
+to run the SSH command above by hand:
+
+```
+$ ./scripts/relay-tunnel-url.sh
+relay: https://screenshot-threats-bodies-aug.trycloudflare.com  (/health 200)
+
+$ ./scripts/relay-tunnel-url.sh --refresh      # re-mint after it dies
+```
+
+It reads the hostname from the connector's **current pid** on purpose: the journal
+still holds the previous process's hostname, and `journalctl -n 200 | tail -1` hands
+that stale name back — which is exactly the failure mode this box has produced
+three times. It then makes a real `/health` request before printing anything.
+
+A restart mints a new hostname **and kills the old one**: the name in use before a
+refresh answered `530` (Cloudflare's "tunnel not found") afterwards. So a URL handed
+to someone is good until the next restart of the unit, no longer. A vault stores the
+relay it was created against, so a vault pointed at a dead URL needs
+`hush-cli --dir <vault> relay set --url <new url>`.
 
 A **release** client accepts this URL — which is the point of the whole exercise:
 
