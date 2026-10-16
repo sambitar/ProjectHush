@@ -50,7 +50,7 @@ pub use chat_log::{
     MailAttachmentRecord, MailState,
 };
 pub use error::Error;
-pub use invite::InvitePayload;
+pub use invite::{InvitePayload, ShortInvite};
 pub use mail::{
     format_address, normalize_handle, normalize_vault_name, DEFAULT_VAULT_NAME, MAX_HANDLE_LEN,
 };

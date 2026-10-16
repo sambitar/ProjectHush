@@ -93,6 +93,9 @@ async fn reach_announcement_narrows_the_peer() {
         .set_contact_reach("bob", TrusteeReach::MailOnly)
         .await
         .unwrap();
+    // The announcement is queued, not delivered inline: the sender flushes
+    // it the way the daemon's outbox timer does.
+    assert_eq!(alice.retry_pending_reach().await.unwrap(), 1);
 
     // Bob drains the announcement. It is the only thing in his queue, because
     // Alice's `add_contact` grant already went out before the reach change.
@@ -243,6 +246,38 @@ async fn reach_survives_reopen() {
         reopened.send_text("bob", "hi").await,
         Err(Error::ReachMailOnly)
     ));
+}
+
+/// A reach change is recorded even when the relay is unreachable, and the
+/// queued announcement goes out on a later drain — the user's toggle never
+/// waits on the relay for it, and the peer still converges.
+#[tokio::test]
+async fn a_reach_change_queues_and_delivers_when_the_relay_returns() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let (mut alice, mut bob, _a, _b) = pair(&relay).await;
+
+    // Point the vault at a dead port. The choice must still save, with no
+    // delivery attempt — and therefore no retry storm — in the caller's path.
+    alice
+        .set_relay_clearnet("http://127.0.0.1:1")
+        .await
+        .unwrap();
+    alice
+        .set_contact_reach("bob", TrusteeReach::MailOnly)
+        .await
+        .unwrap();
+
+    // Back on the live relay, the next drain delivers without a new toggle.
+    alice.set_relay_clearnet(&relay).await.unwrap();
+    assert_eq!(alice.retry_pending_reach().await.unwrap(), 1);
+
+    let inbox = bob.recv().await.unwrap();
+    assert!(inbox.messages.is_empty(), "a reach change is not a message");
+    assert_eq!(
+        bob.contacts()[0].peer_reach,
+        TrusteeReach::MailOnly,
+        "the queued announcement lands once the relay is back"
+    );
 }
 
 /// Narrowing a relationship does not retroactively remove a trustee from a

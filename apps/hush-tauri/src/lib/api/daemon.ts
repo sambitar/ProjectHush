@@ -58,6 +58,12 @@ function apiFromQuery(): string | null {
   return v ? v.replace(/\/+$/, "") : null;
 }
 
+/** The relay every new vault is created against. Not a user choice — the
+ * create screen never asks. Release builds bake the same default into the
+ * daemon (`crates/hush-core/src/config.rs`); the onion twin for Tor mode
+ * lives there too. */
+export const HUSH_RELAY_DEFAULT = "https://hushrelay.space";
+
 /**
  * How to reach the daemon. The desktop shell injects the real transport
  * (Unix socket by default, DR-02); a plain browser falls back to loopback HTTP.
@@ -155,8 +161,10 @@ export const api = {
       body: JSON.stringify({ passphrase }),
     }),
   /** First run: create this device's vault. The daemon refuses (409) when a
-   * vault is already there, so this can never overwrite one. */
-  vaultCreate: (passphrase: string, name: string, relay: string) =>
+   * vault is already there, so this can never overwrite one. The relay is
+   * not a user choice: every new vault starts from the production relay
+   * (local-relay dev setups repoint afterwards with `hush-cli relay set`). */
+  vaultCreate: (passphrase: string, name: string, relay: string = HUSH_RELAY_DEFAULT) =>
     request<VaultCreateResponse>("/api/vault/create", {
       method: "POST",
       body: JSON.stringify({ passphrase, name, relay }),

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-labelledby="hush-relay-mono-title">
+  <title id="hush-relay-mono-title">Hush Relay (monochrome)</title>
+
+  <!-- Monochrome variant: fill inherits `currentColor`, so it adapts to the
+       surrounding text color in UI and prints black by default. -->
+
+  <!-- Left pillar -->
+  <path d="M48 53 Q48 47 55 51 L72 63
+       Q77 67 77 74 L77 126
+       Q77 134 71 138 L55 149
+       Q48 153 48 145 Z" fill="currentColor"/>
+
+  <!-- Right pillar -->
+  <path d="M152 53 Q152 47 145 51 L128 63
+       Q123 67 123 74 L123 126
+       Q123 134 129 138 L145 149
+       Q152 153 152 145 Z" fill="currentColor"/>
+
+  <!-- Connecting bridge -->
+  <path d="M75 93 C87 80 112 80 125 93
+       L125 111 C113 98 88 98 75 111 Z" fill="currentColor"/>
+</svg>

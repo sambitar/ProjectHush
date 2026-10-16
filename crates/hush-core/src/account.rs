@@ -19,7 +19,7 @@ use crate::prekey::PreKeyRecord;
 use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_files_exist, unwrap_master_with_recovery};
 use crate::crypto::{decrypt, encrypt};
 use crate::error::Error;
-use crate::invite::InvitePayload;
+use crate::invite::{InvitePayload, ShortInvite};
 use crate::message::{
     InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper, ReceivedVoice,
 };
@@ -516,6 +516,21 @@ struct AccountState {
     /// Introductions received and not yet accepted or dismissed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_intros: Vec<PendingIntro>,
+    /// Reach announcements (Task 24) not yet delivered to the relay.
+    ///
+    /// `set_contact_reach` records the peer's copy of the choice here and
+    /// returns at once; the daemon's outbox timer drains it like queued mail.
+    /// One entry per contact, latest scope wins: a rapid toggle leaves only
+    /// the last choice to deliver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_reach: Vec<PendingReach>,
+}
+
+/// One queued reach announcement: who it is for and what scope it carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingReach {
+    nickname: String,
+    scope: TrusteeReach,
 }
 
 pub struct Account {
@@ -568,11 +583,12 @@ impl Account {
             pending_invites: Vec::new(),
             pending_intro_requests: Vec::new(),
             pending_intros: Vec::new(),
+            pending_reach: Vec::new(),
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
         let chat_log = ChatLog::load(dir, &master)?;
-        let account = Self {
+        let mut account = Self {
             vault,
             device,
             state,
@@ -583,6 +599,13 @@ impl Account {
             chat_retention: ChatRetention::default(),
         };
         account.save().await?;
+        // First prekey publish, so the relay directory can serve the pointer
+        // invite from the moment the vault exists. Best effort: a relay that
+        // is down costs the directory entry, not the vault — the next unlock
+        // publishes again.
+        if let Err(e) = account.publish_prekeys(64).await {
+            eprintln!("hush: initial prekey publish skipped: {e}");
+        }
         Ok(account)
     }
 
@@ -944,22 +967,33 @@ impl Account {
 
     pub async fn invite(&mut self) -> Result<String, Error> {
         if let Some(cached) = &self.state.invite_cache {
-            return Ok(cached.clone());
+            // A cache entry predating pointer invites holds a full v2 payload.
+            // Its fields (relay, inbox, tokens) have not rotated, so it is
+            // re-minted in the short format rather than handed out as-is.
+            if cached.starts_with("hush1") {
+                return Ok(cached.clone());
+            }
+            self.state.invite_cache = None;
         }
-        let local_id = self.device.device_id();
-        let bundle = mint_prekey_bundle(self.device.store_mut(), local_id).await?;
-        // The invite carries the *delivery* token: a contact only ever needs to
-        // put messages in this inbox, never to read or burn it.
-        let payload = invite_from_bundle(
-            &self.state.relay,
-            &self.state.protocol_name,
-            self.device.queue_id(),
-            &self.device.queue_token(),
-            self.state.mail_handle.as_deref(),
-            Some(self.vault_name()),
-            &bundle,
-        )?;
-        let encoded = payload.encode()?;
+        // The pointer names this account; the peer fetches the prekey record
+        // from the relay directory at accept time, so no bundle is minted
+        // (or burned) here. The invite still carries the *delivery* token: a
+        // contact only ever needs to put messages in this inbox, never to
+        // read or burn it.
+        let pointer = ShortInvite {
+            relay: if normalize_relay(&self.state.relay) == normalize_relay(crate::invite::default_relay())
+            {
+                None
+            } else {
+                Some(self.state.relay.clone())
+            },
+            protocol_name: self.state.protocol_name.clone(),
+            queue_id: self.device.queue_id().to_string(),
+            queue_token: self.device.queue_token(),
+            handle: self.state.mail_handle.clone(),
+            vault: Some(self.vault_name().to_string()),
+        };
+        let encoded = pointer.encode()?;
         self.state.invite_cache = Some(encoded.clone());
         self.save().await?;
         Ok(encoded)
@@ -993,7 +1027,8 @@ impl Account {
     }
 
     pub async fn add_contact(&mut self, nickname: &str, invite_str: &str) -> Result<(), Error> {
-        let payload = self.prepare_contact(nickname, invite_str)?;
+        let payload = self.decode_invite(invite_str).await?;
+        self.validate_contact(nickname, &payload)?;
         let bundle = payload.to_prekey_bundle()?;
         let local_name = self.state.protocol_name.clone();
         process_contact_bundle(
@@ -1029,16 +1064,42 @@ impl Account {
         nickname: &str,
         invite_str: &str,
     ) -> Result<(), Error> {
-        let payload = self.prepare_contact(nickname, invite_str)?;
+        // Intro cards carry a full v2 payload inline (the card rides an
+        // already-encrypted session, so there is no size pressure), and the
+        // reverse half must not build a session — so no pointer resolution.
+        let payload = InvitePayload::decode(invite_str)?;
+        self.validate_contact(nickname, &payload)?;
         self.finish_contact(nickname, payload).await
     }
 
-    /// Validate an invite for a new contact and decode it.
+    /// Decode any accepted invite format into a full payload.
+    ///
+    /// A pointer invite (`hush1…`) names the account only: the prekey record
+    /// is fetched from the relay's directory at accept time, which makes this
+    /// the one place adding a contact can fail for a network reason. Legacy
+    /// v1/v2 payloads are decoded locally as before.
+    async fn decode_invite(&self, invite_str: &str) -> Result<InvitePayload, Error> {
+        let trimmed = invite_str.trim();
+        if trimmed.len() > 5 && trimmed[..5].eq_ignore_ascii_case("hush1") {
+            if let Ok(pointer) = ShortInvite::decode(trimmed) {
+                let relay = pointer.effective_relay();
+                if normalize_relay(&relay) != normalize_relay(&self.state.relay) {
+                    return Err(Error::RelayMismatch(relay, self.state.relay.clone()));
+                }
+                let client = self.relay_client()?;
+                return pointer.resolve(&client).await;
+            }
+            // Not a valid pointer: fall through to the legacy decoders, since
+            // a v1 base64 payload could coincidentally begin with "hush1".
+        }
+        InvitePayload::decode(trimmed)
+    }
+
+    /// Validate a decoded invite for a new contact.
     ///
     /// Shared by [`Self::add_contact`] and [`Self::add_contact_from_intro`]:
     /// the relay must match, and the account must be new.
-    fn prepare_contact(&self, nickname: &str, invite_str: &str) -> Result<InvitePayload, Error> {
-        let payload = InvitePayload::decode(invite_str)?;
+    fn validate_contact(&self, nickname: &str, payload: &InvitePayload) -> Result<(), Error> {
         if normalize_relay(&payload.relay) != normalize_relay(&self.state.relay) {
             return Err(Error::RelayMismatch(payload.relay.clone(), self.state.relay.clone()));
         }
@@ -1053,7 +1114,7 @@ impl Account {
         if nickname.trim().is_empty() {
             return Err(Error::InvalidHandle);
         }
-        Ok(payload)
+        Ok(())
     }
 
     /// Store a validated contact record and persist it.
@@ -1120,16 +1181,18 @@ impl Account {
         if !changed {
             return Ok(());
         }
-        self.save().await?;
-        // Store-and-forward: the peer may be away, and a reach change is not
-        // live-only the way a chat line is.
-        if let Err(e) = self
-            .send_payload_inner(nickname, MessagePayload::Reach { scope: reach }, false)
-            .await
-        {
-            eprintln!("hush: reach announcement to {nickname} failed: {e}");
-        }
-        Ok(())
+        // Queue the announcement instead of making the caller wait for it.
+        // The choice itself is local and saved below; the peer's copy is
+        // store-and-forward — "the peer may be away" — so delivering it is
+        // the outbox's job, not this call's. A slow relay used to hold the
+        // user's toggle (and, with it, the whole account worker) for up to
+        // three 15-second delivery attempts.
+        self.state.pending_reach.retain(|p| p.nickname != nickname);
+        self.state.pending_reach.push(PendingReach {
+            nickname: nickname.to_string(),
+            scope: reach,
+        });
+        self.save().await
     }
 
     /// Forget a contact without revoking it.
@@ -1145,6 +1208,9 @@ impl Account {
             .position(|c| c.nickname == nickname)
             .ok_or(Error::ContactNotFound)?;
         self.state.contacts.remove(pos);
+        // A queued reach announcement for a contact that no longer exists
+        // could never deliver; dropping it here keeps the drain pass quiet.
+        self.state.pending_reach.retain(|p| p.nickname != nickname);
         self.save().await?;
         Ok(())
     }
@@ -1170,6 +1236,10 @@ impl Account {
             .ok_or(Error::ContactNotFound)?;
         let account_id = self.state.contacts[pos].account_id.clone();
         self.state.contacts.remove(pos);
+        // A queued reach announcement for a revoked contact would keep
+        // failing against the burned queue forever; the revocation is the
+        // stronger statement about the relationship.
+        self.state.pending_reach.retain(|p| p.nickname != nickname);
         if !self.state.revoked.contains(&account_id) {
             self.state.revoked.push(account_id.clone());
         }
@@ -1612,6 +1682,56 @@ impl Account {
                 now_ms(),
             )?;
             delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// Attempt delivery of every queued reach announcement (Task 24).
+    ///
+    /// The daemon calls this from the outbox timer and from the outbox retry
+    /// route — nobody waits on the result, the way queued mail is drained. An
+    /// entry the relay refuses stays queued for the next pass. One whose
+    /// contact is gone is dropped: there is nobody left to announce to, and a
+    /// revoked queue would refuse delivery forever.
+    ///
+    /// Returns how many announcements went out.
+    pub async fn retry_pending_reach(&mut self) -> Result<usize, Error> {
+        if self.state.pending_reach.is_empty() {
+            return Ok(0);
+        }
+        let queued = std::mem::take(&mut self.state.pending_reach);
+        let mut delivered = 0;
+        let mut kept = Vec::new();
+        for p in queued {
+            if self.find_contact(&p.nickname).is_none() {
+                continue;
+            }
+            match self
+                .send_payload_inner(
+                    &p.nickname,
+                    MessagePayload::Reach { scope: p.scope },
+                    false,
+                )
+                .await
+            {
+                Ok(()) => delivered += 1,
+                Err(e) => {
+                    eprintln!(
+                        "hush: reach announcement to {} not delivered yet: {e}",
+                        p.nickname
+                    );
+                    kept.push(p);
+                }
+            }
+        }
+        self.state.pending_reach = kept;
+        // Re-arm and save. The success path inside `send_payload_inner` saves
+        // too — with the queue momentarily empty — so this final save is what
+        // keeps the on-disk queue matching the entries still owed. A crash
+        // inside that window can only drop an undelivered announcement, which
+        // is the safe direction: the peer then assumes `Full`.
+        if delivered > 0 {
+            self.save().await?;
         }
         Ok(delivered)
     }
@@ -4538,6 +4658,7 @@ mod tests {
             pending_invites: Vec::new(),
             pending_intro_requests: Vec::new(),
             pending_intros: Vec::new(),
+            pending_reach: Vec::new(),
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
         fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();
@@ -4791,8 +4912,9 @@ mod tests {
             first, second,
             "a cached invite must not survive a relay move: it advertises the old relay"
         );
-        let decoded = crate::invite::InvitePayload::decode(&second).unwrap();
-        assert_eq!(decoded.relay, "http://127.0.0.1:2");
+        // A non-default relay travels explicitly inside the pointer.
+        let decoded = crate::invite::ShortInvite::decode(&second).unwrap();
+        assert_eq!(decoded.effective_relay(), "http://127.0.0.1:2");
     }
 
     #[tokio::test]
@@ -5003,7 +5125,7 @@ mod tests {
         let invite = {
             let (_dir, mut stranger) = intro_vault("intro-owner").await;
             stranger.state.protocol_name = STRANGER.to_string();
-            stranger.invite().await.unwrap()
+            stranger.fresh_invite().await.unwrap()
         };
         let dirty = sam
             .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false)
@@ -5038,7 +5160,7 @@ mod tests {
         let invite = {
             let (_dir, mut stranger) = intro_vault("intro-owner-2").await;
             stranger.state.protocol_name = STRANGER.to_string();
-            stranger.invite().await.unwrap()
+            stranger.fresh_invite().await.unwrap()
         };
         sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false)
             .await
@@ -5060,7 +5182,7 @@ mod tests {
         let invite = {
             let (_dir, mut stranger) = intro_vault("intro-reverse-owner").await;
             stranger.state.protocol_name = STRANGER.to_string();
-            stranger.invite().await.unwrap()
+            stranger.fresh_invite().await.unwrap()
         };
         let dirty = sam
             .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, true)

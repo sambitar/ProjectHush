@@ -182,7 +182,9 @@ async fn a_revoked_contact_cannot_deliver_into_the_shared_inbox() {
     recipient_online(&alice).await;
     bob.send_text("alice", "into the inbox").await.unwrap();
 
-    let invite = hush_core::InvitePayload::decode(&alice_invite).unwrap();
+    // The pointer invite is the short hush1… format now; its fields carry the
+    // same inbox coordinates the test rewrites below.
+    let invite = hush_core::ShortInvite::decode(&alice_invite).unwrap();
     let client = RelayClient::new(&relay);
     let read_token = alice.own_read_token().to_string();
     // The inbox holds Bob's queue grant as well as the message, so both are

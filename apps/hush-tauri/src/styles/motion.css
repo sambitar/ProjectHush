@@ -85,23 +85,23 @@
   border-radius: var(--radius-sm);
 }
 
-/* Indeterminate "working…" marker. The daemon decrypts a vault blob to disk
-   before the OS handler can be launched, and that is not observable from the
-   UI, so the user needs something that says "busy" rather than "stuck". */
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
+/* The universal "working" animation: a signal wave crossing the Relay Bridge
+ * (left pillar, bridge, right pillar — the stagger is a per-path
+ * `animation-delay` set by `relayMark(n, "busy")` in `lib/logo.ts`). A slow
+ * round trip reads as the relay passing the request along, not as a freeze.
+ * The paths never fade out entirely, so the mark stays legible. */
+@keyframes relay-flow {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  40% {
+    opacity: 1;
   }
 }
 
-.spinner {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-  border: 2px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+.relay-flow {
+  animation: relay-flow 1.05s linear infinite;
 }
 
 /* Sweeps across the update bar while the server has not said how large the
@@ -116,10 +116,31 @@
   }
 }
 
+/* The unlock transformation's landing: the mark flies from the lock card
+ * into the rail (flown in app.ts), and the connection light it just became
+ * answers with one green pulse. */
+.relay-shield.relay-land {
+  animation: relay-land 0.7s var(--ease-out);
+}
+
+@keyframes relay-land {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.3);
+    box-shadow: 0 0 0 6px rgba(45, 168, 112, 0.25);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(45, 168, 112, 0);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .breathe,
   .skeleton,
-  .spinner {
+  .relay-flow {
     animation: none;
   }
   .shake {
@@ -131,5 +152,80 @@
     animation: none;
     width: 100%;
     opacity: 0.6;
+  }
+  .relay-shield.relay-land {
+    animation: none;
+  }
+}
+
+/* ------------------------------------------------------- the app zoom -----
+ * The iPhone-style dialog transitions driven by lib/modalFx.ts. Opening
+ * springs the card up out of the control that launched it — the origin is the
+ * launch point, stamped inline as --fx-ox/--fx-oy — while the backdrop dims
+ * and pulls focus, like an iOS app window rising out of its icon. Closing
+ * runs the same path in reverse into the same point.
+ *
+ * The pull-focus is a backdrop-filter that eases back to sharp once the zoom
+ * settles (the fx-enter class is removed on animationend): the background
+ * defocuses for the arrival, then relaxes behind the open dialog. */
+.modal-backdrop {
+  backdrop-filter: blur(0px);
+  transition: backdrop-filter var(--dur-slow) var(--ease-out);
+}
+
+.modal-backdrop.fx-enter {
+  animation: modal-backdrop-in var(--dur-slow) var(--ease-out) both;
+  backdrop-filter: blur(14px);
+}
+
+.modal-backdrop.fx-enter > :first-child {
+  animation: modal-app-in var(--dur-slow) var(--ease-spring) both;
+  transform-origin: var(--fx-ox, 50%) var(--fx-oy, 50%);
+}
+
+@keyframes modal-backdrop-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes modal-app-in {
+  from {
+    transform: scale(0.2);
+    opacity: 0.4;
+  }
+  55% {
+    opacity: 1;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Leaving is quicker and accelerating, the way iOS collapses an app back into
+ * its icon. The dying overlay is detached from the live tree and must not
+ * catch clicks while it plays. */
+.modal-backdrop.fx-leave {
+  animation: modal-backdrop-out var(--dur-base) cubic-bezier(0.55, 0, 0.85, 0.35)
+    both;
+  pointer-events: none;
+}
+
+.modal-backdrop.fx-leave > :first-child {
+  animation: modal-app-out var(--dur-base) cubic-bezier(0.55, 0, 0.85, 0.35) both;
+  transform-origin: var(--fx-ox, 50%) var(--fx-oy, 50%);
+}
+
+@keyframes modal-backdrop-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes modal-app-out {
+  to {
+    transform: scale(0.2);
+    opacity: 0;
   }
 }

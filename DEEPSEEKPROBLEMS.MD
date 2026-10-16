@@ -7,6 +7,327 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — Reach announcement outbox drain
+
+### Reach toggle blocked the user on up to three 15-second relay attempts [FIXED]
+
+- Attempted: toggling a trust's reach in the UI took 10–60 s. `setTrustReach` (app.ts) awaited
+  `setContactReach` and then `contacts()` before repainting; the daemon's `set_contact_reach`
+  saved locally and then **inline-awaited** the `MessagePayload::Reach` announcement, which is
+  `send_payload_inner` = up to 3 delivery attempts × the 15 s `REQUEST_TIMEOUT` with 400/800 ms
+  backoffs, over Tor where configured. Its own doc comment called the announcement best-effort,
+  but the await was still paid before the HTTP reply — and the single sequential account worker
+  was blocked the whole time, head-of-line behind heartbeats/outbox/recv besides.
+- Symptom: UI badge froze for the full announce; every other account op queued behind it.
+- Resolution: `set_contact_reach` now records the announcement in a persisted `pending_reach`
+  queue (vault state, one entry per contact, latest scope wins) and returns after the save. The
+  daemon's `outbox_loop` drains it (`Account::retry_pending_reach`, `Work::RetryPendingReach`)
+  on the same 30 s tick as queued mail, and a new `POST /api/outbox/retry` route triggers a
+  drain explicitly (tests now; an Outbox "send now" button later). The CLI, a one-shot process,
+  drains inline before exiting and prints a note when the announcement stayed queued.
+  `remove_contact`/`revoke_contact` drop pending entries for the contact, since a burned queue
+  would otherwise refuse delivery forever. Verified: hush-core 210/210 (lib + all integration
+  suites), hush-daemon 216/216, new test `a_reach_change_queues_and_delivers_when_the_relay_returns`
+  pins the queue-then-deliver behavior.
+- Lesson: "best-effort" must describe the *await*, not just the error handling — swallowing the
+  error while still awaiting the network gives the caller all of the latency and none of the
+  guarantee. Store-and-forward work belongs in the store-and-forward queue.
+
+### Pointer-invite commit left four tests decoding hush1 codes as full invites [FIXED]
+
+- Attempted: the first full `cargo test -p hush-core` run after the reach fix showed
+  `internal_mail` 3/8 failing (`a_handle_round_trips_through_an_invite`,
+  `setting_a_handle_invalidates_a_cached_invite`,
+  `mail_queues_while_the_relay_is_down_and_goes_out_on_retry`); running the suite to completion
+  surfaced `revocation` 1/2 (`a_revoked_contact_cannot_deliver_into_the_shared_inbox`) too.
+- Symptom: `Err(Corrupt)` at `InvitePayload::decode(<hush1…>)` — commit 3d426b9 replaced inline
+  v2 invites with short pointer codes, so `Account::invite()` now returns a `hush1…` string that
+  only `ShortInvite::decode` reads. Two of the tests also paired against a dead relay
+  (`127.0.0.1:1`, a `free_port()` helper), which pointer invites cannot do: the accept fetches
+  the prekey record from the relay directory, so pairing itself now needs a live relay.
+- Resolution: the two decode tests read `ShortInvite::decode` (the handle/vault fields they
+  assert are still carried in the clear); the handle-round-trip test spawns a live relay for
+  its add-contact step; the outbox test pairs live and simulates the outage with
+  `set_relay_clearnet` to a dead port, then back — same queue/retry mechanics, reachable
+  premises. All four pass.
+- Lesson: two compounding ones. (1) A commit that changes a wire format must sweep tests that
+  decode it, and "tests that never run" hide the sweep — cargo's fail-fast stopped the first
+  full run at `internal_mail`, masking that `revocation` was broken too; use `--no-fail-fast`
+  when auditing a whole suite tree. (2) Pairing is no longer offline-capable by design; any
+  test (or doc) assuming offline pairing predates pointer invites.
+
+### Bare `cargo fmt` reformatted 35 untouched files on a repo with no rustfmt.toml [WORKED AROUND]
+
+- Attempted: `cargo fmt -p hush-core -p hush-daemon -p hush-cli` as a hygiene step after the
+  reach fix.
+- Symptom: `git status` jumped from 6 modified files to 42 — the committed code is not
+  rustfmt-clean (no `rustfmt.toml` exists, and the 2026-10-16 pointer-invites commit shows no
+  formatting pass), so fmt rewrote ~2,500 lines across files this task never touched, including
+  a 439-line diff in `zine_store.rs`.
+- Resolution: reverted every file without a functional edit (`git checkout --` on the 35), then
+  reverted the 5 functionally-edited files too and re-applied those edits surgically, because
+  fmt noise had mixed into their diffs (main.rs showed 1,555 changed lines for ~30 real ones).
+  Final diff: 6 files, 206 insertions, 14 deletions.
+- Lesson: check for `rustfmt.toml` before running any formatter; on a repo that isn't
+  format-clean, a bare fmt run is a whole-tree rewrite that drowns the real change in review
+  noise. If formatting is wanted, it is its own commit with its own justification.
+
+## 2026-10-16 — Pointer invites (v3, address-shaped codes)
+
+### Edit tool replaced a three-line block with two lines, silently deleting a field [FIXED]
+
+- Attempted: while adding the `modalKeys` field to `App` (app.ts), the StrReplace `old_string`
+  spanned `paletteOpen` through `filesContactNick` and the `new_string` ended at `filesOpen` —
+  the replacement dropped `private filesContactNick: string | null = null;` outright.
+- Symptom: none at edit time — the tool reported success; the class was missing a field that
+  five later references still used. Caught only because the next verification step (build) was
+  queued and a grep for the field was run alongside it; tsc would have flagged the unknown
+  identifiers on five lines.
+- Resolution: re-edit restored the field and added the intended `modalKeys` block in one
+  replacement; `npm run build` (tsc + vite) then passed clean and all 78 tests green.
+- Lesson: when the intent is "insert after X", the `old_string` should be the smallest anchor
+  plus its `new_string` should *contain* that anchor unchanged. Splicing a replace that
+  shrinks a known-good block is how silent deletions happen; a field deletion is invisible to
+  review that trusts the edit summary.
+
+### A kill-and-restart in one shell kills itself: the restart text matches the kill pattern [FIXED]
+
+- Attempted: `pkill -f "hush-daemo[n].*reach-[b]" ; nohup ./target/debug/hush-daemon --dir
+  …/instances/reach-b …` in one command — both patterns bracket-escaped per this log's rule.
+- Symptom: the whole command died in 233 ms with no output. The pkill patterns no longer match
+  their own *pattern text* (the class trick holds), but the same shell line also contains the
+  restart invocation — `hush-daemon --dir …/reach-b` — which the pattern legitimately matches.
+  The wrapper's cmdline is the sandbox eval of the WHOLE command, so pkill killed the shell
+  running the restart.
+- Resolution: split the kill and the start into two separate Shell calls.
+- Lesson: the character-class trick protects the pattern text, but any *other* text in the same
+  command line that legitimately matches the pattern (here, the restart command itself) is fair
+  game. Kill patterns must be evaluated against the full command line, not just the pattern.
+
+### A Full reach choice is unannounceable, so a peer's stale narrow reach can never widen [OPEN]
+
+- Attempted: two fresh pointer-invite contacts, both added with `reach: full`; one side's
+  `peer_reach` sat at `mail_only` from queued pre-pointer state, refusing the first chat with
+  "this is a mail-only relationship".
+- Symptom: `set_contact_reach(full)` on the full side is a no-op — `changed == false` returns
+  before the `MessagePayload::Reach` announcement (account.rs ~1165) — and `Work::AddContact`
+  skips the announcement for `Full` ("the default needs no announcement", account_worker.rs
+  ~1010). `peer_reach` is only ever written from an inbound announcement, so nothing can widen
+  a stale `mail_only` back to `full` short of the full side toggling narrow→widen by hand.
+- Needed: either announce the reach on add unconditionally (Full included), or let an explicit
+  set announce even when the local choice is unchanged (announce is about the *peer's* mirror,
+  not the local choice, so a no-op local set should still send).
+- Lesson: "X is the default so it needs no announcement" conflates *initial state* with
+  *re-synchronization*. Defaults cover fresh state; a peer recovering from stale or reordered
+  state needs the announcement regardless.
+
+### convert_bits accumulator overflow corrupted every payload past four bytes [FIXED]
+
+- Attempted: hand-rolled bech32 (BIP-173) encode/decode for the ~100-byte
+  pointer-invite body, because the `bech32` crate rejects payloads past the
+  standard's 90-character *address* limit (Lightning's bolt11 makes the same
+  exception).
+- Symptom: `ShortInvite::encode` produced a valid checksummed string, but
+  `decode` returned `Err(Corrupt)` on round trip — for every pointer payload,
+  while the empty-payload BIP-173 spec vectors and the tiny hand probes all
+  passed. Cost five test round trips to localize: the failures were blamed
+  first on the crate's length cap, then on closure index capture, before the
+  trace showed the parse dying on the *second* length-prefixed field.
+- Root cause: the bit converter never masked the accumulator
+  (`acc = (acc << from) | v` with no `& (1 << (from+to)) - 1`). For short
+  inputs the final `& maxv` on extraction hid the garbage; a 102-byte payload
+  left-shifted the u32 accumulator past 32 bits and every extracted byte
+  after the first four was noise.
+- Resolution: added the standard mask (bounded accumulator), plus a
+  regression test that round-trips a full 102-byte body — the empty spec
+  vectors cannot see this bug class.
+- Lesson: spec vectors with *empty* payloads validate the checksum but say
+  nothing about a bit-packing accumulator. Any hand-rolled bit converter
+  needs a full-length round-trip test, not just canonical vectors.
+
+### Closing over a mutable index from two closures was too subtle to debug [WORKED AROUND]
+
+- Attempted: in `ShortInvite::decode`, two `FnMut` closures (`take`, `next`)
+  shared one captured `at` cursor.
+- Symptom: worked for the happy path but made the failure above genuinely
+  hard to trace — every instrumentation attempt inside the closures hit the
+  borrow checker (`cannot borrow \`at\` as immutable because it is also
+  borrowed as mutable`), because each closure holds the `&mut` capture from
+  its definition to its last use.
+- Resolution: rewrote the parse with an explicit `&mut usize` parameter on
+  each helper — no captures, sequential and printable. The missing
+  `*at += len` advance (see next entry) then surfaced immediately.
+- Lesson: when two closures mutate shared parse state, pass the cursor
+  explicitly. Captured-state closures compile even when the state flow is
+  wrong, and they block the instrumentation that would expose it.
+
+### A length-prefixed reader that never advanced past the content [FIXED]
+
+- Attempted: `next()` read a length byte, advanced one byte, validated the
+  bound, and returned the string — without advancing past the string's bytes.
+- Symptom: any pointer payload with a second optional field after the first
+  failed to decode (the cursor landed inside the first field's content, read
+  its data as the next length byte, and the bound check rejected it). Every
+  field-optional combination in the round-trip tests caught it, but only
+  after the bech32 layer was cleared as the culprit.
+- Resolution: `*at += len` before returning the parsed string.
+- Lesson: a length-prefixed field has two advances (length byte, content);
+  writing them adjacent to each other in one helper makes the missing one
+  visible by symmetry with the sibling `take` helper.
+
+## 2026-10-16 — Shorter invite codes (v2 encoding)
+
+### pkill self-match recurred because only one of two patterns was escaped [FIXED]
+
+- Attempted: restart two hush-daemon instances with `pkill -f "hush-daemon.*hush-firstrun" ;
+  pkill -f "hush-daemon.*reach-[b]"` — the second pattern used the character-class trick
+  recorded in this log, the first did not.
+- Symptom: the whole command died in 133 ms with no output; the first pkill matched the
+  sandbox wrapper's own cmdline (which contains the literal pattern text) and killed the
+  shell running the command, so the second pattern never ran and no daemon restarted.
+- Resolution: re-ran both pkills with the class trick on every pattern
+  (`hush-firstru[n]`), verified with pgrep, then restarted.
+- Lesson: the character-class escape is per-pattern, not per-command. Every `pkill -f`
+  pattern must be written so its own wrapper cannot match it, even when other patterns in
+  the same line already are.
+
+## 2026-10-16 — Universal loading animation (logo busy mode)
+
+### CDP `Animation.setPlaybackRate` rejected by the browser tool wrapper [WORKED AROUND]
+
+- Attempted: to slow all page animations so a 650 ms transition could be screenshotted,
+  called `browser_cdp` with `Animation.setPlaybackRate {"playbackSpeed": 0.12}` (after
+  `Animation.enable`, which worked).
+- Symptom: `Error invoking remote method 'vscode:webviewSendCDPCommand': Error: Invalid
+  parameters` — twice, so the wrapper rejects this method/param shape, not a transient.
+- Resolution: patched `Element.prototype.animate` in-page instead (multiply `duration`),
+  which also allowed targeting only the app's animations. Verified the unlock flight and
+  the new `relay-flow` busy wave this way, then restored the original in the same page.
+- Lesson: when a CDP domain method is blocked by the tool wrapper, in-page monkey-patching
+  via `Runtime.evaluate` is the equivalent lever.
+
+## 2026-10-16 — Logo SVG review (Downloads/log.svg)
+
+Three tooling problems in one short session; none are repo problems.
+
+### Read tool's line-number markers look exactly like file corruption [FIXED]
+
+- Attempted: read `/home/sam/Downloads/log.svg` (the Hush logo source, user asked to look
+  into it). The Read output showed `    10|` on its own line and `    20|` **inside** the
+  right pillar's `d` attribute — which would be invalid path data and would truncate the
+  pillar mid-render (SVG paths stop at the first parse error).
+- Symptom: looked like someone pasted chat output with line numbers into the file.
+- Resolution: false alarm. `rg '\d+\|'` on log.svg found no matches, and the same
+  `    10|` / `    20|` markers appear mid-sentence when reading this log file — they are
+  the Read tool's every-10-lines display markers, right-aligned to 6 chars. Confirmed the
+  SVG is clean by rendering check instead (see below).
+- Lesson: do not trust inline `N|` tokens as file content when reading; verify with
+  `rg` before diagnosing "corrupted" files.
+
+### Read tool returns empty content for image files [WORKED AROUND]
+
+- Attempted: visually inspect `apps/hush-tauri/src-tauri/icons/icon.png`, the user's
+  attached logo PNG, and an IDE-browser screenshot — all three Read calls returned
+  "Read image file" with no image content.
+- Symptom: no visual verification possible via Read this session, for both repo assets
+  and tool screenshots.
+- Workaround: analyzed pixels programmatically with PIL (content bounding box, per-column
+  extents, mirrored-half symmetry diff, corner color samples). Sufficient for geometry
+  and gradient checks; actual visual confirmation was not possible.
+- Needed to resolve: image attachment path for Read (tooling), or accept numeric checks.
+
+### No SVG rasterizer installed despite librsvg2-dev being a build dependency [WORKED AROUND]
+
+- Attempted: render log.svg to PNG with `rsvg-convert`, ImageMagick `convert`, and
+  `cairosvg` — all three absent. README's build deps list `librsvg2-dev` (the library,
+  not the CLI). `sudo apt install librsvg2-bin` not run (needs sudo approval).
+- Workaround: served `/tmp` via `python3 -m http.server` on localhost:8931 and screenshotted
+  `file`-less via the IDE browser MCP (browser_navigate rejects `file://` URLs). Server
+  killed after use; port verified free with curl (000). Later in the same session: `pip
+  install --user` is refused by PEP 668 (externally managed env), but a throwaway venv
+  works with no sudo: `python3 -m venv /tmp/svgenv && /tmp/svgenv/bin/pip install cairosvg`.
+- Lesson: for repeat SVG work, the venv+cairosvg route removes the whole browser detour
+  (used for the 1024px app-icon raster).
+
+### My own `d="` regex matched `id="` — false "geometry mismatch" [FIXED]
+
+- Attempted: verify the cleaned canonical SVGs kept the mark's geometry by hashing the
+  `d="..."` attributes of original vs. rewritten files. Hashes differed, which looked
+  like the rewrite had altered paths.
+- Symptom: token comparison listed garbage "paths" like `['h','u','s','h','r','e','l','a','y']`
+  — the pattern `d="[^"]*"` also matches inside `id="hush-relay-title"`.
+- Resolution: use `\sd="` (whitespace-boundary) and compare token sequences; all three
+  files then verified token-identical (3 paths each). Re-verified again after the color
+  retheme.
+- Lesson: when grepping for attribute-like patterns, anchor the attribute name or the
+  comparison is guaranteed false positives on ids ending in the same letter.
+
+### Browser screenshot background flipped to black between captures [WORKED AROUND]
+
+- Attempted: render-verify `hush-relay-mono.svg` via the IDE browser + PIL as before.
+- Symptom: screenshot came back entirely black; PIL found no content pixels. The same
+  pipeline had produced a white-background capture 30 seconds earlier. A/B reload of the
+  color SVG also came back black-backgrounded — but with `#8b7df0` pixels scattered
+  exactly where the mark is, so content was rendering; the page background (standalone
+  SVG document) had gone dark.
+- Workaround: for the mono check, wrapped the SVG in a tiny HTML page with explicit
+  white background and `<img>` (in `<img>` context `currentColor` resolves to black);
+  shape then measured 265x257 at 512px with symmetric pillar columns. Never trust the
+  standalone viewer's background; assert on the shape, not the page.
+- Lesson/tooling: screenshot pipelines here can change page background between captures;
+  pixel assertions must be background-agnostic or use an explicit-background wrapper.
+
+### Actual SVG findings (the deliverable)
+
+- `log.svg` is valid and correct: two slanted pillars + arch bridge, one diagonal
+  gradient `#A5C5FF → #718CFF → #8060F5`, content symmetric (both pillars span identical
+  rows in a 150px render; only 336/11k pixels differ from mirror symmetry, antialiasing
+  noise). Matches the user's attached render exactly (bbox 36,37→113,112 at 150px ==
+  viewBox 48,47→152,153 at 200).
+- Minor quality notes, not bugs: no `width`/`height` (standalone open fills viewport);
+  gradient id `relay` is collision-prone if inlined into the Tauri app HTML (prefix it,
+  e.g. `hush-logo-relay`); no `<title>`/`role="img"` for accessibility. Repo has no SVG
+  assets — the logo ships only as rasters (`icon.png/ico/icns`), so this file is the only
+  vector source that exists.
+
+## 2026-10-16 — Hush instance web preview (reach-b)
+
+### A forgotten passphrase is unrecoverable through any user-facing path [OPEN]
+
+- Attempted: log into the live `reach-b` web view (`:5173/?api=`) for the user, who did not
+  know the vault's passphrase. Searched shell history, terminal logs, and scripts (the vault
+  was created by typing into the desktop window, so no record exists); checked for a
+  lockout (none) and for a recovery path.
+- Finding: `hush-core` has `unwrap_master_with_recovery` (`recovery.rs:71`) — the recovery
+  code shown once at creation really does wrap/unwrap the master key — but **no daemon
+  route and no `hush-cli` command exposes it**. The only recovery routes are
+  `/api/recovery/pending` and `/api/recovery/acknowledge`, which record that the code was
+  saved; they do not redeem it. A locked vault with a lost passphrase is dead weight.
+- Workaround this time: the vault was effectively empty (0 contacts, no mail handle,
+  511-byte `chat.enc`), so it was recreated: daemon stopped, dir moved to
+  `/tmp/reach-b-backup-1855`, daemon restarted with the same flags, new vault created
+  through the UI against `https://hushrelay.space`.
+- Needed to resolve (product): wire recovery into a user-facing path — e.g.
+  `POST /api/recovery/redeem {code, new_passphrase}` and/or `hush-cli recover`, or a
+  "forgot passphrase" flow on the unlock screen. The library half already exists.
+- Side effect to remember: the recreated `reach-b` has a NEW identity. Any trust entry
+  other vaults hold for the old identity (e.g. `reach-a`'s contact row) is stale until
+  re-invited.
+
+### pkill -f self-match trap, hit again via a different door [FIXED]
+
+- Attempted: restart the reach-b daemon — `pkill -f "hush-daemon.*instances/reach-b"`,
+  then `mv` the vault dir and start a fresh daemon.
+- Symptom: the whole `;`-chained command produced no output and did nothing after the
+  pkill — the wrapper shell's own command line contained the pattern text, so pkill killed
+  the shell running the command (same failure mode logged 2026-10-15: "`pgrep -f` matches
+  the searcher").
+- Resolution: anchored the pattern with a character class — `pkill -f
+  "hush-daemon.*reach-[b]"` — then moved the dir and started the daemon; verified
+  `vault_present: false` on `/api/status` and proceeded.
+- Lesson: this keeps recurring whenever the kill and the work share one command line.
+  Anchor patterns with `[x]` classes, or run the kill in a separate call from the work.
+
 ## 2026-10-16 — Update hosting on hushrelay.space
 
 ### Three wrong guesses about the minisign format, found by testing against a real release [FIXED]

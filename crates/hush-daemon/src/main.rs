@@ -423,6 +423,7 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/contacts/add", post(add_contact))
         .route("/api/contacts/remove", post(remove_contact))
         .route("/api/contacts/reach", post(set_contact_reach))
+        .route("/api/outbox/retry", post(outbox_retry))
         .route("/api/send", post(send_text))
         .route("/api/send-file", post(send_file))
         .route("/api/send-file-data", post(send_file_data))
@@ -809,7 +810,10 @@ async fn auto_lock_loop(state: Arc<App>) {
 /// Queued mail is the one piece of work with no user action behind it: the
 /// message is already written, and the only thing missing is a relay that will
 /// take it. Retrying here means a message composed while the relay was down goes
-/// out on its own. A tick with nothing queued touches no network at all.
+/// out on its own. Reach announcements (Task 24) ride the same pass: the user's
+/// toggle records the choice locally and returns, and the peer hears about it
+/// from here rather than from a user request blocking on a slow relay.
+/// A tick with nothing queued touches no network at all.
 /// Keep this vault's relay presence live while the vault is unlocked.
 ///
 /// Presence is "heartbeat seen in the last 90 s" at the relay, and without this
@@ -856,6 +860,7 @@ async fn outbox_loop(state: Arc<App>) {
             continue;
         }
         let _ = state.worker.retry_outbox().await;
+        let _ = state.worker.retry_pending_reach().await;
     }
 }
 
@@ -1880,6 +1885,21 @@ async fn remove_contact(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     map_err(state.worker.remove_contact(&body.nickname).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Flush the Outbox on demand: queued mail and queued reach announcements.
+///
+/// The outbox timer drains both every 30 s and is the path everything
+/// normally rides. This route exists so a drain can be triggered explicitly
+/// (an Outbox screen's "send now", and the API tests): delivery stays
+/// something nobody's request waits on.
+async fn outbox_retry(
+    State(state): State<Arc<App>>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let _ = state.worker.retry_outbox().await;
+    let _ = state.worker.retry_pending_reach().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8794,7 +8814,11 @@ mod paper_api_tests {
         let mut peer = hush_core::Account::create(peer_dir.path(), "pw", "http://127.0.0.1:9")
             .await
             .unwrap();
-        let invite = peer.invite().await.unwrap();
+        // A full v2 invite, not the pointer: this test's relay is a dead
+        // address on purpose, and a pointer add resolves the bundle from the
+        // relay's directory, which needs the network. The full payload carries
+        // everything inline, so the add stays offline.
+        let invite = peer.fresh_invite().await.unwrap();
         assert!(matches!(
             app.worker
                 .add_contact("peer", &invite, TrusteeReach::Full)
@@ -9746,6 +9770,11 @@ mod reach_api_tests {
                 Some(r#"{"nickname":"bo","reach":"mail_only"}"#),
             )
             .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+
+        // The announcement is queued, not delivered inline: flush it the way
+        // the outbox timer (or an Outbox "send now") would.
+        let (status, err) = a.post("/api/outbox/retry", None).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
 
         b.poll().await;

@@ -1,6 +1,6 @@
 mod presence_helper;
 
-use hush_core::{Account, InvitePayload, RelayClient};
+use hush_core::{Account, RelayClient, ShortInvite};
 use presence_helper::recipient_online;
 use hush_relay::{RelayConfig, router};
 use tempfile::TempDir;
@@ -116,6 +116,79 @@ async fn a_verified_queue_grant_marks_the_contact_inbound_ready() {
     assert!(!reopened.contacts()[0].heard_from);
 }
 
+/// The pointer invite end to end: the code names the account, the prekey
+/// bundle comes from the relay's directory at accept time, and the session
+/// works exactly as with a full inline invite.
+#[tokio::test]
+async fn a_pointer_invite_adds_a_contact_through_the_directory() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    // Account::create publishes the prekey record, so the directory can
+    // already serve the bundle a pointer invite points at.
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    let alice_invite = alice.invite().await.unwrap();
+    assert!(
+        alice_invite.starts_with("hush1"),
+        "the shared invite is a pointer code: {alice_invite}"
+    );
+    assert!(
+        alice_invite.len() < 250,
+        "the code stays address-shaped: {} chars",
+        alice_invite.len()
+    );
+
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+
+    recipient_online(&alice).await;
+    bob.send_text("alice", "hello via the directory").await.unwrap();
+    let inbox = alice.recv().await.unwrap();
+    assert_eq!(inbox.messages.len(), 1);
+    assert_eq!(inbox.messages[0].from_nick, "bob");
+    assert_eq!(
+        inbox.messages[0].payload,
+        hush_core::MessagePayload::Text {
+            body: "hello via the directory".into()
+        }
+    );
+}
+
+/// `add_contact` still accepts the legacy full-payload invites (v2 JSON and
+/// v1 base64): old copies of the app and printed codes keep working.
+#[tokio::test]
+async fn a_legacy_full_invite_still_adds_a_contact() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    // Mint the legacy format directly: a fresh full bundle, exactly what a
+    // peer on an older build shares.
+    let legacy = alice.fresh_invite().await.unwrap();
+    bob.add_contact("alice", &legacy).await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+
+    recipient_online(&alice).await;
+    bob.send_text("alice", "legacy path still fine").await.unwrap();
+    let inbox = alice.recv().await.unwrap();
+    assert_eq!(inbox.messages.len(), 1);
+}
+
 #[tokio::test]
 async fn relay_blob_has_no_cleartext_sender_json() {
     let (relay, _relay_dir) = spawn_relay().await;
@@ -138,20 +211,20 @@ async fn relay_blob_has_no_cleartext_sender_json() {
     recipient_online(&alice).await;
     bob.send_text("alice", "opaque wire test").await.unwrap();
 
-    let alice_inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
+    let alice_ptr = hush_core::ShortInvite::decode(&alice.invite().await.unwrap()).unwrap();
     let client = RelayClient::new(&relay);
     // Reading our own inbox needs the private read credential; the invite carries
     // only the delivery token, which must not authorize a read. Bob's add-contact
     // grant and his message are both queued here, so both ciphertexts are checked.
     let ids = client
-        .list(&alice_inv.queue_id, alice.own_read_token())
+        .list(&alice_ptr.queue_id, alice.own_read_token())
         .await
         .unwrap();
     assert_eq!(ids.len(), 2, "one queue grant and one message");
     let bob_id = bob.protocol_name();
     for id in &ids {
         let body = client
-            .get(&alice_inv.queue_id, alice.own_read_token(), id)
+            .get(&alice_ptr.queue_id, alice.own_read_token(), id)
             .await
             .unwrap();
         assert!(
@@ -278,7 +351,7 @@ async fn reporting_a_queue_burns_it() {
         .await
         .unwrap();
 
-    let inv = InvitePayload::decode(&alice.invite().await.unwrap()).unwrap();
+    let inv = ShortInvite::decode(&alice.invite().await.unwrap()).unwrap();
     let client = RelayClient::new(&relay);
 
     // The device is live and its inbox holds the pending message plus bob's

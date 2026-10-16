@@ -88,7 +88,10 @@ the bytes are deliverable either way, and the app chooses not to offer or accept
 - **Applied only from a known contact** — the 1:1 session is the authentication. A stranger's
   announcement is dropped.
 - **Store-and-forward**, so an away peer learns the choice on their next drain; the local choice stands
-  even if the announcement cannot be delivered (the next change re-sends).
+  even if the announcement cannot be delivered (the next change re-sends). The announcement is
+  **queued in the vault, not delivered inline**: `set_contact_reach` records it in `pending_reach` and
+  returns, and the daemon's outbox timer (or `POST /api/outbox/retry`) drains it like queued mail —
+  a slow relay must not hold the user's toggle for three 15-second delivery attempts.
 - **No signature.** It can only ever narrow, so a forged announcement can at worst hide a surface the
   sender was not going to use.
 - Unknown-tag tolerance is the shared discipline the other tasks already carry: a build that does not
