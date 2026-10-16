@@ -55,20 +55,51 @@ resolution, and the status.
 - Lesson: a documented bypass is a claim about UI the document cannot see. It should say which
   error it applies to, not just that it works.
 
-### The ad-hoc signature could not be verified on this host [OPEN]
+### The ad-hoc signature could not be verified on this host [FIXED]
 
 - Attempted: to confirm that `signingIdentity: "-"` produces a signed bundle, by building the
   macOS bundle and running `codesign -dv --verbose=4` against it.
 - Symptom: this is a Linux workstation. `codesign`, `xattr`, `spctl` and Gatekeeper do not
   exist here, and the macOS leg of the release workflow is the only macOS in reach. Everything
   in the entry above is read from the published artifact's bytes, not from a signing run. The
-  config change is therefore unverified: it matches Tauri's documentation and the schema, and
+  config change was therefore unverified: it matched Tauri's documentation and the schema, and
   nothing more.
-- Resolution: needs a real macOS host — or the next tagged release, whose `Hush_aarch64.app.tar.gz`
-  should gain a `Contents/_CodeSignature/CodeResources` — to close this. Until then, do not
-  describe the fix as proven.
+- Resolution: closed by the new `verify the macOS bundle is signed` step, which runs on the
+  macOS runners. In release run 38976342470 (aarch64 leg) it printed
+  `Hush.app: valid on disk`, `Hush.app: satisfies its Designated Requirement`, and
+  `CodeDirectory v=20500 size=34417 flags=0x10002(adhoc,runtime) hashes=1069+3 location=embedded`,
+  with the nested `Contents/MacOS/hush-daemon` reported as `--prepared`/`--validated`. That was
+  then confirmed independently, off the runner: the rebuilt `Hush_aarch64.app.tar.gz` contains
+  `Contents/_CodeSignature/CodeResources`, which the v0.2.0 artifact did not, and the copy on
+  the relay is byte-identical (`sha256 7e0716b887dc9bf45f480dcf9bd807e1ad7d2f853042ce455503919e9042b2a5`).
+  `scripts/verify-update-signature.py --manifest https://hushrelay.space/updates/latest.json --all`
+  reports OK for all seven platform entries.
 - Lesson: "the artifact has no signature" is provable from anywhere; "the build now signs" is
-  not. Do not let the first, which was measured, stand in for the second, which was not.
+  not. Do not let the first, which was measured, stand in for the second, which was not. A CI
+  step is what converts the second into something measurable.
+
+### A published release cannot be rebuilt by re-running the tag [WORKED AROUND]
+
+- Attempted: to rebuild v0.2.0 with the signing fix and no version bump, by re-running
+  `release.yml` for the existing tag.
+- Symptom: two traps, both silent until they bite.
+  (1) `release.yml` is `on: push: tags: v*` and `actions/checkout` takes the *tag's* commit, so
+  re-running the workflow without moving the tag builds the old, unfixed code.
+  (2) tauri-action's `getOrCreateRelease` looks for a **draft** when `releaseDraft: true`; on
+  finding a published release with that tag it logs "Found release with tag v0.2.0 but it's NOT
+  a draft!" and then throws `release not found` — after the whole build has already run. A
+  re-run against a published release therefore burns a full multi-leg build and fails at the
+  upload.
+- Resolution: unpublish the release first (`gh release edit v0.2.0 --draft=true`, which keeps
+  the release and its assets and does not touch the relay's copy), then move the tag to the
+  merged fix (`git push --force-with-lease`), which triggers the build; tauri-action then finds
+  the draft and replaces the same-named assets. Publishing the draft again fires
+  `publish-updates.yml`, which re-mirrors. The relay keeps serving the old manifest throughout,
+  so there is no window where downloads break. Written up in RELEASING.md, "Re-releasing an
+  existing tag".
+- Lesson: `release.yml` has no `workflow_dispatch`, and adding one would not have helped — the
+  build reads the tag's commit, so the tag has to move either way. Rebuilding a release is a
+  tag rewrite, and the release has to be a draft when the build starts.
 
 ### A Linux x86-64 ELF ships inside the macOS bundle [OPEN]
 

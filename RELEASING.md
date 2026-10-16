@@ -313,6 +313,54 @@ rollout: the next check every running copy makes will offer it.
 
 ---
 
+## Re-releasing an existing tag
+
+Needed when a release has to be rebuilt without a version bump — a signing or
+packaging fix, say. The version files stay where they are, so the tag has to move
+to the commit carrying the fix. Two things make that less obvious than it sounds:
+
+- `release.yml` runs `actions/checkout` at the **tag's** commit, not the branch
+  tip. Leaving the tag behind rebuilds the old, unfixed code.
+- tauri-action looks for a **draft** release when `releaseDraft: true`. If the
+  release is already published it logs `Found release with tag v0.2.0 but it's NOT
+  a draft!` and then fails with `release not found` — after the build has already
+  run, which is a wasted multi-leg build.
+
+So the order is: unpublish, move the tag, build, publish.
+
+```bash
+# 1. Unpublish. Keeps the release and its assets, and does not touch the relay's
+#    copy, so downloads keep working from the old manifest throughout.
+gh release edit v0.2.0 --draft=true
+
+# 2. Move the tag to the commit carrying the fix. This is what triggers the build.
+git tag -f v0.2.0 <commit>
+git push --force-with-lease=refs/tags/v0.2.0:<old-commit> origin refs/tags/v0.2.0
+
+# 3. Wait for every leg, then publish again. Publishing is what fires
+#    publish-updates.yml and re-mirrors the relay.
+gh run watch "$(gh run list --workflow=release.yml --limit 1 \
+  --json databaseId --jq '.[0].databaseId')"
+gh release edit v0.2.0 --draft=false --latest
+```
+
+tauri-action deletes any existing asset of the same name before uploading, so the
+rebuild replaces the bundles in place. Asset names are version-derived and the
+version has not changed, so nothing is left stale.
+
+Verify the result from outside, as for a normal release — read `latest.json` back
+off the relay, and confirm the bundle itself carries a signature:
+
+```bash
+curl -sS https://hushrelay.space/updates/Hush_aarch64.app.tar.gz \
+  | tar tzf - | grep _CodeSignature
+```
+
+That line is the difference between a copy a user can open and one Gatekeeper tells
+them to move to the Trash.
+
+---
+
 ## Testing an update locally
 
 The updater replaces an installed bundle, not a development build. `cargo tauri
