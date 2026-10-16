@@ -9,6 +9,22 @@ resolution, and the status.
 
 ## 2026-10-16 — Pointer invites (v3, address-shaped codes)
 
+### Edit tool replaced a three-line block with two lines, silently deleting a field [FIXED]
+
+- Attempted: while adding the `modalKeys` field to `App` (app.ts), the StrReplace `old_string`
+  spanned `paletteOpen` through `filesContactNick` and the `new_string` ended at `filesOpen` —
+  the replacement dropped `private filesContactNick: string | null = null;` outright.
+- Symptom: none at edit time — the tool reported success; the class was missing a field that
+  five later references still used. Caught only because the next verification step (build) was
+  queued and a grep for the field was run alongside it; tsc would have flagged the unknown
+  identifiers on five lines.
+- Resolution: re-edit restored the field and added the intended `modalKeys` block in one
+  replacement; `npm run build` (tsc + vite) then passed clean and all 78 tests green.
+- Lesson: when the intent is "insert after X", the `old_string` should be the smallest anchor
+  plus its `new_string` should *contain* that anchor unchanged. Splicing a replace that
+  shrinks a known-good block is how silent deletions happen; a field deletion is invisible to
+  review that trusts the edit summary.
+
 ### A kill-and-restart in one shell kills itself: the restart text matches the kill pattern [FIXED]
 
 - Attempted: `pkill -f "hush-daemo[n].*reach-[b]" ; nohup ./target/debug/hush-daemon --dir

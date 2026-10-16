@@ -157,3 +157,75 @@
     animation: none;
   }
 }
+
+/* ------------------------------------------------------- the app zoom -----
+ * The iPhone-style dialog transitions driven by lib/modalFx.ts. Opening
+ * springs the card up out of the control that launched it — the origin is the
+ * launch point, stamped inline as --fx-ox/--fx-oy — while the backdrop dims
+ * and pulls focus, like an iOS app window rising out of its icon. Closing
+ * runs the same path in reverse into the same point.
+ *
+ * The pull-focus is a backdrop-filter that eases back to sharp once the zoom
+ * settles (the fx-enter class is removed on animationend): the background
+ * defocuses for the arrival, then relaxes behind the open dialog. */
+.modal-backdrop {
+  backdrop-filter: blur(0px);
+  transition: backdrop-filter var(--dur-slow) var(--ease-out);
+}
+
+.modal-backdrop.fx-enter {
+  animation: modal-backdrop-in var(--dur-slow) var(--ease-out) both;
+  backdrop-filter: blur(14px);
+}
+
+.modal-backdrop.fx-enter > :first-child {
+  animation: modal-app-in var(--dur-slow) var(--ease-spring) both;
+  transform-origin: var(--fx-ox, 50%) var(--fx-oy, 50%);
+}
+
+@keyframes modal-backdrop-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes modal-app-in {
+  from {
+    transform: scale(0.2);
+    opacity: 0.4;
+  }
+  55% {
+    opacity: 1;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Leaving is quicker and accelerating, the way iOS collapses an app back into
+ * its icon. The dying overlay is detached from the live tree and must not
+ * catch clicks while it plays. */
+.modal-backdrop.fx-leave {
+  animation: modal-backdrop-out var(--dur-base) cubic-bezier(0.55, 0, 0.85, 0.35)
+    both;
+  pointer-events: none;
+}
+
+.modal-backdrop.fx-leave > :first-child {
+  animation: modal-app-out var(--dur-base) cubic-bezier(0.55, 0, 0.85, 0.35) both;
+  transform-origin: var(--fx-ox, 50%) var(--fx-oy, 50%);
+}
+
+@keyframes modal-backdrop-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes modal-app-out {
+  to {
+    transform: scale(0.2);
+    opacity: 0;
+  }
+}

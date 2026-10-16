@@ -1,4 +1,5 @@
 import { groupDirectory, isFollowing, rowSubtitle, toggleFollow } from "./lib/explorePage";
+import { enterModal, leaveModal, stampModalOrigin } from "./lib/modalFx";
 import { api, AppError, getApiBase } from "./lib/api/daemon";
 import type {
   ContactDto,
@@ -600,6 +601,13 @@ export class App {
   /** True while the Vault pane is showing the exchanged-files browser. */
   private filesOpen = false;
   private filesContactNick: string | null = null;
+  /**
+   * Keys of the dialogs the current render pass mounted, under the same names
+   * the mount block uses. Compared against what the previous pass mounted to
+   * tell a freshly opened dialog (zoom in) from one a background refresh
+   * rebuilt under the user (repaint in place) from one just closed (zoom out).
+   */
+  private modalKeys = new Set<string>();
   private filesDirection: "received" | "sent" = "received";
   private recoveryModalCode: string | null = null;
   private mailFolder: MailFolder = "inbox";
@@ -1163,6 +1171,18 @@ export class App {
         e.preventDefault();
         this.paletteOpen = !this.paletteOpen;
         this.render();
+      }
+      // Ctrl+L / Cmd+L locks the vault from anywhere — the password-manager
+      // convention, so a panic lock does not require finding the Vault page
+      // first. A locked vault has nothing to lock, so the combo is inert there.
+      if (
+        this.status &&
+        !this.status.locked &&
+        (e.ctrlKey || e.metaKey) &&
+        (e.key === "l" || e.key === "L")
+      ) {
+        e.preventDefault();
+        void this.lock();
       }
       if (e.key === "Escape") {
         // The update prompt is the topmost layer when it is up, so Escape
@@ -1741,6 +1761,15 @@ export class App {
     // DOM is discarded, or it would keep patching a detached tree.
     this.ircPane?.unmount();
     this.ircPane = null;
+    // Take the dialogs the previous render mounted before the wipe. Their
+    // elements drive the zoom choreography: kept for the close zoom, copied
+    // from for a silent rebuild, absent for a fresh open.
+    const prevModals = new Map<string, HTMLElement>();
+    this.root.querySelectorAll<HTMLElement>("[data-modal-key]").forEach((back) => {
+      const key = back.dataset.modalKey;
+      if (key) prevModals.set(key, back);
+    });
+    this.modalKeys = new Set();
     this.root.innerHTML = "";
     if (!this.status || this.status.locked) {
       this.stopDropsPoll();
@@ -1754,6 +1783,9 @@ export class App {
           ? this.renderVaultSetup()
           : this.renderUnlock(),
       );
+      // Locking can land while a dialog is up: its element was wiped with the
+      // tree, so still give it the zoom-out over the unlock screen.
+      for (const back of prevModals.values()) leaveModal(back);
       return;
     }
     // A conversation the rail cannot list cannot stay open. Reach narrows from
@@ -1860,36 +1892,66 @@ export class App {
       liveZines.scrollTop = Math.min(this.pendingZinesScroll, liveZines.scrollHeight);
       this.pendingZinesScroll = null;
     }
-    if (this.paletteOpen) this.root.appendChild(this.renderPalette());
-    if (this.addFriendOpen) this.root.appendChild(this.renderAddFriend());
-    if (this.readsAddOpen) this.root.appendChild(this.renderReadsAddModal());
-    if (this.profileNick) this.root.appendChild(this.renderProfile());
-    if (this.recoveryModalCode) this.root.appendChild(this.renderRecoveryModal());
-    if (this.trustDeleteNick) this.root.appendChild(this.renderTrustDeleteModal());
-    if (this.conclaveCreateOpen) this.root.appendChild(this.renderConclaveCreateModal());
-    if (this.conclaveInviteOpen) this.root.appendChild(this.renderConclaveInviteModal());
-    if (this.conclaveEndId) this.root.appendChild(this.renderConclaveEndModal());
-    if (this.conclaveDeleteId) this.root.appendChild(this.renderConclaveDeleteModal());
-    if (this.readsConfirmUrl) this.root.appendChild(this.renderReadsConfirm());
-    if (this.torrentsDeleteId) this.root.appendChild(this.renderTorrentsDeleteModal());
-    if (this.notesViewingId) this.root.appendChild(this.renderNoteViewModal());
+    // Dialogs mount last, above the shell. A key the previous pass already had
+    // up is a rebuild under a background refresh: repaint it in place, carrying
+    // its launch point across so a later close still zooms to where it began.
+    // A new key is an open: zoom in from what the user pressed. A key the
+    // previous pass showed but this one drops was just closed: zoom its wiped
+    // element back out over the fresh UI.
+    const mountModal = (key: string, back: HTMLElement): void => {
+      back.dataset.modalKey = key;
+      const prev = prevModals.get(key);
+      if (prev) {
+        const ox = prev.style.getPropertyValue("--fx-ox");
+        const oy = prev.style.getPropertyValue("--fx-oy");
+        if (ox) back.style.setProperty("--fx-ox", ox);
+        if (oy) back.style.setProperty("--fx-oy", oy);
+      } else {
+        stampModalOrigin(back);
+      }
+      this.root.appendChild(back);
+      this.modalKeys.add(key);
+      enterModal(back, !prev);
+    };
+    if (this.paletteOpen) mountModal("palette", this.renderPalette());
+    if (this.addFriendOpen) mountModal("addFriend", this.renderAddFriend());
+    if (this.readsAddOpen) mountModal("readsAdd", this.renderReadsAddModal());
+    if (this.profileNick) mountModal("profile", this.renderProfile());
+    if (this.recoveryModalCode) mountModal("recovery", this.renderRecoveryModal());
+    if (this.trustDeleteNick) mountModal("trustDelete", this.renderTrustDeleteModal());
+    if (this.conclaveCreateOpen)
+      mountModal("conclaveCreate", this.renderConclaveCreateModal());
+    if (this.conclaveInviteOpen)
+      mountModal("conclaveInvite", this.renderConclaveInviteModal());
+    if (this.conclaveEndId) mountModal("conclaveEnd", this.renderConclaveEndModal());
+    if (this.conclaveDeleteId)
+      mountModal("conclaveDelete", this.renderConclaveDeleteModal());
+    if (this.readsConfirmUrl) mountModal("readsConfirm", this.renderReadsConfirm());
+    if (this.torrentsDeleteId)
+      mountModal("torrentsDelete", this.renderTorrentsDeleteModal());
+    if (this.notesViewingId) mountModal("noteView", this.renderNoteViewModal());
     if (this.chatHistoryNick)
-      this.root.appendChild(this.renderChatHistoryModal());
-    if (this.identityTarget)
-      this.root.appendChild(this.renderIdentityModal());
-    if (this.introPicker) this.root.appendChild(this.renderIntroPicker());
+      mountModal("chatHistory", this.renderChatHistoryModal());
+    if (this.identityTarget) mountModal("identity", this.renderIdentityModal());
+    if (this.introPicker) mountModal("introPicker", this.renderIntroPicker());
     if (this.pendingIntroConsent())
-      this.root.appendChild(this.renderIntroConsent());
+      mountModal("introConsent", this.renderIntroConsent());
     if (this.mailNotePickerOpen)
-      this.root.appendChild(this.renderMailNotePicker());
-    if (this.zinesPenNameOpen) this.root.appendChild(this.renderZinesPenNameModal());
-    if (this.zinesForgetId) this.root.appendChild(this.renderZinesForgetModal());
-    if (this.zinesShareId) this.root.appendChild(this.renderZinesShareModal());
-    if (this.atprotoSetupOpen) this.root.appendChild(this.renderAtprotoModal());
+      mountModal("mailNotePicker", this.renderMailNotePicker());
+    if (this.zinesPenNameOpen)
+      mountModal("zinesPenName", this.renderZinesPenNameModal());
+    if (this.zinesForgetId) mountModal("zinesForget", this.renderZinesForgetModal());
+    if (this.zinesShareId) mountModal("zinesShare", this.renderZinesShareModal());
+    if (this.atprotoSetupOpen)
+      mountModal("atprotoSetup", this.renderAtprotoModal());
     if (this.atprotoExploreOpen)
-      this.root.appendChild(this.renderAtprotoExploreModal());
-    if (this.zinesPublishId) this.root.appendChild(this.renderZinesPublishModal());
-    if (this.pendingUpdate) this.root.appendChild(this.renderUpdatePrompt());
+      mountModal("atprotoExplore", this.renderAtprotoExploreModal());
+    if (this.zinesPublishId)
+      mountModal("zinesPublish", this.renderZinesPublishModal());
+    if (this.pendingUpdate) mountModal("updatePrompt", this.renderUpdatePrompt());
+    for (const [key, back] of prevModals) {
+      if (!this.modalKeys.has(key)) leaveModal(back);
+    }
   }
 
   private async maybeShowRecoveryCode(): Promise<void> {
@@ -13249,7 +13311,7 @@ export class App {
       mins <= 0
         ? "Only manual lock or suspend"
         : `${Math.ceil(remain / 60000)}m until lock`;
-    lock.innerHTML = `<div class="text-15">Auto-lock</div><div class="muted text-13">${idleLabel}</div><div class="text-13">${countdown}</div><button class="btn-secondary pressable lock-now" style="margin-top:12px">Lock now</button>`;
+    lock.innerHTML = `<div class="text-15">Auto-lock</div><div class="muted text-13">${idleLabel}</div><div class="text-13">${countdown}</div><button class="btn-secondary pressable lock-now" style="margin-top:12px" title="Ctrl+L / Cmd+L">Lock now</button>`;
     lock.querySelector(".lock-now")!.addEventListener("click", () => void this.lock());
     const backup = document.createElement("div");
     backup.className = "tile";
