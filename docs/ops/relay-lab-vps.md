@@ -106,6 +106,34 @@ So a **release** daemon cannot use this plain-HTTP relay; it needs `https://` (t
 in front — see `docs/ops/relay-https-checklist.md`) or a **debug** build. The lab
 cross-machine test therefore runs debug binaries.
 
+## Third-party domains land on this box (nginx is a catch-all)
+
+Checked 2026-10-16 because the access log carries referers for hostnames nobody here
+configured. The only nginx site is `alhakim` — `server_name _;` with
+`listen 80 default_server;` — so **any** hostname whose A record points at
+`137.184.129.205` is served the clinic app, and the app builds its redirect from
+whatever `Host` it was asked for:
+
+```
+$ curl -H "Host: qualifireprotection.com" http://127.0.0.1/
+307  →  location: http://qualifireprotection.com/login?next=%2F
+```
+
+Five names point here and none are ours, with nothing on the box referencing any of
+them (`grep -ril -e qualifire -e hagerbet /etc/nginx /etc/systemd/system /home /etc/cron*`
+returns nothing):
+
+| Hostname | Note |
+|---|---|
+| `qualifireprotection.com`, `www.` | registered 2015-05-07 via eNom, expires 2027-05-07 (RDAP) |
+| `hagerbet.net`, `www.`, `feedback.` | betting domain, NS `mysecurecloudhost.com` |
+
+Most likely a recycled DigitalOcean IP: the box's ssh host keys were born
+`2026-08-17`, and these records still point at the address their owner held before this
+droplet took it. They are **not ours to use** — do not put a certificate on them, the
+DNS is not ours to validate. Serving them is harmless while the clinic app is only
+reached by IP, and was left as-is by choice on 2026-10-16.
+
 ## HTTPS origin: current state (2026-10-16)
 
 The quick tunnel hostnames this document used to name are **all dead** — Cloudflare
