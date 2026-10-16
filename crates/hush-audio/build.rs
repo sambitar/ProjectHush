@@ -25,9 +25,6 @@ fn main() {
         .define("OPUS_BUILD", None)
         .define("HAVE_LRINT", None)
         .define("HAVE_LRINTF", None)
-        // The temporary-allocation mode: C99 variable-length arrays, the
-        // standard choice on Linux.
-        .define("VAR_ARRAYS", None)
         .include("vendor/opus/include")
         .include("vendor/opus/src")
         .include("vendor/opus/celt")
@@ -36,6 +33,20 @@ fn main() {
         .include("vendor/opus/silk/fixed")
         .warnings(false)
         .opt_level(2);
+
+    // The temporary-allocation mode, which Opus's `celt/stack_alloc.h` selects
+    // between. C99 variable-length arrays are the standard choice on Linux and
+    // macOS. MSVC has no VLAs at all and rejects every one of them with
+    // C2057/C2466/C2133 — `analysis.c` and `opus_decoder.c` are where it starts
+    // — so the alloca mode is used there instead, which is the mode Opus's own
+    // CMake build picks for Visual Studio. Both are one macro, so the host
+    // platforms keep the mode they already had.
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_env == "msvc" {
+        build.define("USE_ALLOCA", None);
+    } else {
+        build.define("VAR_ARRAYS", None);
+    }
 
     let skip: &[&str] = &[
         "opus_compare.c",
