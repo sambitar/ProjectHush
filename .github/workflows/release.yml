@@ -40,11 +40,13 @@ jobs:
             # The AppImage is the only Linux bundle the updater can replace in
             # place; the deb is published alongside it for a first install.
             args: "--bundles appimage,deb"
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            # One Windows installer type only, so the updater manifest cannot
-            # disagree with how a copy was installed. See RELEASING.md.
-            args: "--bundles nsis"
+          # No Windows leg until the daemon has a Windows transport. It listens
+          # on `tokio::net::UnixListener`, which does not exist on Windows, so
+          # `stage the daemon sidecar` fails with E0433/E0425 and a Windows
+          # bundle would carry no daemon for the app to start. Restore this entry
+          # — platform windows-latest, target x86_64-pc-windows-msvc, args
+          # "--bundles nsis" — once crates/hush-daemon can listen on a named pipe
+          # or loopback TCP there. See RELEASING.md, "Platform notes".
 
     runs-on: ${{ matrix.platform }}
 
