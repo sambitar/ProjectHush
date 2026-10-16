@@ -7,6 +7,29 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — The sweep for the clinic's real hostname answered with 8075 license URLs
+
+### A repo-wide URL grep was read as "no app hostnames here" [FIXED]
+
+- Attempted: find out whether the clinic app on the box has a real public hostname
+  configured, to judge whether nginx's catch-all is serving anything that matters.
+  Grepped `/opt /home/alhakim /root /etc/systemd/system /etc/cloudflared` for
+  `https?://<host>.<tld>` with a vendor blocklist.
+- Symptom: the top 25 hits were `openpgpjs.org` (8075), `slsa.dev` (7686),
+  `openssl.org` (4670), eleven variants of the ECMA-262 spec, and nextjs docs. The
+  sweep walked `node_modules` and build output, so the output was noise at the top and
+  the real answer was not in the visible list at all. It reads as "no app hostnames
+  here", which is not what it demonstrated — anything further down was simply cut off
+  by `head -25`. No `node_modules` exclusion, no `-prune`, no bound to config surfaces.
+- Resolution: re-ran bounded — `find -maxdepth 4` pruning `node_modules`, `.next`,
+  `dist`, `.git`, then grepping only `.env*`, `next.config.*` and `*.service`. That
+  answered it: the clinic app configures no domain (it is reached by IP), and the only
+  app URL on the box is cricket's `CRICKET_PUBLIC_BASE`, still pointing at the dead
+  `sources-baghdad-sullivan-olive.trycloudflare.com`.
+- Lesson: a repo-wide URL grep is not evidence about configuration. Name the files that
+  can hold the answer and grep those; an unbounded grep plus `head` reports "none" for
+  "not in the first 25".
+
 ## 2026-10-16 — Cloudflare quick-tunnel hostnames die, and a live connector hides it
 
 ### Three trycloudflare hostnames were NXDOMAIN while their connectors reported healthy [WORKED AROUND]
