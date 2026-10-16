@@ -84,17 +84,22 @@ Copy `~/.tauri/hush.key` and its password somewhere durable and offline. If you
 lose them you cannot ship another update that existing installs will accept;
 you would have to generate a new key pair and have every user reinstall by hand.
 
-### 6. macOS and Windows icons
+### 6. Icons
 
-`src-tauri/icons/` carries `icon.icns` and `icon.ico` alongside the PNGs, which
-is what the macOS and Windows matrix legs need. They were generated once from
-the 512×512 `icons/icon.png` with:
+`src-tauri/icons/` carries `icon.icns` and `icon.ico` alongside the PNGs. They
+were generated once from the 512×512 `icons/icon.png` with:
 
 ```bash
 cd apps/hush-tauri
 npm run tauri icon src-tauri/icons/icon.png -o /tmp/hush-icons
 cp /tmp/hush-icons/icon.icns /tmp/hush-icons/icon.ico src-tauri/icons/
 ```
+
+`bundle.icon` in `tauri.conf.json` names them. That list is load-bearing: Tauri
+bundles the icons it is told about and no others, so an unset `bundle.icon` ships
+iconless bundles on every platform and fails the AppImage build outright
+("couldn't find a square icon to use as AppImage icon"). If you add a size,
+add it to that list too.
 
 Nothing to do at release time. Regenerate the same way only if the app icon
 changes; the source is only 512×512, so a larger `icon.png` is worth adding
@@ -106,21 +111,21 @@ The repository has no remote configured yet, and `.github/workflows/release.yml`
 only runs on GitHub. Create the repository, add it as `origin`, and push. The
 `OWNER/REPO` you used in step 1 must match.
 
-> **Not yet exercised.** The workflow has only been checked as far as this
-> machine allows: the YAML parses, `npm ci` succeeds against the committed
-> lockfile, the `updater`/`process` permission namespaces resolve, and the CLI
-> accepts the bundle args. Nothing has run on a GitHub or macOS/Windows runner,
-> so the first tagged release is where the action's argument forwarding, the
-> nested `apps/hush-tauri` `projectPath`, the platform keys it writes into
-> `latest.json`, and the actual update round trip get their first real test.
-> Treat the first tag as a rehearsal and read the draft release before
-> publishing it.
+> **Exercised once, on 2026-10-16.** The first tag (`v0.1.0`) ran the workflow on
+> real runners and settled what local checks could not: the action's argument
+> forwarding, the nested `apps/hush-tauri` `projectPath`, the sidecar staging, and
+> the platform keys in `latest.json` all work, and both macOS legs built and
+> published. Four things it did not have right, all since fixed: the apt list
+> named two conflicting appindicator packages; the Linux leg needed
+> `libasound2-dev` for the daemon's audio dependency; `bundle.icon` was unset, so
+> the AppImage refused to build and macOS had been shipping iconless; and the
+> rust-cache key carried the comma in the Linux args, which rust-cache rejects, so
+> that leg rebuilt libsignal from scratch on every run.
 >
-> The daemon sidecar adds two first-run risks to that rehearsal: every leg now
-> needs `protoc` installed (the app does not link `hush-core`, the daemon does),
-> and the Windows leg builds the daemon for the first time — its socket path is
-> `tokio::net::UnixListener`, which compiles on Windows but has never been built
-> or run there.
+> The Windows leg is out of the matrix until the daemon has a Windows transport.
+> Its socket path is `tokio::net::UnixListener`, which does not exist on Windows
+> at all: the first run failed with `E0433`/`E0425` rather than the
+> build-and-see this note used to predict. See "Platform notes".
 
 ---
 
@@ -225,12 +230,13 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-The workflow builds macOS (Apple Silicon and Intel), Windows, and Ubuntu in
-parallel and attaches everything to a **draft** release named after the tag.
+The workflow builds macOS (Apple Silicon and Intel) and Ubuntu in parallel and
+attaches everything to a **draft** release named after the tag. There is no
+Windows leg; see "Platform notes".
 
 ### 3. Publish the draft
 
-Wait for all four jobs to finish, then check the draft before publishing:
+Wait for all three jobs to finish, then check the draft before publishing:
 
 ```bash
 gh release list
@@ -238,9 +244,10 @@ gh release view v0.2.0 --json assets --jq '.assets[].name'
 ```
 
 Confirm `latest.json` is present and that it lists an entry for every platform
-you intend to support (`darwin-aarch64`, `darwin-x86_64`, `linux-x86_64`,
-`windows-x86_64`), alongside the installers. A platform missing from
-`latest.json` is a platform whose existing installs will never see the update.
+you intend to support (`darwin-aarch64`, `darwin-x86_64`, `linux-x86_64`),
+alongside the installers. A platform missing from `latest.json` is a platform
+whose existing installs will never see the update. `windows-x86_64` will appear
+there again once the Windows leg returns.
 
 ```bash
 gh release edit v0.2.0 --draft=false
@@ -318,13 +325,19 @@ endpoint is baked into the binary.
   refuses the download, because an AppImage is not a deb. So the `.deb` the
   workflow publishes is for first installs; point anyone who wants in-place
   updates at the AppImage.
-- **Windows:** Tauri generates updater artifacts for both the MSI and the NSIS
-  installer, and the plugin looks for `windows-x86_64-nsis` or
-  `windows-x86_64-msi` before falling back. The workflow builds `--bundles nsis`
-  so the release carries a single Windows installer type and the manifest
-  cannot disagree with how a copy was installed. If you also want the MSI, add
-  it to the matrix `args` and check which artifact `latest.json` ends up
-  pointing at before publishing.
+- **Windows: not built.** The leg is out of the matrix because the daemon cannot
+  be built for Windows yet. It listens on a Unix socket —
+  `tokio::net::UnixListener`, which does not exist on Windows; the build fails
+  with `E0433`/`E0425` in `crates/hush-daemon` — so a Windows bundle would have
+  no daemon in it and the app would find nothing to start. The port is a Windows
+  transport in the daemon (a named pipe, or loopback TCP), and the leg comes back
+  with it. Everything below describes how Windows will behave once it does.
+  Tauri generates updater artifacts for both the MSI and the NSIS installer, and
+  the plugin looks for `windows-x86_64-nsis` or `windows-x86_64-msi` before
+  falling back. The workflow built `--bundles nsis` so the release would carry a
+  single Windows installer type and the manifest could not disagree with how a
+  copy was installed. If you also want the MSI, add it to the matrix `args` and
+  check which artifact `latest.json` ends up pointing at before publishing.
 - **macOS:** the `.app.tar.gz` is what the updater downloads; the `.dmg` is for
   first installs. Builds are **unsigned** — no Apple certificate and no
   notarization — so Gatekeeper refuses the first launch. See the section below.
