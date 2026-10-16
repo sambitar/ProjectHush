@@ -7,6 +7,62 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — Production relay VPS setup (37.27.150.250, Hetzner)
+
+### Deployed the workstation-built binary to an ARM VPS — systemd 203/EXEC crash loop [FIXED]
+
+- Attempted: the lab doc's deploy path — `cargo build --release` on the workstation, scp the
+  binary to the VPS. That path documents a glibc match and an x86_64 match as its safety
+  condition; the glibc check passed (both 2.39) and nobody checked the arch.
+- Symptom: unit enters `activating (auto-restart)`, journal shows
+  `Failed to execute /usr/local/bin/hush-relay: Exec format error`, `status=203/EXEC`, restart
+  counter climbing. Root cause: the Hetzner instance is **aarch64** (`CAX` line), the
+  workstation-built binary is x86_64.
+- Resolution: cross-compiled in a disposable `ubuntu:24.04` container
+  (`gcc-aarch64-linux-gnu` + rustup target `aarch64-unknown-linux-gnu`, source mounted ro,
+  CARGO_TARGET_DIR inside the container so root-owned artifacts never touch the host target/),
+  6m47s. Binary verified `ELF ... ARM aarch64`, deployed, service active, /health 200.
+  `systemctl reset-failed` was needed before the restart — the unit had hit its start limit.
+- Lesson: `uname -m` on the target belongs next to the glibc check in
+  `docs/ops/relay-lab-vps.md` before any scp of a binary. The doc's "workstation and box are
+  both x86_64" is an assumption to re-verify per box, not a property of the deploy path.
+  Workstation sudo is password-protected, so the cross toolchain came from a container, not
+  apt on the host.
+
+### Tor config written after tor had already started, and `/etc/tor/torrc.d` did not exist [FIXED]
+
+- Attempted: one `set -e` SSH script doing useradd, tor config, Caddyfile, ufw, service
+  enables, on a freshly `apt-get install tor`-ed box.
+- Symptom: script died at the first heredoc —
+  `bash: line 5: /etc/tor/torrc.d/hush-relay.torrc: No such file or directory` (the directory
+  ships as a comment in torrc, it is not created). Nothing after it ran. On the re-run tor
+  came up `active`, `Bootstrapped 100%`, but no onion hostname appeared: tor had been started
+  by its package's enable before the `%include /etc/tor/torrc.d` line existed, so the hidden
+  service was never in its config. A 25 s post-restart `cat hostname` also raced publication
+  and printed nothing.
+- Resolution: `mkdir -p /etc/tor/torrc.d` before the heredoc; after the config re-run,
+  `sudo systemctl restart tor@default` and read the hostname a beat later — the service keys
+  and `hostname` then appear under `/var/lib/tor/hush-relay/`. Onion verified with
+  `curl --socks5-hostname 127.0.0.1:9050 http://<onion>/health` → 200.
+- Lesson: on a `set -e` provisioning script, everything after the first failed line silently
+  does not happen — split config writing from service starts, and after changing tor config,
+  restart the `tor@default` instance explicitly; `active` + `Bootstrapped 100%` says nothing
+  about which config the running instance loaded.
+
+## 2026-10-16 — Production relay VPS cloud-init (packaging/cloud-init/relay-vps.yaml)
+
+### cloud-init's `swap` module rejects `state: active` shown in its own published examples [FIXED]
+
+- Attempted: `swap: {filename: /swapfile, size: 2G, state: active}` in the cloud-init
+  user-data, following the example that appears in cloud-init's public docs and most howtos.
+- Symptom: `cloud-init schema --config-file` (cloud-init 26.1, the version Ubuntu 24.04
+  ships) — `Error: Cloud config schema errors: swap: Additional properties are not allowed
+  ('state' was unexpected)`. YAML parses fine; only the schema check catches it.
+- Resolution: dropped `state`; the module creates and activates the swapfile from
+  `filename` + `size` alone. Schema check now passes: `Valid schema`.
+- Lesson: cloud-init's published examples lag its schema — run `cloud-init schema` locally
+  (it is on this workstation) before pasting user-data into a provider, not after boot.
+
 ## 2026-10-16 — First tagged release: seven failures the workflow had never been in a position to find
 
 The first tag (`v0.1.0`) was the workflow's first execution, and it took four attempts to get
@@ -16,6 +72,30 @@ args. Three of the seven (the apt list, the AppImage, the missing `libasound2-de
 been rehearsed locally before the tag by running the workflow's apt list in a container and
 building the AppImage here. That is the cheap lesson of this slice: the workflow was treated as
 untestable until it ran, and it was not.
+
+One thing the release did not settle is the first entry below, left OPEN: the updater endpoint
+cannot serve a private repository, which the tag made verifiable for the first time.
+
+### The updater endpoint cannot serve a private repository [OPEN]
+
+- Attempted: after publishing `v0.1.0`, verify the URL the app polls is reachable.
+- Symptom: `https://github.com/sambitar/ProjectHush/releases/latest/download/latest.json`
+  returns **404**, as do `/releases/download/v0.1.0/latest.json` and the release page itself —
+  while `gh api repos/.../releases/latest` reports `v0.1.0`, `draft: false`, `prerelease: false`,
+  and `gh release download` fetches the assets without complaint. The repository is private
+  (`visibility: PRIVATE`), and GitHub answers 404 rather than 403 for every unauthenticated
+  release URL in a private repository. The asset list, `latest.json` and the `.sig` files are all
+  correct; nothing about the build is wrong.
+- Consequence: no installed copy can fetch the manifest, so **auto-update cannot work while the
+  repository is private**, however correct the signing pair is. The startup probe is silent by
+  design (`STARTUP_UPDATE_DELAY_MS`), so this shows up only as a failed manual check in
+  Settings → About rather than as an error at launch. Downloads carry the same constraint: the
+  release page is visible to collaborators only.
+- Resolution: none yet, and it needs a decision rather than a fix. Either the repository becomes
+  public, or `latest.json` is hosted at a publicly reachable URL and
+  `plugins.updater.endpoints` points there, or updates are shipped by hand for now.
+- Lesson: "the release published successfully" and "an installed copy can see the release" are
+  two different claims, and only the first one was ever checked before this tag.
 
 ### `bundle.icon` was never set, so macOS shipped iconless and the AppImage refused to build [FIXED]
 
