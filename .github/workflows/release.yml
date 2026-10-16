@@ -114,7 +114,11 @@ jobs:
           # The cargo workspace root is the repository root (apps/hush-tauri is
           # a member), and its target directory is `target`.
           workspaces: ". -> target"
-          key: ${{ matrix.platform }}-${{ matrix.args }}
+          # The target triple, not matrix.args: the Linux args carry a comma
+          # ("--bundles appimage,deb") and rust-cache rejects any key containing
+          # one — "Key Validation Error: ... cannot contain commas" — which left
+          # that leg rebuilding libsignal from scratch on every run.
+          key: ${{ matrix.platform }}-${{ matrix.target }}
 
       - name: install frontend dependencies
         working-directory: apps/hush-tauri
