@@ -22,14 +22,17 @@ command below is written from the repository root unless it says otherwise.
 
 ### 1. Point the app at your repository
 
-`apps/hush-tauri/src-tauri/tauri.conf.json` ships with a placeholder endpoint:
+`apps/hush-tauri/src-tauri/tauri.conf.json` names the repository that holds the
+releases:
 
 ```json
-"endpoints": ["https://github.com/OWNER/REPO/releases/latest/download/latest.json"]
+"endpoints": ["https://github.com/sambitar/ProjectHush/releases/latest/download/latest.json"]
 ```
 
-Replace `OWNER/REPO` with the GitHub owner and repository that will hold the
-releases. Nothing else in that file needs to change.
+Already set for this repository. Change the owner and name only if you fork, and
+change them before the first release: the endpoint is compiled into the binary, so
+an installed copy keeps asking the old URL until it is reinstalled or updated from
+it. Nothing else in that file needs to change.
 
 ### 2. Generate the signing key
 
