@@ -7,6 +7,85 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — macOS ad-hoc code signing
+
+### v0.2.0 shipped an unsigned macOS bundle, so Gatekeeper called it damaged [FIXED]
+
+- Attempted: downloaded the published `Hush_0.2.0_aarch64.dmg` the way a user would (through
+  a browser) and launched it. macOS refused with "Hush is damaged and can't be opened. You
+  should move it to the Trash." — a dialog with only *Move to Trash* and *Cancel*, no Open
+  button, so no bypass was offered.
+- Symptom: the published `Hush_aarch64.app.tar.gz` contains no
+  `Hush.app/Contents/_CodeSignature/CodeResources`. Parsing the Mach-O load commands of
+  `Contents/MacOS/hush-tauri` and `Contents/MacOS/hush-daemon` showed a single
+  `LC_CODE_SIGNATURE` superblob each, holding one blob of type `0x0` (CodeDirectory) and
+  nothing else — the signature `ld` writes automatically on arm64, never a `codesign`
+  invocation. The root cause is that `apps/hush-tauri/src-tauri/tauri.conf.json` had no
+  `bundle.macOS` section at all, and the release workflow passes no `APPLE_SIGNING_IDENTITY`,
+  so `tauri build` had no identity and skipped signing entirely. The browser's
+  `com.apple.quarantine` flag then made Gatekeeper assess the bundle, find no signature, and
+  report it as damaged. The app itself was never broken. A second contributor, from the CLI's
+  own `--no-binary-patching` help text: `tauri build` patches the main executable in place to
+  record the bundle type, which invalidates whatever signature the linker wrote, and Tauri
+  re-signs after patching only when it has an identity — so the linker's automatic signature
+  cannot stand in for a real one.
+- Resolution: added `"macOS": { "signingIdentity": "-" }` to `bundle` in
+  `apps/hush-tauri/src-tauri/tauri.conf.json`, per Tauri's "Ad-Hoc Signing" documentation. This
+  is the no-Apple-account option: it does not remove the Gatekeeper warning, but it downgrades
+  it from "damaged and can't be opened" (unbypassable) to "cannot be checked for malicious
+  software" (clearable from Finder or Privacy & Security). RELEASING.md's macOS platform note
+  and its first-install section were rewritten to match.
+- Lesson: an unsigned macOS bundle and an ad-hoc-signed one produce two different Gatekeeper
+  dialogs, and only one of them is survivable by the user. "Unsigned" was documented here as a
+  known state, but nobody had checked what the dialog actually said — the documented Finder
+  bypass was written for the ad-hoc case and never applied to what shipped.
+
+### RELEASING.md documented a Finder bypass that this dialog does not offer [FIXED]
+
+- Attempted: followed the repo's own "Installing an unsigned macOS build" section on the
+  refusal above.
+- Symptom: the section offered, as an alternative to `xattr -dr com.apple.quarantine`, "in
+  Finder, right-click the app → Open → Open in the dialog, which is offered only the first
+  time." The dialog in the screenshot has no Open button and no way to reach one — that route
+  is offered for "developer cannot be verified", not for "is damaged and can't be opened". The
+  instruction sent the reader to a dead end at the exact moment they were stuck.
+- Resolution: the section is now titled "Installing an ad-hoc-signed macOS build", states
+  plainly that the Finder route exists only for the ad-hoc case, and no longer presents it as a
+  fallback for a build with no signature.
+- Lesson: a documented bypass is a claim about UI the document cannot see. It should say which
+  error it applies to, not just that it works.
+
+### The ad-hoc signature could not be verified on this host [OPEN]
+
+- Attempted: to confirm that `signingIdentity: "-"` produces a signed bundle, by building the
+  macOS bundle and running `codesign -dv --verbose=4` against it.
+- Symptom: this is a Linux workstation. `codesign`, `xattr`, `spctl` and Gatekeeper do not
+  exist here, and the macOS leg of the release workflow is the only macOS in reach. Everything
+  in the entry above is read from the published artifact's bytes, not from a signing run. The
+  config change is therefore unverified: it matches Tauri's documentation and the schema, and
+  nothing more.
+- Resolution: needs a real macOS host — or the next tagged release, whose `Hush_aarch64.app.tar.gz`
+  should gain a `Contents/_CodeSignature/CodeResources` — to close this. Until then, do not
+  describe the fix as proven.
+- Lesson: "the artifact has no signature" is provable from anywhere; "the build now signs" is
+  not. Do not let the first, which was measured, stand in for the second, which was not.
+
+### A Linux x86-64 ELF ships inside the macOS bundle [OPEN]
+
+- Attempted: nothing yet; noticed while inspecting the bundle for the signing problem.
+- Symptom: `Hush.app/Contents/Resources/tor/tor` and its `libevent-2.1.so.7` are Linux ELF
+  binaries, and `bundle.resources` in `tauri.conf.json` names them unconditionally, so every
+  platform's bundle carries them. On macOS this is ~10 MB of dead weight that can never
+  execute; RELEASING.md already documents the user-visible half ("the Mac reports no Tor").
+  It is not known to break ad-hoc signing, but it is exactly the kind of payload Apple's notary
+  service scrutinises, so it is a blocker for the notarization path rather than a cosmetic one.
+- Resolution: needs a platform-conditional `resources` block (a `tauri.macos.conf.json`, or a
+  per-platform resource list) so each bundle ships only its own Tor. The Windows plan at
+  `docs/plans/2026-10-16-windows-release.md` Task 8 Step 3 already flags the same problem from
+  the Windows side.
+- Lesson: a `bundle.resources` map is not platform-scoped, and nothing in the build warns when
+  it names a binary for the wrong OS.
+
 ## 2026-10-16 — Reach announcement outbox drain
 
 ### Reach toggle blocked the user on up to three 15-second relay attempts [FIXED]

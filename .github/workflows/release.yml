@@ -164,3 +164,28 @@ jobs:
           releaseName: ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
+
+      # Prove the bundle is signed, rather than trusting that the config took.
+      # v0.2.0 shipped with no Contents/_CodeSignature at all and nothing in this
+      # pipeline noticed: the only symptom was a Gatekeeper dialog on a user's Mac
+      # ("Hush is damaged and can't be opened"), with no Open button to get past it.
+      # `bundle.macOS.signingIdentity` is "-", and `codesign -dv` reports that as
+      # "Signature=adhoc". This runs after the upload, so a failure here leaves the
+      # assets on a *draft* release, which nobody can install until it is published
+      # by hand — a loud failure, and a safe one.
+      - name: verify the macOS bundle is signed
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          set -euo pipefail
+          app="$(find target -type d -name 'Hush.app' -path '*/bundle/macos/*' | head -1)"
+          if [[ -z "$app" ]]; then
+            echo "no Hush.app under target/; nothing was bundled"
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | tee /tmp/codesign.txt
+          if ! grep -q 'Signature=adhoc' /tmp/codesign.txt; then
+            echo "the bundle is not ad-hoc signed; a downloaded copy will be refused as damaged"
+            exit 1
+          fi
+          echo "OK: $app carries an ad-hoc signature"
