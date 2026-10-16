@@ -113,16 +113,17 @@ The lab VPS relay is reachable two ways, and they are not equivalent:
 
 | Relay URL | Build it needs |
 |---|---|
-| `https://<tunnel-host>` — Cloudflare tunnel on the same box | **release** (what a packaged build does) |
+| `https://hushrelay.space` — the production relay (Hetzner, ARM, Caddy TLS) | **release** (what a packaged build does) |
+| `http://<tunnel-host>` — Cloudflare quick tunnel on the lab box, changes on restart | debug only |
 | `http://137.184.129.205:8790` — the lab VPS, plain HTTP, no TLS | debug only |
 
 `hush-core`'s `HttpPolicy` refuses a plain-HTTP relay that is not loopback or a v3
-onion in a release build, so the plain-HTTP URL forces the run scripts to build the
-daemon in **debug** and say so. The HTTPS tunnel has a publicly trusted certificate,
-so a release daemon dials it with no client configuration — that is the path to test
-the way it ships.
+onion in a release build, so the plain-HTTP URLs force the run scripts to build the
+daemon in **debug** and say so. The production relay has a publicly trusted
+certificate, so a release daemon dials it with no client configuration — release
+builds default to it, which is the path to test the way it ships.
 
-`<tunnel-host>` is a `trycloudflare.com` name minted when
+The lab box's tunnel hostname is a `trycloudflare.com` name minted when
 `cloudflared-hush-quick.service` on the box last restarted, so it changes and it
 expires. `./scripts/relay-tunnel-url.sh` prints the one that is live now and checks
 it; `--refresh` re-mints it if it has died. The durable alternatives — a Public
@@ -132,6 +133,20 @@ vault made against a dead hostname has to be repointed. Set `HUSH_CLOUD_RELAY_UR
 move the default the scripts fall back to.
 
 ## Relays
+
+The **production relay** is `https://hushrelay.space`, with the onion twin
+`http://qvo7toe6urizihhbj7tp4ibsf2rhkilsrwvnkdk5jlwubjm3e7rnrlad.onion`
+(release builds carry both as defaults; Tor relay mode is a per-vault switch and
+fails closed when either half is missing). Deploy steps, the reboot-test record
+and the onion key backup are in `docs/ops/relay-prod-vps.md`.
+
+The same origin serves the releases: `https://hushrelay.space/updates/` holds the
+installers and the updater manifest (`latest.json`) that installed copies poll.
+That is not a convenience — this repository is private, and GitHub 404s
+unauthenticated release downloads, so a private repo cannot serve its own
+updates or hand an installer to someone without a GitHub account. Publishing is
+automatic when a release is published, via
+`.github/workflows/publish-updates.yml`; the whole path is in `RELEASING.md`.
 
 Each vault stores the relay it was created against and the daemon dials that one;
 a loopback URL means a relay on this machine, which the run scripts start from
@@ -146,7 +161,7 @@ disagree rather than moving the vault, because the mailbox lives on the old one.
 To move a vault deliberately:
 
 ```
-cargo run -p hush-cli -- --dir instances/me relay set --url http://relay.example:8787
+cargo run -p hush-cli -- --dir instances/me relay set --url https://hushrelay.space
 ```
 
 The lab relay (`http://137.184.129.205:8790`) and its onion address, with the

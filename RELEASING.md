@@ -2,16 +2,23 @@
 
 Hush updates itself through the official Tauri updater plugin. Each release is a
 GitHub Release built by `.github/workflows/release.yml`, and installed copies
-poll `releases/latest/download/latest.json` for a newer version.
+poll `https://hushrelay.space/updates/latest.json` for a newer version.
 
-Two properties of that design drive everything below:
+Three properties of that design drive everything below:
 
 - The updater only trusts an artifact whose signature matches the public key
   compiled into the app. That key is a one-time decision: change it and no
   already-installed copy will accept anything you publish again.
-- `releases/latest` ignores drafts. The workflow creates drafts on purpose, so
-  nothing reaches users until you publish, and a half-built release cannot be
-  picked up by mistake.
+- The update origin is the relay, not GitHub. This repository is private, and
+  GitHub answers 404 for unauthenticated release downloads on a private repo —
+  which is exactly what the updater makes. `.github/workflows/publish-updates.yml`
+  mirrors the manifest and every bundle it names to the relay after a release is
+  published. The same directory is what makes the installers publicly
+  downloadable; the GitHub release page cannot serve them to anyone without a
+  GitHub account and a token.
+- The build creates a **draft** release, and nothing is mirrored until that draft
+  is published. Publishing is the single gate, so a half-built release cannot
+  reach an installed copy.
 
 The desktop app lives in `apps/hush-tauri`, not at the repository root. Every
 command below is written from the repository root unless it says otherwise.
@@ -20,19 +27,22 @@ command below is written from the repository root unless it says otherwise.
 
 ## One-time setup
 
-### 1. Point the app at your repository
+### 1. Point the app at the update origin
 
-`apps/hush-tauri/src-tauri/tauri.conf.json` names the repository that holds the
-releases:
+`apps/hush-tauri/src-tauri/tauri.conf.json` names where the updater looks:
 
 ```json
-"endpoints": ["https://github.com/sambitar/ProjectHush/releases/latest/download/latest.json"]
+"endpoints": ["https://hushrelay.space/updates/latest.json"]
 ```
 
-Already set for this repository. Change the owner and name only if you fork, and
-change them before the first release: the endpoint is compiled into the binary, so
-an installed copy keeps asking the old URL until it is reinstalled or updated from
-it. Nothing else in that file needs to change.
+Already set for this deployment. It has to be a public origin that can serve
+`latest.json` and the bundles it names without credentials — see the note above
+about private repositories. A fork needs its own relay, or any HTTPS host holding
+that directory.
+
+Change it before the first release, not after: the endpoint is compiled into the
+binary, so an installed copy keeps asking the old URL until it is reinstalled, or
+updated from the old URL one last time. Nothing else in that file needs to change.
 
 ### 2. Generate the signing key
 
@@ -126,6 +136,31 @@ only runs on GitHub. Create the repository, add it as `origin`, and push. The
 > Its socket path is `tokio::net::UnixListener`, which does not exist on Windows
 > at all: the first run failed with `E0433`/`E0425` rather than the
 > build-and-see this note used to predict. See "Platform notes".
+
+### 8. Add the relay deploy key
+
+`.github/workflows/publish-updates.yml` mirrors each published release to the
+relay over ssh, as an unprivileged account that may only write to the one
+directory being served. Two repository secrets carry that:
+
+| Secret | What it is |
+| --- | --- |
+| `RELAY_UPDATES_SSH_KEY` | the private half of the deploy key pair |
+| `RELAY_UPDATES_KNOWN_HOSTS` | the relay's pinned host key, so an upload cannot be redirected to another host |
+
+Set both from a workstation that already holds the pair:
+
+```bash
+gh secret set RELAY_UPDATES_SSH_KEY < ~/.ssh/hush-updates-deploy
+ssh-keyscan -t ed25519 37.27.150.250 2>/dev/null \
+  | gh secret set RELAY_UPDATES_KNOWN_HOSTS
+```
+
+`docs/ops/relay-prod-vps.md` has the other half of this: creating the
+`relay-updates` account, installing the public key with the `restrict` option,
+the served directory, and the Caddy route. A key rotation is the same procedure
+with `gh secret set` at the end, and needs no rebuild — nothing about it is
+compiled into the app.
 
 ---
 
@@ -253,6 +288,26 @@ there again once the Windows leg returns.
 gh release edit v0.2.0 --draft=false
 ```
 
+Publishing starts `publish-updates.yml`, which downloads the release's assets,
+rewrites every URL in `latest.json` onto the relay, uploads the bundles, checks
+each one is publicly reachable, and publishes the manifest last. Watch it finish,
+then check what an installed copy will actually fetch:
+
+```bash
+gh run watch "$(gh run list --workflow=publish-updates.yml --limit 1 \
+  --json databaseId --jq '.[0].databaseId')"
+curl -sS https://hushrelay.space/updates/latest.json \
+  | jq '{version, platforms: (.platforms | keys)}'
+```
+
+`version` must be the tag you just published, and `platforms` must list every
+platform the release carried. If the mirror fails, the release itself is fine —
+fix the cause and re-run it from the Actions tab, or:
+
+```bash
+gh workflow run publish-updates.yml -f tag=v0.2.0
+```
+
 Publishing is the moment users start seeing the update. There is no staged
 rollout: the next check every running copy makes will offer it.
 
@@ -276,9 +331,9 @@ the updater has nothing to replace.
    run `node scripts/bump-version.mjs --check`.
 
 3. **Publish the new version.** Bump to `0.1.1`, tag, push, wait for the build,
-   and publish the draft (see above). Until it is published, the old copy sees
-   nothing, which is worth verifying once: click **Check for updates** and
-   confirm it says you are on the latest version.
+   publish the draft, then wait for the mirror (see above). Until both are done
+   the old copy sees nothing, which is worth verifying once: click **Check for
+   updates** and confirm it says you are on the latest version.
 
 4. **Trigger the update.** In the still-running 0.1.0 copy, click **Check for
    updates** in **Settings → About**. It should find `0.1.1` and show the
@@ -291,8 +346,16 @@ the updater has nothing to replace.
 
 ### A faster loop, without GitHub
 
-To test the plumbing without publishing anything, serve a manifest locally and
-point the config at it:
+The mirror script is runnable by hand, and `--dry-run` exercises all of it except
+the upload: it downloads the tag's assets, rewrites the manifest, and checks every
+signature against the `.sig` the release carries.
+
+```bash
+scripts/publish-updates-to-relay.sh --tag v0.1.1 --dry-run
+```
+
+To test the app's own plumbing, serve a manifest locally and point the config at
+it:
 
 ```bash
 # A directory holding latest.json and the .tar.gz/.sig the manifest names.
@@ -300,7 +363,7 @@ python3 -m http.server 8000
 ```
 
 Set `plugins.updater.endpoints` to `["http://localhost:8000/latest.json"]`,
-build, and run. Remember to put the GitHub URL back before releasing — the
+build, and run. Remember to put the relay URL back before releasing — the
 endpoint is baked into the binary.
 
 ### What a failure looks like
@@ -309,6 +372,22 @@ endpoint is baked into the binary.
   fails its signature check. Nothing is installed and the app keeps running;
   the message says the update did not pass verification. This is the case worth
   testing deliberately, by signing with a different key.
+
+  When it happens for real, check the pairing from the outside instead of guessing
+  which end is wrong:
+
+  ```bash
+  # Downloads and verifies every artifact the public manifest names.
+  scripts/verify-update-signature.py \
+    --manifest https://hushrelay.space/updates/latest.json --all
+  ```
+
+  `OK` for every platform means the published artifacts match the key the app
+  carries, so the fault is local — a stale install, a proxy, a truncated download.
+  `FAIL` naming a different key id means the release was signed with a key other
+  than the one compiled into the app, and no installed copy will accept it.
+  Needs `pip install cryptography`; it is deliberately not part of the publish
+  path, which runs on `jq`, `rsync` and `curl` alone.
 - **Offline or a 404 endpoint:** the manual check reports the error; the
   launch-time check says nothing at all.
 - **`Version` row empty in About:** the app is running outside the Tauri shell,
@@ -339,8 +418,13 @@ endpoint is baked into the binary.
   copy was installed. If you also want the MSI, add it to the matrix `args` and
   check which artifact `latest.json` ends up pointing at before publishing.
 - **macOS:** the `.app.tar.gz` is what the updater downloads; the `.dmg` is for
-  first installs. Builds are **unsigned** — no Apple certificate and no
-  notarization — so Gatekeeper refuses the first launch. See the section below.
+  first installs. Those bundle names carry no version — the release produces
+  `Hush_aarch64.app.tar.gz`, and the next release overwrites it on the relay.
+  That is why the mirror uploads bundles before the manifest: a client that has
+  read a manifest always finds its artifact present, and one that races a release
+  either verifies against the new file or fails cleanly and retries. Builds are
+  **unsigned** — no Apple certificate and no notarization — so Gatekeeper refuses
+  the first launch. See the section below.
 - **Signing keys are a pair.** The `pubkey` in `tauri.conf.json` and the
   `TAURI_SIGNING_PRIVATE_KEY` secret must come from the same `signer generate`
   run. Replacing one without the other makes every future update fail

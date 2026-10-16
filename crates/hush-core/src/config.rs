@@ -21,7 +21,24 @@ use crate::paths::default_runtime_dir;
 use crate::relay_client::normalize_relay_base;
 
 /// Default relay for a fresh local dogfood run.
+///
+/// Split by build type: a debug build defaults to a relay on this machine (the
+/// run scripts start one), while a release build — what a packaged app ships —
+/// defaults to the production relay, which is HTTPS with a publicly trusted
+/// certificate and so passes the release HttpPolicy unchanged. A vault stores
+/// the relay it was created with; this default only decides what a fresh
+/// install dials first. Onion twin: [`DEFAULT_RELAY_ONION_URL`].
+#[cfg(debug_assertions)]
 pub const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8787";
+#[cfg(not(debug_assertions))]
+pub const DEFAULT_RELAY_URL: &str = "https://hushrelay.space";
+/// The production relay's onion twin, baked into release builds so Tor relay
+/// mode works on a fresh install with no configuration. Debug builds have no
+/// default onion — a local dogfood relay generally has none. Precedence:
+/// `HUSH_RELAY_ONION_URL` > `client-config.json` > this.
+#[cfg(not(debug_assertions))]
+pub const DEFAULT_RELAY_ONION_URL: &str =
+    "http://qvo7toe6urizihhbj7tp4ibsf2rhkilsrwvnkdk5jlwubjm3e7rnrlad.onion";
 /// Default daemon HTTP bind address, used only when TCP is explicitly enabled.
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:9876";
 /// Environment override for the relay URL.
@@ -165,14 +182,20 @@ pub fn resolve_relay_url(data_dir: &Path, explicit: Option<&str>) -> String {
 }
 
 /// Effective onion address for the relay, when one is on file (env or config
-/// file). No clearnet fallback exists — an onion address is either configured
-/// or absent.
+/// file; release builds also carry a baked-in production default). No clearnet
+/// fallback exists — an onion address is either configured or absent.
 pub fn resolve_onion_relay_url(data_dir: &Path) -> Option<String> {
     if let Some(v) = non_empty(std::env::var(ENV_RELAY_ONION_URL).ok().as_deref()) {
         return Some(v.to_string());
     }
     let file = load(data_dir);
-    non_empty(file.onion_relay.as_deref()).map(str::to_string)
+    if let Some(v) = non_empty(file.onion_relay.as_deref()) {
+        return Some(v.to_string());
+    }
+    #[cfg(not(debug_assertions))]
+    return Some(DEFAULT_RELAY_ONION_URL.to_string());
+    #[cfg(debug_assertions)]
+    return None;
 }
 
 /// Effective STUN server for the Conclave Paper data channel, when one is on

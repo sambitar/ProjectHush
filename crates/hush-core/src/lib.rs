@@ -32,8 +32,11 @@ pub use config::{
     ClientConfig, ConfigSource, DEFAULT_DAEMON_ADDR, DEFAULT_RELAY_URL, ENV_DAEMON_ADDR,
     ENV_DAEMON_SOCKET, ENV_RELAY_URL, SOCKET_FILE_NAME, config_path, default_socket_path,
     resolve_daemon_addr, resolve_daemon_addr_with_source, resolve_daemon_socket,
-    resolve_daemon_socket_with_source, resolve_relay_url, resolve_relay_url_with_source,
+    resolve_daemon_socket_with_source, resolve_onion_relay_url, resolve_relay_url,
+    resolve_relay_url_with_source,
 };
+#[cfg(not(debug_assertions))]
+pub use config::DEFAULT_RELAY_ONION_URL;
 pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
 pub use drop::{
     decode_drop_pk, decode_drop_sk, drop_keypair, encode_drop_pk, encode_drop_sk,

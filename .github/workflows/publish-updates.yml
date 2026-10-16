@@ -1,0 +1,78 @@
+# Mirror a published release to the relay, so installed copies can update.
+#
+# Why not GitHub: this repository is private, and GitHub answers 404 for every
+# unauthenticated /releases/latest/download/... request on a private repo. The
+# Tauri updater fetches latest.json with no credentials, so a private repo cannot
+# serve its own updates. The manifest and the bundles it names are mirrored to
+# https://hushrelay.space/updates/ instead, which also makes the installers
+# publicly downloadable.
+#
+# Trigger: publishing a release. The build job in release.yml creates the release
+# as a draft and attaches the bundles to it; nothing is mirrored until someone
+# publishes that draft, so the relay's manifest never points at a half-built
+# release. workflow_dispatch exists to re-mirror a tag by hand (a key rotation, a
+# failed run) without rebuilding.
+#
+# The work itself is in scripts/publish-updates-to-relay.sh, which is also
+# runnable from a workstation against the same host. It uploads bundles first,
+# checks each one is publicly reachable, and publishes latest.json last.
+name: Publish updates
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to mirror, e.g. v0.1.1"
+        required: true
+        type: string
+
+# Only reads the release it is mirroring. The upload goes over ssh with a
+# dedicated key, not through the API.
+permissions:
+  contents: read
+
+# Two mirrors at once would interleave bundles and manifests. Queue them.
+concurrency:
+  group: publish-updates
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The script reads these two paths; the secrets are written to them below.
+      RELAY_UPDATES_SSH_KEY_FILE: /home/runner/.ssh/relay-updates
+      RELAY_UPDATES_KNOWN_HOSTS_FILE: /home/runner/.ssh/relay_known_hosts
+    steps:
+      - uses: actions/checkout@v4
+
+      # The upload key belongs to an unprivileged account whose key may only
+      # reach the one directory being published to (restrict, no-pty,
+      # no-port-forwarding), so a leak here is not shell access to the relay.
+      # Secrets reach the shell through the environment rather than being
+      # interpolated into the script text, so their contents cannot break it.
+      - name: install the deploy key and the pinned host key
+        env:
+          RELAY_KEY: ${{ secrets.RELAY_UPDATES_SSH_KEY }}
+          RELAY_KNOWN_HOSTS: ${{ secrets.RELAY_UPDATES_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          umask 077
+          printf '%s\n' "$RELAY_KEY" > "$RELAY_UPDATES_SSH_KEY_FILE"
+          printf '%s\n' "$RELAY_KNOWN_HOSTS" > "$RELAY_UPDATES_KNOWN_HOSTS_FILE"
+          # A host key that does not parse would fail later as a confusing
+          # handshake error; check it here while the message is still obvious.
+          ssh-keygen -l -f "$RELAY_UPDATES_KNOWN_HOSTS_FILE" >/dev/null
+
+      # `github.event.release.tag_name` is empty on a manual run, which is what
+      # the `||` falls back from.
+      - name: mirror the release to the relay
+        run: |
+          ./scripts/publish-updates-to-relay.sh \
+            --tag "${{ github.event.release.tag_name || inputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY"
