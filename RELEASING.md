@@ -51,10 +51,12 @@ the intended home is `~/.tauri`, outside the tree entirely.
 
 ### 3. Paste the public key into the config
 
-Put the printed public key where the placeholder is:
+`npm run tauri signer generate` prints the public key and also writes it beside
+the private key as `~/.tauri/hush.key.pub`, so it can be read from there instead
+of copied out of the terminal. It goes where the placeholder was:
 
 ```json
-"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6..."
+"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY2ODlDQjdFOTU3MkM2RTQKUldUa3huS1Zmc3VKWmgyOGJaRkVlSFVtMXVNaTI3UW1udzJlVTVTT2tyd2krRWdOMXRkUGtXYjYK"
 ```
 
 This is the only key that goes in the repository. It is a public key; publishing
