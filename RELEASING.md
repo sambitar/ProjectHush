@@ -423,8 +423,8 @@ endpoint is baked into the binary.
   That is why the mirror uploads bundles before the manifest: a client that has
   read a manifest always finds its artifact present, and one that races a release
   either verifies against the new file or fails cleanly and retries. Builds are
-  **unsigned** — no Apple certificate and no notarization — so Gatekeeper refuses
-  the first launch. See the section below.
+  **ad-hoc signed** but carry no Apple certificate and no notarization, so
+  Gatekeeper still refuses the first launch. See the section below.
 - **Signing keys are a pair.** The `pubkey` in `tauri.conf.json` and the
   `TAURI_SIGNING_PRIVATE_KEY` secret must come from the same `signer generate`
   run. Replacing one without the other makes every future update fail
@@ -432,19 +432,47 @@ endpoint is baked into the binary.
 
 ---
 
-## Installing an unsigned macOS build
+## Installing an ad-hoc-signed macOS build
 
-Nothing in the workflow signs with an Apple certificate, so a downloaded copy is
-quarantined and the first launch is refused — "Apple cannot check it for
-malicious software", or "is damaged and can't be opened". Both bypasses are on the
-user's machine:
+There is no Apple certificate and no notarization. What the build does carry is an
+**ad-hoc signature**, set by `bundle.macOS.signingIdentity` in
+`apps/hush-tauri/src-tauri/tauri.conf.json`:
+
+```json
+"macOS": {
+  "signingIdentity": "-"
+}
+```
+
+That one line is the difference between the two Gatekeeper refusals, and the reason
+it is not optional:
+
+- With **no** signature at all, a quarantined copy is refused as **"Hush is damaged
+  and can't be opened. You should move it to the Trash."** That dialog offers only
+  *Move to Trash* and *Cancel* — there is no Open button, and nothing in Finder gets
+  past it. This is what v0.2.0 shipped: `Hush.app` had no
+  `Contents/_CodeSignature/CodeResources`, because `tauri build` signs only when it
+  is given an identity, and none was configured.
+- With an ad-hoc signature, the same copy is refused as **"Hush cannot be opened
+  because Apple cannot check it for malicious software."** That one the user can
+  clear.
+
+Ad-hoc signing is also load-bearing rather than cosmetic on Apple Silicon, where the
+kernel requires a valid signature for any executable to run. The linker writes one
+automatically, but `tauri build` patches the main executable in place to record the
+bundle type, and that patch invalidates it. Tauri re-signs after patching — again,
+only when it has an identity to sign with.
+
+Ad-hoc signing does **not** remove the warning; it makes the warning one the user can
+clear. Both bypasses are on the user's machine:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/Hush.app
 ```
 
 or, in Finder, right-click the app → **Open** → **Open** in the dialog, which is
-offered only the first time.
+offered only the first time. The Finder route exists for the ad-hoc case only: it is
+*not* offered for "damaged", so it is not a fallback for a build with no signature.
 
 To remove the warning properly: join the Apple Developer Program, add a Developer
 ID certificate, and pass `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
