@@ -1,4 +1,4 @@
-use hush_core::{Account, ChatRecordPayload, InvitePayload, MessagePayload};
+use hush_core::{Account, ChatRecordPayload, MessagePayload, ShortInvite};
 use hush_relay::{RelayConfig, router};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
@@ -22,23 +22,14 @@ async fn spawn_relay_on(port: u16) -> (String, TempDir) {
     (base, dir)
 }
 
-/// A port that nothing is listening on, so a relay URL pointed at it fails to
-/// connect until the test serves one there.
-async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
 #[tokio::test]
 async fn a_handle_round_trips_through_an_invite() {
+    let (relay, _relay_dir) = spawn_relay().await;
     let alice_dir = TempDir::new().unwrap();
     let bob_dir = TempDir::new().unwrap();
-    let relay = "http://127.0.0.1:1";
 
-    let mut alice = Account::create(alice_dir.path(), "pw", relay).await.unwrap();
-    let mut bob = Account::create(bob_dir.path(), "pw", relay).await.unwrap();
+    let mut alice = Account::create(alice_dir.path(), "pw", &relay).await.unwrap();
+    let mut bob = Account::create(bob_dir.path(), "pw", &relay).await.unwrap();
 
     alice.set_mail_handle("Sandy").await.unwrap();
     assert_eq!(alice.mail_handle(), Some("sandy"));
@@ -48,7 +39,9 @@ async fn a_handle_round_trips_through_an_invite() {
     assert_eq!(alice.mail_address().as_deref(), Some("sandy@quiet-harbor"));
 
     let invite = alice.invite().await.unwrap();
-    let decoded = InvitePayload::decode(&invite).unwrap();
+    // Pointer invites (hush1…) carry the handle and vault in the clear; the
+    // prekey record they point at is what needs the relay.
+    let decoded = ShortInvite::decode(&invite).unwrap();
     assert_eq!(decoded.handle.as_deref(), Some("sandy"));
     assert_eq!(decoded.vault.as_deref(), Some("quiet-harbor"));
 
@@ -71,7 +64,7 @@ async fn setting_a_handle_invalidates_a_cached_invite() {
     let after = account.invite().await.unwrap();
     assert_ne!(before, after, "a new handle must go out on the next invite");
     assert_eq!(
-        InvitePayload::decode(&after).unwrap().handle.as_deref(),
+        ShortInvite::decode(&after).unwrap().handle.as_deref(),
         Some("sandy")
     );
 }
@@ -192,11 +185,14 @@ async fn a_reply_lands_in_the_same_thread() {
 
 /// The Outbox exists because the relay can be down. A send must survive that:
 /// it is recorded as queued, and the next flush puts it on the wire.
+///
+/// Pointer invites need the relay to pair (the accept fetches the prekey
+/// record), so the accounts meet while it is up and the down stretch is
+/// simulated by pointing the vault at a dead address — the same seam the
+/// relay settings use.
 #[tokio::test]
 async fn mail_queues_while_the_relay_is_down_and_goes_out_on_retry() {
-    let port = free_port().await;
-    let relay = format!("http://127.0.0.1:{port}");
-
+    let (relay, _relay_dir) = spawn_relay().await;
     let alice_dir = TempDir::new().unwrap();
     let bob_dir = TempDir::new().unwrap();
     let mut alice = Account::create(alice_dir.path(), "pw", &relay).await.unwrap();
@@ -206,7 +202,11 @@ async fn mail_queues_while_the_relay_is_down_and_goes_out_on_retry() {
     bob.add_contact("alice", &a_inv).await.unwrap();
     alice.add_contact("bob", &b_inv).await.unwrap();
 
-    // Nothing is listening on that port yet.
+    // The relay "goes down": the vault's base points at a dead port.
+    alice
+        .set_relay_clearnet("http://127.0.0.1:1")
+        .await
+        .unwrap();
     let outcome = alice
         .send_mail("bob", None, Some("later"), "when the relay is back", &[])
         .await
@@ -225,8 +225,8 @@ async fn mail_queues_while_the_relay_is_down_and_goes_out_on_retry() {
     );
     assert_eq!(alice.queued_mail_count(), 1);
 
-    // The relay comes up on that port; the next flush delivers.
-    let _relay_dir = spawn_relay_on(port).await;
+    // The relay "comes back"; the next flush delivers.
+    alice.set_relay_clearnet(&relay).await.unwrap();
     assert_eq!(alice.retry_outbox().await.unwrap(), 1);
     assert_eq!(alice.queued_mail_count(), 0);
 

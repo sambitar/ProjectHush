@@ -202,6 +202,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 account
                     .set_contact_reach(&nickname, TrusteeReach::MailOnly)
                     .await?;
+                // One-shot process: flush the queued announcement now, since
+                // the daemon may never run this vault. A failure keeps it
+                // queued in the vault for a later drain.
+                let delivered = account.retry_pending_reach().await.unwrap_or(0);
+                if delivered == 0 {
+                    println!("note: the reach announcement is queued for the next drain");
+                }
             }
             println!(
                 "added contact {nickname}{}",
@@ -212,12 +219,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reach = parse_reach(&reach)?;
             let mut account = open(&dir, &passphrase).await?;
             account.set_contact_reach(&nickname, reach).await?;
+            // One-shot process: flush the queued announcement now, since the
+            // daemon may never run this vault.
+            let delivered = account.retry_pending_reach().await.unwrap_or(0);
             println!(
-                "{nickname} is now {}",
+                "{nickname} is now {}{}",
                 match reach {
                     TrusteeReach::MailOnly => "mail only",
                     TrusteeReach::Full => "full: mail, chat and conclaves",
-                }
+                },
+                if delivered > 0 {
+                    ""
+                } else {
+                    " (announcement queued for the next drain)"
+                },
             );
         }
         Commands::Send { to, text } => {

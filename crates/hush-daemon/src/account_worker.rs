@@ -446,6 +446,9 @@ enum Work {
     RetryOutbox {
         reply: oneshot::Sender<WorkResult>,
     },
+    RetryPendingReach {
+        reply: oneshot::Sender<WorkResult>,
+    },
     Conclaves {
         reply: oneshot::Sender<WorkResult>,
     },
@@ -1804,6 +1807,18 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::RetryPendingReach { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.retry_pending_reach().await {
+                                    // Same contract as the mail flush: a failed
+                                    // pass keeps the queue, the next tick tries
+                                    // again, nothing to surface.
+                                    Ok(_) | Err(_) => WorkResult::Ok,
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::Conclaves { reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
@@ -2833,6 +2848,12 @@ impl AccountWorker {
     /// Flush the Outbox. Called on a timer, not by the UI.
     pub async fn retry_outbox(&self) -> WorkResult {
         self.call(|reply| Work::RetryOutbox { reply }).await
+    }
+
+    /// Flush queued reach announcements. Called by the outbox timer and by
+    /// the outbox retry route.
+    pub async fn retry_pending_reach(&self) -> WorkResult {
+        self.call(|reply| Work::RetryPendingReach { reply }).await
     }
 
     pub async fn conclaves(&self) -> WorkResult {

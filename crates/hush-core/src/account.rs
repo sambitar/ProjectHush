@@ -516,6 +516,21 @@ struct AccountState {
     /// Introductions received and not yet accepted or dismissed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_intros: Vec<PendingIntro>,
+    /// Reach announcements (Task 24) not yet delivered to the relay.
+    ///
+    /// `set_contact_reach` records the peer's copy of the choice here and
+    /// returns at once; the daemon's outbox timer drains it like queued mail.
+    /// One entry per contact, latest scope wins: a rapid toggle leaves only
+    /// the last choice to deliver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_reach: Vec<PendingReach>,
+}
+
+/// One queued reach announcement: who it is for and what scope it carries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingReach {
+    nickname: String,
+    scope: TrusteeReach,
 }
 
 pub struct Account {
@@ -568,6 +583,7 @@ impl Account {
             pending_invites: Vec::new(),
             pending_intro_requests: Vec::new(),
             pending_intros: Vec::new(),
+            pending_reach: Vec::new(),
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
@@ -1165,16 +1181,18 @@ impl Account {
         if !changed {
             return Ok(());
         }
-        self.save().await?;
-        // Store-and-forward: the peer may be away, and a reach change is not
-        // live-only the way a chat line is.
-        if let Err(e) = self
-            .send_payload_inner(nickname, MessagePayload::Reach { scope: reach }, false)
-            .await
-        {
-            eprintln!("hush: reach announcement to {nickname} failed: {e}");
-        }
-        Ok(())
+        // Queue the announcement instead of making the caller wait for it.
+        // The choice itself is local and saved below; the peer's copy is
+        // store-and-forward — "the peer may be away" — so delivering it is
+        // the outbox's job, not this call's. A slow relay used to hold the
+        // user's toggle (and, with it, the whole account worker) for up to
+        // three 15-second delivery attempts.
+        self.state.pending_reach.retain(|p| p.nickname != nickname);
+        self.state.pending_reach.push(PendingReach {
+            nickname: nickname.to_string(),
+            scope: reach,
+        });
+        self.save().await
     }
 
     /// Forget a contact without revoking it.
@@ -1190,6 +1208,9 @@ impl Account {
             .position(|c| c.nickname == nickname)
             .ok_or(Error::ContactNotFound)?;
         self.state.contacts.remove(pos);
+        // A queued reach announcement for a contact that no longer exists
+        // could never deliver; dropping it here keeps the drain pass quiet.
+        self.state.pending_reach.retain(|p| p.nickname != nickname);
         self.save().await?;
         Ok(())
     }
@@ -1215,6 +1236,10 @@ impl Account {
             .ok_or(Error::ContactNotFound)?;
         let account_id = self.state.contacts[pos].account_id.clone();
         self.state.contacts.remove(pos);
+        // A queued reach announcement for a revoked contact would keep
+        // failing against the burned queue forever; the revocation is the
+        // stronger statement about the relationship.
+        self.state.pending_reach.retain(|p| p.nickname != nickname);
         if !self.state.revoked.contains(&account_id) {
             self.state.revoked.push(account_id.clone());
         }
@@ -1657,6 +1682,56 @@ impl Account {
                 now_ms(),
             )?;
             delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    /// Attempt delivery of every queued reach announcement (Task 24).
+    ///
+    /// The daemon calls this from the outbox timer and from the outbox retry
+    /// route — nobody waits on the result, the way queued mail is drained. An
+    /// entry the relay refuses stays queued for the next pass. One whose
+    /// contact is gone is dropped: there is nobody left to announce to, and a
+    /// revoked queue would refuse delivery forever.
+    ///
+    /// Returns how many announcements went out.
+    pub async fn retry_pending_reach(&mut self) -> Result<usize, Error> {
+        if self.state.pending_reach.is_empty() {
+            return Ok(0);
+        }
+        let queued = std::mem::take(&mut self.state.pending_reach);
+        let mut delivered = 0;
+        let mut kept = Vec::new();
+        for p in queued {
+            if self.find_contact(&p.nickname).is_none() {
+                continue;
+            }
+            match self
+                .send_payload_inner(
+                    &p.nickname,
+                    MessagePayload::Reach { scope: p.scope },
+                    false,
+                )
+                .await
+            {
+                Ok(()) => delivered += 1,
+                Err(e) => {
+                    eprintln!(
+                        "hush: reach announcement to {} not delivered yet: {e}",
+                        p.nickname
+                    );
+                    kept.push(p);
+                }
+            }
+        }
+        self.state.pending_reach = kept;
+        // Re-arm and save. The success path inside `send_payload_inner` saves
+        // too — with the queue momentarily empty — so this final save is what
+        // keeps the on-disk queue matching the entries still owed. A crash
+        // inside that window can only drop an undelivered announcement, which
+        // is the safe direction: the peer then assumes `Full`.
+        if delivered > 0 {
+            self.save().await?;
         }
         Ok(delivered)
     }
@@ -4583,6 +4658,7 @@ mod tests {
             pending_invites: Vec::new(),
             pending_intro_requests: Vec::new(),
             pending_intros: Vec::new(),
+            pending_reach: Vec::new(),
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
         fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();
