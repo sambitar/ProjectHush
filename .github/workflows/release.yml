@@ -55,9 +55,13 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
+          # libappindicator3-dev is deliberately absent: on 22.04 it conflicts
+          # with libayatana-appindicator3-dev, and apt refuses the whole list
+          # when both are named ("libayatana-appindicator3-dev : Conflicts:
+          # libappindicator3-dev"). Ayatana is the maintained fork and the one
+          # Tauri v2 documents.
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
             librsvg2-dev \
             patchelf \
             build-essential \
