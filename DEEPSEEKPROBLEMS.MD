@@ -7,6 +7,173 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — First tagged release: seven failures the workflow had never been in a position to find
+
+The first tag (`v0.1.0`) was the workflow's first execution, and it took four attempts to get
+macOS and Linux through. Every failure was pre-existing and none was reachable by the local
+checks that had been done: the YAML parsed, `npm ci` worked, and the CLI accepted the bundle
+args. Three of the seven (the apt list, the AppImage, the missing `libasound2-dev`) could have
+been rehearsed locally before the tag by running the workflow's apt list in a container and
+building the AppImage here. That is the cheap lesson of this slice: the workflow was treated as
+untestable until it ran, and it was not.
+
+### `bundle.icon` was never set, so macOS shipped iconless and the AppImage refused to build [FIXED]
+
+- Attempted: build all four matrix legs on the first tag.
+- Symptom: the Linux leg aborted in the AppImage bundler —
+  `thread '<unnamed>' panicked at .../linuxdeploy.rs:101:6: couldn't find a square icon to use
+  as AppImage icon / Aborted (core dumped)`. The icons were all present and square (32, 128, 256,
+  512), because `bundle.icon` in `tauri.conf.json` was unset and Tauri bundles only the icons it
+  is told about. The same absence meant the macOS legs had been "succeeding" while producing an
+  `.app` with no `icon.icns` at all — a fact only visible by unpacking the published tarball.
+- Resolution: `bundle.icon` lists the five existing icon files. Verified locally: the deb now
+  installs `usr/share/icons/hicolor/{32x32,128x128,256x256@2}/apps/hush-tauri.png`.
+- Lesson: a bundler that silently omits something will keep succeeding. The AppImage panicking is
+  what made a latent packaging gap visible.
+
+### linuxdeploy cannot resolve the libevent that Tor brings its own copy of [FIXED]
+
+- Attempted: build the AppImage now that it had an icon.
+- Symptom: `failed to bundle project: `failed to run linuxdeploy``. Reproducing the same command
+  against the AppDir the bundler had already assembled gave the real error —
+  `Deploying dependencies for ELF file Hush.AppDir/usr/lib/Hush/tor/tor / ERROR: Could not find
+  dependency: libevent-2.1.so.7 / ERROR: Failed to deploy dependencies for existing files`.
+  linuxdeploy resolves every ELF file in the AppDir, including the bundled Tor; Tor carries its
+  own libevent beside it and finds it at runtime via `LD_LIBRARY_PATH` (`tor.rs`), but linuxdeploy
+  searches system paths and never looks in `usr/lib/Hush/tor`.
+- Resolution: `libevent-2.1-7` in the workflow's apt list, so the library is visible to
+  linuxdeploy at build time. Verified locally against the same AppDir: linuxdeploy completes,
+  deploys `usr/lib/libevent-2.1.so.7`, and produces a 95 MB AppImage.
+- Lesson: an AppImage bundler treats every ELF file as its own responsibility. A self-contained
+  runtime layout (library beside its binary) is invisible to it.
+
+### The Linux daemon links alsa, which the runner image did not have [FIXED]
+
+- Attempted: stage the daemon sidecar on the Linux leg.
+- Symptom: six minutes into the build,
+  `pkg-config exited with status code 1 / Package alsa was not found in the pkg-config search
+  path. / The system library `alsa` required by crate `alsa-sys` was not found.`
+- Resolution: `libasound2-dev` (plus `libdbus-1-dev` for the app's `tao → dbus → libdbus-sys`
+  path, which Tauri's documented list does not name). The chain is `hush-daemon → cpal → alsa →
+  alsa-sys`, so the daemon — not the app — is what needs it; the app is the only thing that had
+  ever been built on that image.
+- Lesson: the dependency list a project inherits from a framework's docs covers the framework's
+  app, not a sidecar the framework knows nothing about.
+
+### The workflow's apt list named two conflicting appindicator packages [FIXED]
+
+- Attempted: the same first run, in `install Linux dependencies`.
+- Symptom: apt refused the entire list before installing anything —
+  `libappindicator3-dev : Depends: libappindicator3-1 (= 12.10.1+20.10.20200706.1-0ubuntu1)` /
+  `libayatana-appindicator3-dev : Conflicts: libappindicator3-dev` /
+  `E: Unable to correct problems, you have held broken packages.`
+- Resolution: the legacy `libappindicator3-dev` is gone; Ayatana is the maintained fork and the
+  package Tauri v2 documents.
+- Lesson: apt fails the whole list, not the offending package, so the error names packages that
+  are individually fine.
+
+### rust-cache rejected the Linux key, silently disabling that leg's cache [FIXED]
+
+- Attempted: read the failure logs of the second run.
+- Symptom: every run printed, while setting up the cache,
+  `##[error]ValidationError: Key Validation Error: v0-rust-ubuntu-22.04---bundles
+  appimage,deb-publish-Linux-x64-01b81e85 cannot contain commas.` and then built libsignal and the
+  rest from scratch anyway. The key was `matrix.platform` + `matrix.args`, and the Linux args are
+  `--bundles appimage,deb`. Cost: roughly ten minutes per run instead of one.
+- Resolution: the key uses `matrix.target`, which identifies the build and cannot contain a comma.
+- Lesson: a cache that fails to save looks exactly like a cache that is cold. The error was in the
+  log from the very first run and read as noise.
+
+### A tracked filename containing a colon stops Windows checkout [FIXED]
+
+- Attempted: run the Windows leg.
+- Symptom: `##[error]error: invalid path '# Project Handoff: Private, Local-First,.md'` at
+  `actions/checkout`, before any step of ours. A colon is a drive separator on Windows, so the
+  file cannot exist in a Windows working tree. It was the only tracked path with a character
+  Windows refuses.
+- Resolution: renamed to `Project-Handoff-Private-Local-First.md`; contents untouched.
+- Lesson: a repository that has never been cloned on Windows can carry paths Windows cannot hold.
+
+### MSVC has no variable-length arrays, so the vendored Opus would not compile [FIXED]
+
+- Attempted: stage the daemon on Windows, after the filename was fixed.
+- Symptom: every Opus C file failed —
+  `vendor/opus/src\analysis.c(180): error C2057: expected constant expression`,
+  `C2466: cannot allocate an array of constant size 0`, `C2133: 'tmp': unknown size`, from the
+  `VAR_ARRAYS` define the build script set. That trio is MSVC's way of reporting a C99 VLA.
+- Resolution: `hush-audio`'s build script defines `USE_ALLOCA` instead of `VAR_ARRAYS` when
+  `CARGO_CFG_TARGET_ENV` is `msvc`, which is the mode Opus's own CMake build picks for Visual
+  Studio and which resolves to `_alloca` on `_WIN32`. Only the `msvc` branch changed, so Linux and
+  macOS keep the mode they already build with; the host build was recompiled afterwards to
+  confirm it is unaffected.
+- Not verified locally: this machine has no MSVC toolchain. The CI leg is what proved it — the
+  build advanced past all of Opus and failed later, in Rust.
+
+### The daemon cannot exist on Windows: tokio has no `UnixListener` there [WORKED AROUND]
+
+- Attempted: the same Windows leg, with Opus fixed.
+- Symptom: `error[E0433]: cannot find `UnixListener` in `net`` and
+  `error[E0425]: cannot find type `UnixListener` in module `tokio::net``. The daemon's transport is
+  a Unix domain socket and tokio does not provide one on Windows.
+- Resolution: the Windows matrix leg is removed. A Windows bundle would carry no daemon, and the
+  app would start and find nothing to talk to — worse than no Windows bundle. The transport port
+  (named pipe, or loopback TCP) is a change to `crates/hush-daemon`, not to the workflow; the
+  matrix comment carries the exact entry to restore.
+- Lesson: this is the one problem here that is not fixed, and the release it blocks is a platform
+  rather than a step.
+
+### RELEASING.md predicted the Windows socket path "compiles" — the run disproved it [FIXED]
+
+- Attempted: trust the document's own risk note when scoping the sidecar work.
+- Symptom: the note said the socket path "compiles on Windows but has never been built or run
+  there". It does not compile: `E0433`/`E0425`, above. A prediction written to be honest had been
+  wrong for as long as it existed, and it was wrong in the direction that made the platform look
+  cheaper than it is.
+- Resolution: the note records what the tag actually found, the Windows platform note is marked as
+  describing a leg that is not built, and the icon section says `bundle.icon` is load-bearing.
+- Lesson: "not yet exercised" notes age into claims. Date them and replace them with results.
+
+### tauri-bundler discards linuxdeploy's output, so its error message names nothing [WORKED AROUND]
+
+- Attempted: diagnose `failed to bundle project: `failed to run linuxdeploy`` from the CI log.
+- Symptom: the log contains nothing between `Bundling Hush_0.1.0_amd64.AppImage` and the failure.
+  linuxdeploy's own `ERROR: Could not find dependency: libevent-2.1.so.7` was never printed.
+- Resolution: the bundler leaves the assembled AppDir behind, so running linuxdeploy against
+  `target/release/bundle/appimage/Hush.AppDir` by hand — the extracted binaries are under
+  `/tmp/appimage_extracted_*` after a run — prints the real error. This is how the libevent cause
+  was found, and it should be the first move for any future AppImage failure.
+- Lesson: a bundler that swallows a subprocess's stderr turns a one-line cause into a guessing
+  game. Its leftover artifacts are the way in.
+
+### Tooling: a commit message containing backticks was executed by the shell [FIXED]
+
+- Attempted: `git commit -m "<long message with `UnixListener` and `tokio::net` in it>"` through
+  the Shell tool.
+- Symptom: the backticks were command-substituted before git saw them —
+  `error: pathspec 'on' did not match any file(s) known to git`, `Command 'run' not found` — and
+  the commit silently did not happen. The `&&` chain stopped there, so the branch was created but
+  left empty and the push never ran.
+- Resolution: commit messages and PR bodies are written to files and passed with `-F` /
+  `--body-file`. Backticks in commit messages are normal for this repository and will recur.
+- Lesson: tooling-related. Shell metacharacters in prose are a trap, and the failure mode is a
+  missing commit rather than an error about quoting.
+
+### Tooling: in-progress run logs are not readable, and one grep rendered text wrongly [OPEN]
+
+- Attempted: watch the Linux leg while it was still running, and read `tor.rs` through the Shell
+  tool's `rg`.
+- Symptom: two separate tooling problems. (1) `gh run view --log-failed` returned zero lines for a
+  run that had failed jobs, and `gh api .../jobs/<id>/logs` returned
+  `<Error><Code>BlobNotFound</Code>` until the run completed, so a long leg can only be watched
+  by polling job status. (2) `rg -rn 'LD_LIBRARY_PATH|libevent'` printed `std::env::var_os("n")`
+  for source that reads `std::env::var_os("LD_LIBRARY_PATH")` — the literal string was rendered as
+  `n`. Reading the same file with the Grep tool showed it correctly.
+- Resolution: none for either; both were worked around (poll status instead of reading logs; use
+  the Grep tool for source). Recorded because the first one cost a diagnosis delay and the second
+  briefly looked like a source corruption in `tor.rs`.
+- Lesson: tooling-related, not repo problems. Treat a suspicious single-token reading from shell
+  grep as suspect and re-read the file with the file tools before acting on it.
+
 ## 2026-10-16 — Bundling the daemon as a Tauri sidecar: one rejected flag, one build-time coupling
 
 ### `cargo build --profile debug` is rejected, and the stager's first version used it [FIXED]
