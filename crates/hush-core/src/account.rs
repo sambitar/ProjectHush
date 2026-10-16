@@ -4485,13 +4485,12 @@ mod tests {
     use super::*;
     use crate::device::DEVICE_FILE;
     use crate::signal_persist::export_store;
+    use crate::testutil::ScratchDir;
     use crate::vault::Vault;
 
-    fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("hush-account-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+    /// A vault directory that deletes itself when the test ends.
+    fn scratch(name: &str) -> ScratchDir {
+        ScratchDir::new(&format!("account-{name}"))
     }
 
     /// Write the on-disk layout a vault had before the multi-device model: the
@@ -4849,11 +4848,18 @@ mod tests {
     const FRIEND: &str = "bb";
     const STRANGER: &str = "cc";
 
-    async fn intro_vault(name: &str) -> Account {
+    /// An account in a vault of its own, with the vault directory.
+    ///
+    /// The directory is returned because it deletes itself when it goes out of
+    /// scope, and the account writes to it for the whole test: the caller has to
+    /// hold it. Dropping it here instead would pull the vault out from under the
+    /// account mid-test.
+    async fn intro_vault(name: &str) -> (ScratchDir, Account) {
         let dir = scratch(name);
-        Account::create(&dir, "pw", "http://127.0.0.1:1")
+        let account = Account::create(&dir, "pw", "http://127.0.0.1:1")
             .await
-            .unwrap()
+            .unwrap();
+        (dir, account)
     }
 
     /// Seed the account's conclave record: three joined members, one conclave.
@@ -4903,7 +4909,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_intro_request_addressed_to_this_vault_waits_for_consent() {
-        let mut stranger = intro_vault("intro-target").await;
+        let (_dir, mut stranger) = intro_vault("intro-target").await;
         let cid = seed_mesh_conclave(&mut stranger, STRANGER);
 
         // The friend relays Sam's request; the stranger is the target.
@@ -4936,7 +4942,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_relayed_intro_request_for_an_unreachable_target_is_dropped() {
-        let mut friend = intro_vault("intro-courier").await;
+        let (_dir, mut friend) = intro_vault("intro-courier").await;
         let cid = seed_mesh_conclave(&mut friend, FRIEND);
 
         // The courier does not know the target: it cannot help, so the
@@ -4967,7 +4973,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delivered_intro_is_stored_and_accepting_adds_the_contact() {
-        let mut sam = intro_vault("intro-seeker").await;
+        let (_dir, mut sam) = intro_vault("intro-seeker").await;
         let cid = seed_mesh_conclave(&mut sam, SAM);
 
         // A forged origin — an invite "for" someone else's account — is
@@ -4983,7 +4989,7 @@ mod tests {
         // A courier cannot swap in their own invite: the payload must name
         // the roster member it claims.
         let swapped = {
-            let mut friend_vault = intro_vault("intro-swap").await;
+            let (_dir, mut friend_vault) = intro_vault("intro-swap").await;
             friend_vault.state.protocol_name = FRIEND.to_string();
             friend_vault.invite().await.unwrap()
         };
@@ -4995,7 +5001,7 @@ mod tests {
 
         // The real shape: the stranger's own invite, carried by the friend.
         let invite = {
-            let mut stranger = intro_vault("intro-owner").await;
+            let (_dir, mut stranger) = intro_vault("intro-owner").await;
             stranger.state.protocol_name = STRANGER.to_string();
             stranger.invite().await.unwrap()
         };
@@ -5026,11 +5032,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_intro_cannot_collide_with_another_contacts_nickname() {
-        let mut sam = intro_vault("intro-nick").await;
+        let (_dir, mut sam) = intro_vault("intro-nick").await;
         let cid = seed_mesh_conclave(&mut sam, SAM);
         seed_contact(&mut sam, "taken", "deadbeef");
         let invite = {
-            let mut stranger = intro_vault("intro-owner-2").await;
+            let (_dir, mut stranger) = intro_vault("intro-owner-2").await;
             stranger.state.protocol_name = STRANGER.to_string();
             stranger.invite().await.unwrap()
         };
@@ -5046,13 +5052,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_reverse_intro_adds_the_contact_without_consuming_the_bundle() {
-        let mut sam = intro_vault("intro-reverse").await;
+        let (_dir, mut sam) = intro_vault("intro-reverse").await;
         let cid = seed_mesh_conclave(&mut sam, SAM);
 
         // The stranger accepted our invite first, so their card comes back
         // flagged reverse: the bundle inside must stay unconsumed.
         let invite = {
-            let mut stranger = intro_vault("intro-reverse-owner").await;
+            let (_dir, mut stranger) = intro_vault("intro-reverse-owner").await;
             stranger.state.protocol_name = STRANGER.to_string();
             stranger.invite().await.unwrap()
         };

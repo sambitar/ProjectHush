@@ -7,6 +7,52 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-15 — Test scratch directories: 1576 vaults' worth of private keys left in /tmp
+
+### A test vault's private keys were left in the system temp dir, 2027 directories of them [FIXED]
+
+- Attempted: tidy up after the onboarding slice and looked at `/tmp`.
+- Symptom: 2027 `hush-*` directories, 1576 of them holding an `identity.secret`, spanning two
+  days of runs, 215 MB, directories mode 0775 and files 0664 — readable by group and other.
+  `fn scratch` in `vault.rs`, `account.rs`, and `device.rs` built a path from `temp_dir()` plus
+  the process id and never removed it. The id changes every run, so the `remove_dir_all` at the
+  *start* of the function never matched anything the previous run had made, and the count grew by
+  one directory per test per run, without limit.
+- Resolution: `crates/hush-core/src/testutil.rs` (test-only) with `ScratchDir`, a
+  `tempfile::TempDir` that derefs to its path and deletes itself when the test ends, a panicking
+  test included. Used by `vault.rs`, `account.rs`, `device.rs`, and the 13 sites in `chat_log.rs`;
+  `tests/vault_identity.rs` holds a `TempDir` directly. Verified: `cargo test -p hush-core` leaves
+  the `/tmp` count unchanged (2027 before, 2027 after) with all 202 tests passing. The existing
+  2064 entries were deleted, 215 MB.
+- Lesson: `temp_dir().join(pid)` is not a scratch directory, it is a directory that happens to
+  have a unique name. Cleanup that only runs at the start of the next process never runs.
+
+### A self-deleting scratch directory cannot be created inside a helper that returns the account [FIXED]
+
+- Attempted: swap the three `scratch` helpers over to `ScratchDir` and move on.
+- Symptom: `cargo test -p hush-core` went from 137 passing to 5 failing, all in `account::tests`,
+  all panicking at `account.rs:4879` inside `create_conclave`. `intro_vault(name)` created the
+  directory, built the account, and returned only the account — so the guard dropped at the end of
+  the helper and deleted the vault out from under an account that still writes to it. The
+  directory had survived before precisely because nothing owned it.
+- Resolution: `intro_vault` returns `(ScratchDir, Account)` and the nine call sites bind it as
+  `let (_dir, mut x) = ...`, so the test body owns the directory for as long as the account lives.
+  All 202 tests pass.
+- Lesson: turning a leak into an owned guard moves the question from "when does this get deleted"
+  to "who holds it". A helper that returns something outliving the directory is the case that
+  breaks.
+
+### The same pattern is still in three other crates [OPEN]
+
+- `crates/hush-daemon/src/reads.rs` (a reader cache), `apps/hush-tauri/src-tauri/src/tor.rs` (five
+  Tor data dirs) and `daemon_client.rs` (a proxy test dir) still build `temp_dir()` paths from the
+  process id and never remove them. None of them holds a vault or a key — the 2064 entries I
+  deleted included 14 `hush-proxy-test` and a handful of `hush-tor-*`, all disposable state — so
+  the harm is clutter rather than secrets.
+- Not fixed here because `testutil` is `#[cfg(test)]` and private to `hush-core`, so each crate
+  would need its own guard, and that is a change to three crates' test scaffolding rather than to
+  the thing that was leaking keys. Recorded so the next run does not rediscover it as a surprise.
+
 ## 2026-10-15 — First run in the product: create the vault from the window
 
 ### The daemon could not tell "no vault" from "locked", and could not create one [FIXED]

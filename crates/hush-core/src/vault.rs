@@ -775,11 +775,8 @@ impl DropDrainKey {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("hush-vault-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn scratch(name: &str) -> crate::testutil::ScratchDir {
+        crate::testutil::ScratchDir::new(&format!("vault-{name}"))
     }
 
     fn lock_json(vault_dir: &Path) -> serde_json::Value {

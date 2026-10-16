@@ -895,11 +895,14 @@ impl ChatLog {
 mod tests {
     use super::*;
 
+    /// A log directory that deletes itself when the test ends.
+    fn scratch(name: &str) -> crate::testutil::ScratchDir {
+        crate::testutil::ScratchDir::new(&format!("log-{name}"))
+    }
+
     #[test]
     fn a_mail_record_survives_a_save_and_load() {
-        let dir = std::env::temp_dir().join(format!("hush-mail-log-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("mail");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -926,9 +929,7 @@ mod tests {
 
     #[test]
     fn a_queued_message_keeps_its_state_across_a_reload() {
-        let dir = std::env::temp_dir().join(format!("hush-queued-log-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("queued");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -966,9 +967,7 @@ mod tests {
 
     #[test]
     fn a_draft_is_editable_and_deletable() {
-        let dir = std::env::temp_dir().join(format!("hush-draft-log-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("draft-log");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1009,9 +1008,7 @@ mod tests {
 
     #[test]
     fn a_draft_is_not_chat_history() {
-        let dir = std::env::temp_dir().join(format!("hush-draft-chat-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("draft-chat");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1035,9 +1032,7 @@ mod tests {
 
     #[test]
     fn a_conclave_and_its_messages_survive_a_save_and_load() {
-        let dir = std::env::temp_dir().join(format!("hush-conclave-log-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("conclave-log");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1071,9 +1066,7 @@ mod tests {
 
     #[test]
     fn a_conclave_created_under_an_invite_id_keeps_that_id() {
-        let dir = std::env::temp_dir().join(format!("hush-conclave-id-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("conclave-id");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1096,9 +1089,7 @@ mod tests {
 
     #[test]
     fn conclave_trustee_updates_converge_and_never_revive_a_terminal_state() {
-        let dir = std::env::temp_dir().join(format!("hush-conclave-mem-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("conclave-mem");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1151,9 +1142,7 @@ mod tests {
 
     #[test]
     fn a_legacy_record_hydrates_its_trustees_from_its_nickname_list() {
-        let dir = std::env::temp_dir().join(format!("hush-conclave-hydrate-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("conclave-hydrate");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1193,10 +1182,7 @@ mod tests {
     /// This is the regression that made a pre-consent vault unusable.
     #[test]
     fn a_legacy_record_resolves_the_local_accounts_own_nickname() {
-        let dir =
-            std::env::temp_dir().join(format!("hush-conclave-hydrate-self-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("conclave-hydrate-self");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1234,10 +1220,7 @@ mod tests {
     /// re-processed so the vault self-heals rather than staying unusable.
     #[test]
     fn an_already_hydrated_fallback_account_id_self_heals() {
-        let dir = std::env::temp_dir()
-            .join(format!("hush-conclave-hydrate-heal-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("conclave-hydrate-heal");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1273,8 +1256,7 @@ mod tests {
     /// still disagree (2 trustees vs 1) after the fix.
     #[test]
     fn both_legacy_shapes_hydrate_to_the_same_trustee_set() {
-        let dir = std::env::temp_dir().join(format!("hush-conclave-hydrate-agree-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = scratch("conclave-hydrate-agree");
         let master = [7u8; MASTER_KEY_LEN];
 
         // Alice's copy: the legacy list named her own nickname too.
@@ -1343,9 +1325,7 @@ mod tests {
 
     #[test]
     fn ending_a_conclave_keeps_its_record_and_log() {
-        let dir = std::env::temp_dir().join(format!("hush-conclave-end-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("conclave-end");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
@@ -1379,9 +1359,7 @@ mod tests {
 
     #[test]
     fn deleting_a_conclave_drops_its_log_but_keeps_the_list_shape() {
-        let dir = std::env::temp_dir().join(format!("hush-conclave-delete-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("conclave-delete");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();

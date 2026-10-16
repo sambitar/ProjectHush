@@ -17,6 +17,8 @@ mod recovery;
 mod relay_client;
 mod signal;
 mod signal_persist;
+#[cfg(test)]
+mod testutil;
 mod vault;
 mod voice;
 mod wire;
