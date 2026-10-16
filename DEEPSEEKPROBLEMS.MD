@@ -7,6 +7,42 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-16 — Cloudflare quick-tunnel hostnames die, and a live connector hides it
+
+### Three trycloudflare hostnames were NXDOMAIN while their connectors reported healthy [WORKED AROUND]
+
+- Attempted: answer "can we use the Cloudflare HTTPS tunnel instead of the plain-HTTP lab
+  relay, so teammates can run release builds?" by checking the box rather than the doc.
+- Symptom: every `trycloudflare.com` hostname this repo names was gone — `ban-therapeutic-
+  daughter-organic` (nginx/relay via path ingress), `sources-baghdad-sullivan-olive` (the
+  cricket app's `CRICKET_PUBLIC_BASE`), `remedy-relief-patricia-main` (the relay-facing
+  quick tunnel) — while `systemctl is-active cloudflared-*.service` said `active` for all of
+  them and the journal still showed the old hostname. NXDOMAIN at 1.1.1.1 and 8.8.8.8, so it
+  was not local resolver cache. Same failure as 2026-10-10, now for the third hostname on
+  this box: Cloudflare reclaims account-less tunnel names and the connector does not notice.
+- Resolution (workaround): restarting `cloudflared-hush-quick.service` mints a new hostname,
+  and that one works — `/health` 200 with `ssl_verify_result=0`, `/drop` 200 at 53837 bytes,
+  `smoke-relay-lab.sh` green end to end through it, and a **release** `hush-cli` accepts it
+  where it refuses `http://137.184.129.205:8790` with `insecure relay URL`. Recorded in
+  `docs/ops/relay-lab-vps.md` along with the three durable alternatives.
+- Lesson: "the connector is active" is not evidence a hostname resolves. A quick tunnel needs
+  the hostname fetched from the log and a live request against it, every time; anything that
+  outlives a session needs a named tunnel with a real DNS record.
+
+### The `hush` named tunnel has been up for days and can serve nothing [OPEN]
+
+- Attempted: use the purpose-built named tunnel instead of a quick one.
+- Symptom: account `75743fae14d6c875d63ca54494668df8`, tunnel
+  `e8c187f1-e516-4371-ab7d-18053dcf5b11`, connector `cloudflared-hush.service` `active` with
+  four QUIC connections — and no public hostname, so the connector logs `No ingress rules were
+  defined … cloudflared will return 503 for all incoming HTTP requests`. The box has no
+  `cert.pem` and no Cloudflare API token, so `cloudflared tunnel list` / `route dns` cannot
+  even enumerate it from there.
+- Needed: a Public Hostname added in the dashboard for that tunnel (service HTTP →
+  `localhost:8790`, pointed at the relay rather than nginx), on a zone in that account. This
+  is a dashboard action with no CLI path available from this machine, so it stays OPEN until
+  someone with dashboard access adds it.
+
 ## 2026-10-15 — Test scratch directories: 1576 vaults' worth of private keys left in /tmp
 
 ### A test vault's private keys were left in the system temp dir, 2027 directories of them [FIXED]

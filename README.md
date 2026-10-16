@@ -94,24 +94,36 @@ creates the vault it needs:
 
 ```
 # one side: a new vault on the shared relay, then the window
-./scripts/run-one-ui.sh --relay http://137.184.129.205:8790
+./scripts/run-one-ui.sh --relay https://<tunnel-host>
 
 # the other side: two vaults, both on the same relay
-./scripts/run-two-ui.sh --relay http://137.184.129.205:8790
+./scripts/run-two-ui.sh --relay https://<tunnel-host>
 ```
 
 Then exchange invites inside the app: **Copy my invite** on one side, **Add
 contact** on the other. The relay address in the vault is what makes that work, so
 the two runs have to name the same one.
 
-The shared relay is `http://137.184.129.205:8790` — the lab VPS, plain HTTP with
-no TLS, deliberately open for this. A **release** daemon refuses a plain-HTTP
-relay that is not loopback or a v3 onion (`hush-core`'s `HttpPolicy`), so when the
-relay is plain HTTP on a public host the run scripts build and run the daemon in
-**debug** and say so. To run a release daemon against a remote relay, terminate
-TLS in front of it or use its onion address: both are in
-`docs/ops/relay-lab-vps.md`. Set `HUSH_CLOUD_RELAY_URL` to move the default the
-scripts fall back to.
+The lab VPS relay is reachable two ways, and they are not equivalent:
+
+| Relay URL | Build it needs |
+|---|---|
+| `https://<tunnel-host>` — Cloudflare tunnel on the same box | **release** (what a packaged build does) |
+| `http://137.184.129.205:8790` — the lab VPS, plain HTTP, no TLS | debug only |
+
+`hush-core`'s `HttpPolicy` refuses a plain-HTTP relay that is not loopback or a v3
+onion in a release build, so the plain-HTTP URL forces the run scripts to build the
+daemon in **debug** and say so. The HTTPS tunnel has a publicly trusted certificate,
+so a release daemon dials it with no client configuration — that is the path to test
+the way it ships.
+
+`<tunnel-host>` is a `trycloudflare.com` name minted when
+`cloudflared-hush-quick.service` on the box last restarted, so it changes and it
+expires: read the current one with the command in `docs/ops/relay-lab-vps.md`, which
+also has the durable alternatives (a Public Hostname on the named `hush` tunnel, or
+TLS on the box itself). A vault stores the relay it was created against, so a vault
+made against a dead hostname has to be repointed. Set `HUSH_CLOUD_RELAY_URL` to move
+the default the scripts fall back to.
 
 ## Relays
 

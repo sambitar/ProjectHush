@@ -106,6 +106,86 @@ So a **release** daemon cannot use this plain-HTTP relay; it needs `https://` (t
 in front — see `docs/ops/relay-https-checklist.md`) or a **debug** build. The lab
 cross-machine test therefore runs debug binaries.
 
+## HTTPS origin: current state (2026-10-16)
+
+The quick tunnel hostnames this document used to name are **all dead** — Cloudflare
+reclaimed them again, the same way it did on 2026-10-10. Checked 2026-10-16:
+
+| Hostname | Serves | DNS |
+|---|---|---|
+| `ban-therapeutic-daughter-organic.trycloudflare.com` | nginx (relay via path ingress) | NXDOMAIN |
+| `sources-baghdad-sullivan-olive.trycloudflare.com` | nginx (cricket `CRICKET_PUBLIC_BASE`) | NXDOMAIN |
+| `remedy-relief-patricia-main.trycloudflare.com` | relay directly | NXDOMAIN |
+
+The connectors were still `active` with their old hostnames in the log, which is the
+trap: a healthy-looking connector is not a working hostname.
+
+**The relay-facing quick tunnel is `cloudflared-hush-quick.service`** —
+`cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8790`, `enabled`,
+`Restart=always`. It points straight at the relay, so no nginx path ingress is
+involved. Restarting it mints a new hostname:
+
+```sh
+ssh -i /home/sam/.ssh/alhakim_deploy root@137.184.129.205 \
+  "systemctl restart cloudflared-hush-quick.service && sleep 12 && \
+   journalctl -u cloudflared-hush-quick.service --no-pager \
+   | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1"
+```
+
+Verified 2026-10-16 with `https://bolt-heroes-mailed-grass.trycloudflare.com`:
+
+```
+/health        200, ssl_verify_result=0 (publicly trusted, so webpki-roots accepts it)
+/drop          200, 53837 bytes (the drop page)
+/k/<zero key>  404 (no such key)
+```
+
+`HUSH_RELAY_URL=https://<hostname> ./scripts/smoke-relay-lab.sh` passes end to end
+through it: both vaults record the relay, invite/contact exchange completes, a mail
+is queued and received, and the reply comes back.
+
+A **release** client accepts this URL — which is the point of the whole exercise:
+
+```
+$ hush-cli --dir <vault> init --passphrase pw --relay https://bolt-heroes-mailed-grass.trycloudflare.com
+vault ready …  relay: https://bolt-heroes-mailed-grass.trycloudflare.com
+
+$ hush-cli --dir <vault> init --passphrase pw --relay http://137.184.129.205:8790
+Error: Relay("insecure relay URL: use HTTPS except for localhost")
+```
+
+**Lifetime: still ephemeral.** The hostname changes on every restart of the unit and
+Cloudflare gives account-less tunnels no uptime guarantee — it has now reclaimed
+three hostnames on this box. Treat any `trycloudflare.com` URL as good for a
+session, not for a teammate's vault.
+
+### Durable options
+
+1. **Public Hostname on the `hush` named tunnel** (the right fix). Account
+   `75743fae14d6c875d63ca54494668df8`, tunnel `e8c187f1-e516-4371-ab7d-18053dcf5b11`,
+   connector `cloudflared-hush.service` already `active` with 4 QUIC connections.
+   Dashboard → Zero Trust → Networks → Tunnels → `hush` → Public Hostname → add a
+   subdomain on a zone **in that account** → service **HTTP** → `localhost:8790`.
+   Point it at the relay, not nginx: every relay route then works verbatim. Until a
+   hostname exists the connector logs `No ingress rules were defined … cloudflared
+   will return 503 for all incoming HTTP requests`, so the tunnel is up and useless.
+   No `cert.pem` and no API token are on the box, so this cannot be done from the
+   CLI there — it is a dashboard action.
+2. **Proxied DNS record on an existing Cloudflare zone.** `ironline-pal.com` is the
+   only Cloudflare-hosted zone visible from here (`nucum.ns.cloudflare.com`), and it
+   is not this box: `api.ironline-pal.com` answers 404 for `/health`, `/drop` and
+   `/ironlink-health`, so it is the IronLine API elsewhere. A record such as
+   `relay.ironline-pal.com` → this origin would need the zone's SSL mode to allow
+   Cloudflare→origin plain HTTP, and it exposes the origin address.
+3. **TLS on the box.** `qualifireprotection.com` and `hagerbet.net` both resolve
+   straight to `137.184.129.205` (neither is on Cloudflare), and nginx already serves
+   the relay paths on port 80, so `http://qualifireprotection.com/health` is 200
+   today. A certificate plus a `listen 443` block on this nginx would make that a
+   stable HTTPS origin with no Cloudflare in the path — see
+   `docs/ops/relay-https-checklist.md` for the nginx shape and the path-transparency
+   requirements. This changes the listener that also fronts the alhakim app, so do it
+   deliberately.
+
 ## HTTPS origin (Cloudflare quick tunnel + nginx path ingress)
 
 Added 2026-10-08 for the drop opener, extended 2026-10-10 to carry the whole relay protocol so
