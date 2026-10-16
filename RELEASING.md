@@ -110,10 +110,55 @@ only runs on GitHub. Create the repository, add it as `origin`, and push. The
 > `latest.json`, and the actual update round trip get their first real test.
 > Treat the first tag as a rehearsal and read the draft release before
 > publishing it.
+>
+> The daemon sidecar adds two first-run risks to that rehearsal: every leg now
+> needs `protoc` installed (the app does not link `hush-core`, the daemon does),
+> and the Windows leg builds the daemon for the first time — its socket path is
+> `tokio::net::UnixListener`, which compiles on Windows but has never been built
+> or run there.
+
+---
+
+## What a bundle carries
+
+Two binaries: the app, and the daemon. `bundle.externalBin` names
+`binaries/hush-daemon`, which Tauri resolves to a file carrying the target triple
+— `binaries/hush-daemon-aarch64-apple-darwin` — and copies into the bundle beside
+the executable (`Contents/MacOS/hush-daemon` in a `.app`).
+
+Cargo names nothing that way, so `scripts/stage-daemon-sidecar.sh` builds the
+daemon and copies it under the name Tauri looks for. This is not optional:
+`tauri-build` refuses to compile the app when the file is missing —
+
+```
+resource path `binaries/hush-daemon-x86_64-unknown-linux-gnu` doesn't exist
+```
+
+— which makes the daemon a build-time dependency of the app, not just a runtime
+one. The run scripts call the stager, the release workflow calls it once per
+matrix leg, and a developer who only wants `cargo check -p hush-tauri` calls it
+once by hand.
+
+Because the bundle now carries the daemon, the workflow needs `protoc` on every
+leg: the app does not link `hush-core`, the daemon does.
+
+At runtime the app starts that daemon itself, but only when nothing else has:
+`HUSH_API_URL` set — a run script, or a daemon started by hand — means someone
+else owns the socket, and the app spawns the sidecar only when the environment
+names no transport. That is why `scripts/run-one-ui.sh` behaves exactly as it did
+before. The vault and the socket live under the app's local data directory
+(`~/Library/Application Support/com.hush.capsule` on macOS), and the daemon is
+killed when the app exits, so the vault lock is released for the next launch.
 
 ---
 
 ## Building locally
+
+`npm run tauri build` needs the staged daemon before it will compile:
+
+```bash
+./scripts/stage-daemon-sidecar.sh --profile release
+```
 
 `npm run tauri build` now requires the signing key, because
 `bundle.createUpdaterArtifacts` is on. Without it the build finishes the bundle
@@ -276,8 +321,47 @@ endpoint is baked into the binary.
   it to the matrix `args` and check which artifact `latest.json` ends up
   pointing at before publishing.
 - **macOS:** the `.app.tar.gz` is what the updater downloads; the `.dmg` is for
-  first installs.
+  first installs. Builds are **unsigned** — no Apple certificate and no
+  notarization — so Gatekeeper refuses the first launch. See the section below.
 - **Signing keys are a pair.** The `pubkey` in `tauri.conf.json` and the
   `TAURI_SIGNING_PRIVATE_KEY` secret must come from the same `signer generate`
   run. Replacing one without the other makes every future update fail
   verification.
+
+---
+
+## Installing an unsigned macOS build
+
+Nothing in the workflow signs with an Apple certificate, so a downloaded copy is
+quarantined and the first launch is refused — "Apple cannot check it for
+malicious software", or "is damaged and can't be opened". Both bypasses are on the
+user's machine:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Hush.app
+```
+
+or, in Finder, right-click the app → **Open** → **Open** in the dialog, which is
+offered only the first time.
+
+To remove the warning properly: join the Apple Developer Program, add a Developer
+ID certificate, and pass `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+`APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` to
+`tauri-action`. Until then the bypass is the documented path.
+
+Two more things a first run on macOS needs:
+
+- **The relay.** The compiled-in default is loopback `http://127.0.0.1:8787`, and a
+  bundled copy has no run script to override it, so the **Relay** field on the
+  Welcome screen is where the URL goes. The vault stores it from then on. A
+  release daemon accepts HTTPS and a v3 onion address; it refuses plain HTTP that
+  is not loopback. To skip the typing, launch from a terminal with the relay in
+  the environment, which the daemon the app spawns inherits:
+
+  ```bash
+  HUSH_RELAY_URL=https://relay.example open -a Hush
+  ```
+
+- **Tor.** The bundled sidecar in `resources/tor/` is a Linux binary, so the Mac
+  reports no Tor and onion mail waits. `brew install tor` or `HUSH_TOR_BIN` covers
+  it; mail over an HTTPS relay does not involve Tor at all.

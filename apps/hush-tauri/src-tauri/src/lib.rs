@@ -1,12 +1,14 @@
 use tauri::Manager;
 
 mod daemon_client;
+mod daemon_supervisor;
 mod drops;
 mod irc;
 mod sound;
 mod tor;
 
 use daemon_client::{ApiReply, DaemonClient, Transport};
+use daemon_supervisor::{DaemonState, Plan};
 use drops::DropsState;
 use tor::TorManager;
 
@@ -168,27 +170,11 @@ async fn hush_api(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let transport = daemon_client::transport_from_env();
-    let proxy = match &transport {
-        Transport::Unix { path } => ProxyState {
-            client: Some(DaemonClient::new(std::path::Path::new(path))),
-        },
-        Transport::Tcp { .. } => ProxyState { client: None },
-    };
     let window_title = std::env::var("HUSH_WINDOW_TITLE").unwrap_or_else(|_| "Hush".to_string());
-    let display = match &transport {
-        Transport::Unix { path } => format!("unix://{}", path),
-        Transport::Tcp { base } => base.clone(),
-    };
-    let init_js = format!(
-        "window.__HUSH_API__ = {}; window.__HUSH_TRANSPORT__ = {};",
-        serde_json::to_string(&display).expect("api url json"),
-        serde_json::to_string(&transport).expect("transport json")
-    );
 
     let mut builder = tauri::Builder::default()
-        .manage(proxy)
         .manage(irc::IrcState::new())
+        .manage(DaemonState::default())
         .invoke_handler(tauri::generate_handler![
             hush_save_file,
             hush_open_file,
@@ -233,6 +219,56 @@ pub fn run() {
 
     let app = builder
         .setup(move |app| {
+            // The daemon comes first, because the transport the window is told
+            // about depends on whether this process starts one. A bundled copy
+            // has a daemon staged beside its executable and no run script behind
+            // it, so it starts the daemon here; a repository run is handed
+            // `HUSH_API_URL` by `scripts/run-one-ui.sh` and keeps that.
+            let transport = match daemon_supervisor::plan_for_app(app.handle()) {
+                Plan::External => daemon_client::transport_from_env(),
+                Plan::Sidecar { bin, socket, vault } => {
+                    let log_dir = socket
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(std::env::temp_dir);
+                    match daemon_supervisor::Daemon::start(&bin, &socket, &vault, &log_dir) {
+                        Ok(mut daemon) => {
+                            // The window opens either way; a daemon that never
+                            // answers leaves its reason in daemon.log, and the
+                            // UI reports the socket as unreachable.
+                            if !daemon.wait_ready(daemon_supervisor::READY_TIMEOUT) {
+                                eprintln!(
+                                    "hush: the bundled daemon did not answer on {}; \
+                                     see {}",
+                                    socket.display(),
+                                    log_dir.join("daemon.log").display()
+                                );
+                            }
+                            let socket = daemon.socket().display().to_string();
+                            if let Some(state) = app.try_state::<DaemonState>() {
+                                if let Ok(mut slot) = state.0.lock() {
+                                    *slot = Some(daemon);
+                                }
+                            }
+                            Transport::Unix { path: socket }
+                        }
+                        Err(why) => {
+                            eprintln!("hush: {why}; the window will report the daemon unreachable");
+                            Transport::Unix {
+                                path: socket.display().to_string(),
+                            }
+                        }
+                    }
+                }
+            };
+
+            match &transport {
+                Transport::Unix { path } => app.manage(ProxyState {
+                    client: Some(DaemonClient::new(std::path::Path::new(path))),
+                }),
+                Transport::Tcp { .. } => app.manage(ProxyState { client: None }),
+            };
+
             // Tor lives under the app's local data dir, not in the vault, and is
             // owned by this process. It is managed at the app level: the relay
             // switch keeps it alive for the whole session, and the Drop view
@@ -247,6 +283,15 @@ pub fn run() {
             app.manage(DropsState::new());
 
             if let Some(window) = app.get_webview_window("main") {
+                let display = match &transport {
+                    Transport::Unix { path } => format!("unix://{}", path),
+                    Transport::Tcp { base } => base.clone(),
+                };
+                let init_js = format!(
+                    "window.__HUSH_API__ = {}; window.__HUSH_TRANSPORT__ = {};",
+                    serde_json::to_string(&display).expect("api url json"),
+                    serde_json::to_string(&transport).expect("transport json")
+                );
                 window.set_title(&window_title)?;
                 window.eval(&init_js)?;
             }
@@ -259,6 +304,15 @@ pub fn run() {
         if let tauri::RunEvent::Exit = event {
             if let Some(tor) = app_handle.try_state::<TorManager>() {
                 tor.stop();
+            }
+            // The daemon this process started goes with it: left running it would
+            // hold the vault lock, and the next launch could not unlock.
+            if let Some(state) = app_handle.try_state::<DaemonState>() {
+                if let Ok(mut slot) = state.0.lock() {
+                    if let Some(mut daemon) = slot.take() {
+                        daemon.stop();
+                    }
+                }
             }
         }
     });

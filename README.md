@@ -161,7 +161,13 @@ in use, and onion mail waits until there is one.
 
 ## Tests
 
+`cargo test --workspace` builds the desktop app, and `tauri-build` refuses to
+compile it without the daemon staged as a sidecar — the bundle carries the daemon,
+so it is a build-time dependency of the app, not just a runtime one. Stage it once
+after cloning; the run scripts do this for you.
+
 ```
+./scripts/stage-daemon-sidecar.sh        # debug daemon, enough for tests
 cargo test --workspace
 (cd apps/hush-tauri && npm test)
 ```

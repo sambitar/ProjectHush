@@ -13,6 +13,12 @@ apps/hush-tauri/node_modules/
 crates/hush-relay/node_modules/
 .cursor/
 
+# The daemon staged for Tauri's `bundle.externalBin` as
+# `hush-daemon-<target-triple>`. It is a build artifact of `cargo build -p
+# hush-daemon` under a name Tauri looks for, not a source file; see
+# scripts/stage-daemon-sidecar.sh.
+apps/hush-tauri/src-tauri/binaries/
+
 # Updater signing keys. A leaked private key lets anyone publish an update the
 # app will happily install, so these never enter the repository. The default
 # location is ~/.tauri, outside the tree, but a key generated in here must not
