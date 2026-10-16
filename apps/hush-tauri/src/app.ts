@@ -1720,7 +1720,14 @@ export class App {
       this.stopDropsPoll();
       this.stopTorPoll();
       setTorrentsPaneOpen(false);
-      this.root.appendChild(this.renderUnlock());
+      // A device with no vault is not a locked vault: there is no passphrase to
+      // check against and no recovery code to redeem, so the first run creates
+      // one instead of asking for a secret that cannot exist yet.
+      this.root.appendChild(
+        this.status && !this.status.vault_present
+          ? this.renderVaultSetup()
+          : this.renderUnlock(),
+      );
       return;
     }
     // A conversation the rail cannot list cannot stay open. Reach narrows from
@@ -2010,6 +2017,170 @@ export class App {
     daemon.style.marginTop = "var(--space-4)";
     daemon.textContent = getApiBase();
     card.append(logoWrap, title, hint, pass, showRow, torRow, err, btn, daemon);
+    wrap.appendChild(card);
+    return wrap;
+  }
+
+  /**
+   * First run: this device holds no vault, so one is created here.
+   *
+   * Deliberately not the unlock card with a different heading. There is no
+   * passphrase to check and no recovery code to redeem, and two things have to be
+   * decided before the vault exists — its name, which becomes the suffix of the
+   * mail address, and the relay, which is the only thing that leaves the device.
+   * The relay is prefilled with the one this daemon was started with, so a
+   * launcher that named the shared relay does not have to be retyped.
+   *
+   * Creation is refused by the daemon when a vault is already present, so this
+   * screen cannot overwrite an identity; the passphrase is then used to unlock,
+   * which keeps one unlock path rather than two.
+   */
+  private renderVaultSetup(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "unlock-screen";
+    const card = document.createElement("div");
+    card.className = "unlock-card";
+    const logoWrap = document.createElement("div");
+    logoWrap.className = "logo-wrap";
+    const ring = document.createElement("div");
+    ring.className = "logo-ring breathe";
+    const mark = document.createElement("div");
+    mark.className = "logo-mark";
+    mark.appendChild(icon("vault"));
+    logoWrap.append(ring, mark);
+    const title = document.createElement("h1");
+    title.className = "text-28";
+    title.textContent = "Welcome";
+    const hint = document.createElement("p");
+    hint.className = "muted text-13";
+    hint.textContent =
+      "This is a new vault, created here. Its keys never leave this device.";
+
+    const name = document.createElement("input");
+    name.className = "input-field";
+    name.placeholder = "Vault name";
+    name.autocomplete = "off";
+    name.spellcheck = false;
+    name.value = this.status?.vault_name ?? "";
+    name.style.marginTop = "var(--space-4)";
+    const nameHint = document.createElement("p");
+    nameHint.className = "faint text-12";
+    nameHint.style.marginTop = "6px";
+    nameHint.textContent = "Your mail address ends with this name.";
+
+    const pass = document.createElement("input");
+    pass.type = "password";
+    pass.className = "input-field";
+    pass.placeholder = "Choose a passphrase";
+    pass.autocomplete = "new-password";
+    pass.style.marginTop = "var(--space-4)";
+    const confirm = document.createElement("input");
+    confirm.type = "password";
+    confirm.className = "input-field";
+    confirm.placeholder = "Repeat the passphrase";
+    confirm.autocomplete = "new-password";
+    confirm.style.marginTop = "8px";
+    const showRow = document.createElement("label");
+    showRow.className = "text-13 muted";
+    showRow.style.display = "flex";
+    showRow.style.gap = "8px";
+    showRow.style.marginTop = "8px";
+    const showCb = document.createElement("input");
+    showCb.type = "checkbox";
+    showCb.onchange = () => {
+      const kind = showCb.checked ? "text" : "password";
+      pass.type = kind;
+      confirm.type = kind;
+    };
+    showRow.append(showCb, document.createTextNode("Show passphrase"));
+
+    const relay = document.createElement("input");
+    relay.className = "input-field";
+    relay.placeholder = "Relay";
+    relay.autocomplete = "off";
+    relay.spellcheck = false;
+    relay.value = this.status?.relay ?? "";
+    relay.style.marginTop = "var(--space-4)";
+    const relayHint = document.createElement("p");
+    relayHint.className = "faint text-12";
+    relayHint.style.marginTop = "6px";
+    relayHint.textContent =
+      "Mail travels through this relay, and both sides have to name the same one.";
+
+    const err = document.createElement("p");
+    err.className = "text-13";
+    err.style.color = "var(--danger)";
+    err.hidden = true;
+    const btn = document.createElement("button");
+    btn.className = "btn-primary pressable";
+    btn.style.marginTop = "var(--space-4)";
+    btn.textContent = "Create vault";
+    btn.onclick = async () => {
+      err.hidden = true;
+      const phrase = pass.value;
+      if (!phrase) {
+        err.hidden = false;
+        err.textContent = "Choose a passphrase for the vault.";
+        return;
+      }
+      if (phrase !== confirm.value) {
+        err.hidden = false;
+        err.textContent = "The two passphrases don't match.";
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const created = await api.vaultCreate(
+          phrase,
+          name.value.trim(),
+          relay.value.trim(),
+        );
+        // Creation leaves the vault locked and the passphrase is already in hand,
+        // so unlocking follows rather than being asked for a second time.
+        await api.unlock(phrase);
+        pass.value = "";
+        confirm.value = "";
+        this.unlockedAt = Date.now();
+        ring.classList.add("bloom");
+        await sleep(400);
+        await this.refreshStatus();
+        await refreshContactPrefs();
+        const history = await api.messages();
+        if (history) loadHistory(history);
+        // The code comes from this response and nowhere else: the vault keeps a
+        // hash of it, so a later unlock cannot show it again. Setting it before
+        // the render is what puts the modal on screen.
+        if (created?.recovery_code) this.recoveryModalCode = created.recovery_code;
+        this.render();
+      } catch (e) {
+        card.classList.add("shake");
+        setTimeout(() => card.classList.remove("shake"), 300);
+        err.hidden = false;
+        err.textContent =
+          e instanceof AppError ? e.message : "The vault could not be created.";
+        btn.disabled = false;
+      }
+    };
+
+    const daemon = document.createElement("p");
+    daemon.className = "faint text-12";
+    daemon.style.marginTop = "var(--space-4)";
+    daemon.textContent = getApiBase();
+    card.append(
+      logoWrap,
+      title,
+      hint,
+      name,
+      nameHint,
+      pass,
+      confirm,
+      showRow,
+      relay,
+      relayHint,
+      err,
+      btn,
+      daemon,
+    );
     wrap.appendChild(card);
     return wrap;
   }

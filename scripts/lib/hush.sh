@@ -110,6 +110,13 @@ hush_vault_relay() {
   ' "$cfg" 2>/dev/null
 }
 
+# Whether a vault exists in a directory, without opening it. `vault.lock.json` is
+# the file hush-core's `Vault::create` writes first and refuses to overwrite, so
+# this agrees with `vault_exists` in crates/hush-core/src/vault.rs.
+hush_vault_present() {
+  [[ -f "$1/vault.lock.json" ]]
+}
+
 # True when a release daemon would refuse this relay URL, so the daemon has to be
 # built and run in debug instead.
 #

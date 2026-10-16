@@ -6,23 +6,23 @@
 # desktop binary before it starts (the dist is baked in at compile time, so a
 # UI change without this rebuild shows the old interface).
 #
-# A first run with no vault at VAULT_DIR creates one: a new identity, new keys,
-# the passphrase the person chooses, against the shared relay. Nothing is
-# pre-seeded, so cloning the repository and running this is a new user's first
-# run. Later runs reuse that vault.
+# A first run with no vault at VAULT_DIR creates one in the app: the window opens
+# on a "Welcome" screen that asks for the vault name, a passphrase, and the relay,
+# then shows the recovery code once. Nothing is pre-seeded, so cloning the
+# repository and running this is a new user's first run. Later runs reuse that
+# vault and go straight to the passphrase.
 #
 # Usage:
-#   ./scripts/run-one-ui.sh                      # vault instances/peer-a, created if absent
-#   ./scripts/run-one-ui.sh --name alice         # vault name, which becomes the mail address
-#   ./scripts/run-one-ui.sh --relay http://host:8790   # relay for a vault that is being created
+#   ./scripts/run-one-ui.sh                      # vault instances/peer-a, created in the app if absent
+#   ./scripts/run-one-ui.sh --relay http://host:8790   # relay a new vault is created against
 #   ./scripts/run-one-ui.sh --vault instances/me # somewhere else to keep the vault
 #   VAULT_DIR=instances/peer-b ./scripts/run-one-ui.sh
 #   ./scripts/run-one-ui.sh --no-relay           # never start a local relay
 #
 # An existing vault keeps the relay stored inside it: that is the one the daemon
-# dials, and --relay only warns when the two disagree.
-#
-# HUSH_PASSPHRASE supplies the passphrase without a prompt when creating a vault.
+# dials, and --relay only warns when the two disagree. For a vault that does not
+# exist yet, --relay (then HUSH_RELAY_URL, then the shared relay) is what the
+# create screen starts from.
 #
 # The desktop binary reads HUSH_API_URL (unix socket) and HUSH_WINDOW_TITLE.
 set -euo pipefail
@@ -36,7 +36,6 @@ hush_check_prereqs
 
 NO_RELAY=0
 RELAY_ARG=""
-NAME_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-relay) NO_RELAY=1; shift ;;
@@ -46,12 +45,6 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --relay=*) RELAY_ARG="${1#--relay=}"; shift ;;
-    --name)
-      [[ $# -ge 2 ]] || { echo "--name needs a value." >&2; exit 2; }
-      NAME_ARG="$2"
-      shift 2
-      ;;
-    --name=*) NAME_ARG="${1#--name=}"; shift ;;
     --vault)
       [[ $# -ge 2 ]] || { echo "--vault needs a path." >&2; exit 2; }
       VAULT_DIR="$2"
@@ -63,7 +56,7 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      echo "Unknown argument: $1 (options: --relay <url>, --name <value>, --vault <path>, --no-relay)." >&2
+      echo "Unknown argument: $1 (options: --relay <url>, --vault <path>, --no-relay)." >&2
       exit 2
       ;;
   esac
@@ -80,38 +73,10 @@ LOG_DIR="${RUN_DIR}/logs"
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 chmod 700 "$RUN_DIR" 2>/dev/null || true
 
-# A new vault, created here rather than expected to exist: new identity, new keys,
-# the passphrase the person chooses, nothing pre-seeded. The relay is the one this
-# run would use, and the recovery code init prints is the only copy of the
-# recovery secret, so it is called out again afterwards.
-create_vault() { # <vault dir> <relay url> [name]
-  local dir="$1" relay="$2" name="${3:-}"
-  local pass="${HUSH_PASSPHRASE:-}"
-  if [[ -z "$pass" ]]; then
-    if [[ ! -t 0 ]]; then
-      echo "No vault at $dir and no HUSH_PASSPHRASE set: cannot prompt for one here." >&2
-      exit 2
-    fi
-    echo "Creating a new vault at $dir (relay $relay)."
-    read -rsp "Choose a passphrase for it: " pass
-    echo
-    [[ -n "$pass" ]] || { echo "A vault needs a passphrase." >&2; exit 2; }
-  fi
-  echo "Creating the vault (new identity, new keys)…"
-  mkdir -p "$(dirname "$dir")"
-  cargo build -p hush-cli
-  "$ROOT/target/debug/hush-cli" --dir "$dir" init --passphrase "$pass" \
-    --relay "$relay" ${name:+--name "$name"}
-  # Record the relay in client-config.json as well. The vault keeps its own copy,
-  # but that one is encrypted and cannot be read back without the passphrase, so
-  # this plaintext copy is what tells a later run which daemon profile the relay
-  # needs. Debug binary on purpose: a release build refuses to write a plaintext
-  # non-loopback relay, which is the whole reason this file exists here.
-  "$ROOT/target/debug/hush-cli" --dir "$dir" config set --relay "$relay" >/dev/null
-  echo "Save the recovery code printed above: it is shown once, and it is the only"
-  echo "way back into this vault if the passphrase is lost."
-  VAULT_CREATED=1
-}
+# A new vault is created by the app, not here: the first screen asks for the
+# passphrase and the vault name, so a fresh clone gets the same first run a
+# packaged build would have. `hush-cli init` remains the path for automation —
+# see the README.
 
 # Tor is bundled as an app resource (src-tauri/resources/tor/) so a packaged
 # build needs no system install. A dev run does not get that for free, and the
@@ -139,8 +104,8 @@ fi
 # the shared relay. A teammate's first run has no vault and no local relay worth
 # starting (it would only talk to itself), and the point of the shared one is that
 # two machines can reach each other through it.
-VAULT_CREATED=0
-if [[ -d "$VAULT_DIR" ]]; then
+NEW_VAULT=0
+if hush_vault_present "$VAULT_DIR"; then
   VAULT_RELAY="$(hush_vault_relay "$VAULT_DIR")"
   if [[ -z "$VAULT_RELAY" ]]; then
     # No client-config.json: the vault was created by hand (or by an older script),
@@ -157,8 +122,11 @@ if [[ -d "$VAULT_DIR" ]]; then
     echo "      cargo run -p hush-cli -- --dir $VAULT_DIR config set --relay $RELAY_ARG" >&2
   fi
 else
-  create_vault "$VAULT_DIR" "${RELAY_ARG:-${HUSH_RELAY_URL:-$HUSH_CLOUD_RELAY_URL}}" "$NAME_ARG"
-  VAULT_RELAY="$(hush_vault_relay "$VAULT_DIR")"
+  # No vault yet. The window's first screen creates one, so nothing is created
+  # here: the relay below is handed to the daemon as the value that screen starts
+  # with, and the profile it needs is decided the same way as for a real vault.
+  VAULT_RELAY="${RELAY_ARG:-${HUSH_RELAY_URL:-$HUSH_CLOUD_RELAY_URL}}"
+  NEW_VAULT=1
 fi
 
 # A release daemon refuses plain HTTP to a relay that is not loopback or a v3
@@ -233,7 +201,11 @@ elif [[ "$WITH_LOCAL_RELAY" -eq 1 ]]; then
       ;;
   esac
 else
-  echo "Using the relay stored in the vault${VAULT_RELAY:+ ($VAULT_RELAY)} (no local relay started; WITH_LOCAL_RELAY=1 to run one)."
+  if [[ "$NEW_VAULT" -eq 1 ]]; then
+    echo "Relay for the new vault: $VAULT_RELAY (no local relay started; WITH_LOCAL_RELAY=1 to run one)."
+  else
+    echo "Using the relay stored in the vault${VAULT_RELAY:+ ($VAULT_RELAY)} (no local relay started; WITH_LOCAL_RELAY=1 to run one)."
+  fi
   # Worth saying out loud before the window opens: with the shared relay down, a
   # new user's first invite has nowhere to go and every failure looks local.
   if [[ -n "$VAULT_RELAY" ]] && ! curl -sf -o /dev/null --connect-timeout 5 "${VAULT_RELAY%/}/health"; then
@@ -268,9 +240,16 @@ if pgrep -f "$DAEMON_MATCH" >/dev/null 2>&1; then
 fi
 rm -f "$SOCK" 2>/dev/null || true
 # The relay stored in the vault is the runtime source of truth; an inherited
-# HUSH_RELAY_URL would override it while the vault is locked.
-env -u HUSH_RELAY_URL HUSH_RUNTIME_DIR="$RUN_DIR" \
-  "$DAEMON_BIN" --dir "$VAULT_DIR" --socket "$SOCK" >"$LOG_DIR/daemon.log" 2>&1 &
+# HUSH_RELAY_URL would override it while the vault is locked. On a first run there
+# is no vault and no stored relay yet, so the relay this run resolved is passed in:
+# the create screen starts from it, and creating the vault stores it.
+if [[ "$NEW_VAULT" -eq 1 ]]; then
+  env HUSH_RELAY_URL="$VAULT_RELAY" HUSH_RUNTIME_DIR="$RUN_DIR" \
+    "$DAEMON_BIN" --dir "$VAULT_DIR" --socket "$SOCK" >"$LOG_DIR/daemon.log" 2>&1 &
+else
+  env -u HUSH_RELAY_URL HUSH_RUNTIME_DIR="$RUN_DIR" \
+    "$DAEMON_BIN" --dir "$VAULT_DIR" --socket "$SOCK" >"$LOG_DIR/daemon.log" 2>&1 &
+fi
 DAEMON_PID=$!
 for _ in $(seq 1 100); do
   daemon_ready "$SOCK" && break
@@ -302,10 +281,10 @@ sleep 2
 kill -0 "$UI_PID" 2>/dev/null || { echo "UI exited at startup:" >&2; tail -n 20 "$LOG_DIR/ui.log" >&2; exit 1; }
 
 echo ""
-if [[ "$VAULT_CREATED" -eq 1 ]]; then
-  echo "Window is up. Unlock with the passphrase you chose, then add a contact with the"
-  echo "invite the other person sends you (Add contact → paste it), and send yours back"
-  echo "with Copy my invite."
+if [[ "$NEW_VAULT" -eq 1 ]]; then
+  echo "Window is up. This device has no vault yet: the Welcome screen creates one."
+  echo "Pick the vault name (it ends your mail address), a passphrase, and the relay"
+  echo "(prefilled with $VAULT_RELAY). The recovery code is shown once — save it."
 else
   echo "Window is up. Unlock with the vault's passphrase (peer vaults: peer-a-pass)."
 fi

@@ -33,20 +33,20 @@ inside prost-build.
 
 ## Run it
 
-One vault, one daemon, one window. With no vault yet, this creates one: a new
-identity, new keys, and a passphrase you choose, on the shared relay. A fresh
-clone plus this command is a new user's first run, not a pre-built vault.
+One vault, one daemon, one window. With no vault on the device, the window opens
+on a **Welcome** screen that creates one: it asks for the vault name, a passphrase
+you choose, and the relay (prefilled with the shared one), then shows the recovery
+code once. A fresh clone plus this command is a new user's first run — the same
+first run a packaged build would have, with nothing pre-seeded.
 
 ```
 ./scripts/run-one-ui.sh
 ```
 
 ```
-./scripts/run-one-ui.sh --name alice                  # vault name, which becomes your mail address
-./scripts/run-one-ui.sh --relay http://host:8790      # relay for a vault being created
+./scripts/run-one-ui.sh --relay http://host:8790      # relay a new vault is created against
 ./scripts/run-one-ui.sh --vault instances/me          # keep the vault somewhere else
 ./scripts/run-one-ui.sh --no-relay                    # never start a local relay
-HUSH_PASSPHRASE=... ./scripts/run-one-ui.sh           # no prompt, when creating a vault
 ```
 
 An existing vault is reused as it is, relay included, so the passphrase is asked
@@ -75,6 +75,9 @@ The desktop window needs a graphical session. On a headless machine use `--dev`
 and open the browser URL, or use the CLI.
 
 ### Without the UI
+
+The window is the only place a vault is created interactively; the CLI does the
+same thing for automation and for machines without a display:
 
 ```
 cargo build -p hush-cli

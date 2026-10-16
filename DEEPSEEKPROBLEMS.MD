@@ -7,6 +7,52 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-15 — First run in the product: create the vault from the window
+
+### The daemon could not tell "no vault" from "locked", and could not create one [FIXED]
+
+- Attempted: make a teammate's first run create a brand new vault in the app, the way a packaged
+  build would, instead of pre-creating one from a script before the UI starts.
+- Symptom: `GET /api/status` reported only lock state. A window with no vault on disk was
+  indistinguishable from one with a locked vault, and `app.ts` always rendered the unlock screen.
+  There was no route that created a vault at all: `Account::create` was reachable only from the CLI
+  and from the test helpers.
+- Resolution: `hush_core::vault_exists(dir)` (the `vault.lock.json` marker that `Account::create`
+  already writes) is surfaced as `vault_present` in `/api/status`, and `POST /api/vault/create`
+  creates, names, and configures the vault in one call, returning 409 if one already exists. The
+  window renders a Welcome screen while `!vault_present` and unlocks into the recovery-code modal
+  after creating. Verified end to end in a headless browser against a fresh directory: filled the
+  Welcome form, got `vault.lock.json` and `client-config.json` on disk, unlocked, and saw the
+  recovery code.
+- Lesson: "locked" and "absent" are different states and the UI needs both; a boolean that only
+  covers one of them will silently render the wrong screen.
+
+### A create route cannot be served straight from the axum handler [FIXED]
+
+- Attempted: call `Account::create` inside the `vault_create` handler, next to the unlock handler.
+- Symptom: `error[E0277]: the trait bound Account: Send is not satisfied` / "future cannot be sent
+  between threads" / "required by a bound in `Handler`". `Account` holds state that is not `Send`, so
+  holding it across an `await` in a handler is a compile error — the unlock path never hit this
+  because it goes through `AccountWorker` and only sends a reply over a channel.
+- Resolution: creation follows the existing worker pattern. `Work::Create` carries the directory,
+  passphrase, name, and relay; the worker runs `Account::create` on its own thread and answers with
+  `WorkResult::Created { recovery_code, vault_name, relay }`. The handler only awaits the reply.
+- Lesson: in this daemon, nothing that owns an `Account` may be held across an `await` in a handler.
+  The worker channel is the boundary, not an optimization.
+
+### The recovery code is only obtainable at creation, and the UI must say so [FIXED]
+
+- Attempted: rely on the existing post-unlock recovery-code prompt to show the code after creating.
+- Symptom: reading `Account::create` and the unlock path showed the code is returned by `create` and
+  is not re-derivable from a later unlock — `maybeShowRecoveryCode` shows a stored code only when the
+  client already holds it. Without wiring the create response into the modal, a new user would have
+  created a vault and never seen the one thing they must keep.
+- Resolution: the create response's `recovery_code` is handed straight to the existing modal
+  (`this.recoveryModalCode = created.recovery_code`), so the code is shown immediately after
+  creation, once, and the client is never left without it.
+- Lesson: a secret that exists only in one response has to be displayed by the screen that receives
+  it; a later screen cannot recover it.
+
 ## 2026-10-15 — Handoff readiness: what a teammate gets from a clone
 
 ### `protoc` was a hard build requirement and named nowhere [FIXED]
