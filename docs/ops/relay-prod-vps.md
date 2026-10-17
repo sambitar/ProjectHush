@@ -5,6 +5,15 @@ Provisioned 2026-10-16. This is the **production** relay box (Hetzner, instance 
 workstation is x86_64, so the binary must be cross-compiled — see "Deploying a new binary".
 The lab box and its constraints are documented separately in `relay-lab-vps.md`.
 
+**Deployed 2026-10-17:** new binary with the WAL store (`PRAGMA journal_mode = WAL`,
+`synchronous = NORMAL`, `busy_timeout = 5000`) and the two-phase batched drain routes
+(`POST /q/{id}/drain` peek page, `POST /q/{id}/drain/ack` confirm; legacy per-blob routes
+kept). Verified after restart: service `active`; `https://hushrelay.space/health` → 200;
+drain route answers 401 to a tokenless probe (registered, not 404); onion `/health` → 200
+through tor; `relay.db-wal`/`-shm` beside the DB. Previous binary kept at
+`/usr/local/bin/hush-relay.bak-20261016`. Cross-built from the working tree at commit-time
+with the container command below (`--locked`).
+
 Host: `37.27.150.250` (Ubuntu 24.04.4, glibc 2.39, 2 vCPU, 3.8 GB RAM, 38 GB disk,
 hostname `Relay`). SSH: `ssh hush-relay-prod` (alias in `~/.ssh/config`, key
 `~/.ssh/hush_relay_vps`, user `deploy`, passwordless sudo). Root SSH is **disabled**
