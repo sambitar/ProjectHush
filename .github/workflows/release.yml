@@ -40,9 +40,12 @@ jobs:
             args: "--target x86_64-apple-darwin"
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            # The AppImage is the only Linux bundle the updater can replace in
-            # place; the deb is published alongside it for a first install.
-            args: "--bundles appimage,deb"
+            # The AppImage is the only Linux bundle: it is what the updater can
+            # replace in place, and it installs fine without a package — a deb
+            # in the release would be a dead artifact that never receives an
+            # update (the updater does not touch it), so it only invited
+            # installs that strand on an old version.
+            args: "--bundles appimage"
           # No Windows leg until the daemon has a Windows transport. It listens
           # on `tokio::net::UnixListener`, which does not exist on Windows, so
           # `stage the daemon sidecar` fails with E0433/E0425 and a Windows
@@ -125,10 +128,11 @@ jobs:
           # The cargo workspace root is the repository root (apps/hush-tauri is
           # a member), and its target directory is `target`.
           workspaces: ". -> target"
-          # The target triple, not matrix.args: the Linux args carry a comma
-          # ("--bundles appimage,deb") and rust-cache rejects any key containing
-          # one — "Key Validation Error: ... cannot contain commas" — which left
-          # that leg rebuilding libsignal from scratch on every run.
+          # The target triple, not matrix.args: args are bundle switches that
+          # have carried commas before ("--bundles appimage,deb") and
+          # rust-cache rejects any key containing one — "Key Validation Error:
+          # ... cannot contain commas" — which left that leg rebuilding
+          # libsignal from scratch on every run.
           key: ${{ matrix.platform }}-${{ matrix.target }}
 
       - name: install frontend dependencies
