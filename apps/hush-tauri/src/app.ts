@@ -1770,6 +1770,26 @@ export class App {
       if (key) prevModals.set(key, back);
     });
     this.modalKeys = new Set();
+    // Focus carried across the wipe: the composer is the one place a repaint
+    // may not interrupt, because the user is mid-sentence. Captured before
+    // the tree dies — value, caret, and which composer it belongs to (the
+    // composers stamp themselves with `data-composer-key`) — so the new
+    // tree's matching box can be found without depending on DOM order. After
+    // a send the box is empty and the caret returns to it; a repaint that
+    // lands mid-typing puts both the draft and the caret back.
+    const focused = document.activeElement;
+    const composerKey =
+      focused instanceof HTMLTextAreaElement
+        ? focused.getAttribute("data-composer-key")
+        : null;
+    const composerState =
+      focused instanceof HTMLTextAreaElement && composerKey
+        ? {
+            value: focused.value,
+            start: focused.selectionStart ?? focused.value.length,
+            end: focused.selectionEnd ?? focused.value.length,
+          }
+        : null;
     this.root.innerHTML = "";
     if (!this.status || this.status.locked) {
       this.stopDropsPoll();
@@ -1951,6 +1971,29 @@ export class App {
     if (this.pendingUpdate) mountModal("updatePrompt", this.renderUpdatePrompt());
     for (const [key, back] of prevModals) {
       if (!this.modalKeys.has(key)) leaveModal(back);
+    }
+    // Hand the caret back to the composer the wipe took it from. After a
+    // send the box is empty and the caret goes to the start, ready for the
+    // next message; a repaint that landed mid-typing puts the draft and the
+    // caret back exactly where they were.
+    if (composerKey) {
+      const next = this.root.querySelector<HTMLTextAreaElement>(
+        `[data-composer-key="${CSS.escape(composerKey)}"]`,
+      );
+      if (next) {
+        if (composerState && !next.value && composerState.value) {
+          next.value = composerState.value;
+          next.dispatchEvent(new Event("input"));
+        }
+        next.focus();
+        if (composerState) {
+          const len = next.value.length;
+          next.setSelectionRange(
+            Math.min(composerState.start, len),
+            Math.min(composerState.end, len),
+          );
+        }
+      }
     }
   }
 
@@ -2839,6 +2882,9 @@ export class App {
     };
     const ta = document.createElement("textarea");
     ta.rows = 1;
+    // The focus carrier: a repaint can put the caret back in THIS box (not
+    // just any box), keyed by who it belongs to.
+    ta.dataset.composerKey = `chat:${nick}`;
     ta.placeholder = contactOnline ? "Message" : "Waiting for them to come online…";
     ta.disabled = !contactOnline;
     const send = document.createElement("button");
@@ -4419,6 +4465,7 @@ export class App {
     };
     const ta = document.createElement("textarea");
     ta.rows = 1;
+    ta.dataset.composerKey = `conclave:${conclave.id}`;
     ta.placeholder = "Message conclave";
     const send = document.createElement("button");
     send.className = "send-fab btn-icon-round pressable";
