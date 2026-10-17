@@ -1,9 +1,11 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::Response,
     routing::{get, post, put},
     Json, Router,
@@ -15,8 +17,96 @@ use crate::config::RelayConfig;
 use crate::error::RelayError;
 use crate::store::{BlobMeta, Store};
 
+/// What the relay has served, by outcome.
+///
+/// The relay is deliberately dumb — it holds opaque ciphertext and cannot say
+/// what any of it means — so when a client reports that mail never arrived it
+/// has nothing to offer. These are the only facts it can honestly give: how many
+/// writes it accepted and how many it refused, by reason. They answer the one
+/// question a sender cannot answer alone, which is whether a message ever
+/// reached the relay at all.
+///
+/// Read them as a pair. `rate_limited` climbing while `puts` does not means a
+/// client is bursting past the window; `puts` climbing while a peer's queue
+/// keeps growing means the peer is not draining.
+#[derive(Debug, Default)]
+pub struct Counters {
+    pub puts: AtomicU64,
+    /// Every read: a queue listing, a single blob, a presence check, a prekey
+    /// record. Not split by route — the question these answer is whether a
+    /// client is writing, and how often the relay refuses the write.
+    pub gets: AtomicU64,
+    pub deletes: AtomicU64,
+    /// Refused by the per-queue write limit.
+    pub rate_limited: AtomicU64,
+    /// Wrong token, or a burned queue.
+    pub unauthorized: AtomicU64,
+    /// Over `max_blob_bytes`, or otherwise malformed.
+    pub rejected: AtomicU64,
+    pub other_errors: AtomicU64,
+}
+
+impl Counters {
+    fn record(&self, method: &Method, status: StatusCode) {
+        let counter = match status {
+            StatusCode::TOO_MANY_REQUESTS => &self.rate_limited,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => &self.unauthorized,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::BAD_REQUEST => &self.rejected,
+            s if s.is_success() => match *method {
+                Method::PUT => &self.puts,
+                Method::GET => &self.gets,
+                Method::DELETE => &self.deletes,
+                _ => return,
+            },
+            _ => &self.other_errors,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> CountersResponse {
+        let read = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        CountersResponse {
+            puts: read(&self.puts),
+            gets: read(&self.gets),
+            deletes: read(&self.deletes),
+            rate_limited: read(&self.rate_limited),
+            unauthorized: read(&self.unauthorized),
+            rejected: read(&self.rejected),
+            other_errors: read(&self.other_errors),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CountersResponse {
+    puts: u64,
+    gets: u64,
+    deletes: u64,
+    rate_limited: u64,
+    unauthorized: u64,
+    rejected: u64,
+    other_errors: u64,
+}
+
+/// Count every response by outcome.
+///
+/// A middleware rather than a line in each handler: the classification is one
+/// rule over the status, and repeating it in a dozen handlers is how the counts
+/// drift apart.
+async fn count_outcomes(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let response = next.run(request).await;
+    state.counters.record(&method, response.status());
+    response
+}
+
 pub struct AppState {
     pub store: Store,
+    pub counters: Counters,
 }
 
 #[derive(Serialize)]
@@ -121,6 +211,77 @@ async fn delete_blob(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct DrainQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// One drained blob, base64 so the JSON body can carry ciphertext — the same
+/// wire shape the bulletin drain uses.
+#[derive(Serialize)]
+struct DrainEntryResponse {
+    id: String,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct DrainResponse {
+    blobs: Vec<DrainEntryResponse>,
+}
+
+#[derive(Deserialize)]
+struct DrainAckRequest {
+    ids: Vec<String>,
+}
+
+/// Drain a queue in one request: the page comes back, nothing is consumed
+/// until the client confirms with the ack route. The count limit is clamped
+/// and only ever tightens the response; the real bound is the store's
+/// per-page byte ceiling. Authorized with the read token, like the list it
+/// replaces.
+const DRAIN_LIMIT_DEFAULT: usize = 256;
+const DRAIN_LIMIT_MAX: usize = 1024;
+
+async fn drain_queue(
+    State(state): State<Arc<AppState>>,
+    Path(queue_id): Path<String>,
+    Query(query): Query<DrainQuery>,
+    headers: HeaderMap,
+) -> Result<Json<DrainResponse>, RelayError> {
+    let token = bearer_token(&headers)?;
+    let limit = query
+        .limit
+        .unwrap_or(DRAIN_LIMIT_DEFAULT)
+        .clamp(1, DRAIN_LIMIT_MAX);
+    let blobs = state.store.drain_blobs(&queue_id, &token, limit)?;
+    Ok(Json(DrainResponse {
+        blobs: blobs
+            .into_iter()
+            .map(|(id, body)| DrainEntryResponse {
+                id,
+                body: B64.encode(&body),
+            })
+            .collect(),
+    }))
+}
+
+/// Confirm the ids the client finished filing; the relay deletes them in one
+/// transaction. Idempotent per id, so overlapping drains do not fail each
+/// other.
+async fn ack_drain(
+    State(state): State<Arc<AppState>>,
+    Path(queue_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<DrainAckRequest>,
+) -> Result<StatusCode, RelayError> {
+    let token = bearer_token(&headers)?;
+    state
+        .store
+        .ack_drained(&queue_id, &token, &body.ids)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn touch_presence(
     State(state): State<Arc<AppState>>,
     Path(queue_id): Path<String>,
@@ -166,8 +327,14 @@ fn presence_is_live(last_at: u64) -> bool {
     now.saturating_sub(last_at) <= 90
 }
 
-async fn health() -> StatusCode {
-    StatusCode::OK
+/// A liveness probe that also reports what the relay has served.
+///
+/// The body is new; the status is not. Every caller in `scripts/` and
+/// `RelayClient::ping` only checks for a 2xx, so this stays the same liveness
+/// answer and adds the counters beside it. Polling this is how a stuck queue is
+/// told apart from a client that never wrote.
+async fn health(State(state): State<Arc<AppState>>) -> Json<CountersResponse> {
+    Json(state.counters.snapshot())
 }
 
 /// Publish an account's prekey record.
@@ -340,28 +507,45 @@ async fn get_bulletin(
 /// gains no new abilities" — see `docs/THREAT_MODEL.md`, which states what it
 /// costs.
 pub fn router(db_path: &str, config: RelayConfig) -> Result<Router, RelayError> {
+    let enable_batch_drain = config.enable_batch_drain;
     let store = Store::open(db_path, config)?;
-    let state = Arc::new(AppState { store });
-    Ok(Router::new()
-        .route("/health", get(health))
-        .route("/drop", get(drop_page))
-        .route(
-            "/drop/{id}",
-            put(put_drop).get(get_drop).delete(delete_drop),
-        )
-        .route(
-            "/k/{account_id}",
-            put(put_prekey_record).get(get_prekey_record),
-        )
-        .route("/q/{queue_id}", put(put_blob).get(list_blobs))
-        .route(
-            "/q/{queue_id}/presence",
-            put(touch_presence)
-                .get(get_presence)
-                .delete(clear_presence),
-        )
-        .route("/q/{queue_id}/report", post(report_queue))
-        .route("/q/{queue_id}/{blob_id}", get(get_blob).delete(delete_blob))
-        .route("/b/{queue_id}", put(put_bulletin).get(get_bulletin))
+    let state = Arc::new(AppState {
+        store,
+        counters: Counters::default(),
+    });
+    // The batched drain is a separate merge so the kill-switch can leave it
+    // unregistered entirely: an unregistered route answers 404, which is what
+    // tells an old-shaped client to fall back to its list/get/delete walk.
+    let router = {
+        let mut router = Router::new()
+            .route("/health", get(health))
+            .route("/drop", get(drop_page))
+            .route(
+                "/drop/{id}",
+                put(put_drop).get(get_drop).delete(delete_drop),
+            )
+            .route(
+                "/k/{account_id}",
+                put(put_prekey_record).get(get_prekey_record),
+            )
+            .route("/q/{queue_id}", put(put_blob).get(list_blobs))
+            .route(
+                "/q/{queue_id}/presence",
+                put(touch_presence)
+                    .get(get_presence)
+                    .delete(clear_presence),
+            )
+            .route("/q/{queue_id}/report", post(report_queue))
+            .route("/q/{queue_id}/{blob_id}", get(get_blob).delete(delete_blob))
+            .route("/b/{queue_id}", put(put_bulletin).get(get_bulletin));
+        if enable_batch_drain {
+            router = router
+                .route("/q/{queue_id}/drain", post(drain_queue))
+                .route("/q/{queue_id}/drain/ack", post(ack_drain));
+        }
+        router
+    };
+    Ok(router
+        .layer(middleware::from_fn_with_state(state.clone(), count_outcomes))
         .with_state(state))
 }

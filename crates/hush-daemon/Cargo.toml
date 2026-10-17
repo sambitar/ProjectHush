@@ -58,8 +58,15 @@ cpal = "0.15"
 bytes = "1.12.1"
 async-trait = "0.1.92"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# `flock` guards the vault on every unix. Linux, macOS and the BSDs all have
+# it, and it is the only thing that stops a second daemon from taking over the
+# vault of a first that is alive but not answering on its socket.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# logind's PrepareForSleep, so the daemon relocks the vault when the machine
+# suspends. Linux-only: the equivalent elsewhere is a different API.
+[target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]

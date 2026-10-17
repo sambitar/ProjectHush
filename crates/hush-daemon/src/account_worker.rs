@@ -3,7 +3,7 @@ use std::thread;
 
 use hush_core::{
   Account, ChatRecord, ChatRetention, ConclaveRecord, InboxResult, MessagePayload,
-  PaperDescriptor, PendingInvite, PendingIntroRequest, TrusteeReach, VoiceDescriptor,
+  PaperDescriptor, PendingInvite, PendingIntroRequest, QueueMap, TrusteeReach, VoiceDescriptor,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -449,7 +449,16 @@ enum Work {
     RetryPendingReach {
         reply: oneshot::Sender<WorkResult>,
     },
+    RetryPendingConclave {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    RetryRegrants {
+        reply: oneshot::Sender<WorkResult>,
+    },
     Conclaves {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    Queues {
         reply: oneshot::Sender<WorkResult>,
     },
     CreateConclave {
@@ -690,6 +699,8 @@ pub enum WorkResult {
     Exists,
     Invite(String),
     Contacts(Vec<ContactDto>),
+    /// The relay queues this vault drains and delivers into, for diagnosis.
+    Queues(QueueMap),
     Inbox(InboxResult),
     Meta {
         protocol_name: String,
@@ -1127,6 +1138,16 @@ impl AccountWorker {
                                 None => WorkResult::Ok,
                                 Some(a) => {
                                     a.set_relay_socks(socks);
+                                    // The baked-in default onion is the twin of
+                                    // the baked-in default relay: staging it
+                                    // for a vault the user pointed at another
+                                    // relay would publish a drop page on a
+                                    // relay the vault does not use. Refuse the
+                                    // default there; configured onions pass.
+                                    let onion = onion.filter(|raw| {
+                                        !hush_core::config::is_baked_default_onion(raw)
+                                            || a.relay() == hush_core::config::DEFAULT_RELAY_URL
+                                    });
                                     match a.set_relay_tor(use_tor, onion.as_deref()).await {
                                         Ok(()) => WorkResult::Ok,
                                         Err(e) => WorkResult::Err(e.to_string()),
@@ -1819,10 +1840,39 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::RetryPendingConclave { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.retry_pending_conclave().await {
+                                    // Same contract again: a refused copy stays
+                                    // queued and the next tick tries again.
+                                    Ok(_) | Err(_) => WorkResult::Ok,
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RetryRegrants { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.retry_regrants().await {
+                                    // A contact that could not be reached keeps
+                                    // the flag set, so the next tick tries again.
+                                    Ok(_) | Err(_) => WorkResult::Ok,
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::Conclaves { reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => WorkResult::Conclaves(a.conclaves()),
+                            };
+                            (reply, result)
+                        }
+                        Work::Queues { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::Queues(a.queue_map()),
                             };
                             (reply, result)
                         }
@@ -2856,8 +2906,30 @@ impl AccountWorker {
         self.call(|reply| Work::RetryPendingReach { reply }).await
     }
 
+    /// Flush conclave copies the relay refused. Called by the outbox timer and
+    /// by the outbox retry route.
+    pub async fn retry_pending_conclave(&self) -> WorkResult {
+        self.call(|reply| Work::RetryPendingConclave { reply }).await
+    }
+
+    /// Re-announce this vault's per-contact queues if the device rotated them.
+    ///
+    /// Driven by the outbox timer alongside the other retries: a restored or
+    /// migrated vault has to tell every contact where to deliver, and it can
+    /// only do that while unlocked and online.
+    pub async fn retry_regrants(&self) -> WorkResult {
+        self.call(|reply| Work::RetryRegrants { reply }).await
+    }
+
     pub async fn conclaves(&self) -> WorkResult {
         self.call(|reply| Work::Conclaves { reply }).await
+    }
+
+    /// The queues this vault drains and delivers into. A local diagnostic: it
+    /// answers "is the queue filling on the relay mine?" without reading a vault
+    /// file, which is otherwise impossible because the ids are derived.
+    pub async fn queues(&self) -> WorkResult {
+        self.call(|reply| Work::Queues { reply }).await
     }
 
     pub async fn create_conclave(&self, name: &str, trustees: Vec<String>) -> WorkResult {

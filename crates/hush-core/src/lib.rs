@@ -24,8 +24,8 @@ mod voice;
 mod wire;
 
 pub use account::{
-  Account, Contact, DropInboxReport, MailOutcome, PendingInvite, PendingIntro,
-  PendingIntroRequest,
+  Account, Contact, ContactQueues, DropInboxReport, MailOutcome, PendingInvite, PendingIntro,
+  PendingIntroRequest, QueueMap,
 };
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{

@@ -8,6 +8,11 @@ use crate::auth::{hash_token, tokens_match};
 use crate::config::RelayConfig;
 use crate::error::RelayError;
 
+/// Ceiling on the bytes one batched drain will return. Bounds a single
+/// response when a deep queue meets large blobs; the client pages until a
+/// drain comes back empty.
+const DRAIN_MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
 pub struct Store {
     conn: Mutex<Connection>,
     config: RelayConfig,
@@ -18,6 +23,37 @@ pub struct Store {
 impl Store {
     pub fn open(path: &str, config: RelayConfig) -> Result<Self, RelayError> {
         let conn = Connection::open(path).map_err(|_| RelayError::Internal)?;
+
+        // Durability and concurrency settings, applied before the schema.
+        //
+        // SQLite's defaults are a rollback journal with `synchronous=FULL`, which
+        // makes every autocommitted write a journal create, two fsyncs and an
+        // unlink. Measured on ext4 an 8-byte blob cost 22 ms to store and 30 ms
+        // to delete; with the same code and the same requests against tmpfs —
+        // only the sync removed — those became 1.15 ms and 0.95 ms. The cost was
+        // the syscall, never the payload.
+        //
+        // WAL also lets a reader proceed while a write is open. The store keeps
+        // one connection behind a mutex, so without this a `list_blobs` blocks a
+        // concurrent `put_blob` outright: twenty writers to twenty distinct
+        // queues measured no faster than twenty in sequence.
+        //
+        // `synchronous=NORMAL` under WAL syncs at checkpoints rather than on
+        // every commit, so a crash can lose the last few transactions but cannot
+        // corrupt the file. For a store-and-forward relay holding ciphertext the
+        // sender also keeps, that is the right trade.
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .map_err(|_| RelayError::Internal)?;
+        // A network filesystem cannot do WAL, and an in-memory database has no
+        // journal to choose. Both still work, just without the win, so this warns
+        // rather than refusing to start.
+        if !mode.eq_ignore_ascii_case("wal") && !mode.eq_ignore_ascii_case("memory") {
+            eprintln!("hush-relay: journal_mode is {mode}, not wal; writes will be slow");
+        }
+        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")
+            .map_err(|_| RelayError::Internal)?;
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS queues (
@@ -34,6 +70,12 @@ impl Store {
                 FOREIGN KEY (queue_id) REFERENCES queues(id)
             );
             CREATE INDEX IF NOT EXISTS idx_blobs_queue ON blobs(queue_id);
+            -- `purge_expired` runs on every read and deletes by age, so without
+            -- this the sweep is a full scan of every stored blob, once per read.
+            -- `drops` and `bulletin` already carry the equivalent
+            -- (idx_drops_created, idx_bulletin_inserted); blobs was the one table
+            -- that did not.
+            CREATE INDEX IF NOT EXISTS idx_blobs_created ON blobs(created_at);
             -- Left over from the multi-device model. An account has one device
             -- now, so the directory is gone and the row is dropped on upgrade;
             -- it held only public key material, so nothing is lost.
@@ -108,14 +150,24 @@ impl Store {
             *entry = (now, 0);
         }
         if entry.1 >= max {
-            return Err(RelayError::RateLimited);
+            // The window is anchored on the first write in it, so what remains
+            // is the rest of that window, not a fresh one.
+            let elapsed = now.saturating_sub(entry.0);
+            return Err(RelayError::RateLimited {
+                retry_after: window.saturating_sub(elapsed).max(1),
+            });
         }
         entry.1 += 1;
         Ok(())
     }
 
-    fn load_queue(&self, queue_id: &str) -> Result<Option<QueueRow>, RelayError> {
-        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+    /// The queue row, read on a connection the caller already holds.
+    ///
+    /// `load_queue` is the locking wrapper around this. It exists so a caller
+    /// that wants its read and its write in one transaction does not have to
+    /// drop the lock and take it again in between — which is what let a burn land
+    /// between an authorize and the insert it authorized.
+    fn load_queue_on(conn: &Connection, queue_id: &str) -> Result<Option<QueueRow>, RelayError> {
         let mut stmt = conn
             .prepare("SELECT token_hash, burned FROM queues WHERE id = ?1")
             .map_err(|_| RelayError::Internal)?;
@@ -133,14 +185,22 @@ impl Store {
         Ok(None)
     }
 
-    fn authorize(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {
-        match self.load_queue(queue_id)? {
+    fn load_queue(&self, queue_id: &str) -> Result<Option<QueueRow>, RelayError> {
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        Self::load_queue_on(&conn, queue_id)
+    }
+
+    /// Bind an unclaimed queue to `token`, or check an existing one against it.
+    ///
+    /// Takes the connection rather than locking it, so `put_blob` can hold a
+    /// single transaction across this and the insert it guards.
+    fn authorize_on(conn: &Connection, queue_id: &str, token: &str) -> Result<(), RelayError> {
+        match Self::load_queue_on(conn, queue_id)? {
             Some(q) if q.burned => Err(RelayError::Burned),
             Some(q) if tokens_match(&q.token_hash, token) => Ok(()),
             Some(_) => Err(RelayError::Unauthorized),
             None => {
                 let hash = hash_token(token);
-                let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
                 conn.execute(
                     "INSERT INTO queues (id, token_hash, burned) VALUES (?1, ?2, 0)",
                     params![queue_id, hash.as_slice()],
@@ -160,17 +220,28 @@ impl Store {
         if body.len() > self.config.max_blob_bytes {
             return Err(RelayError::TooLarge);
         }
-        self.authorize(queue_id, token)?;
-        self.check_rate(queue_id)?;
-
         let blob_id = hex::encode(Sha256::digest(body));
         let created = Self::now_secs() as i64;
-        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
-        conn.execute(
+
+        // Authorize, rate-check and insert as one transaction. Held together
+        // because otherwise a `report_queue` can land in between: it takes the
+        // same mutex, burns the queue and deletes that queue's blobs, and this
+        // insert would then write a blob into a queue that is already burned —
+        // and a burned queue refuses every read, so nothing would ever drain it.
+        //
+        // The rate check takes the `rate` mutex, making the lock order here
+        // connection-then-rate. Nothing takes them in the other order: every
+        // other `check_rate` caller has released the connection first.
+        let mut conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let tx = conn.transaction().map_err(|_| RelayError::Internal)?;
+        Self::authorize_on(&tx, queue_id, token)?;
+        self.check_rate(queue_id)?;
+        tx.execute(
             "INSERT INTO blobs (id, queue_id, body, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![blob_id, queue_id, body, created],
         )
         .map_err(|_| RelayError::Internal)?;
+        tx.commit().map_err(|_| RelayError::Internal)?;
         Ok(blob_id)
     }
 
@@ -238,6 +309,85 @@ impl Store {
         Ok(())
     }
 
+    /// Fetch a drain page: up to `limit` blobs in created order, NOT consumed.
+    ///
+    /// The batched half of the client's list-then-get walk: one request
+    /// returns what used to cost one `list` plus one `get` per message. The
+    /// page is left in place on purpose — the caller files what it fetched and
+    /// then confirms exactly the ids it processed with [`Self::ack_drained`].
+    /// Consuming here instead would drop the two hold cases the walk keeps:
+    /// a payload for a conclave this vault has not joined yet, and a blob
+    /// whose session is not ready — both must survive to be redelivered.
+    ///
+    /// Authorized with the read token, like every other read. Not
+    /// rate-limited, like the bulletin drain: the PUT limit is what keeps a
+    /// sender from filling the queue, and counting drains against it would
+    /// make a poll compete with a delivery.
+    pub fn drain_blobs(
+        &self,
+        queue_id: &str,
+        read_token: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, RelayError> {
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        Self::authorize_read_on(&conn, queue_id, read_token)?;
+        let mut stmt = conn
+            .prepare("SELECT id, body FROM blobs WHERE queue_id = ?1 ORDER BY created_at")
+            .map_err(|_| RelayError::Internal)?;
+        let mut rows = stmt
+            .query(params![queue_id])
+            .map_err(|_| RelayError::Internal)?;
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut total = 0usize;
+        while out.len() < limit {
+            let Some(row) = rows.next().map_err(|_| RelayError::Internal)? else {
+                break;
+            };
+            let id: String = row.get(0).map_err(|_| RelayError::Internal)?;
+            let body: Vec<u8> = row.get(1).map_err(|_| RelayError::Internal)?;
+            // The first blob always goes in, however large — a single blob
+            // over the budget is a page of one, not a stuck queue.
+            if !out.is_empty() && total + body.len() > DRAIN_MAX_PAGE_BYTES {
+                break;
+            }
+            total += body.len();
+            out.push((id, body));
+        }
+        Ok(out)
+    }
+
+    /// Confirm the ids a caller finished filing, deleting them in one
+    /// transaction.
+    ///
+    /// This is the batched half of the per-message `delete`. Idempotent: an
+    /// id another drain already removed deletes zero rows and still succeeds,
+    /// so two overlapping drains cannot fail each other. Held blobs simply
+    /// never arrive here and stay for the next poll. Authorized with the read
+    /// token; every deleted id must also belong to this queue, so a token can
+    /// never consume another queue's blobs by naming their ids.
+    pub fn ack_drained(
+        &self,
+        queue_id: &str,
+        read_token: &str,
+        ids: &[String],
+    ) -> Result<(), RelayError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        let tx = conn.transaction().map_err(|_| RelayError::Internal)?;
+        Self::authorize_read_on(&tx, queue_id, read_token)?;
+        for id in ids {
+            tx.execute(
+                "DELETE FROM blobs WHERE queue_id = ?1 AND id = ?2",
+                params![queue_id, id],
+            )
+            .map_err(|_| RelayError::Internal)?;
+        }
+        tx.commit().map_err(|_| RelayError::Internal)?;
+        Ok(())
+    }
+
     pub fn touch_presence(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {
         self.authorize_read_or_create(queue_id, token)?;
         let now = Self::now_secs() as i64;
@@ -290,14 +440,19 @@ impl Store {
 
     pub fn report_queue(&self, queue_id: &str, token: &str) -> Result<(), RelayError> {
         self.authorize_read(queue_id, token)?;
-        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        // Burn and delete as one unit. Split apart, a crash between them leaves
+        // the queue burned with its blobs still in it — and a burned queue
+        // refuses every read, so nothing would ever drain them.
+        let tx = conn.transaction().map_err(|_| RelayError::Internal)?;
+        tx.execute(
             "UPDATE queues SET burned = 1 WHERE id = ?1",
             params![queue_id],
         )
         .map_err(|_| RelayError::Internal)?;
-        conn.execute("DELETE FROM blobs WHERE queue_id = ?1", params![queue_id])
+        tx.execute("DELETE FROM blobs WHERE queue_id = ?1", params![queue_id])
             .map_err(|_| RelayError::Internal)?;
+        tx.commit().map_err(|_| RelayError::Internal)?;
         Ok(())
     }
 
@@ -398,7 +553,20 @@ impl Store {
     /// fallback is what the split exists to remove: it would let the published
     /// delivery token list, delete and burn the inbox.
     fn authorize_read(&self, queue_id: &str, read_token: &str) -> Result<(), RelayError> {
-        match self.load_queue(queue_id)? {
+        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        Self::authorize_read_on(&conn, queue_id, read_token)
+    }
+
+    /// [`Self::authorize_read`] on a connection the caller already holds, so a
+    /// caller that wants its read and its write in one transaction can keep
+    /// both under a single commit — the batched drain needs its select and its
+    /// deletes to land together.
+    fn authorize_read_on(
+        conn: &Connection,
+        queue_id: &str,
+        read_token: &str,
+    ) -> Result<(), RelayError> {
+        match Self::load_queue_on(conn, queue_id)? {
             Some(q) if q.burned => Err(RelayError::Burned),
             Some(q) => {
                 let delivery = hush_core::queue_delivery_token(read_token);
@@ -443,22 +611,26 @@ impl Store {
     }
 
     fn purge_expired(&self) -> Result<(), RelayError> {
-        let ttl = self.config.blob_ttl.as_secs() as i64;
-        let cutoff = Self::now_secs() as i64 - ttl;
+        let now = Self::now_secs() as i64;
+        let cutoff = now - self.config.blob_ttl.as_secs() as i64;
         // The bulletin has its own, longer TTL: it is the corpus, not a drained
         // inbox, so one window cannot serve both.
-        let bulletin_cutoff =
-            Self::now_secs() as i64 - self.config.bulletin_ttl.as_secs() as i64;
-        let conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
-        conn.execute("DELETE FROM blobs WHERE created_at < ?1", params![cutoff])
+        let bulletin_cutoff = now - self.config.bulletin_ttl.as_secs() as i64;
+        let mut conn = self.conn.lock().map_err(|_| RelayError::Internal)?;
+        // The three sweeps are one unit of work. Outside a transaction each is
+        // its own autocommit, so a crash between them can leave one table
+        // swept and another not.
+        let tx = conn.transaction().map_err(|_| RelayError::Internal)?;
+        tx.execute("DELETE FROM blobs WHERE created_at < ?1", params![cutoff])
             .map_err(|_| RelayError::Internal)?;
-        conn.execute("DELETE FROM drops WHERE created_at < ?1", params![cutoff])
+        tx.execute("DELETE FROM drops WHERE created_at < ?1", params![cutoff])
             .map_err(|_| RelayError::Internal)?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM bulletin WHERE inserted_at < ?1",
             params![bulletin_cutoff],
         )
         .map_err(|_| RelayError::Internal)?;
+        tx.commit().map_err(|_| RelayError::Internal)?;
         Ok(())
     }
 

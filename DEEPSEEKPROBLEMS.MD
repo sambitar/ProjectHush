@@ -7,6 +7,406 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-17 — Relay redesign: the bottleneck measured end to end
+
+### The drain peek loop re-read the same page forever — `recv()` spun at 100% CPU for 24 minutes [FIXED]
+
+- Attempted: page through a deep queue by repeating the non-consuming peek
+  (`POST /q/{id}/drain?limit=N`) inside `Account::fetch_queue` until an empty page came
+  back, with acks deferred to the filing phase.
+- Symptom: the flood suite's first test never finished — the test binary sat at 100% CPU for
+  24 minutes with three temp dirs and no progress (`ps` showed 140996 ticks of CPU on one
+  core). The peek is a pure `SELECT ... ORDER BY created_at LIMIT ?`: with nothing acked yet,
+  page 2 is page 1, so the fetch loop can never reach an empty page. Every queue looped
+  forever, so the run wedged on the very first test.
+- Resolution: restructured to progress-gated rounds in `recv()` (`crates/hush-core/src/account.rs`).
+  Each round: peek one page per queue concurrently -> file serially -> one ack per queue
+  (awaited) -> re-peek only queues whose ack was non-empty. The ack is what moves the peek
+  forward; a queue that files nothing (all blobs held) stops until the next poll. Whole flood
+  suite after the fix: 4/4 passed in 104.79 s release.
+- Lesson: a non-consuming read cannot be paged by repetition — pagination needs a cursor or
+  an interleaved consume. Also: a `loop` over a page endpoint belongs behind the same
+  progress guarantee as the data it reads; and an unattended `cargo test` needs `timeout` and
+  output capture so a wedge is visible in minutes, not half an hour.
+
+### Release-only test failures: config precedence tests and the drops page-url test were debug-hermetic only [FIXED]
+
+- Attempted: run all three suites under `cargo test --release` (the load-restricted box
+  pushed every run into release after the concurrent debug runs crashed it).
+- Symptom: `hush-core` config tests panicked with `insecure relay URL: use HTTPS except for
+  localhost` — they use `http://10.0.0.5` LAN addresses, and `HttpPolicy::current()` is
+  `Allow` in debug but `LoopbackOnly` in release. `hush-daemon`'s drops test failed with
+  `page_url follows the vault's relay: http://qvo7….onion/drop`: release builds bake in
+  `DEFAULT_RELAY_ONION_URL`, and `apply_relay_prefs` staged it into every unlocked vault,
+  so `drop_page_url` preferred the production onion even for a test vault created against a
+  localhost relay. Both suites had only ever been run in debug.
+- Resolution: config tests now use loopback URLs, which pass both policies (they exercise
+  precedence, not URL validation). The real bug got a product fix, not a test tweak: the
+  worker's `RelayApply` handler (`crates/hush-daemon/src/account_worker.rs`) now refuses the
+  baked-in default onion unless the vault's relay is the baked-in default relay — a
+  self-hoster's drop page no longer silently points at the production relay. Added
+  `config::is_baked_default_onion` to recognize it. All suites green in release:
+  relay 31, core 149 lib + 12 + 5 integration, daemon 219.
+- Lesson: `cfg!(debug_assertions)` in production defaults makes every test that depends on
+  the default profile-hermetic in debug only. Any default that varies by build profile needs
+  a test pinned in both, or the release CI run lies.
+
+### The production VPS still runs the pre-WAL binary — the Oct 17 store fix never reached it [FIXED]
+
+- Attempted: verify which relay binary `hushrelay.space` runs, after finding the fsync/WAL fix
+  sitting uncommitted in the working tree (`git diff crates/hush-relay/src/store.rs`).
+- Symptom: the deployed binary is dated Oct 16 16:53 (the cross-build in terminal 358792), one
+  day before the WAL fix existed. `ssh hush-relay-prod 'grep -c "journal_mode = WAL"
+  /usr/local/bin/hush-relay'` returns **0** — the pragma block is not in the binary — and
+  `/var/lib/hush-relay/relay/` holds a bare `relay.db` with no `-wal`/`-shm` beside it. So prod
+  still runs rollback-journal with `synchronous=FULL`, and every PUT/DELETE still pays the
+  multi-fsync autocommit plus the reader/writer serialization the fix removes.
+- Resolution: deployed 2026-10-17. Cross-built hush-relay aarch64 from the working tree in the
+  disposable container (the doc's command), verified the artifact locally (aarch64 ELF,
+  `journal_mode = WAL` present, drain route strings present), backed up the old binary to
+  `/usr/local/bin/hush-relay.bak-20261016`, installed and restarted. Evidence after restart:
+  unit `active`; `https://hushrelay.space/health` → 200; tokenless probe of
+  `POST /q/x/drain` → 401 (route registered); legacy route still 401 (old clients fine);
+  onion `/health` → 200; `relay.db-wal`/`-shm` exist beside the DB.
+- Lesson: a performance fix that never ships fixes nothing. Check what the deployed artifact
+  contains (`strings`/`grep` the binary) before crediting the working tree.
+
+### A chat send pays two fresh TLS handshakes because `relay_client()` builds a new `reqwest::Client` per call [OPEN]
+
+- Attempted: explain why the real relay feels slow when the relay's per-op latency is
+  sub-millisecond with WAL, by counting network round trips in the client paths.
+- Symptom, measured against `https://hushrelay.space` (Hetzner `37.27.150.250`): ping RTT
+  **164 ms**; a request on a reused connection costs **~165 ms**; a request on a fresh
+  connection costs **0.55–0.65 s** (DNS 40 ms + TCP 205 ms + TLS 390–450 ms + request).
+  `Account::relay_client()` (`crates/hush-core/src/account.rs:1019`) constructs a brand-new
+  `RelayClient` — and therefore a new `reqwest::Client` with an empty connection pool — on
+  **every call**, and there are 13 call sites. A live chat send calls it twice
+  (`contact_is_online`, then `deliver_to`), so one chat line costs ~1.1–1.3 s of handshakes
+  before any queueing; `recv()` builds one client per poll, so only the drain's first request
+  pays and the per-blob `get`/`delete` reuse that connection.
+- Resolution needed: construct the `RelayClient` once (at unlock/create, or lazily cached on
+  the account) and reuse the pool. No protocol change; purely client lifetime.
+- Lesson: `Client::new` per operation silently discards keep-alive. On a 164 ms link each
+  discarded pool costs half a second, which dwarfs everything the server does per request.
+
+### Round-trip arithmetic on the real link: a message costs 2 RTT to send, 3 RTT to receive, plus a 4 s poll [OPEN]
+
+- Attempted: account for every round trip in the send and drain paths at the measured 164 ms.
+- Symptom: a chat send is a presence `GET` + the payload `PUT` (2 RTT ≈ 330 ms, or ~1.3 s with
+  the fresh-client bug above). Receiving is `list` + per message `get` + `delete`, all
+  sequential: 3 RTT ≈ 0.5 s per message, and a poll walks the inbox plus one queue per contact
+  serially (a list per queue per 4 s `RECV_POLL_MS` tick). A ten-trustee conclave fan-out is
+  one PUT per trustee, sequential, each subject to that queue's 60/60 s rate limit. The UI
+  polls every 4 s, so inbound latency floor is 4 s + queue-walk + drain.
+- Resolution needed (redesign, ranked): batch the drain (one authenticated call returning and
+  consuming a page of blobs collapses 2N+1 RTT to 1); long-poll or notify on queue depth
+  instead of fixed 4 s polling; drop the presence round trip from the send path (cache presence
+  from the poll, or let the PUT answer it); honor `Retry-After` on 429 (the new binary sends
+  it). Server-side, WAL + a small read pool behind `spawn_blocking` is the next ceiling after
+  that, at ~5k ops/s for one connection today — not the current bottleneck.
+- Caveat: `hush.space` (the name used in conversation) is not the relay — it resolves elsewhere
+  (28 ms ping, `/health` fails). The production relay is `hushrelay.space` per
+  `docs/ops/relay-prod-vps.md`. The 164 ms RTT is to that box.
+- Lesson: on a far relay the bottleneck is RTT × round trips, not bytes or bandwidth. Count
+  round trips per message before redesigning storage: the store's fsync fix mattered 22 ms per
+  write; the network costs 165 ms per *request*, and the client issues three per message.
+
+## 2026-10-17 — `pkill -f` / `pgrep -f` matched their own shell wrapper
+
+### "Tests are still running" was wrong, twice, and one command killed its own session [WORKED AROUND]
+
+- Attempted: check whether the background test run had finished, and separately stop a benchmark
+  relay, using `pgrep -f 'cargo test -p hush'` and `pkill -f 'target/debug/hush-relay'`.
+- Symptom: both patterns match the `bash -c` wrapper that is *executing* them, because the pattern
+  text appears in that wrapper's own command line. Two consequences:
+  - `pgrep -f 'cargo test -p hush'` kept reporting a match after the run had genuinely finished, so
+    the user was told the suite was still running when it was done (466 passed, 0 failed, 23
+    binaries). Caught only by cross-checking `pgrep -x cargo` and `/proc/loadavg`, both of which
+    showed idle.
+  - `pkill -f 'target/debug/hush-relay'` killed the shell running it. The command returned exit 0
+    with no output at all, which reads as success.
+- Resolution: use exact-name matching — `pgrep -x cargo`, `pkill -x hush-relay` — or verify with a
+  second, independent signal (process count by exact name, or load average) before reporting
+  anything as running or stopped.
+- Lesson: a `-f` pattern is matched against the invoker's own command line, so a check can report on
+  itself. Exit 0 from `pkill` proves nothing; it reports "signalled", not "found and killed". Any
+  claim of the form "X is still running" needs a signal that cannot be satisfied by the checking
+  command itself. This is tooling, not a repo problem.
+
+## 2026-10-17 — Relay write path is fsync-bound and single-threaded
+
+### An 8-byte write costs 22 ms, and no two writes can overlap [OPEN]
+
+- Attempted: answer "why is the relay slow when we send so little data?" by reading the store and
+  then measuring the built relay rather than reasoning about it.
+- Symptom: it is not bandwidth. Timed against the real `target/debug/hush-relay` over one
+  keep-alive connection, 300 samples each, median:
+
+  | request | DB on ext4 | DB on tmpfs |
+  |---|---|---|
+  | `GET /health` (no SQL) | 0.57 ms | 0.56 ms |
+  | `GET /q/{id}` (read) | 1.13 ms | 1.08 ms |
+  | `PUT /q/{id}` (8-byte blob) | 22.33 ms | 1.15 ms |
+  | `GET /q/{id}/{blob}` (read) | 1.21 ms | 1.04 ms |
+  | `DELETE /q/{id}/{blob}` (write) | 29.82 ms | 0.95 ms |
+
+  Reads are identical on both; writes fall ~25x when the disk is taken out of the path. The cost
+  is the durability syscall, not the payload. Cause: `Connection::open` in `store.rs` is followed
+  by the schema batch and **no PRAGMA at all** — no `journal_mode`, no `synchronous`, no
+  `busy_timeout` — so SQLite runs at defaults, rollback journal with `synchronous=FULL`, and
+  every autocommitted `INSERT`/`DELETE` pays journal-create, two fsyncs and an unlink.
+- Second symptom: writes cannot overlap at all. `Store` holds one `Mutex<Connection>`, `Store::open`
+  runs once in `router()`, and the whole relay shares it through `Arc<AppState>` — so reads block
+  writes too. Twenty concurrent clients writing to twenty *distinct* queues took as long as
+  twenty sequential ones:
+
+  ```
+  20 writes sequential :  523.8 ms  (26.2 ms/write)
+  20 writes concurrent :  613.8 ms  (30.7 ms/write)
+  speedup from concurrency: 0.85x
+  ```
+
+  That puts the relay's ceiling at roughly 38 writes/sec for the whole process, and one client's
+  burst stalls every other client's reads.
+- Contributing, not yet measured at depth: `purge_expired()` runs on every `list` and every `get`
+  and issues three unbounded `DELETE`s. `DELETE FROM blobs WHERE created_at < ?` has no supporting
+  index — the only index on `blobs` is `idx_blobs_queue` — and neither does
+  `bulletin.inserted_at` (`drops` does, via `idx_drops_created`). Cheap today only because nothing
+  is expired yet, so no page is dirtied and no fsync happens; it becomes a write cost on every
+  read once rows start expiring, and the scan is linear in table size.
+- Client-side amplification, DB-independent: `recv()` walks the inbox plus one queue per contact
+  and does a separate `get` and `delete` per message, sequentially. Draining 41 messages is 1 list
+  + 41 gets + 41 deletes = 83 round trips, 41 of them ~30 ms fsyncs, about 1.2 s of pure disk sync
+  before any network latency.
+- Resolution needed: none was applied — recorded by choice. The measured fix is
+  `journal_mode=WAL` plus `synchronous=NORMAL` plus `busy_timeout`, which targets exactly the
+  22 ms; then batching the drain and wrapping `purge_expired` plus the read in one transaction.
+  WAL also lets readers proceed alongside the single writer. Postgres was considered and is the
+  correct answer to the *concurrency* half (it removes the single-writer cap and group-commits
+  concurrent fsyncs) but not to the per-write latency half, since it also syncs on commit by
+  default — and it would trade a single binary plus one file plus one systemd unit for a service
+  to run, back up and secure.
+- Caveat on the numbers: measured on this machine's disk (ext4 on `/dev/sda2`). On slower storage
+  the fsync cost is worse, so the PRAGMA change is worth more, not less.
+- Lesson: "we send almost no data" and "it is slow" are compatible whenever the cost is per
+  transaction rather than per byte. Measure the same binary against tmpfs before theorising about
+  bandwidth — it separates the syscall from everything else in one run.
+
+## 2026-10-17 — Relay flood (what a burst does to each surface)
+
+### A chat line the relay rate-limits is dropped, while mail, conclave messages and paper deltas queue [OPEN]
+
+- Attempted: flood one peer with chats, conclave messages, paper deltas and mail and see which
+  surfaces queue rather than fail.
+- Symptom: with one write per two seconds allowed on a queue, six sends per surface measured one
+  surface at a time: chat accepted 3/6 and **lost the other 3**, while conclave messages 6/6,
+  paper deltas 6/6 and mail 6/6 all arrived after the window rolled. `send_payload_inner` returns
+  `Err` on the refusal and nothing queues a chat line; mail goes to the chat log's queued state,
+  and conclave payloads go to `pending_conclave`, so those two survive by construction. Chat is
+  live-only by design, so a refusal is reported to the caller — but the default window is 60 s,
+  and the retry below cannot outlast it, so a burst over 60 lines a minute to one peer loses
+  everything past the limit with only an error string to show for it.
+- Resolution needed: a product decision, not a code fix. Either chat lines get a durable queue
+  (they stop being live-only), or the refusal is surfaced to the user as "not sent, retry" and
+  the UI stops pretending otherwise. Recorded rather than chosen.
+- Evidence: `a_refusal_that_outlasts_the_retry_is_lost_for_chat_and_queued_for_the_rest` and
+  `a_refusal_costs_each_surface_the_same` in `crates/hush-core/tests/relay_flood.rs`.
+
+### The delivery retry is shaped for a dropped packet and applied to HTTP 429 [OPEN]
+
+- Attempted: measure what a refused send costs the caller, per surface.
+- Symptom: `send_payload_inner` retries three times with 400 ms and 800 ms sleeps before giving
+  up. Against a rate limit that is both useless and expensive: the relay's window is a minute by
+  default, so all three attempts land inside the window that refused the first, and every
+  surface pays ~1 s of blocking retry per refused send regardless of whether it queues
+  afterwards. Measured per surface (1 write / 2 s, 6 sends): chat 1 s avg, conclave message
+  940 ms, paper delta 978 ms, mail 965 ms. For a conclave fan-out the cost is per trustee, so a
+  ten-trustee conclave refused once blocks the send call for ~10 s.
+- Resolution needed: distinguish a 429 from a transport blip. The relay now sends `Retry-After`
+  (below), so the delivery path can either wait it out for a live-only send or hand straight to
+  the durable queue for a store-and-forward one. Both are behaviour changes; neither was made.
+- Evidence: the per-surface table in `a_refusal_costs_each_surface_the_same`.
+
+### The relay could not say whether a write ever arrived [FIXED]
+
+- Attempted: work out from the client side whether a flood was being refused or dropped.
+- Symptom: nothing. `put` collapsed every non-2xx into `Error::Relay("put failed: 429 Too Many
+  Requests")` with no `Retry-After`, and the relay had no counters, no request log and a `/health`
+  that returned a bare 200. A sender that queues a refusal cannot tell "the relay took it" from
+  "the relay refused it and my outbox will retry" — the two look identical to the caller.
+- Resolution: the relay counts responses by outcome (`puts`, `gets`, `deletes`, `rate_limited`,
+  `unauthorized`, `rejected`, `other_errors`) through one middleware and reports them on
+  `/health`; a 429 now carries `Retry-After` with the seconds left in the window; and the client
+  carries that into its error text. `/health` still answers 200, so every script and
+  `RelayClient::ping` that only checks for success is unaffected.
+- Evidence: the flood tests read the counters and assert `rate_limited > 0`, which is what makes
+  "the burst actually crossed the limit" checkable at all.
+
+### Two wrong readings of the burst, both from measuring four surfaces at once [FIXED]
+
+- Attempted: read the per-surface cost out of one mixed burst of chats, conclave messages, paper
+  deltas and mail.
+- Symptom: the first burst reported conclave messages at 66 ms and mail at 78 ms while chat and
+  paper deltas took ~900 ms, which reads as "conclave and mail queue cheaply, chat and paper
+  retry expensively". It is an ordering artefact: `send_payload_inner` blocks ~1 s retrying a
+  refused write, which rolls the one-second window, so whichever surface runs next inherits a
+  fresh budget and looks instant. The four surfaces share one delivery path; the difference was
+  only their position in the loop. The second run of the same test showed the opposite
+  assignment, which is what exposed it. Separately, an earlier assertion counted
+  `inbox.messages` to prove a conclave invite had arrived, but an invite is a control payload and
+  never appears there, so the check failed against working code.
+- Resolution: `a_refusal_costs_each_surface_the_same` measures one surface at a time, on its own
+  pair of vaults, and that is the measurement to trust. The invite check reads
+  `pending_invites()`.
+- Lesson: a shared resource plus a sequential loop means position in the loop is a hidden
+  variable. When every subject rides the same path, measure them one at a time or the numbers
+  describe the loop, not the subject.
+
+## 2026-10-16 — Conclave delivery hardening (stale per-contact queue)
+
+### A re-grant sweep for a restored vault was a false fix [FIXED]
+
+- Attempted: treat a fresh device identity (a restore that carried the shared vault but not
+  `device.enc`) the same as a queue rotation, and re-grant every contact its new per-contact
+  queue on the outbox timer.
+- Symptom: the sweep reported success and cleared its own flag, while the peer kept delivering
+  into the abandoned queue. The relay accepted the blob, so nothing on the sender's side failed.
+  On the receiver, `apply_queue_grant` verifies the grant signature against `contact.identity_key`
+  — the key pinned from the *invite* — and a fresh device signs with a **new** identity key, so
+  every re-grant was refused with a bare `Ok(false)` and discarded silently. Both ends saw
+  success.
+- Resolution: split the two cases instead of pretending they are one. `queue_rotated` (a v1 file,
+  or a migration off the legacy layout) keeps the identity key and every session, so peers verify
+  the re-grant against the key they already pinned and the sweep genuinely converges. A fresh
+  device is recorded as `identity_restored` and reported through `/api/queues` and one stderr
+  warning at open, because the relationship needs a re-add. Accepting a changed identity key
+  automatically is exactly the substitution the pin exists to stop, so it is not repaired.
+- Evidence: `a_restored_vault_reports_the_identity_its_contacts_pinned` asserts the restore is
+  reported, is *not* queued as a re-grant, and that the peer keeps the dead queue after a sweep;
+  `a_regrant_from_the_same_identity_replaces_the_stored_queue` and
+  `a_grant_signed_by_an_unpinned_identity_is_refused` pin the accept/refuse split; the existing
+  `a_v1_device_file_rotates_its_queue_once_and_keeps_its_identity` now also asserts the open
+  queues a re-grant and does not claim an identity restore.
+- Lesson: `Ok(false)` on a security check is invisible to the sender. A repair built on the
+  assumption that the far side accepted the payload cannot be validated from the sender's side
+  alone; the check that refuses it has to be read first.
+
+### `grant_queues_to` swallowed delivery failures [FIXED]
+
+- Attempted: build a retry that clears its flag once every contact has been re-granted.
+- Symptom: `grant_queues_to` logged a failed delivery with `eprintln!` and returned `Ok(())`, so
+  every caller saw success. A retry built on it would clear its flag on a grant that never left
+  the process.
+- Resolution: it now returns whether the grant reached the relay (`Result<bool, Error>`); a
+  revoked contact reports `true` because nothing is owed, so a sweep does not retry it forever.
+  `add_contact` still ignores the value, but now warns that the peer will keep delivering to the
+  shared inbox.
+- Evidence: `a_regrant_sweep_keeps_its_flag_while_the_relay_is_unreachable` asserts the flag
+  survives an unreachable relay.
+
+### The rotation sweep's relay-level convergence is not covered end to end [OPEN]
+
+- Attempted: reach the queue-rotation path from an integration test in
+  `crates/hush-core/tests/two_party_relay.rs`.
+- Symptom: a rotation needs either a v1 `device.enc` or a legacy `signal.enc`, and both are
+  written with `crypto::encrypt` under the vault master key. `encrypt` is private, and the only
+  public route to the master key (`Vault::master_key`) does not include a way to re-encrypt a
+  device file, so no test outside the crate can build one. `DeviceKeys::from_store` and
+  `DeviceKeys::load` are the only producers of a rotated queue and both are out of reach.
+- Resolution needed: either a `#[doc(hidden)]` test hook that rotates a device queue without
+  touching the identity (it must keep the identity, or it stops testing the case that works), or a
+  feature-gated fixture. The pieces are covered individually — rotation detection and the queued
+  re-grant, the accept/replace of a second grant, and the sweep's failure handling — but nothing
+  asserts the full loop of rotate, re-grant, drain, converge against a live relay.
+- Note: a v1 rotation test already existed in `account.rs` (`a_v1_device_file_rotates_its_queue_
+  once_and_keeps_its_identity`), so the rotation trigger was covered before this slice; the first
+  draft of this slice added a second, near-identical test in `device.rs` and it was removed. The
+  duplicated test was written before reading the surrounding test module.
+- Lesson: an in-crate integration path that needs the master key cannot be tested from `tests/`.
+  When a helper is only reachable through private crypto, plan the test seam before writing the
+  test.
+
+## 2026-10-16 — macOS vault lock (`flock` was Linux-only)
+
+### The vault lock was a no-op on macOS, so the two-daemon bug was never fixed there [FIXED]
+
+- Attempted: work out why a MacBook (macOS 27.0.1, build 26A434) showed relay-dependent UI
+  actions lagging, dropping, and sometimes not completing, while the same build behaved on Linux.
+- Symptom: `acquire_vault_lock` — the fix logged further down as "Two daemons ran against one
+  vault — FIXED" — was gated `#[cfg(target_os = "linux")]`, with a stub returning `Ok(None)`
+  everywhere else under the comment "No-op on platforms without `flock`". macOS is not such a
+  platform: Darwin has `flock(2)`, and `libc::flock` is declared for it. So on macOS the lock was
+  never taken, `libc` was not even a dependency of `hush-daemon` (it sat under
+  `[target.'cfg(target_os = "linux")'.dependencies]`), and the only guard left was the socket
+  liveness probe that the earlier entry had already ruled out as insufficient. A force-quit on
+  macOS leaves `hush-daemon` running (the shell stops it only on a clean `RunEvent::Exit`) and the
+  next launch cannot see it, so two daemons run against one vault: whole-file `account.enc`
+  overwrites, duplicated queue drains, clobbered Signal sessions, invites that never arrive.
+- Resolution: widened the gate to `#[cfg(unix)]`, with `#[cfg(not(unix))]` for the Windows stub;
+  moved `libc` to `[target.'cfg(unix)'.dependencies]` (`zbus` stayed Linux-only — logind is a
+  Linux API); corrected the stub's comment, which named a limitation that does not exist. Three
+  tests in `vault_lock_tests` assert the lock is a held file, that a second daemon on one vault is
+  refused by name, and that a daemon that exits leaves no stale lock.
+- Evidence: the daemon builds and the three tests pass. Two real daemons on one temp vault with
+  *different* sockets give `Error: "another hush-daemon is already running on /tmp/hush-lock-e2e
+  (Resource temporarily unavailable (os error 11)); stop it before starting a new one"`, exit 1,
+  and never create their socket. `SIGKILL`ing the holder leaves the lock file on disk and the next
+  daemon still starts. `cargo check` for `aarch64-apple-darwin` is blocked here by `ring`'s build
+  script (it wants a macOS SDK), so the darwin side was checked by compiling the verbatim
+  `acquire_vault_lock` block from `main.rs` as a standalone crate for that target: it compiles,
+  `cfg!(unix)` is true, `libc::flock` resolves, and a `compile_error!` under `cfg(not(unix))` does
+  not fire.
+- Not verified: the macOS runtime path itself. No Mac was available, so "the lock is taken on
+  Darwin" rests on the target compiling the unix branch, not on having run it there.
+- Lesson: a platform gate written `target_os = "linux"` around a POSIX API makes a fix a
+  Linux-only fix while the log entry still reads `FIXED`. `flock`, `AsRawFd` and the unix socket
+  types are `unix`, not `linux` — gate on the API, not on the OS the bug was first seen on.
+
+## 2026-10-16 — relay drop diagnosis (chat/mail on prod)
+
+### `sqlite3` is not installed on the production relay host [WORKED AROUND]
+
+- Attempted: read aggregate state out of `/var/lib/hush-relay/relay/relay.db` directly on
+  `hush-relay-prod` to see queue/blob/burn counts and blob ages.
+- Symptom: every query returned `sudo: sqlite3: command not found`. The relay ships the SQLite
+  library statically via `rusqlite`, but no `sqlite3` CLI is present on the box, and the deploy
+  user has passwordless sudo so the workaround was not blocked, only unexpected.
+- Resolution: copied the DB off-box (`sudo cp` to `/tmp`, `scp` to `/tmp/hush-relay-inspect/`)
+  and queried it locally, where `sqlite3` exists. The DB is 139 KB, so the copy is trivial.
+- Lesson: the ops runbooks describe reading the relay DB but never say what reads it. Either
+  install `sqlite3` on the box or keep the copy-local step in the runbook. Tooling gap, not a
+  repo bug.
+
+### A relay queue id cannot be mapped back to a vault or contact with the tools on hand [OPEN]
+
+- Attempted: decide whether the two queues accumulating blobs on the prod relay belonged to the
+  local vault (a local drain bug) or to the remote peer (a consumer-side stall), to attribute a
+  "messages never arrive" report.
+- Symptom: nothing maps a queue id to a vault. `hush-cli` has no queue-id command, `/api/status`
+  returns `protocol_name` but no queue ids, and the ids are HMACs over the vault read token, which
+  lives only in the encrypted `device.enc`. Attribution had to be inferred indirectly: the two
+  queues have `presence_at = 0` (presence is inbox-only, so these are per-contact queues), and the
+  local vault's own `/api/recv` is clean, which rules the local vault out as their reader.
+- Resolution needed: a local diagnostic that prints this vault's own queue ids (inbox plus one per
+  contact) turns this into a one-line check. It does not exist.
+- Lesson: derived-only, never-stored identifiers are the right call for privacy and the wrong call
+  for operations. An opt-in local "which queues are mine" view costs nothing and would have
+  replaced the inference above with a fact.
+
+### The production relay logs no per-request detail, so a drop could not be attributed [OPEN]
+
+- Attempted: pin down why chat/mail messages were reported as dropped by reading the relay's
+  request log for `429` (rate limit), `401` (auth), `403` (burned) or `500` responses.
+- Symptom: there is nothing to read. `hush-relay` logs only its startup line
+  (`hush-relay listening on ...`), and the Caddy front end is configured with `log { output
+  discard }`, so no access log is kept either. The relay DB shows the residue (23 blobs, one
+  queue holding 17 undrained blobs, all under ~3 h old) but not the cause.
+- Resolution needed: the drop mechanism is inferred from the code paths, not observed on the
+  wire. To close this, add request-level logging to the relay (or stop discarding Caddy's access
+  log) and reproduce. Until then, the "17 blobs stuck on one queue" is a lead, not a diagnosis.
+- Lesson: a store-and-forward service with no request log cannot be debugged from its own host.
+  The absence of observability is itself the defect to fix first.
+
 ## 2026-10-16 — macOS ad-hoc code signing
 
 ### v0.2.0 shipped an unsigned macOS bundle, so Gatekeeper called it damaged [FIXED]

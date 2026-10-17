@@ -27,7 +27,9 @@ use crate::payload::{
     MailAttachment, MessagePayload, PaperDescriptor, VoiceDescriptor, MAX_INLINE_FILE_BYTES,
     MAX_MAIL_ATTACHMENTS,
 };
-use crate::relay_client::{normalize_relay_base, validate_onion_relay, BulletinBlob, RelayClient};
+use crate::relay_client::{
+    normalize_relay_base, validate_onion_relay, BulletinBlob, DrainedBlob, RelayClient,
+};
 use crate::signal::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
     process_contact_bundle, protocol_address, protocol_name_from_identity, sign_queue_grant,
@@ -524,6 +526,31 @@ struct AccountState {
     /// the last choice to deliver.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_reach: Vec<PendingReach>,
+    /// Conclave fan-out copies the relay refused, still owed to their targets.
+    ///
+    /// A conclave has no relay-side room and no group object, so a fan-out is N
+    /// independent 1:1 puts and a subset can fail while the rest land. There is
+    /// nowhere to re-read the refused copy from, so the encoded payload and the
+    /// nicks still owed it are kept here and the daemon's outbox timer drains
+    /// them, exactly like queued mail and reach announcements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_conclave: Vec<PendingConclave>,
+    /// Set when this device's queues rotated — a v1 device file, or a migration
+    /// off the pre-multi-device layout. Every contact must then be re-granted
+    /// the new per-contact queue, or it keeps delivering into the one this
+    /// device no longer reads. Drained by the daemon's outbox timer.
+    #[serde(default)]
+    regrant_all: bool,
+    /// Set when this vault's device identity was minted fresh, because the vault
+    /// was restored from a backup without this device's keys.
+    ///
+    /// Every contact pinned the previous identity key in their invite, so they
+    /// refuse this vault's grants and cannot read its messages: the relationship
+    /// has to be re-established by re-adding the contact. Recorded rather than
+    /// repaired — accepting a changed identity key automatically is exactly the
+    /// substitution the pin exists to stop.
+    #[serde(default)]
+    identity_restored: bool,
 }
 
 /// One queued reach announcement: who it is for and what scope it carries.
@@ -531,6 +558,87 @@ struct AccountState {
 struct PendingReach {
     nickname: String,
     scope: TrusteeReach,
+}
+
+/// One conclave payload still owed to some of its targets.
+///
+/// The payload is kept as the bytes it was encoded to rather than as a decoded
+/// struct: the retry re-encrypts a fresh copy per target anyway, and storing the
+/// wire bytes means a retry that outlives a payload-shape change still decodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingConclave {
+    conclave_id: String,
+    payload: Vec<u8>,
+    /// The nicks still owed a copy.
+    targets: Vec<String>,
+}
+
+/// What one conclave fan-out did.
+///
+/// A fan-out is N independent puts, so the outcome is split rather than a single
+/// `Result`: `refused` is worth retrying over the same 1:1 session, `unreachable`
+/// is not (there is no session to retry over), and a fan-out that reached nobody
+/// is worth telling the sender about.
+#[derive(Debug, Default, Clone)]
+struct ConclaveFanOut {
+    /// Nicks the payload reached.
+    delivered: Vec<String>,
+    /// Nicks the relay refused; owed a retry.
+    refused: Vec<String>,
+    /// Joined trustees this vault has no contact record for, by display name.
+    unreachable: Vec<String>,
+}
+
+impl ConclaveFanOut {
+    /// Whether the payload reached no one at all — nobody delivered, nothing to
+    /// retry. A message that lands here went nowhere and only a warning says so.
+    fn reached_nobody(&self) -> bool {
+        self.delivered.is_empty() && self.refused.is_empty()
+    }
+}
+
+/// The relay queues one vault drains and delivers into, derived on demand.
+///
+/// Queue ids are HMACs over the device read token and are never written to the
+/// vault, which is the right call for privacy and a hard one for operations:
+/// when a queue on the relay is filling and nothing is draining it, there is no
+/// file that says whose it is. This is the local, read-only answer — a queue
+/// that is not in this map does not belong to this vault.
+///
+/// Ids only, never the read tokens: an id is what the relay already knows and is
+/// not reversible to the token, while the token is what authorizes draining and
+/// burning.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueMap {
+    /// The queue this vault drains for itself.
+    pub inbox: String,
+    /// One row per contact, in contact order.
+    pub contacts: Vec<ContactQueues>,
+    /// Whether every contact still owes a re-grant because this device's queues
+    /// rotated. While true, the grants peers hold name queues this vault no
+    /// longer drains, so their mail sits on the relay.
+    pub regrant_pending: bool,
+    /// Whether this vault's device identity is newer than the one every contact
+    /// pinned. While true, peers refuse its grants and cannot read its messages:
+    /// the contact has to be re-added, which no automatic sweep can do.
+    pub identity_restored: bool,
+}
+
+/// One contact's queues, in both directions.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactQueues {
+    pub nickname: String,
+    pub account_id: String,
+    /// The queue this vault mints for the contact and drains: the contact
+    /// delivers into it.
+    pub read_queue: String,
+    /// Where this vault delivers to the contact — the contact's granted
+    /// per-contact queue when one has arrived, the contact's inbox otherwise.
+    pub send_queue: String,
+    /// Whether `send_queue` is the granted per-contact queue. `false` means the
+    /// grant has not arrived, so delivery falls back to the shared inbox and a
+    /// delete of this contact cannot revoke it.
+    pub granted: bool,
 }
 
 pub struct Account {
@@ -550,6 +658,113 @@ pub struct Account {
     /// Runtime-only like the proxy: the daemon re-applies it on unlock and
     /// whenever the prefs change, and the log enforces it on every append.
     chat_retention: ChatRetention,
+    /// The relay client built for the current endpoint, reused across calls.
+    ///
+    /// Runtime-only. Building a client per call discards the HTTP connection
+    /// pool, and a discarded pool means every operation pays a fresh
+    /// DNS+TCP+TLS handshake — measured at 0.5-0.65 s against the production
+    /// relay, twice per chat send, where a reused connection costs one round
+    /// trip. The cache key is the endpoint pair the client was built from, so
+    /// flipping Tor relay mode or swapping the SOCKS port rebuilds rather
+    /// than serves stale.
+    relay_client_cache: std::sync::Mutex<Option<RelayClientCache>>,
+    /// Whether the relay serves the batched drain, if the question has come
+    /// up. `None` until a poll has probed; `Some(false)` latches the legacy
+    /// per-blob walk so later polls skip the probe. A relay is not upgraded
+    /// mid-session in practice, and a wrong latch costs one 404 next poll.
+    drain_supported: Option<bool>,
+}
+
+/// The cache key and client for [`Account::relay_client`]: the endpoint pair
+/// the client was built from, so a change to either rebuilds it.
+struct RelayClientCache {
+    key: (String, Option<String>),
+    client: RelayClient,
+}
+
+/// How many blobs one batched drain page asks for. The relay clamps harder
+/// when a page would exceed its byte ceiling; the client keeps paging until
+/// a page comes back empty, which is the only reliable stop signal.
+const DRAIN_PAGE_LIMIT: usize = 256;
+
+/// One queue's fetch: the blobs that were queued on it when the poll ran.
+struct FetchedQueue {
+    expected_contact: Option<String>,
+    queue_id: String,
+    read_token: String,
+    /// Fetched through the batched drain, so filed blobs are confirmed with
+    /// one ack rather than one `delete` per blob.
+    drained: bool,
+    /// What a drain attempt discovered about the relay, if one was tried
+    /// this poll. `None` when the caller already knew and skipped the probe.
+    drain_discovered: Option<bool>,
+    blobs: Vec<DrainedBlob>,
+}
+
+/// The per-blob fetch walk a pre-drain relay needs: list, then one `get` per
+/// blob. Blobs are deleted after they file, on the caller side.
+async fn legacy_walk(
+    relay: &RelayClient,
+    queue_id: &str,
+    read_token: &str,
+) -> Result<Vec<DrainedBlob>, Error> {
+    let ids = relay.list_optional(queue_id, read_token).await?;
+    let mut blobs = Vec::with_capacity(ids.len());
+    for id in ids {
+        let body = relay.get(queue_id, read_token, &id).await?;
+        blobs.push(DrainedBlob { id, body });
+    }
+    Ok(blobs)
+}
+
+/// Fetch one queue's queued blobs. Touches no account state, so queues can
+/// run concurrently; the client's connection pool spreads the requests.
+async fn fetch_queue(
+    relay: RelayClient,
+    expected_contact: Option<String>,
+    queue_id: String,
+    read_token: String,
+    drain_supported: Option<bool>,
+) -> Result<FetchedQueue, Error> {
+    // Latched legacy: skip the probe, walk per blob.
+    if drain_supported == Some(false) {
+        let blobs = legacy_walk(&relay, &queue_id, &read_token).await?;
+        return Ok(FetchedQueue {
+            expected_contact,
+            queue_id,
+            read_token,
+            drained: false,
+            drain_discovered: None,
+            blobs,
+        });
+    }
+    match relay.drain(&queue_id, &read_token, DRAIN_PAGE_LIMIT).await? {
+        // A relay without the drain route: walk per blob this poll and latch
+        // the discovery so later polls skip the probe.
+        None => {
+            let blobs = legacy_walk(&relay, &queue_id, &read_token).await?;
+            Ok(FetchedQueue {
+                expected_contact,
+                queue_id,
+                read_token,
+                drained: false,
+                drain_discovered: Some(false),
+                blobs,
+            })
+        }
+        // One page per fetch. A peek never consumes — the ack that follows
+        // filing does — so paging here would re-read the same rows forever.
+        // Deeper backlogs are fetched by the round loop in `recv`, which
+        // re-peeks after the ack.
+        Some(page) => Ok(FetchedQueue {
+            expected_contact,
+            queue_id,
+            read_token,
+            drained: true,
+            drain_discovered: Some(true),
+            blobs: page,
+        }),
+    }
 }
 
 impl Account {
@@ -584,6 +799,9 @@ impl Account {
             pending_intro_requests: Vec::new(),
             pending_intros: Vec::new(),
             pending_reach: Vec::new(),
+            pending_conclave: Vec::new(),
+            regrant_all: false,
+            identity_restored: false,
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
@@ -597,6 +815,8 @@ impl Account {
             pending_recovery_code: Some(recovery_code),
             relay_socks: None,
             chat_retention: ChatRetention::default(),
+            relay_client_cache: std::sync::Mutex::new(None),
+            drain_supported: None,
         };
         account.save().await?;
         // First prekey publish, so the relay directory can serve the pointer
@@ -667,6 +887,31 @@ impl Account {
         if queue_rotated {
             state.invite_cache = None;
         }
+        // A rotated queue also invalidates every grant this vault handed out:
+        // the per-contact queues are derived from the new read token, so peers
+        // holding the old grant deliver into a queue nothing drains. Both ends
+        // see success, so the blob simply sits until its TTL. Re-granting is the
+        // only repair, and it needs the relay, so it is queued for the daemon
+        // rather than done here — open stays offline-capable.
+        //
+        // Only a rotation is queued, never a fresh device. A rotation keeps the
+        // identity key and every session, so peers verify the re-grant against
+        // the key they already pinned. A fresh device mints a **new** identity,
+        // and `apply_queue_grant` verifies the grant against the key pinned in
+        // the peer's invite — so every re-grant is silently refused, and the
+        // sweep would clear its own flag on a delivery the peer discarded. That
+        // case is a re-add, not a re-grant; it is reported instead.
+        if queue_rotated {
+            state.regrant_all = true;
+        }
+        if fresh_device {
+            state.identity_restored = true;
+            eprintln!(
+                "hush: this vault was restored without its device keys, so it has a new \
+                 identity. Every contact pinned the previous one and will refuse its \
+                 grants and messages: re-add each contact to re-establish the relationship."
+            );
+        }
 
         let mut pending_recovery_code = None;
         if !recovery_files_exist(dir) {
@@ -687,6 +932,8 @@ impl Account {
             pending_recovery_code,
             relay_socks: None,
             chat_retention: ChatRetention::default(),
+            relay_client_cache: std::sync::Mutex::new(None),
+            drain_supported: None,
         };
         if needs_save {
             account.save().await?;
@@ -882,8 +1129,15 @@ impl Account {
     /// no onion address on file, no live Tor SOCKS port — is an error rather
     /// than a silent fall back to clearnet. Only the switch turning the mode
     /// off sends traffic directly.
+    ///
+    /// The client is cached against the endpoint it was built for and reused,
+    /// because a fresh `Client` carries an empty connection pool and its first
+    /// request pays a full DNS+TCP+TLS handshake — measured at half a second
+    /// against the production relay, where a reused connection costs one
+    /// round trip. The cache key is the endpoint pair, so a mode flip or a
+    /// new SOCKS port rebuilds instead of serving stale.
     fn relay_client(&self) -> Result<RelayClient, Error> {
-        if self.state.use_tor_relay {
+        let key = if self.state.use_tor_relay {
             let base = self.state.onion_relay.as_deref().ok_or_else(|| {
                 Error::Relay(
                     "Tor relay mode is on, but no onion address is on file for this vault."
@@ -903,10 +1157,27 @@ impl Account {
                             .into(),
                     )
                 })?;
-            RelayClient::try_new_with_proxy(base, Some(&socks))
+            (base.to_string(), Some(socks))
         } else {
-            RelayClient::try_new_with_proxy(&self.state.relay, None)
+            (self.state.relay.clone(), None)
+        };
+        let mut cached = self
+            .relay_client_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match cached.as_ref() {
+            Some(hit) if hit.key == key => return Ok(hit.client.clone()),
+            _ => {}
         }
+        let client = match key.1.as_deref() {
+            Some(socks) => RelayClient::try_new_with_proxy(&key.0, Some(socks))?,
+            None => RelayClient::try_new_with_proxy(&key.0, None)?,
+        };
+        *cached = Some(RelayClientCache {
+            key: key.clone(),
+            client: client.clone(),
+        });
+        Ok(client)
     }
 
     pub fn protocol_name(&self) -> &str {
@@ -1043,8 +1314,13 @@ impl Account {
         // makes deleting them revocable. Best effort and one-shot: nothing
         // re-sends this, so a relay that is down here leaves the peer
         // delivering to our inbox until it drains a message from us.
-        if let Err(e) = self.grant_queues_to(nickname).await {
-            eprintln!("hush: could not grant a queue to {nickname}: {e}");
+        match self.grant_queues_to(nickname).await {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "hush: the queue grant to {nickname} did not reach the relay; they \
+                 keep delivering to our inbox until they next drain a message"
+            ),
+            Err(e) => eprintln!("hush: could not grant a queue to {nickname}: {e}"),
         }
         Ok(())
     }
@@ -1752,6 +2028,17 @@ impl Account {
             .count()
     }
 
+    /// How many conclave payloads are waiting for the relay.
+    ///
+    /// The sibling of [`Self::queued_mail_count`], and the other half of the
+    /// answer to "did that send land": a conclave fan-out that the relay refused
+    /// is queued rather than reported, so the caller's `Ok` says nothing about
+    /// delivery. A count that stays above zero across outbox ticks is a fan-out
+    /// that is not getting through.
+    pub fn pending_conclave_count(&self) -> usize {
+        self.state.pending_conclave.len()
+    }
+
     /// Create a draft, or replace an existing one when `id` is set. Returns the
     /// draft's record id.
     pub async fn save_draft(
@@ -2000,18 +2287,225 @@ impl Account {
             body: body.to_string(),
             file: None,
         };
-        let targets: Vec<String> = conclave
-            .joined()
-            .filter(|m| m.account_id != me)
-            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
-            .collect();
-        for nick in targets {
-            self.send_payload_inner(&nick, payload.clone(), false).await?;
-        }
+        let out = self.fan_out_conclave(&conclave, &payload, None).await;
+        self.warn_conclave_fan_out(conclave_id, &out);
+        self.queue_conclave_retry(conclave_id, &payload, out.refused)
+            .await?;
         let master = *self.vault.master_key();
         self.chat_log
             .append_conclave_message(&master, conclave_id, true, None, body)?;
         Ok(())
+    }
+
+    /// Fan one payload out to a conclave's joined trustees, over their own 1:1
+    /// sessions.
+    ///
+    /// This is the whole of "group messaging": there is no relay-side room and
+    /// no group object, so a payload reaches a conclave as N encryptions and N
+    /// queue puts. Keeping that in one place is what makes two rules hold for
+    /// every payload that rides it — a message, a file, a roster update, an end,
+    /// a paper delta:
+    ///
+    /// - a target the relay refuses does not abandon the rest. Propagating the
+    ///   first error with `?` used to lose a whole roster update to one dead
+    ///   peer, and the sender was never told;
+    /// - a joined trustee with no contact record is reported, not dropped. It
+    ///   cannot be retried — there is no session to retry over — so the only fix
+    ///   is to add them as a contact, and only a warning can say so.
+    ///
+    /// `except` skips one trustee by account id, for a payload the sender already
+    /// knows that peer has (the paper-delta relay).
+    async fn fan_out_conclave(
+        &mut self,
+        record: &ConclaveRecord,
+        payload: &MessagePayload,
+        except: Option<&str>,
+    ) -> ConclaveFanOut {
+        let me = self.state.protocol_name.clone();
+        let mut out = ConclaveFanOut::default();
+        let targets: Vec<(String, String)> = record
+            .joined()
+            .filter(|m| m.account_id != me && except != Some(m.account_id.as_str()))
+            .map(|m| (m.account_id.clone(), m.nick.clone()))
+            .collect();
+        for (account_id, nick) in targets {
+            let Some(contact_nick) = self.contact_nick_for_protocol(&account_id) else {
+                // A joined trustee this vault has no 1:1 session with. The copy
+                // has nowhere to go, and it cannot be queued either — a retry
+                // would resolve the same missing contact. Report it.
+                let shown = if nick.is_empty() {
+                    short_name(&account_id)
+                } else {
+                    nick
+                };
+                eprintln!(
+                    "hush: conclave fan-out to {shown} skipped — no contact record, so no 1:1 session to ride"
+                );
+                out.unreachable.push(shown);
+                continue;
+            };
+            match self
+                .send_payload_inner(&contact_nick, payload.clone(), false)
+                .await
+            {
+                Ok(()) => out.delivered.push(contact_nick),
+                Err(e) => {
+                    eprintln!(
+                        "hush: conclave fan-out to {contact_nick} was refused, will retry: {e}"
+                    );
+                    out.refused.push(contact_nick);
+                }
+            }
+        }
+        out
+    }
+
+    /// Say so when a fan-out reached nobody.
+    ///
+    /// This is the failure the sender cannot otherwise see: the record and the
+    /// local log both say the message was sent, and the peer's vault has no way
+    /// to report an absence. The daemon log is where it lands.
+    fn warn_conclave_fan_out(&self, conclave_id: &str, out: &ConclaveFanOut) {
+        if out.reached_nobody() {
+            eprintln!(
+                "hush: a payload for conclave {conclave_id} reached nobody — no reachable joined trustee"
+            );
+        }
+    }
+
+    /// Record a fan-out's refused targets for the outbox timer, then save.
+    ///
+    /// An empty list queues nothing: a payload that reached nobody and was
+    /// refused by nobody has no target to retry, and only a warning applies.
+    async fn queue_conclave_retry(
+        &mut self,
+        conclave_id: &str,
+        payload: &MessagePayload,
+        refused: Vec<String>,
+    ) -> Result<(), Error> {
+        if refused.is_empty() {
+            return Ok(());
+        }
+        let bytes = match payload.encode() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("hush: a conclave payload could not be queued for retry: {e}");
+                return Ok(());
+            }
+        };
+        self.state.pending_conclave.push(PendingConclave {
+            conclave_id: conclave_id.to_string(),
+            payload: bytes,
+            targets: refused,
+        });
+        self.save().await
+    }
+
+    /// Re-send the conclave copies the relay refused, once per outbox tick.
+    ///
+    /// Returns how many copies went out. A target that is gone — the contact was
+    /// removed, the trustee left, or the conclave was ended or deleted — is
+    /// dropped rather than retried forever: there is nobody left to reach, and
+    /// an ended conclave is read-only on every peer.
+    pub async fn retry_pending_conclave(&mut self) -> Result<usize, Error> {
+        if self.state.pending_conclave.is_empty() {
+            return Ok(0);
+        }
+        let queued = std::mem::take(&mut self.state.pending_conclave);
+        let mut delivered = 0;
+        let mut kept = Vec::new();
+        for entry in queued {
+            let Ok(payload) = MessagePayload::decode(&entry.payload) else {
+                eprintln!("hush: dropping an unreadable queued conclave payload");
+                continue;
+            };
+            let Some(record) = self
+                .chat_log
+                .conclave(&entry.conclave_id)
+                .filter(|c| !c.ended)
+                .cloned()
+            else {
+                continue;
+            };
+            let live: Vec<String> = record
+                .joined()
+                .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
+                .collect();
+            let mut still = Vec::new();
+            for nick in entry.targets {
+                if !live.contains(&nick) {
+                    continue;
+                }
+                match self.send_payload_inner(&nick, payload.clone(), false).await {
+                    Ok(()) => delivered += 1,
+                    Err(e) => {
+                        eprintln!("hush: conclave retry to {nick} still refused: {e}");
+                        still.push(nick);
+                    }
+                }
+            }
+            if !still.is_empty() {
+                kept.push(PendingConclave {
+                    conclave_id: entry.conclave_id,
+                    payload: entry.payload,
+                    targets: still,
+                });
+            }
+        }
+        self.state.pending_conclave = kept;
+        self.save().await?;
+        Ok(delivered)
+    }
+
+    /// Re-announce this vault's per-contact queues after the device's queues
+    /// rotated, once per outbox tick.
+    ///
+    /// A rotation replaces this device's queue, so the per-contact queues
+    /// derived from the new read token all change, and every grant already
+    /// handed out names a queue this vault no longer drains. Neither side
+    /// notices: the sender's copy reads `sent` and the blob sits until its TTL.
+    /// Re-granting is the only repair, and it is idempotent on the receiving
+    /// side, so this retries until every contact has been re-announced.
+    ///
+    /// Only a rotation reaches here. A rotation keeps the identity key, so the
+    /// peer can verify the re-grant against the key it pinned; a restored vault
+    /// mints a **new** identity, and its grants are refused on arrival. See
+    /// `AccountState::identity_restored`.
+    ///
+    /// Returns how many contacts were re-granted. Contacts that fail — offline,
+    /// relay down — keep the flag set and are retried on the next tick.
+    pub async fn retry_regrants(&mut self) -> Result<usize, Error> {
+        if !self.state.regrant_all {
+            return Ok(0);
+        }
+        let nicknames: Vec<String> = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| c.nickname.clone())
+            .collect();
+        let mut regranted = 0;
+        let mut failed = false;
+        for nickname in nicknames {
+            match self.grant_queues_to(&nickname).await {
+                Ok(true) => regranted += 1,
+                // Handed to the relay but refused: it never got there, so the
+                // contact still holds the old queue. Retry next tick.
+                Ok(false) => {
+                    eprintln!("hush: re-grant to {nickname} did not reach the relay");
+                    failed = true;
+                }
+                Err(e) => {
+                    eprintln!("hush: could not re-grant a queue to {nickname}: {e}");
+                    failed = true;
+                }
+            }
+        }
+        if !failed {
+            self.state.regrant_all = false;
+            self.save().await?;
+        }
+        Ok(regranted)
     }
 
     /// Fan one conclave control payload (paper or voice) out to the conclave's
@@ -2044,15 +2538,10 @@ impl Account {
         if !conclave.is_joined(&me) {
             return Err(Error::NotConclaveTrustee);
         }
-        let targets: Vec<String> = conclave
-            .joined()
-            .filter(|m| m.account_id != me)
-            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
-            .collect();
-        for nick in targets {
-            self.send_payload_inner(&nick, payload.clone(), false).await?;
-        }
-        Ok(())
+        let out = self.fan_out_conclave(&conclave, &payload, None).await;
+        self.warn_conclave_fan_out(conclave_id, &out);
+        self.queue_conclave_retry(conclave_id, &payload, out.refused)
+            .await
     }
 
     /// Tell the conclave's trustees that a paper exists, or that its hub moved.
@@ -2171,22 +2660,15 @@ impl Account {
         if conclave.ended || !conclave.is_joined(&me) {
             return Ok(());
         }
-        let targets: Vec<String> = conclave
-            .joined()
-            .filter(|m| m.account_id != me && m.account_id != from_account)
-            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
-            .collect();
-        for nick in targets {
-            self.send_payload_inner(
-                &nick,
-                MessagePayload::PaperDelta {
-                    paper_id: paper_id.to_string(),
-                    update: update.to_vec(),
-                },
-                false,
-            )
+        let payload = MessagePayload::PaperDelta {
+            paper_id: paper_id.to_string(),
+            update: update.to_vec(),
+        };
+        let out = self
+            .fan_out_conclave(&conclave, &payload, Some(from_account))
+            .await;
+        self.queue_conclave_retry(conclave_id, &payload, out.refused)
             .await?;
-        }
         Ok(())
     }
 
@@ -2406,14 +2888,10 @@ impl Account {
                 data: data.to_vec(),
             }),
         };
-        let targets: Vec<String> = conclave
-            .joined()
-            .filter(|m| m.account_id != me)
-            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
-            .collect();
-        for nick in targets {
-            self.send_payload_inner(&nick, payload.clone(), false).await?;
-        }
+        let out = self.fan_out_conclave(&conclave, &payload, None).await;
+        self.warn_conclave_fan_out(conclave_id, &out);
+        self.queue_conclave_retry(conclave_id, &payload, out.refused)
+            .await?;
         let master = *self.vault.master_key();
         self.chat_log
             .append_conclave_file(&master, conclave_id, true, None, name, &blob_id, data.len() as u64)?;
@@ -3220,22 +3698,12 @@ impl Account {
             .conclave(conclave_id)
             .cloned()
             .ok_or(Error::ConclaveNotFound)?;
-        let descriptor = descriptor_of(&record);
-        let targets: Vec<String> = record
-            .joined()
-            .filter(|m| m.account_id != me)
-            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
-            .collect();
-        for nick in targets {
-            self.send_payload_inner(
-                &nick,
-                MessagePayload::ConclaveEnd {
-                    descriptor: descriptor.clone(),
-                },
-                false,
-            )
+        let payload = MessagePayload::ConclaveEnd {
+            descriptor: descriptor_of(&record),
+        };
+        let out = self.fan_out_conclave(&record, &payload, None).await;
+        self.queue_conclave_retry(conclave_id, &payload, out.refused)
             .await?;
-        }
         self.save().await?;
         Ok(())
     }
@@ -3274,24 +3742,12 @@ impl Account {
 
     /// Send the convener's authoritative roster to every joined trustee.
     async fn broadcast_update(&mut self, record: &ConclaveRecord) -> Result<(), Error> {
-        let me = self.state.protocol_name.clone();
-        let descriptor = descriptor_of(record);
-        let targets: Vec<String> = record
-            .joined()
-            .filter(|m| m.account_id != me)
-            .filter_map(|m| self.contact_nick_for_protocol(&m.account_id))
-            .collect();
-        for nick in targets {
-            self.send_payload_inner(
-                &nick,
-                MessagePayload::ConclaveUpdate {
-                    descriptor: descriptor.clone(),
-                },
-                false,
-            )
-            .await?;
-        }
-        Ok(())
+        let payload = MessagePayload::ConclaveUpdate {
+            descriptor: descriptor_of(record),
+        };
+        let out = self.fan_out_conclave(record, &payload, None).await;
+        self.queue_conclave_retry(&record.id, &payload, out.refused)
+            .await
     }
 
     /// Map a wire roster onto this vault's nicknames.
@@ -3638,7 +4094,10 @@ impl Account {
     /// it, which is what makes deleting the contact able to burn exactly that
     /// queue. Sent to the contact's **inbox**, which is the grant channel, never
     /// to a delivery queue.
-    async fn grant_queues_to(&mut self, nickname: &str) -> Result<(), Error> {
+    ///
+    /// Returns whether the grant reached the relay. A revoked contact is owed
+    /// nothing and reports `true`, so a re-grant sweep does not retry it forever.
+    async fn grant_queues_to(&mut self, nickname: &str) -> Result<bool, Error> {
         let contact = self
             .find_contact(nickname)
             .ok_or(Error::ContactNotFound)?
@@ -3648,7 +4107,7 @@ impl Account {
         // the grant is verified by its signature on the far side anyway (see
         // `apply_queue_grant`). Not sending it saves a pointless delivery.
         if self.state.revoked.contains(&contact.account_id) {
-            return Ok(());
+            return Ok(true);
         }
         let queue_id = self.device.contact_queue_id(&contact.account_id);
         let delivery_token = self.device.contact_queue_delivery_token(&contact.account_id);
@@ -3663,22 +4122,32 @@ impl Account {
 
         // The grant channel is the contact's inbox; the grant must not be sent
         // to a per-contact queue, which the recipient may not have bound yet.
-        if let Err(e) = self
+        //
+        // The outcome is reported, not swallowed: a caller re-granting after a
+        // queue rotation must know whether the grant actually reached the relay,
+        // or it would clear its retry flag on a delivery that never happened.
+        // `add_contact` ignores the value on purpose — a contact is added whether
+        // or not the relay is reachable at that moment.
+        let delivered = match self
             .deliver_to(&contact, &contact.queue_id, &contact.queue_token, &plain)
             .await
         {
-            eprintln!(
-                "hush: grant to {} failed: {e}",
-                short_name(&contact.account_id)
-            );
-        }
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "hush: grant to {} failed: {e}",
+                    short_name(&contact.account_id)
+                );
+                false
+            }
+        };
         // Encrypting the grant advances the session ratchet. Persist it here:
         // otherwise a caller that exits right after adding a contact (the CLI)
         // leaves the ratchet on disk at its pre-grant position, and the next
         // message is encrypted with a reused chain key that the peer cannot
         // decrypt. The daemon masks this by saving again on its next send.
         self.save().await?;
-        Ok(())
+        Ok(delivered)
     }
 
     /// Make sure a session with a contact exists, opening one from its published
@@ -3749,6 +4218,40 @@ impl Account {
             self.device.contact_queue_id(account_id),
             self.device.contact_queue_read_token(account_id),
         )
+    }
+
+    /// The relay queues this vault drains and delivers into.
+    ///
+    /// Derived on demand and never stored, which is why a queue filling on the
+    /// relay cannot be attributed from the vault files: this is the local,
+    /// read-only view that answers "is that queue mine?" in one call. A queue
+    /// that is not in this map belongs to the peer, not to this vault.
+    pub fn queue_map(&self) -> QueueMap {
+        let contacts = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| {
+                let granted = c.delivery_queue_id.is_some() && c.delivery_queue_token.is_some();
+                let send_queue = match c.delivery_queue_id.as_deref() {
+                    Some(id) if granted => id.to_string(),
+                    _ => c.queue_id.clone(),
+                };
+                ContactQueues {
+                    nickname: c.nickname.clone(),
+                    account_id: c.account_id.clone(),
+                    read_queue: self.device.contact_queue_id(&c.account_id),
+                    send_queue,
+                    granted,
+                }
+            })
+            .collect();
+        QueueMap {
+            inbox: self.device.queue_id().to_string(),
+            contacts,
+            regrant_pending: self.state.regrant_all,
+            identity_restored: self.state.identity_restored,
+        }
     }
 
     /// Publish one opaque blob to this member's bulletin, answering with its
@@ -3878,10 +4381,77 @@ impl Account {
                 )
             })
             .collect();
-        for (expected_contact, queue_id, read_token) in queues {
-            let ids = relay.list_optional(&queue_id, &read_token).await?;
-            for blob_id in ids {
-                let body = relay.get(&queue_id, &read_token, &blob_id).await?;
+        // The drain is round-based, not page-looped inside a queue: each
+        // round peeks one page per queue (concurrently), files it, acks what
+        // it filed, and only re-peeks queues that made progress. The ack is
+        // what makes the next peek see different rows — a peek alone never
+        // consumes, so a page-loop without the ack would re-read the same
+        // page forever. A queue that files nothing in a round (everything in
+        // its page is held — a conclave message waiting on its roster, say)
+        // stops until the next poll, exactly like the per-blob walk it
+        // replaces.
+        let mut pending: Vec<(Option<String>, String, String)> = queues;
+        while !pending.is_empty() {
+        // Phase 1 — fetch one page per queue. Every queue is fetched
+        // concurrently: the client's pool spreads the requests over separate
+        // connections, so a contact count no longer multiplies the wall-clock
+        // cost of a poll. The batches themselves are what turn a drain into
+        // one round trip per page instead of one `get` and one `delete` per
+        // message.
+        let drain_supported = self.drain_supported;
+        let mut handles = Vec::new();
+        for (expected_contact, queue_id, read_token) in std::mem::take(&mut pending) {
+            let relay = relay.clone();
+            handles.push(tokio::spawn(async move {
+                fetch_queue(
+                    relay,
+                    expected_contact,
+                    queue_id,
+                    read_token,
+                    drain_supported,
+                )
+                .await
+            }));
+        }
+        let mut fetched: Vec<FetchedQueue> = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(result) => fetched.push(result?),
+                Err(join_err) => return Err(Error::Relay(format!("fetch task: {join_err}"))),
+            }
+        }
+        // Latch what the probes found, so a legacy relay is walked directly
+        // from the next poll on.
+        if self.drain_supported.is_none() {
+            self.drain_supported = fetched.iter().find_map(|f| f.drain_discovered);
+        }
+
+        // Phase 2 — file, serially: decryption and payload application mutate
+        // session and account state. A blob fetched through the drain is
+        // already out of the "delete per blob" business — it is confirmed
+        // with one ack per queue once everything in the page that could be
+        // filed has been filed.
+        let mut acks: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut repeek: Vec<(Option<String>, String, String)> = Vec::new();
+        for mut fetched_queue in fetched {
+            let drained = fetched_queue.drained;
+            let expected_contact = fetched_queue.expected_contact.take();
+            let queue_id = std::mem::take(&mut fetched_queue.queue_id);
+            let read_token = std::mem::take(&mut fetched_queue.read_token);
+            let mut acked: Vec<String> = Vec::new();
+            // Consume a blob the way its transport demands: a drained page
+            // records the id for the queue's single ack; the legacy walk
+            // deletes the blob here, exactly as it always did.
+            macro_rules! consume {
+                ($id:ident) => {
+                    if drained {
+                        acked.push($id.clone());
+                    } else {
+                        relay.delete(&queue_id, &read_token, &$id).await?;
+                    }
+                };
+            }
+            for DrainedBlob { id: blob_id, body } in std::mem::take(&mut fetched_queue.blobs) {
                 let (ct, legacy_from) = decode_relay_blob(&body)?;
                 let decrypted = match &expected_contact {
                     // A per-contact queue can only carry that contact's messages.
@@ -3902,7 +4472,15 @@ impl Account {
                         );
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        // Surface the error, but not at the cost of the page's
+                        // filing progress: confirm what already filed, so the
+                        // next poll does not re-file — and duplicate — it.
+                        if drained && !acked.is_empty() {
+                            let _ = relay.ack_drain(&queue_id, &read_token, &acked).await;
+                        }
+                        return Err(e);
+                    }
                 };
 
                 // A deleted contact must not be able to keep delivering into the
@@ -3910,7 +4488,7 @@ impl Account {
                 // memory on the device that did the delete, so the blob can be
                 // decrypted and attributed; drop it instead of filing it.
                 if self.state.revoked.contains(&from_account) {
-                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                consume!(blob_id);
                     dirty = true;
                     continue;
                 }
@@ -3932,7 +4510,7 @@ impl Account {
                     {
                         dirty = true;
                     }
-                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                consume!(blob_id);
                     continue;
                 }
 
@@ -3960,7 +4538,7 @@ impl Account {
                         key: key.clone(),
                         latest_hash: latest_hash.clone(),
                     });
-                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                consume!(blob_id);
                     continue;
                 }
 
@@ -3981,7 +4559,7 @@ impl Account {
                             dirty = true;
                         }
                     }
-                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                consume!(blob_id);
                     continue;
                 }
 
@@ -3998,35 +4576,35 @@ impl Account {
                             warnings.push(format!(
                                 "An invite from {nick} was refused — this is a mail-only relationship."
                             ));
-                            relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                             dirty = true;
                             continue;
                         }
                         if self.receive_conclave_invite(descriptor, &from_account, &nick)? {
                             dirty = true;
                         }
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         continue;
                     }
                     MessagePayload::ConclaveAccept { descriptor } => {
                         if self.receive_conclave_accept(descriptor).await? {
                             dirty = true;
                         }
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         continue;
                     }
                     MessagePayload::ConclaveDecline { conclave_id, member } => {
                         if self.receive_conclave_decline(conclave_id, member)? {
                             dirty = true;
                         }
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         continue;
                     }
                     MessagePayload::ConclaveLeave { descriptor } => {
                         if self.receive_conclave_leave(descriptor).await? {
                             dirty = true;
                         }
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         continue;
                     }
                     MessagePayload::ConclaveUpdate { descriptor }
@@ -4034,7 +4612,7 @@ impl Account {
                         if self.receive_conclave_update(descriptor, &from_account)? {
                             dirty = true;
                         }
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         continue;
                     }
                     MessagePayload::ConclaveIntroReq {
@@ -4059,7 +4637,7 @@ impl Account {
                         {
                             dirty = true;
                         }
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         continue;
                     }
                     MessagePayload::ConclaveIntro {
@@ -4086,7 +4664,7 @@ impl Account {
                         {
                             dirty = true;
                         }
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         continue;
                     }
                     _ => {}
@@ -4105,7 +4683,7 @@ impl Account {
                     warnings.push(format!(
                         "A chat from {nick} was refused — this is a mail-only relationship."
                     ));
-                    relay.delete(&queue_id, &read_token, &blob_id).await?;
+                consume!(blob_id);
                     dirty = true;
                     continue;
                 }
@@ -4159,24 +4737,47 @@ impl Account {
                         self.enforce_chat_retention();
                         (None, Vec::new())
                     }
-                    // A conclave message. The conclave must already exist and
-                    // the sender must be a joined trustee: a message never
-                    // materialises a conclave, so a stray fan-out cannot invent
-                    // one. The invite handled above must be accepted first.
+                    // A conclave message. A message never materialises a
+                    // conclave, so a stray fan-out cannot invent one — the
+                    // invite handled above must be accepted first. But the
+                    // guard must not turn a roster race into silent loss:
+                    //
+                    // - a joined sender is delivered;
+                    // - a terminal sender (left or kicked) is no longer a
+                    //   member, so the blob is consumed and dropped;
+                    // - anything else — the conclave is not known here yet, or
+                    //   the sender is still only `invited` because the roster
+                    //   has not converged — is HELD, not deleted, so accepting
+                    //   the invite or a later roster update can deliver it.
+                    //
+                    // Deleting on `!known` was how a message that arrived
+                    // before its invite, or during a convergence race, was lost
+                    // with no trace: the sender saw "sent", the receiver never
+                    // saw it, and the relay row was already gone.
                     MessagePayload::Conclave {
                         conclave_id,
                         body,
                         file,
                         ..
                     } => {
-                        let known = self
+                        let sender_state = self
                             .chat_log
                             .conclave(conclave_id)
-                            .is_some_and(|c| c.is_joined(&from_account));
-                        if !known {
-                            relay.delete(&queue_id, &read_token, &blob_id).await?;
-                            dirty = true;
-                            continue;
+                            .and_then(|c| c.trustee(&from_account))
+                            .map(|t| t.state);
+                        match sender_state {
+                            Some(TrusteeState::Joined) => {}
+                            Some(TrusteeState::Left) | Some(TrusteeState::Kicked) => {
+                        consume!(blob_id);
+                                dirty = true;
+                                continue;
+                            }
+                            Some(TrusteeState::Invited) | None => {
+                                warnings.push(format!(
+                                    "A message for a conclave from {nick} was held — this vault has not joined it yet."
+                                ));
+                                continue;
+                            }
                         }
                         let master = *self.vault.master_key();
                         match file {
@@ -4247,7 +4848,7 @@ impl Account {
                                 .map(|c| c.convener.as_str())
                                 .unwrap_or_default();
                             if convener.is_empty() || convener != from_account {
-                                relay.delete(&queue_id, &read_token, &blob_id).await?;
+                        consume!(blob_id);
                                 dirty = true;
                                 continue;
                             }
@@ -4257,7 +4858,7 @@ impl Account {
                             from_nick: nick.clone(),
                             payload: payload.clone(),
                         });
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         dirty = true;
                         continue;
                     }
@@ -4283,7 +4884,7 @@ impl Account {
                             from_nick: nick.clone(),
                             payload: payload.clone(),
                         });
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         dirty = true;
                         continue;
                     }
@@ -4295,7 +4896,7 @@ impl Account {
                             from_nick: nick.clone(),
                             payload: payload.clone(),
                         });
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         dirty = true;
                         continue;
                     }
@@ -4307,7 +4908,7 @@ impl Account {
                             from_nick: nick.clone(),
                             payload: payload.clone(),
                         });
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         dirty = true;
                         continue;
                     }
@@ -4318,7 +4919,7 @@ impl Account {
                     MessagePayload::VoiceOpen { .. }
                     | MessagePayload::VoiceMute { .. }
                     | MessagePayload::VoiceLeave { .. } => {
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         dirty = true;
                         continue;
                     }
@@ -4326,7 +4927,7 @@ impl Account {
                     // Consumed and dropped: it can never be interpreted here,
                     // and leaving it would re-deliver it on every poll forever.
                     MessagePayload::Unknown => {
-                        relay.delete(&queue_id, &read_token, &blob_id).await?;
+                    consume!(blob_id);
                         continue;
                     }
                 };
@@ -4348,9 +4949,25 @@ impl Account {
                     file_blob_id,
                     mail_attachments,
                 });
-                relay.delete(&queue_id, &read_token, &blob_id).await?;
+                consume!(blob_id);
                 dirty = true;
             }
+            // A drained queue that filed something this round gets its acks
+            // sent and another peek next round; a drained queue that filed
+            // nothing (everything held) waits for the next poll. The legacy
+            // walk already deleted per blob, so it has nothing to ack.
+            if drained && !acked.is_empty() {
+                repeek.push((expected_contact, queue_id.clone(), read_token.clone()));
+                acks.push((queue_id, read_token, acked));
+            }
+        }
+        // Phase 3 — confirm the filed blobs, one request per queue. The ack
+        // is what moves the next peek past this page: a peek alone never
+        // consumes, so re-peeking without the ack would return the same rows.
+        for (queue_id, read_token, ids) in acks {
+            relay.ack_drain(&queue_id, &read_token, &ids).await?;
+        }
+        pending = repeek;
         }
         if dirty {
             self.save().await?;
@@ -4659,6 +5276,9 @@ mod tests {
             pending_intro_requests: Vec::new(),
             pending_intros: Vec::new(),
             pending_reach: Vec::new(),
+            pending_conclave: Vec::new(),
+            regrant_all: false,
+            identity_restored: false,
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
         fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();
@@ -4759,6 +5379,15 @@ mod tests {
             "a v1 queue was bound to a public token, so it must be replaced"
         );
         assert!(upgraded.device.queue_rotated());
+        assert!(
+            upgraded.queue_map().regrant_pending,
+            "the contacts still hold grants for the replaced queue, so the open \
+             must queue a re-grant or they deliver into a queue nothing drains"
+        );
+        assert!(
+            !upgraded.queue_map().identity_restored,
+            "a rotation keeps the identity, so this is a re-grant, not a re-add"
+        );
 
         let reloaded = DeviceKeys::load(&dir, &master).await.unwrap();
         assert_eq!(
@@ -5027,6 +5656,131 @@ mod tests {
             reach: TrusteeReach::Full,
             peer_reach: TrusteeReach::Full,
         });
+    }
+
+    /// A queued conclave copy is pruned, not retried forever, once its conclave
+    /// is gone or ended.
+    ///
+    /// The outbox keeps the copy because a conclave has no relay-side room to
+    /// re-read it from, and that only holds while the conclave is live: an ended
+    /// conclave is read-only on every peer and a deleted one has no targets
+    /// left, so both must prune rather than spin. The relay here is dead, so a
+    /// copy for a live conclave is refused and has to stay.
+    #[tokio::test]
+    async fn a_queued_conclave_copy_is_pruned_once_its_conclave_is_gone_or_ended() {
+        let (_dir, mut account) = intro_vault("conclave-outbox-prune").await;
+        let cid = seed_mesh_conclave(&mut account, SAM);
+        seed_contact(&mut account, "friend", FRIEND);
+
+        let payload = MessagePayload::Conclave {
+            conclave_id: cid.clone(),
+            name: "mesh".into(),
+            trustees: vec!["friend".into()],
+            body: "hello".into(),
+            file: None,
+        };
+        account
+            .queue_conclave_retry(&cid, &payload, vec!["friend".to_string()])
+            .await
+            .unwrap();
+        account
+            .queue_conclave_retry("c-gone", &payload, vec!["friend".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(account.state.pending_conclave.len(), 2);
+
+        let _ = account.retry_pending_conclave().await;
+        assert_eq!(
+            account.state.pending_conclave.len(),
+            1,
+            "the unknown conclave's copy is pruned; the live one's is kept"
+        );
+        assert_eq!(account.state.pending_conclave[0].conclave_id, cid);
+    }
+
+    /// A grant naming a *different* queue must replace the one on record.
+    ///
+    /// This is the whole of the re-grant repair: after a queue rotation the peer
+    /// signs a new queue id with the same identity key, and the contact record
+    /// has to follow it. Treating the second grant as "already granted" would
+    /// leave the peer delivering into a queue nothing drains, with no error on
+    /// either side.
+    #[tokio::test]
+    async fn a_regrant_from_the_same_identity_replaces_the_stored_queue() {
+        let (_dir, mut account) = intro_vault("regrant-replace").await;
+        seed_contact(&mut account, "friend", FRIEND);
+
+        let identity = account.device.identity_public().await.unwrap();
+        let key = account.device.identity_key_pair().await.unwrap();
+        account.state.contacts[0].identity_key = identity;
+
+        let first = sign_queue_grant(&key, "queue-one", "token-one").unwrap();
+        assert!(account
+            .apply_queue_grant(FRIEND, "queue-one", "token-one", &first)
+            .unwrap());
+        assert_eq!(
+            account.state.contacts[0].delivery_queue_id.as_deref(),
+            Some("queue-one")
+        );
+
+        let second = sign_queue_grant(&key, "queue-two", "token-two").unwrap();
+        assert!(
+            account
+                .apply_queue_grant(FRIEND, "queue-two", "token-two", &second)
+                .unwrap(),
+            "the rotated queue must be adopted, not ignored as a duplicate"
+        );
+        assert_eq!(
+            account.state.contacts[0].delivery_queue_id.as_deref(),
+            Some("queue-two")
+        );
+
+        // The identical grant again is a no-op, so a sweep can re-send freely.
+        assert!(!account
+            .apply_queue_grant(FRIEND, "queue-two", "token-two", &second)
+            .unwrap());
+    }
+
+    /// A grant signed by a key the contact did not pin is refused.
+    ///
+    /// This is why a restored vault cannot re-grant its way out of a stale
+    /// queue: a fresh device signs with a new identity key, and the peer
+    /// verifies against the key it took from the invite. Accepting it anyway
+    /// would be the identity substitution the pin exists to stop.
+    #[tokio::test]
+    async fn a_grant_signed_by_an_unpinned_identity_is_refused() {
+        let (_dir, mut account) = intro_vault("regrant-unpinned").await;
+        seed_contact(&mut account, "friend", FRIEND);
+
+        // The contact pinned some other key; this vault's own key is the signer.
+        let key = account.device.identity_key_pair().await.unwrap();
+        let grant = sign_queue_grant(&key, "queue-new", "token-new").unwrap();
+
+        assert!(!account
+            .apply_queue_grant(FRIEND, "queue-new", "token-new", &grant)
+            .unwrap());
+        assert!(
+            account.state.contacts[0].delivery_queue_id.is_none(),
+            "a refused grant must not be recorded"
+        );
+    }
+
+    /// A re-grant that never reaches the relay stays queued.
+    ///
+    /// The relay here is unreachable, so the sweep must report nothing regranted
+    /// and keep its flag. Clearing it would mark the rotation repaired while
+    /// every contact still delivers into the abandoned queue.
+    #[tokio::test]
+    async fn a_regrant_sweep_keeps_its_flag_while_the_relay_is_unreachable() {
+        let (_dir, mut account) = intro_vault("regrant-offline").await;
+        seed_contact(&mut account, "friend", FRIEND);
+        account.state.regrant_all = true;
+
+        assert_eq!(account.retry_regrants().await.unwrap(), 0);
+        assert!(
+            account.state.regrant_all,
+            "an undelivered re-grant must be retried, not marked done"
+        );
     }
 
     #[tokio::test]
