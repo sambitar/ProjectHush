@@ -35,7 +35,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
 use hush_core::{
     ChatRecord, ConclaveRecord, Error, MessagePayload, PaperDescriptor, PendingInvite,
-    ReceivedMessage, TrusteeReach, VoiceEffect, VoiceManager, VoiceSession,
+    QueueMap, ReceivedMessage, TrusteeReach, VoiceEffect, VoiceManager, VoiceSession,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -388,6 +388,7 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/torrents/concurrency", post(torrents_concurrency))
         .route("/api/torrents/library/{id}", delete(torrents_delete_library))
         .route("/api/conclaves", get(conclaves).post(create_conclave))
+        .route("/api/queues", get(queue_map))
         .route("/api/conclaves/message", post(send_conclave_message))
         .route("/api/conclaves/file", post(send_conclave_file))
         .route(
@@ -730,7 +731,11 @@ fn bind_socket(path: &std::path::Path) -> std::io::Result<tokio::net::UnixListen
 /// vault: they share the state sidecar and the vault, so they clobber each
 /// other's state and duplicate downloads. This lock closes that hole. The OS
 /// releases it when the process exits, so a crash never leaves a stale lock.
-#[cfg(target_os = "linux")]
+///
+/// Every unix has `flock`, so this is not Linux-only. Leaving it out on macOS
+/// let a force-quit leave a daemon behind that the next launch could not see,
+/// and the two then ran against one vault.
+#[cfg(unix)]
 fn acquire_vault_lock(dir: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     use std::os::unix::io::AsRawFd;
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
@@ -753,8 +758,8 @@ fn acquire_vault_lock(dir: &std::path::Path) -> Result<Option<std::fs::File>, St
     Ok(Some(file))
 }
 
-/// No-op on platforms without `flock`; the socket check still applies.
-#[cfg(not(target_os = "linux"))]
+/// No-op on Windows, which has no `flock`; the socket check still applies.
+#[cfg(not(unix))]
 fn acquire_vault_lock(_dir: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     Ok(None)
 }
@@ -861,6 +866,8 @@ async fn outbox_loop(state: Arc<App>) {
         }
         let _ = state.worker.retry_outbox().await;
         let _ = state.worker.retry_pending_reach().await;
+        let _ = state.worker.retry_pending_conclave().await;
+        let _ = state.worker.retry_regrants().await;
     }
 }
 
@@ -1368,11 +1375,27 @@ async fn conclaves(
     }
 }
 
+/// The relay queues this vault drains and delivers into.
+///
+/// A local diagnostic, and the only way to attribute a queue seen filling on
+/// the relay: the ids are HMACs over the device read token, derived on demand
+/// and never stored, so no vault file names them. A queue that is not in this
+/// list belongs to a peer, not to this vault.
+async fn queue_map(
+    State(state): State<Arc<App>>,
+) -> Result<Json<QueueMap>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.queues().await)?;
+    match result {
+        WorkResult::Queues(map) => Ok(Json(map)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
 async fn create_conclave(
     State(state): State<Arc<App>>,
     Json(body): Json<CreateConclaveRequest>,
-) -> Result<Json<ConclaveRecord>, (StatusCode, Json<ApiError>)> {
-    touch(&state).await;
+) -> Result<Json<ConclaveRecord>, (StatusCode, Json<ApiError>)> {    touch(&state).await;
     let result = map_err(
         state
             .worker
@@ -1888,9 +1911,10 @@ async fn remove_contact(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Flush the Outbox on demand: queued mail and queued reach announcements.
+/// Flush the Outbox on demand: queued mail, queued reach announcements and
+/// conclave copies the relay refused.
 ///
-/// The outbox timer drains both every 30 s and is the path everything
+/// The outbox timer drains all four every 30 s and is the path everything
 /// normally rides. This route exists so a drain can be triggered explicitly
 /// (an Outbox screen's "send now", and the API tests): delivery stays
 /// something nobody's request waits on.
@@ -1900,6 +1924,8 @@ async fn outbox_retry(
     touch(&state).await;
     let _ = state.worker.retry_outbox().await;
     let _ = state.worker.retry_pending_reach().await;
+    let _ = state.worker.retry_pending_conclave().await;
+    let _ = state.worker.retry_regrants().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -10993,5 +11019,55 @@ mod tls_provider_tests {
         let _ = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
+    }
+}
+
+/// One daemon per vault, and the lock is what enforces it.
+///
+/// The socket check cannot stand in for this: a daemon that is alive but not
+/// answering looks dead, and the second daemon unlinks its socket and takes
+/// over. These assert the lock itself rather than the socket path, and they are
+/// `unix` rather than `linux` because macOS is where the lock was missing — a
+/// force-quit there left a daemon behind that the next launch could not see.
+#[cfg(unix)]
+mod vault_lock_tests {
+    use super::*;
+
+    #[test]
+    fn the_lock_is_a_held_file_beside_the_vault() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        let held = acquire_vault_lock(dir.path()).expect("first daemon takes the lock");
+
+        assert!(
+            held.is_some(),
+            "acquire_vault_lock returned a no-op: this platform has flock and has to use it"
+        );
+        assert!(dir.path().join(".hush-daemon.lock").exists());
+    }
+
+    #[test]
+    fn a_second_daemon_on_one_vault_is_refused_by_name() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        let _first = acquire_vault_lock(dir.path()).expect("first daemon takes the lock");
+        let second = acquire_vault_lock(dir.path())
+            .expect_err("a second daemon on one vault must not be allowed to start");
+
+        assert!(
+            second.contains("another hush-daemon is already running"),
+            "the refusal has to say what is wrong, got: {second}"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_exits_leaves_no_stale_lock() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        let held = acquire_vault_lock(dir.path()).expect("first daemon takes the lock");
+        drop(held);
+
+        let next = acquire_vault_lock(dir.path()).expect("a dead daemon leaves no stale lock");
+        assert!(next.is_some());
     }
 }
