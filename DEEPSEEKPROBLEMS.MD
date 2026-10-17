@@ -7,6 +7,98 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-17 — Conclave invite button investigation
+
+### Prod "fresh meeting" invite can never arrive: mahmood is on the old relay [OPEN]
+
+- Attempted: explain why the conclave invite to `mahmood` sat in state `invited` with the
+  contact permanently `online: false`.
+- Symptom: sam's vault queues the invite on `hushrelay.space`, but mahmood's vault still
+  points at the old relay and is offline, so mahmood never drains sam's writes. Regrants do
+  not bridge this: the regrant announcement itself rides the old queue.
+- Resolution: diagnosed, not fixed — nothing to fix in the repo. The user confirmed mahmood
+  is on the old relay and offline. When mahmood returns they must repoint their vault to
+  `https://hushrelay.space` (`hush-cli relay set`) before any queued invite/message can
+  arrive, and whether the queued invite is still there depends on the relay's retention TTL.
+  Evidence is the user's own report, not a wire capture.
+- Lesson: `invited` forever + never-online is a relay-mismatch signature; check both vaults'
+  `client-config.json` before suspecting the invite path.
+
+### Peer A's dev daemon answers in 1–33 s per request; peer B answers in 1 ms [OPEN]
+
+- Attempted: open peer A's vite pane (`:5173/?api=http://127.0.0.1:9876`) to exercise the
+  conclave Invite button in the real UI.
+- Symptom: `#app` stayed empty for minutes. Resource timing inside the page shows the app's
+  own requests crawling: `/api/ui-prefs` 28 s, `/api/status` 22.5 s and 18 s, `/api/contacts`
+  32.8 s — while the same `/api/status` answers curl in 0.2–4.2 s on A and 1 ms on B, from the
+  same machine, with A's process at 0.8% CPU. A raw in-page fetch also hung past an 8 s abort
+  on one try after succeeding in ~4 s earlier, so latency is wildly variable per request. The
+  boot chain awaits five endpoints serially (`refreshStatus`: status → contacts → messages →
+  mailbox → conclaves), so first paint takes minutes and the pane reads as dead.
+- Resolution: none yet. A's state differs from B's in one visible way: A's contact view of bob
+  has `inbound_ready: false` (B's view of alice is `true`), and `POST /api/outbox/retry` did
+  not flip it, so A runs a stuck reach handshake that retries every outbox tick (30 s) over the
+  remote relay on the single worker actor — every API call queues behind it. That fits the
+  bursts but not the continuously high per-request latency; root cause not found. Daemon stdout
+  could not be read (sandbox denies `/proc/<pid>/fd`). Restarting A's daemon is the obvious
+  next experiment, and serializing the boot chain or adding a timeout to `request()` would
+  keep the pane usable while a daemon is slow.
+- Lesson: a "blank pane" was two problems stacked — a slow daemon and a boot chain that paints
+  nothing until every serial fetch lands. Measure inside the page (`performance` resource
+  entries) before concluding the frontend hung.
+
+### Inbound conclave delivery never advances on a headless daemon — only a UI poll pulls [OPEN]
+
+- Attempted: create a conclave as peer A inviting bob (`POST /api/conclaves`, the exact call
+  behind the create dialog), then watch peer B's `/api/conclaves/invites` arrive on its own.
+- Symptom: after 25 s B still had no invite; it appeared only after forcing
+  `POST /api/recv` on B. The daemon's `outbox_loop` retries the send side every 30 s, but
+  nothing on the daemon drains inbound on a schedule — `pollRecv()` in the UI (4 s) is the
+  only `POST /api/recv` caller. Delivery latency is therefore "next time the recipient opens
+  the app", which is by design for store-and-forward but surprising when testing: a daemon
+  left running with no pane never receives the invite.
+- Resolution: worked as designed once a drain ran; no code change. Logged because the
+  invite-never-arrives symptom will be misread as a broken button whenever the recipient's
+  pane is closed.
+- Lesson: the relay holds, the sender retries, but the pull is UI-driven — test invite flows
+  with both panes open or drain via the API.
+
+### The Invite button is enabled for mail-only candidates the modal will not offer [FIXED]
+
+- Attempted: read the convener header button against the invite modal it opens
+  (`apps/hush-tauri/src/app.ts` ~4090 vs ~5250).
+- Symptom: the button computed `candidatesToInvite(conclave, all contact nicks)` — it ignored
+  reach — so a vault whose only contacts are mail-only (or whose full-reach contacts are all
+  trustees) rendered an enabled button; the modal then filtered to `reach === "full"` and the
+  picker was empty ("Everyone you know is already here, or is mail only."). The create dialog
+  handled the same case with distinct empty messages; the header button's disabled state
+  contradicted the modal's.
+- Resolution: FIXED on `fix/conclave-invite-ux`. Both now derive from one helper,
+  `invitableCandidates(conclave, contacts)` in `conclaveStore.ts` (reach-full filter +
+  existing-trustee exclusion in one place). Evidence: 5 new node-test cases in
+  `conclaveStore.test.ts` (mail-only excluded, left/kicked excluded, newcomer kept), full
+  suite 83/83 green, `tsc --noEmit` clean.
+- Lesson: when a button gates a dialog, derive both from one candidate list.
+
+### A trustee who left can never be re-invited — terminal by protocol, surfaced in the UI [OPEN]
+
+- Attempted: explain why the Invite button is permanently disabled in the prod vault's
+  "secret meeting" where the only other member (`mahmood`) is in state `left`.
+- Symptom: `invite_conclave_trustee` refuses anyone already in the trustees list
+  (`Error::AlreadyConclaveTrustee`) regardless of state, and `upsert_trustee` merges
+  monotonically — `left`/`kicked` are never revived (`docs/PROTOCOL.md`: "a terminal state is
+  never revived"). So a left member is locked out of the conclave forever. The UI used to
+  show only a disabled Invite button whose tooltip ("Everyone you know is already in this
+  conclave") misstated the situation.
+- Resolution: split. The UI half is FIXED on `fix/conclave-invite-ux`: the disabled button's
+  tooltip now names the departed member and the terminal state ("mahmood left this conclave
+  and can't be re-invited" / "was removed and can't be re-invited"). The design half stays
+  OPEN: whether a convener should ever be able to re-invite a `left` member is undecided. If
+  yes, the core needs a revive transition and the monotonic merge needs a carve-out for it;
+  if no, the tooltip is the whole answer.
+- Lesson: terminal-state semantics need a surfaced explanation, or users read the disabled
+  button as a bug.
+
 ### Release workflow leaves the GitHub release as a draft, so the relay mirror never runs [FIXED]
 
 - Attempted: tag `v0.3.1`, wait for the Release workflow to finish, expect `publish-updates.yml`
