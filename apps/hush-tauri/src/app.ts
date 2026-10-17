@@ -192,11 +192,11 @@ import {
 } from "./lib/fileBytes";
 import { groupMessages, dayLabel } from "./lib/messageGroups";
 import {
-  candidatesToInvite,
   clearConclaveStore,
   conclaveById,
   conclavePreview,
   invitedTrustees,
+  invitableCandidates,
   joinedTrustees,
   listConclaves,
   listPendingInvites,
@@ -4087,14 +4087,31 @@ export class App {
       const inviteLabel = document.createElement("span");
       inviteLabel.textContent = "Invite";
       inviteBtn.appendChild(inviteLabel);
-      const remaining = candidatesToInvite(
-        conclave,
-        this.contacts.map((c) => c.nickname),
-      );
+      const remaining = invitableCandidates(conclave, this.contacts);
       inviteBtn.disabled = remaining.length === 0;
-      inviteBtn.title = remaining.length
-        ? "Invite a trustee"
-        : "Everyone you know is already in this conclave";
+      // The disabled reason is the tooltip, and the truthful reason depends on
+      // why the list is empty. A departed trustee is the case that reads as a
+      // bug: left and kicked are terminal (the core refuses the re-invite), so
+      // "everyone you know is already in this conclave" would be a lie there.
+      const departed = conclave.trustees.filter(
+        (t) => (t.state === "left" || t.state === "kicked") && t.nick,
+      );
+      if (remaining.length) {
+        inviteBtn.title = "Invite a trustee";
+      } else if (departed.length) {
+        const names = departed.map((t) => displayNick(t.nick)).join(", ");
+        const why =
+          departed.length > 1
+            ? "can't be re-invited"
+            : departed[0].state === "left"
+              ? "left this conclave and can't be re-invited"
+              : "was removed and can't be re-invited";
+        inviteBtn.title = `${names} ${why}`;
+      } else if (this.contacts.some((c) => c.reach !== "full")) {
+        inviteBtn.title = "Everyone you can chat with is already in this conclave";
+      } else {
+        inviteBtn.title = "Everyone you know is already in this conclave";
+      }
       inviteBtn.onclick = () => {
         this.conclaveInviteOpen = true;
         this.conclaveInviteTrustees = [];
@@ -5246,12 +5263,10 @@ export class App {
       invite.disabled = this.conclaveInviteTrustees.length === 0;
     };
 
-    // A mail-only trust cannot join a conclave (Task 24), so it is not offered
-    // here either; the core refuses the invite as the actual rule.
-    const invitable = this.contacts
-      .filter((c) => c.reach === "full")
-      .map((c) => c.nickname);
-    const remaining = conclave ? candidatesToInvite(conclave, invitable) : [];
+    // Same helper as the header button: the two must agree on who is offerable
+    // (mail-only trusts are not — Task 24 — and the core refuses them as the
+    // actual rule).
+    const remaining = conclave ? invitableCandidates(conclave, this.contacts) : [];
     const picker = new ContactPicker({
       items: remaining.map((nick) => {
         const c = this.contacts.find((x) => x.nickname === nick);

@@ -2,6 +2,7 @@ import type {
   ConclaveDto,
   ConclaveMessageDto,
   ConclaveTrusteeDto,
+  ContactDto,
   IntroListsDto,
   PendingInviteDto,
   PendingIntroDto,
@@ -277,4 +278,25 @@ export function conclavePreview(m: Conclave): string {
 export function candidatesToInvite(conclave: Conclave, contactNicks: string[]): string[] {
   const present = new Set(conclave.trustees.map((t) => t.nick));
   return contactNicks.filter((n) => !present.has(n));
+}
+
+/** The contact fields the conclave invite helpers need. */
+export type InvitableContact = Pick<ContactDto, "nickname" | "reach">;
+
+/**
+ * Full-reach contacts who may still join this conclave.
+ *
+ * The header Invite button's enabled state and the invite modal's picker must
+ * agree, so both derive their list here: a mail-only trust cannot join a
+ * conclave (Task 24), and anyone already a trustee is out whatever their state
+ * — left and kicked are terminal, so a departed member cannot be re-invited.
+ */
+export function invitableCandidates(
+  conclave: Conclave,
+  contacts: InvitableContact[],
+): string[] {
+  return candidatesToInvite(
+    conclave,
+    contacts.filter((c) => c.reach === "full").map((c) => c.nickname),
+  );
 }
