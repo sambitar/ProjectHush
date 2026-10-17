@@ -15,6 +15,14 @@ pub struct RelayConfig {
     /// bulletin is what a member browses, not a mailbox they empty; survival
     /// past the window is the holders' vaults plus the re-post sweep.
     pub bulletin_ttl: Duration,
+    /// Whether the batched drain route (`POST /q/{queue_id}/drain`) is served.
+    ///
+    /// Draining one page in a single request replaces the client's
+    /// list-then-get-then-delete walk — two round trips per message become
+    /// one per page. The route is kill-switchable because a client that
+    /// cannot drain falls back to the per-blob path it has always used, so
+    /// turning this off is safe at any time and needs no client release.
+    pub enable_batch_drain: bool,
 }
 
 impl Default for RelayConfig {
@@ -26,6 +34,7 @@ impl Default for RelayConfig {
             rate_limit_window: Duration::from_secs(60),
             bulletin_max_blob_bytes: 256 * 1024,
             bulletin_ttl: Duration::from_secs(30 * 24 * 60 * 60),
+            enable_batch_drain: true,
         }
     }
 }

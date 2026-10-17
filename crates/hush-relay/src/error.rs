@@ -1,5 +1,5 @@
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -17,7 +17,13 @@ pub enum RelayError {
     #[error("payload too large")]
     TooLarge,
     #[error("rate limited")]
-    RateLimited,
+    RateLimited {
+        /// Seconds until this queue's write budget refills. Sent as
+        /// `Retry-After`, because a client cannot tell a 429 that clears in a
+        /// second from one that clears in a minute, and the difference decides
+        /// whether waiting is worth it.
+        retry_after: u64,
+    },
     #[error("bad request")]
     BadRequest,
     #[error("internal")]
@@ -36,7 +42,7 @@ impl RelayError {
             RelayError::Burned => StatusCode::FORBIDDEN,
             RelayError::NotFound => StatusCode::NOT_FOUND,
             RelayError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-            RelayError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            RelayError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             RelayError::BadRequest => StatusCode::BAD_REQUEST,
             RelayError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             RelayError::Mail(_) => StatusCode::BAD_GATEWAY,
@@ -46,7 +52,21 @@ impl RelayError {
 
 impl IntoResponse for RelayError {
     fn into_response(self) -> Response {
+        let status = self.status();
+        // A rate limit is the one refusal a client can act on by waiting, so it
+        // carries how long. `Retry-After` is seconds by default, which is what
+        // `retry_after` already holds.
+        let retry_after = match self {
+            RelayError::RateLimited { retry_after } => Some(retry_after),
+            _ => None,
+        };
         let body = Json(json!({ "error": self.to_string() }));
-        (self.status(), body).into_response()
+        let mut response = (status, body).into_response();
+        if let Some(seconds) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
