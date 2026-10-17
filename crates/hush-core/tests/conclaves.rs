@@ -127,6 +127,75 @@ async fn an_invitee_receives_no_messages_until_they_accept() {
     }
 }
 
+/// One refused copy must not abandon the rest of the fan-out.
+///
+/// A conclave is N independent 1:1 puts with no relay-side room to re-read a
+/// copy from. The old fan-out propagated the first error with `?`, so one dead
+/// target silently cost every trustee after it and the sender was told nothing.
+/// Revoking one trustee's queue makes exactly its put refused (403) while it
+/// stays a contact, so the assertions are that the *other* trustee still gets
+/// the message and that the sender keeps her own copy.
+#[tokio::test]
+async fn a_refused_trustee_does_not_abandon_the_rest_of_the_fan_out() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let carol_dir = TempDir::new().unwrap();
+    let (mut alice, mut bob) = two_contacts(&relay, &alice_dir, &bob_dir).await;
+
+    let mut carol = Account::create(carol_dir.path(), "carol-pass", &relay)
+        .await
+        .unwrap();
+    let alice_invite = alice.invite().await.unwrap();
+    let carol_invite = carol.invite().await.unwrap();
+    alice.add_contact("carol", &carol_invite).await.unwrap();
+    carol.add_contact("alice", &alice_invite).await.unwrap();
+
+    let conclave = alice
+        .create_conclave("Trip", &["bob".to_string(), "carol".to_string()])
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_conclave_invite(&conclave.id).await.unwrap();
+    carol.recv().await.unwrap();
+    carol.accept_conclave_invite(&conclave.id).await.unwrap();
+
+    // Alice drains the accepts *and* the queue grants, so she holds bob's
+    // per-contact queue and delivers into it rather than his inbox.
+    alice.recv().await.unwrap();
+    assert_eq!(
+        alice.conclaves()[0].joined().count(),
+        3,
+        "all three are joined before the send"
+    );
+
+    // Bob cuts alice off: this burns the queue she was handed for him, so her
+    // next put there is refused — while bob is still her contact.
+    bob.revoke_contact("alice").await.unwrap();
+
+    alice
+        .send_conclave_message(&conclave.id, "we leave at six")
+        .await
+        .unwrap();
+
+    // Carol, ordered after bob, still receives it: the refusal did not abort.
+    let inbox = carol.recv().await.unwrap();
+    let got = inbox.messages.iter().any(|m| {
+        matches!(&m.payload, MessagePayload::Conclave { body, .. } if body == "we leave at six")
+    });
+    assert!(
+        got,
+        "carol must still get the message after bob's copy was refused"
+    );
+
+    // And the sender kept her own copy rather than losing it to the error.
+    let logged = alice.conclaves()[0]
+        .messages
+        .iter()
+        .any(|m| m.body == "we leave at six");
+    assert!(logged, "the sender's own copy is still recorded");
+}
+
 /// A file shared in a conclave reaches every joined trustee as its own encrypted
 /// copy and is appended to each recipient's conclave log; a named invitee who
 /// has not accepted gets nothing. Files are per-recipient blobs, so this is N

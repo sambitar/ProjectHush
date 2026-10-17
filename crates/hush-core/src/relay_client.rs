@@ -4,9 +4,17 @@ use serde::Deserialize;
 
 use crate::error::Error;
 
+#[derive(Clone)]
 pub struct RelayClient {
     base: String,
     http: Client,
+}
+
+/// One blob off a batched drain, already decoded from its base64 wire form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainedBlob {
+    pub id: String,
+    pub body: Vec<u8>,
 }
 
 /// How long a single relay request may take.
@@ -189,6 +197,29 @@ pub fn validate_socks_proxy(value: &str) -> Result<(), Error> {
     socks_proxy(value).map(|_| ())
 }
 
+/// Describe a refused queue write, including how long the relay said to wait.
+///
+/// A bare "429 Too Many Requests" is not actionable: the relay's window is a
+/// minute by default, so a caller that retries in under a second — as the
+/// delivery path does — is guaranteed to be refused again, and the operator
+/// reading the log cannot tell a one-second limit from a one-minute one. The
+/// relay sends `Retry-After`; carrying it into the message is what makes the
+/// refusal diagnosable from the client side alone.
+fn describe_put_failure(res: &reqwest::Response) -> String {
+    let status = res.status();
+    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return format!("put failed: {status}");
+    }
+    match res
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(seconds) => format!("put failed: {status} (retry after {seconds}s)"),
+        None => format!("put failed: {status}"),
+    }
+}
+
 /// The configured SOCKS proxy, if any. Whitespace-only counts as unset so a
 /// half-edited env line does not become a broken client.
 fn proxy_from_env() -> Option<String> {
@@ -339,13 +370,12 @@ impl RelayClient {
             .await
             .map_err(|e| Error::Relay(e.to_string()))?;
         if !res.status().is_success() {
-            return Err(Error::Relay(format!("put failed: {}", res.status())));
+            return Err(Error::Relay(describe_put_failure(&res)));
         }
         Ok(())
     }
 
-    pub async fn list(&self, queue_id: &str, token: &str) -> Result<Vec<String>, Error> {
-        let res = self
+    pub async fn list(&self, queue_id: &str, token: &str) -> Result<Vec<String>, Error> {        let res = self
             .http
             .get(format!("{}/q/{}", self.base, queue_id))
             .header("authorization", Self::auth(token))
@@ -418,6 +448,86 @@ impl RelayClient {
             .map_err(|e| Error::Relay(e.to_string()))?;
         if !res.status().is_success() {
             return Err(Error::Relay(format!("delete failed: {}", res.status())));
+        }
+        Ok(())
+    }
+
+    /// Drain a queue in one request: up to `limit` blobs, returned and consumed.
+    ///
+    /// `Ok(None)` means the relay does not serve the batched drain — a relay
+    /// that predates the route answers 404, or 405 because the path falls
+    /// through to `/q/{queue_id}/{blob_id}`, which has no POST handler; either
+    /// way the caller falls back to the per-blob walk. A page shorter than
+    /// `limit` can also mean the relay's per-page byte ceiling cut it, so the
+    /// only reliable stop signal is an empty page.
+    pub async fn drain(
+        &self,
+        queue_id: &str,
+        token: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<DrainedBlob>>, Error> {
+        #[derive(Deserialize)]
+        struct DrainEntry {
+            id: String,
+            body: String,
+        }
+        #[derive(Deserialize)]
+        struct DrainResponse {
+            blobs: Vec<DrainEntry>,
+        }
+        let res = self
+            .http
+            .post(format!("{}/q/{}/drain?limit={}", self.base, queue_id, limit))
+            .header("authorization", Self::auth(token))
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if matches!(
+            res.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Ok(None);
+        }
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("drain failed: {}", res.status())));
+        }
+        let parsed: DrainResponse = res.json().await.map_err(|e| Error::Relay(e.to_string()))?;
+        let mut out = Vec::with_capacity(parsed.blobs.len());
+        for entry in parsed.blobs {
+            let body = B64
+                .decode(entry.body.as_bytes())
+                .map_err(|_| Error::Relay("drain body is not base64".into()))?;
+            out.push(DrainedBlob {
+                id: entry.id,
+                body,
+            });
+        }
+        Ok(Some(out))
+    }
+
+    /// Confirm the ids a caller finished filing; the relay deletes them in
+    /// one transaction. The relay side is idempotent per id, so a repeated
+    /// ack after a redelivery is success, not an error.
+    pub async fn ack_drain(
+        &self,
+        queue_id: &str,
+        token: &str,
+        ids: &[String],
+    ) -> Result<(), Error> {
+        #[derive(serde::Serialize)]
+        struct AckBody<'a> {
+            ids: &'a [String],
+        }
+        let res = self
+            .http
+            .post(format!("{}/q/{}/drain/ack", self.base, queue_id))
+            .header("authorization", Self::auth(token))
+            .json(&AckBody { ids })
+            .send()
+            .await
+            .map_err(|e| Error::Relay(e.to_string()))?;
+        if !res.status().is_success() {
+            return Err(Error::Relay(format!("drain ack failed: {}", res.status())));
         }
         Ok(())
     }

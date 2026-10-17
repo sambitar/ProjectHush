@@ -67,6 +67,112 @@ async fn two_accounts_exchange_encrypted_text() {
     );
 }
 
+/// The queue one vault delivers into for a contact is the queue that contact
+/// drains for it.
+///
+/// This is the invariant behind "messages reach the relay and pile up": if
+/// alice's `send_queue` for bob is not bob's `read_queue` for alice, every
+/// message alice sends lands in a queue bob never reads, and neither side can
+/// see it — alice's copy says sent, and the blob just sits until its TTL. The
+/// ids are derived and never stored, so `queue_map` is the only way to check it.
+#[tokio::test]
+async fn a_vault_delivers_into_the_queue_its_contact_drains() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+    let alice_invite = alice.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+
+    // Drain so each side has applied the other's queue grant.
+    alice.recv().await.unwrap();
+    bob.recv().await.unwrap();
+
+    let alice_map = alice.queue_map();
+    let bob_map = bob.queue_map();
+
+    assert_eq!(alice_map.contacts.len(), 1);
+    assert_eq!(bob_map.contacts.len(), 1);
+    assert_ne!(alice_map.inbox, bob_map.inbox, "inboxes are per device");
+    assert_ne!(
+        alice_map.inbox, alice_map.contacts[0].read_queue,
+        "a per-contact queue is not the inbox"
+    );
+    assert!(alice_map.contacts[0].granted, "bob's grant has arrived");
+
+    assert_eq!(
+        alice_map.contacts[0].send_queue, bob_map.contacts[0].read_queue,
+        "alice must deliver into the queue bob drains for her"
+    );
+    assert_eq!(
+        bob_map.contacts[0].send_queue, alice_map.contacts[0].read_queue,
+        "and the other direction must hold too"
+    );
+}
+
+#[tokio::test]
+async fn a_restored_vault_reports_the_identity_its_contacts_pinned() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+    let alice_invite = alice.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+    alice.add_contact("bob", &bob_invite).await.unwrap();
+    bob.add_contact("alice", &alice_invite).await.unwrap();
+    alice.recv().await.unwrap();
+    bob.recv().await.unwrap();
+
+    let old_read_queue = alice.queue_map().contacts[0].read_queue.clone();
+    assert!(!alice.queue_map().identity_restored);
+
+    // A restore carries the shared vault but not this device's keys, so the
+    // device identity is minted fresh and every derived queue changes.
+    std::fs::remove_file(alice_dir.path().join("device.enc")).unwrap();
+    let mut alice = Account::open(alice_dir.path(), "alice-pass").await.unwrap();
+
+    let new_read_queue = alice.queue_map().contacts[0].read_queue.clone();
+    assert_ne!(
+        old_read_queue, new_read_queue,
+        "a fresh device derives a new per-contact queue"
+    );
+    assert!(
+        alice.queue_map().identity_restored,
+        "a restored vault must report that its identity is newer than the pin"
+    );
+    assert!(
+        !alice.queue_map().regrant_pending,
+        "a restore must not be queued as a re-grant: the peer verifies the grant \
+         against the identity it pinned and silently refuses it"
+    );
+
+    // Re-granting is attempted and reaches the relay, but bob cannot verify the
+    // signature against the key he pinned, so he keeps the dead queue. This is
+    // the silent stall, and it is why the restore is reported rather than
+    // swept: the relationship needs a re-add.
+    assert!(alice.retry_regrants().await.unwrap() == 0);
+    bob.recv().await.unwrap();
+    assert_eq!(
+        bob.queue_map().contacts[0].send_queue,
+        old_read_queue,
+        "bob still holds the queue the restored vault abandoned"
+    );
+}
+
 /// `add_contact` sends the new contact a queue grant, and a grant that verifies
 /// against the identity key their invite pinned is proof they added our invite.
 /// Draining it has to leave the trust established rather than pending until the

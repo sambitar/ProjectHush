@@ -198,6 +198,26 @@ pub fn resolve_onion_relay_url(data_dir: &Path) -> Option<String> {
     return None;
 }
 
+/// Whether this onion address is the baked-in production default rather than
+/// something the user configured. Release builds bake the production relay's
+/// onion twin so Tor relay mode works on a fresh install; that twin belongs
+/// only to a vault still running on the baked-in relay — staging it for a
+/// vault pointed at another relay would publish a drop page (and route
+/// traffic) for a relay the vault does not use. Callers staging an onion
+/// must refuse the default in that case; explicitly configured onions are
+/// always honored.
+pub fn is_baked_default_onion(url: &str) -> bool {
+    #[cfg(not(debug_assertions))]
+    {
+        url == DEFAULT_RELAY_ONION_URL
+    }
+    #[cfg(debug_assertions)]
+    {
+        let _ = url;
+        false
+    }
+}
+
 /// Effective STUN server for the Conclave Paper data channel, when one is on
 /// file (env or config file).
 ///
@@ -385,7 +405,10 @@ mod tests {
             save(
                 dir.path(),
                 &ClientConfig {
-                    relay_url: Some("http://10.0.0.5:8787".into()),
+                    // Loopback so the URL passes the release build's
+                    // HTTPS-except-loopback policy: these tests exercise
+                    // precedence, not URL validation.
+                    relay_url: Some("http://127.0.0.1:8785".into()),
                     daemon_addr: Some("127.0.0.1:9999".into()),
                     ..Default::default()
                 },
@@ -394,7 +417,7 @@ mod tests {
 
             assert_eq!(
                 resolve_relay_url_with_source(dir.path(), None),
-                ("http://10.0.0.5:8787".into(), ConfigSource::File)
+                ("http://127.0.0.1:8785".into(), ConfigSource::File)
             );
             assert_eq!(
                 resolve_daemon_addr(dir.path(), None),
@@ -414,20 +437,20 @@ mod tests {
             save(
                 dir.path(),
                 &ClientConfig {
-                    relay_url: Some("http://10.0.0.5:8787".into()),
+                    relay_url: Some("http://127.0.0.1:8785".into()),
                     ..Default::default()
                 },
             )
             .unwrap();
-            std::env::set_var(ENV_RELAY_URL, "http://10.0.0.6:8787");
+            std::env::set_var(ENV_RELAY_URL, "http://127.0.0.1:8786");
 
             assert_eq!(
                 resolve_relay_url_with_source(dir.path(), None),
-                ("http://10.0.0.6:8787".into(), ConfigSource::Env)
+                ("http://127.0.0.1:8786".into(), ConfigSource::Env)
             );
             assert_eq!(
-                resolve_relay_url_with_source(dir.path(), Some("http://10.0.0.7:8787")),
-                ("http://10.0.0.7:8787".into(), ConfigSource::Argument)
+                resolve_relay_url_with_source(dir.path(), Some("http://127.0.0.1:8787")),
+                ("http://127.0.0.1:8787".into(), ConfigSource::Argument)
             );
         });
     }
@@ -439,14 +462,14 @@ mod tests {
             save(
                 dir.path(),
                 &ClientConfig {
-                    relay_url: Some("http://10.0.0.5:8787".into()),
+                    relay_url: Some("http://127.0.0.1:8785".into()),
                     ..Default::default()
                 },
             )
             .unwrap();
             assert_eq!(
                 resolve_relay_url(dir.path(), Some("   ")),
-                "http://10.0.0.5:8787"
+                "http://127.0.0.1:8785"
             );
         });
     }
