@@ -7,6 +7,89 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-17 — Composer focus fix and dev-rig wiring
+
+### Dev peers had no chats, so the "fixed" composer was invisible [FIXED]
+
+- Attempted: after implementing the focus fix, tell the user to test it in the dev pane.
+- Symptom: the user saw "i dont see nothing" — the peer A pane showed the empty state ("No
+  chats yet", "Quiet in here") because the dev vaults at `/home/sam/hush-dev-peer-*` had
+  contacts created but no chat thread, and peer B's plaintext `client-config.json` was
+  missing entirely. A composer fix cannot be seen where no composer renders.
+- Resolution: rebuilt both dev vaults (`hush-cli init` with known passphrases, relay
+  `https://hushrelay.space`), exchanged invites for mutual trust, restarted the daemons, and
+  seeded a message. Lesson: before asking someone to verify a UI fix, confirm the surface it
+  lives on actually exists on screen.
+
+### `HUSH_PASSPHRASE` does not unlock the daemon — it must be POSTed [FIXED]
+
+- Attempted: pass the passphrase via env when starting `hush-daemon`, expect heartbeats.
+- Symptom: `/api/status` on both dev daemons reported `"locked": true`, chat sends failed
+  with `Error: ContactOffline` even 90 s after start (no heartbeat → relay presence stale).
+  The env var works for `hush-cli` but the daemon ignores it.
+- Resolution: `curl -X POST /api/unlock -d '{"passphrase":"..."}'` on each daemon (204),
+  first heartbeat fires ~30 s later, sends succeed. Lesson: the daemon owns the session and
+  only unlocks via its API; env vars are a CLI-only convenience.
+
+### CLI send/recv while the daemon is unlocked corrupts the daemon's session view [FIXED]
+
+- Attempted: drain queues with `hush-cli recv` to seed chat history while both daemons were
+  unlocked and heartbeating.
+- Symptom: subsequent drains printed "Could not decrypt a queued message — unknown sender or
+  session not ready." and the daemon's `/api/messages` returned `[]` even though the same
+  vault's CLI recv had just printed filed messages. Root cause: two processes (CLI and
+  daemon) held independent in-memory copies of the same encrypted vault; the CLI's ratchet
+  advances were invisible to the daemon's stale in-memory account, so its decrypts failed.
+- Resolution: restarted both daemons so they reloaded the vault with the CLI-filed sessions;
+  the undecryptable blob then decrypted (the drain path leaves Session-error blobs on the
+  relay unconsumed, so nothing was lost). Lesson: never mix `hush-cli` sends/recvs with a
+  running unlocked daemon on the same vault — stop the daemon or use its API instead.
+- Status: FIXED for this session by restart; the vault lock file does not prevent the CLI
+  from opening a daemon-held vault, which is the underlying papercut.
+
+### Dev vaults auto-lock after 15 minutes, silently dropping presence [FIXED]
+
+- Attempted: leave both dev daemons running for the user to test the composer fix later.
+- Symptom: the composer in the pane flipped to disabled ("Waiting for them to come online…",
+  banner "bob is offline") about 15 minutes after setup. B's daemon had self-locked via
+  `auto_lock_loop` — `ui-prefs.json` defaults to `auto_lock_minutes: 15` when the file is
+  absent, and a locked daemon stops heartbeating, so presence goes stale within 90 s.
+- Resolution: wrote `auto_lock_minutes: 0` (off) into `ui-prefs.json` in both dev dirs and
+  re-unlocked B via the API. Lesson: a dev rig meant to sit idle between human tests must
+  disable auto-lock, or the first test after a gap starts from a locked daemon.
+
+## 2026-10-17 — Update flow and two-instance speed verification
+
+### An updated AppImage keeps its old filename, which reads as "not updated" [OPEN]
+
+- Attempted: verify the desktop updater by comparing the installed `Hush_0.2.0_amd64.AppImage`
+  against the freshly published `Hush_0.3.0_amd64.AppImage` from the relay.
+- Symptom: the install's file is still named 0.2.0 with an mtime from Oct 16, so both a human
+  and an agent assume it is 0.2.0 — yet "Check for updates" reports "you're on the latest
+  version" on both instances, and md5 of the running `hush-tauri`/`hush-daemon` binaries in the
+  sandbox mounts are identical between the misnamed install and a fresh 0.3.0 download from
+  `hushrelay.space` (`ceb871b7…` / `2128f905…`).
+- Resolution: none needed in the updater — it replaces the AppImage bytes at the same path,
+  preserving the old file name and (apparently) the mtime. The install had already updated
+  itself to 0.3.0. Lesson: to know what an AppImage install runs, hash the mounted binaries or
+  read the version in the app UI — the file name lies. Candidate follow-up: have the updater
+  rename the file to the new version after replacing, or surface the running version next to
+  the file name somewhere visible.
+- Status: OPEN as a UX papercut only; updater verified working end to end.
+
+### Two-instance relay speed check through production (2026-10-17) [FIXED — measured]
+
+- Setup: two sandboxed Hush instances (private `HOME`/`XDG_*`, own daemons, own throwaway
+  vaults) on the same workstation, both vaults against `https://hushrelay.space`, conclave with
+  both trustees joined, messages exchanged both directions.
+- Result: every message delivered to the peer's daemon — per-message end-to-end (send round
+  trips + receiver's poll cadence) **1.3 s, 2.6 s, 1.9 s, 2.0 s**. The UI on one window did not
+  repaint on arrival (a frontend refresh quirk — the messages were present in the daemon's
+  store and appeared after switching views); transport itself dropped nothing.
+- Note: the relay's counters are the cheap live-view for this kind of test, but `/updates` is
+  served by Caddy's `file_server` and never touches hush-relay, so updater traffic is invisible
+  to the relay's metrics.
+
 ## 2026-10-17 — Relay redesign: the bottleneck measured end to end
 
 ### The drain peek loop re-read the same page forever — `recv()` spun at 100% CPU for 24 minutes [FIXED]
