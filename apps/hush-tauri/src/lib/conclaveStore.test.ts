@@ -5,10 +5,12 @@ import {
   clearConclaveStore,
   conclaveUnreadCount,
   conclaveUnreadTotal,
+  groupConclaveMessages,
   invitableCandidates,
   loadConclaves,
   markConclaveRead,
   type Conclave,
+  type ConclaveMessage,
 } from "./conclaveStore.ts";
 import type { ConclaveDto } from "./api/types.ts";
 
@@ -68,6 +70,83 @@ test("invitableCandidates keeps full-reach newcomers", () => {
   assert.deepEqual(invitableCandidates(conclave, [contact("alice"), contact("bob"), contact("carol")]), [
     "carol",
   ]);
+});
+
+// --- Message grouping ---
+
+const msg = (
+  id: string,
+  outgoing: boolean,
+  from: string | undefined,
+  ts: number,
+): ConclaveMessage => ({
+  id,
+  outgoing,
+  from,
+  body: id,
+  createdAt: ts,
+});
+
+const shape = (groups: ReturnType<typeof groupConclaveMessages>) =>
+  groups.map((g) => `${g.outgoing ? ">" : "<"}${g.from || "me"}:${g.messages.length}`);
+
+test("a run from one sender is one group, so the avatar and name appear once", () => {
+  const now = Date.now();
+  const groups = groupConclaveMessages([
+    msg("a", false, "rushd", now),
+    msg("b", false, "rushd", now + 1000),
+    msg("c", false, "rushd", now + 2000),
+  ]);
+  assert.deepEqual(shape(groups), ["<rushd:3"]);
+});
+
+test("a different sender breaks the run even with no gap in time", () => {
+  const now = Date.now();
+  const groups = groupConclaveMessages([
+    msg("a", false, "rushd", now),
+    msg("b", false, "nadia", now + 1),
+    msg("c", false, "rushd", now + 2),
+  ]);
+  assert.deepEqual(shape(groups), ["<rushd:1", "<nadia:1", "<rushd:1"]);
+});
+
+test("my own reply breaks the run", () => {
+  const now = Date.now();
+  const groups = groupConclaveMessages([
+    msg("a", false, "rushd", now),
+    msg("b", true, undefined, now + 1),
+    msg("c", false, "rushd", now + 2),
+  ]);
+  assert.deepEqual(shape(groups), ["<rushd:1", ">me:1", "<rushd:1"]);
+});
+
+test("a new day breaks the run, so the day separator has a place to sit", () => {
+  const yesterday = Date.now() - 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const groups = groupConclaveMessages([
+    msg("a", false, "rushd", yesterday),
+    msg("b", false, "rushd", now),
+  ]);
+  assert.deepEqual(shape(groups), ["<rushd:1", "<rushd:1"]);
+  assert.notEqual(groups[0].day, groups[1].day);
+});
+
+test("grouping keeps every message exactly once, in order", () => {
+  const now = Date.now();
+  const groups = groupConclaveMessages([
+    msg("a", false, "rushd", now),
+    msg("b", true, undefined, now + 1),
+    msg("c", false, "rushd", now + 2),
+    msg("d", false, "rushd", now + 3),
+  ]);
+  assert.deepEqual(
+    groups.flatMap((g) => g.messages.map((m) => m.id)),
+    ["a", "b", "c", "d"],
+  );
+});
+
+test("an empty log has no groups", () => {
+  assert.deepEqual(groupConclaveMessages([]), []);
 });
 
 // --- Unread counts ---

@@ -7,6 +7,119 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-17 — Conclave chat: the collapsed bubbles and the scroll carry
+
+### Incoming conclave bubbles collapsed to one character per line [FIXED]
+
+- Attempted: explain the screenshot of a conclave chat where every message from the other
+  trustee rendered as a vertical column of single letters, while own messages rendered
+  normally. First guesses were a `word-break` rule, a `writing-mode`, or literal newlines in
+  the message body — all wrong; `app.ts` sets `b.textContent = msg.body` for both directions.
+- Symptom: measured off the screenshot, the incoming bubbles were ~24px wide and ~50-110px
+  tall. Reproduced in Chrome against the real stylesheet with the exact markup: `bodyW` came
+  back as 150/64/65px and the bubble as 72% of that (108/46/47px). `.bubble` carries
+  `max-width: min(72%, 480px)`, and 72% resolves against its containing block — `.conclave-body`.
+  That column was a `flex: 0 1 auto` item, so its width was a content-based shrink-to-fit that
+  itself depended on the bubble's max-width. The circular pair resolved to a sliver, and
+  `overflow-wrap: anywhere` on `.bubble` made min-content exactly one character, so the text
+  broke after every letter. Outgoing bubbles were unaffected because they are direct children
+  of `.bubble-group`, which is full width.
+- Resolution: FIXED — `.conclave-body` is now `flex: 1 1 auto`, so the column has the row's
+  remaining width as a definite size and the percentage has something real to resolve against.
+  Measured after the fix: the same three bubbles are 150/64/65px wide and 46px tall, and a
+  deliberately long message caps at exactly 418px = 72% of the 581px column, wrapping to two
+  lines with no horizontal overflow.
+- Lesson: a percentage `max-width` inside a shrink-to-fit flex item is a circular dependency.
+  When a bubble collapses but its sibling direction renders fine, compare what each one's
+  containing block is sized by before looking for a `word-break` rule.
+
+### Opening a different conclave restored the previous conclave's scroll offset [FIXED]
+
+- Attempted: satisfy a request to be sure the conclave chat still opens on the newest message
+  rather than jumping up, and to check that the layout fix had not broken the scroll carry.
+- Symptom: the conclave decide-step read
+  `pinned = !prev || (prev.conclaveId === conclave.id && prev.atBottom)`. When `prev` belonged
+  to a *different* conclave, `pinned` was false, so the new pane took
+  `mode: "restore", top: prev.top` — the other conclave's offset. Selecting conclave B while A
+  was scrolled to the middle opened B mid-history. Its 1:1 twin already had the right shape
+  (`!prev || prev.nick !== nick || prev.atBottom`), so the two copies of one contract had
+  drifted. Also, the conclave pane had no equivalent of `bottomOnNextChatRender`, so returning
+  to the window re-pinned the thread but left the conclave where it was.
+- Resolution: FIXED — the contract is now one module, `src/lib/paneScroll.ts`
+  (`isAtBottom`, `paneScrollTarget`, `applyPaneScroll`, `AT_BOTTOM_SLACK`), used by both panes,
+  and `paneScrollTarget` discards a position whose key does not match. The apply step now also
+  checks the rendered key on the conclave side, as the thread already did. A
+  `bottomOnNextConclaveRender` flag gives the conclave the thread's fresh-read-on-refocus rule.
+  Covered by 13 tests in `src/lib/paneScroll.test.ts`, including the cross-conclave regression.
+- Lesson: when the same non-trivial decision is written out twice, diff the two copies — the
+  divergence is the bug. Extracting it made the behaviour unit-testable for the first time.
+
+### Consecutive messages repeated the avatar, the sender name and the tail [FIXED]
+
+- Attempted: review the conclave chat for the "huge work" it was reported to need.
+- Symptom: the message loop emitted one `.bubble-group` per message, so three messages in a row
+  from one trustee drew three avatars, three sender names and three tails — reading as three
+  separate people. The 1:1 thread has grouped runs since it landed (`groupMessages`), so this
+  was a divergence from the app's own established pattern, not a deliberate choice.
+- Resolution: FIXED — `groupConclaveMessages` in `conclaveStore.ts` collapses a run of
+  consecutive messages from the same sender on the same day, and `app.ts` emits one avatar, one
+  name and one tail per run. Covered by 6 tests in `conclaveStore.test.ts`.
+- Lesson: check the sibling surface for an existing pattern before calling a rough edge a
+  design choice.
+
+### A `.ts`-extension import is required for modules loaded by `node --test` [FIXED]
+
+- Attempted: add `import { dayLabel } from "./messageGroups"` to `conclaveStore.ts`, which
+  `conclaveStore.test.ts` loads directly under `node --test`.
+- Symptom: `npm test` failed with
+  `Error [ERR_MODULE_NOT_FOUND]: Cannot find module .../src/lib/messageGroups imported from
+  .../src/lib/conclaveStore.ts`. `tsc --noEmit` was happy; only the runtime resolver was not.
+  Tested libs that import `./api/types.ts` were already using the extension, but those are
+  `import type` and get erased, so the requirement was invisible until a value import crossed
+  a module boundary.
+- Resolution: FIXED — the import carries the `.ts` extension, which
+  `allowImportingTsExtensions: true` in `tsconfig.json` permits and Vite resolves either way.
+- Lesson: in this app, a value import between two `src/lib` modules needs the `.ts` extension
+  or `node --test` cannot resolve it. Tooling-related, not a repo bug.
+
+### The layout fix and the scroll carry were verified in WebKitGTK, not in the running app [FIXED]
+
+- Attempted: confirm the fix in the real application. The Conclaves pane needs the daemon — a
+  vault, a conclave record and messages — and the repo's own log records that a cold first paint
+  takes minutes and that a conclave needs a peer to carry traffic, so driving the real pane was
+  not reachable in this session.
+- What was verified instead, against real artefacts: the actual stylesheet, and the actual
+  `src/lib/paneScroll.ts` / `src/lib/conclaveStore.ts` loaded into a page that rebuilds a thread
+  the way `render()` does (capture from the outgoing pane, rebuild, decide, apply). Measured in
+  both engines — Chrome, and WebKitGTK 4.1 through `WebKit2.WebView`, which is the engine the
+  Linux build ships on and the one that produced the original screenshot. All 10 checks pass in
+  both: pinned reader lands on the newest message; a mid-history reader keeps their place; a
+  different conclave opens on the newest message; refocus pins to the newest; no bubble
+  collapses (one line, ~45px WebKit / ~46px Chrome, against 89 and 111 before); one avatar,
+  name and tail per run; no horizontal overflow.
+- Still unverified: the assembled app window itself — `App.render()`'s own wiring of the CSS
+  class names is inferred from the source, not observed. The CSS fix and the module behaviour
+  are each measured directly.
+- Lesson: state the engine. A layout bug seen in one engine is not proven fixed by measuring in
+  another — but a headless WebKitGTK view is reachable on this host, so "Chrome only" is a
+  choice, not a constraint.
+
+### Two harness assertions were wrong, and both first read as product failures [FIXED]
+
+- Attempted: assert that a rebuilt pane lands on the newest message by comparing
+  `pane.scrollTop === pane.scrollHeight`, and that a fixed bubble is one line tall by comparing
+  `height === 46`.
+- Symptom: three scroll checks failed with `1804 == 2422`, `360 == 978`, `2826 == 3444` — every
+  gap exactly `clientHeight`. The browser clamps `scrollTop` to
+  `scrollHeight - clientHeight`, so the panes *were* at the newest message and the assertion was
+  wrong. Separately, the geometry check passed in Chrome and failed in WebKitGTK at 45px
+  instead of 46px: a hardcoded pixel is engine-specific.
+- Resolution: FIXED — the scroll check asserts `scrollTop === scrollHeight - clientHeight`, and
+  the geometry check asserts "one line" (`height < 60`, against 89 and 111 from the bug) rather
+  than an exact height. Both engines then reported 10/10.
+- Lesson: an assertion that fails should be re-read as a claim about the code *or* about the
+  assertion. A gap that equals `clientHeight` exactly is the harness, not the product.
+
 ## 2026-10-17 — Release v0.5.0 (Actions minutes exhausted)
 
 ### The mirror workflow could not start, so the relay was mirrored by hand [WORKED AROUND]

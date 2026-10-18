@@ -9,6 +9,7 @@ import type {
   PendingIntroRequestDto,
   TrusteeStateDto,
 } from "./api/types";
+import { dayLabel } from "./messageGroups.ts";
 
 /**
  * The Conclaves rail's view of a conclave.
@@ -318,6 +319,44 @@ export function joinedTrustees(m: Conclave): ConclaveTrustee[] {
 /** The invited trustees: asked but not yet answered. */
 export function invitedTrustees(m: Conclave): ConclaveTrustee[] {
   return m.trustees.filter((t) => t.state === "invited");
+}
+
+/**
+ * A run of consecutive messages from one sender, on one day.
+ *
+ * `from` is the sender's nick for an incoming run and empty for this vault's
+ * own; `messages` is never empty.
+ */
+export interface ConclaveMessageGroup {
+  outgoing: boolean;
+  from: string;
+  day: string;
+  messages: ConclaveMessage[];
+}
+
+/**
+ * Collapse consecutive messages from the same sender into one group.
+ *
+ * The 1:1 thread has grouped its bubbles since it landed (`groupMessages`), so
+ * a run from one person reads as one block with a single tail. The conclave
+ * chat did not: every message carried its own avatar, its own sender name and
+ * its own tail, so three messages in a row from one trustee read as three
+ * separate people. The rule is the 1:1 one plus the sender, because a conclave
+ * has more than two voices and only one of them is "not me".
+ */
+export function groupConclaveMessages(messages: ConclaveMessage[]): ConclaveMessageGroup[] {
+  const groups: ConclaveMessageGroup[] = [];
+  for (const m of messages) {
+    const day = dayLabel(m.createdAt);
+    const from = m.from ?? "";
+    const last = groups[groups.length - 1];
+    if (last && last.outgoing === m.outgoing && last.from === from && last.day === day) {
+      last.messages.push(m);
+    } else {
+      groups.push({ outgoing: m.outgoing, from, day, messages: [m] });
+    }
+  }
+  return groups;
 }
 
 /** The one-line summary under a conclave's name in the list. */

@@ -196,13 +196,20 @@ import {
   saveVaultBlob,
   type FileBytesSource,
 } from "./lib/fileBytes";
-import { groupMessages, dayLabel } from "./lib/messageGroups";
+import { groupMessages } from "./lib/messageGroups";
+import {
+  applyPaneScroll,
+  isAtBottom,
+  paneScrollTarget,
+  type PaneScrollState,
+} from "./lib/paneScroll";
 import {
   clearConclaveStore,
   conclaveById,
   conclavePreview,
   conclaveUnreadCount,
   conclaveUnreadTotal,
+  groupConclaveMessages,
   invitedTrustees,
   invitableCandidates,
   joinedTrustees,
@@ -552,19 +559,11 @@ export class App {
   /** Scroll state of the thread pane from the render that is being replaced.
    * Keyed by the conversation the old DOM was showing: a position only makes
    * sense within one conversation. */
-  private chatScrollPos: {
-    nick: string | null;
-    atBottom: boolean;
-    top: number;
-  } | null = null;
+  private chatScrollPos: PaneScrollState | null = null;
   /** Scroll state of the conclave chat pane from the render that is being
    * replaced. Keyed by the conclave the old DOM was showing, for the same
    * reason `chatScrollPos` is keyed by conversation. */
-  private conclaveScrollPos: {
-    conclaveId: string | null;
-    atBottom: boolean;
-    top: number;
-  } | null = null;
+  private conclaveScrollPos: PaneScrollState | null = null;
   /** The conversation the thread pane currently shows, for that keying. */
   private renderedNick: string | null = null;
   /** Where the freshly built thread pane should be scrolled once it is in the
@@ -578,6 +577,9 @@ export class App {
   /** Set when the window becomes visible again: the next thread paint opens
    * on the newest message, because returning to the window is a fresh read. */
   private bottomOnNextChatRender = false;
+  /** The same fresh-read rule for the conclave chat, which is repainted by the
+   * same cycle and would otherwise keep a stale position. */
+  private bottomOnNextConclaveRender = false;
   /** Where the freshly built conclave chat should be scrolled once it is in
    * the document — same mechanism as `pendingChatScroll`, same reason: a
    * detached element has no layout, so its scrollTop silently clamps. */
@@ -1134,6 +1136,9 @@ export class App {
       if (this.rail === "drops") this.startDropsPoll();
       if (this.rail === "chats" && this.selectedNick) {
         this.bottomOnNextChatRender = true;
+      }
+      if (this.rail === "conclaves" && this.conclaveId) {
+        this.bottomOnNextConclaveRender = true;
       }
       // The scheduled render repaints from live state and restarts the Tor
       // pill poll on the way through render().
@@ -1913,9 +1918,8 @@ export class App {
     const prevMsgs = this.root.querySelector<HTMLElement>(".chat-messages");
     this.chatScrollPos = prevMsgs
       ? {
-          nick: this.renderedNick,
-          atBottom:
-            prevMsgs.scrollHeight - prevMsgs.scrollTop - prevMsgs.clientHeight < 48,
+          key: this.renderedNick,
+          atBottom: isAtBottom(prevMsgs),
           top: prevMsgs.scrollTop,
         }
       : null;
@@ -1938,12 +1942,8 @@ export class App {
     const prevConclaveMsgs = this.root.querySelector<HTMLElement>(".conclave-messages");
     this.conclaveScrollPos = prevConclaveMsgs
       ? {
-          conclaveId: this.renderedConclaveId,
-          atBottom:
-            prevConclaveMsgs.scrollHeight -
-              prevConclaveMsgs.scrollTop -
-              prevConclaveMsgs.clientHeight <
-            48,
+          key: this.renderedConclaveId,
+          atBottom: isAtBottom(prevConclaveMsgs),
           top: prevConclaveMsgs.scrollTop,
         }
       : null;
@@ -2075,26 +2075,19 @@ export class App {
     const pending = this.pendingChatScroll;
     this.pendingChatScroll = null;
     if (liveMsgs && pending && pending.nick === this.renderedNick) {
-      if (pending.mode === "bottom") {
-        liveMsgs.scrollTop = liveMsgs.scrollHeight;
-      } else {
-        liveMsgs.scrollTop = Math.min(pending.top, liveMsgs.scrollHeight);
-      }
+      applyPaneScroll(liveMsgs, pending);
     }
     // The conclave chat scrolls by the same contract, same reason: the intent
     // was decided while the pane was detached and has only now got layout.
     const liveConclaveMsgs = this.root.querySelector<HTMLElement>(".conclave-messages");
     const conclavePending = this.pendingConclaveScroll;
     this.pendingConclaveScroll = null;
-    if (liveConclaveMsgs && conclavePending) {
-      if (conclavePending.mode === "bottom") {
-        liveConclaveMsgs.scrollTop = liveConclaveMsgs.scrollHeight;
-      } else {
-        liveConclaveMsgs.scrollTop = Math.min(
-          conclavePending.top,
-          liveConclaveMsgs.scrollHeight,
-        );
-      }
+    if (
+      liveConclaveMsgs &&
+      conclavePending &&
+      conclavePending.conclaveId === this.renderedConclaveId
+    ) {
+      applyPaneScroll(liveConclaveMsgs, conclavePending);
     }
     // The front page scrolls like any long page, so a story opened from halfway
     // down it puts the reader back at that point on the way out — the same
@@ -3074,14 +3067,13 @@ export class App {
     // lands on the latest message. Applied after attachment (see render).
     const prev = this.chatScrollPos;
     this.chatScrollPos = null;
-    if (this.bottomOnNextChatRender) {
-      this.bottomOnNextChatRender = false;
-      this.pendingChatScroll = { nick, mode: "bottom" };
-    } else if (!prev || prev.nick !== nick || prev.atBottom) {
-      this.pendingChatScroll = { nick, mode: "bottom" };
-    } else {
-      this.pendingChatScroll = { nick, mode: "restore", top: prev.top };
-    }
+    const forceBottom = this.bottomOnNextChatRender;
+    this.bottomOnNextChatRender = false;
+    const target = paneScrollTarget(prev, nick, forceBottom);
+    this.pendingChatScroll =
+      target.mode === "bottom"
+        ? { nick, mode: "bottom" }
+        : { nick, mode: "restore", top: target.top };
 
     const composer = this.renderComposer(nick, contact.online, contact.reach === "full");
     pane.append(header, scroll, composer);
@@ -4643,41 +4635,41 @@ export class App {
       scroll.appendChild(hint);
     }
     let lastDay = "";
-    for (const msg of conclave.messages) {
-      const day = dayLabel(msg.createdAt);
-      if (day !== lastDay) {
-        lastDay = day;
+    for (const group of groupConclaveMessages(conclave.messages)) {
+      if (group.day !== lastDay) {
+        lastDay = group.day;
         const sep = document.createElement("div");
         sep.className = "day-sep";
-        sep.textContent = day;
+        sep.textContent = group.day;
         scroll.appendChild(sep);
       }
-      const group = document.createElement("div");
-      // `conclave-group` is what makes an incoming message a row — the
-      // trustee's avatar beside the name-and-bubble column. Without it the
-      // base `bubble-group` column stacks avatar over bubble, which is the
-      // skewed look the class was written to prevent.
-      group.className = `bubble-group${msg.outgoing ? " out" : " in conclave-group"}`;
-      // Incoming conclave messages carry the sender's identity: an initials
-      // avatar and a name in the trustee's own colour, both derived from one
-      // stable hue so a trustee reads as one colour everywhere.
-      let body: HTMLElement = group;
-      if (!msg.outgoing) {
-        const name = msg.from ? displayNick(msg.from) : "Unknown";
+      const gEl = document.createElement("div");
+      // `conclave-group` is what makes an incoming run a row — the trustee's
+      // avatar beside the name-and-bubble column. Without it the base
+      // `bubble-group` column stacks avatar over bubble, which is the skewed
+      // look the class was written to prevent.
+      gEl.className = `bubble-group${group.outgoing ? " out" : " in conclave-group"}`;
+      // A run carries the sender's identity once: an initials avatar and a name
+      // in the trustee's own colour, both derived from one stable hue so a
+      // trustee reads as one colour everywhere. Repeating them per message made
+      // three messages in a row read as three separate people.
+      let body: HTMLElement = gEl;
+      if (!group.outgoing) {
+        const name = group.from ? displayNick(group.from) : "Unknown";
         const key =
-          this.contacts.find((c) => c.nickname === msg.from)?.protocol_name ??
-          msg.from ??
+          this.contacts.find((c) => c.nickname === group.from)?.protocol_name ??
+          group.from ??
           "unknown";
         const av = createAvatarEl(key, "sm", false, name);
         av.classList.add("conclave-avatar");
         av.setAttribute("aria-hidden", "true");
         const who = document.createElement("div");
         who.className = "conclave-sender text-12";
-        if (msg.from) {
+        if (group.from) {
           // The lightness is theme's business: the hue is per trustee, the
           // CSS picks a readable tone for light and dark. The var sits on
           // the group so the bubble tint reads it too.
-          group.style.setProperty("--sender-h", String(hueFromKey(key)));
+          gEl.style.setProperty("--sender-h", String(hueFromKey(key)));
         } else {
           who.classList.add("muted");
         }
@@ -4685,44 +4677,54 @@ export class App {
         body = document.createElement("div");
         body.className = "conclave-body";
         body.appendChild(who);
-        group.append(av, body);
+        gEl.append(av, body);
       }
-      const b = document.createElement("div");
-      b.className = `bubble ${msg.outgoing ? "out" : "in"} tail`;
-      if (msg.file) {
-        // A shared file is a file card, not a body: `body` is empty for one.
-        const file = msg.file;
-        const fc = document.createElement("div");
-        fc.className = "file-card";
-        const nameEl = document.createElement("div");
-        nameEl.className = "text-15";
-        nameEl.style.fontWeight = "500";
-        nameEl.textContent = file.name;
-        const sizeEl = document.createElement("div");
-        sizeEl.className = "text-13 muted";
-        sizeEl.textContent = formatBytes(file.size);
-        fc.append(nameEl, sizeEl);
-        attachFileActions(
-          fc,
-          file.name,
-          () => resolveMessageFileBytes(file),
-          file.blobId,
-        );
-        b.appendChild(fc);
-      } else {
-        b.textContent = msg.body;
-      }
-      body.appendChild(b);
-      scroll.appendChild(group);
+      group.messages.forEach((msg, i) => {
+        // Only the last bubble of a run carries the tail, the same rule the
+        // 1:1 thread's bubbles follow.
+        const tail = i === group.messages.length - 1;
+        const b = document.createElement("div");
+        b.className = `bubble ${group.outgoing ? "out" : "in"}${tail ? " tail" : ""}`;
+        if (msg.file) {
+          // A shared file is a file card, not a body: `body` is empty for one.
+          const file = msg.file;
+          const fc = document.createElement("div");
+          fc.className = "file-card";
+          const nameEl = document.createElement("div");
+          nameEl.className = "text-15";
+          nameEl.style.fontWeight = "500";
+          nameEl.textContent = file.name;
+          const sizeEl = document.createElement("div");
+          sizeEl.className = "text-13 muted";
+          sizeEl.textContent = formatBytes(file.size);
+          fc.append(nameEl, sizeEl);
+          attachFileActions(
+            fc,
+            file.name,
+            () => resolveMessageFileBytes(file),
+            file.blobId,
+          );
+          b.appendChild(fc);
+        } else {
+          b.textContent = msg.body;
+        }
+        body.appendChild(b);
+      });
+      scroll.appendChild(gEl);
     }
     // Decided while detached, applied after attachment (see render()): the
-    // reader pinned to the bottom — or opening fresh — rides the newest
-    // message; a reader away in history keeps their place.
+    // reader pinned to the bottom — or opening fresh, or opening a different
+    // conclave — rides the newest message; a reader away in history of this
+    // same conclave keeps their place.
     const prev = this.conclaveScrollPos;
-    const pinned = !prev || (prev.conclaveId === conclave.id && prev.atBottom);
-    this.pendingConclaveScroll = pinned
-      ? { conclaveId: conclave.id, mode: "bottom" }
-      : { conclaveId: conclave.id, mode: "restore", top: prev.top };
+    this.conclaveScrollPos = null;
+    const forceBottom = this.bottomOnNextConclaveRender;
+    this.bottomOnNextConclaveRender = false;
+    const target = paneScrollTarget(prev, conclave.id, forceBottom);
+    this.pendingConclaveScroll =
+      target.mode === "bottom"
+        ? { conclaveId: conclave.id, mode: "bottom" }
+        : { conclaveId: conclave.id, mode: "restore", top: target.top };
 
     // Chat and Paper are the two surfaces of the same meeting; the pill swaps
     // between them without touching the header or the members row. Built before

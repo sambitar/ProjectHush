@@ -2583,7 +2583,14 @@
   font-size: 11px;
 }
 
+/* The name-and-bubble column. It must claim the row's remaining width, not
+ * shrink-wrap its contents: `.bubble`'s `max-width: min(72%, 480px)` is a
+ * percentage of *this* box, so a fit-content column makes the percentage
+ * resolve against a collapsed width and every incoming message wraps to one
+ * character per line. `flex: 1` gives the column a definite width; the
+ * `align-items: flex-start` below still shrink-wraps short bubbles. */
 .conclave-body {
+  flex: 1 1 auto;
   min-width: 0;
   display: flex;
   flex-direction: column;
