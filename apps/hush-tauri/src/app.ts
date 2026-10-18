@@ -33,6 +33,7 @@ import type {
   ZineSummaryDto,
   ZineViewDto,
   ZinesViewDto,
+  VoiceViewDto,
 } from "./lib/api/types";
 import {
   HK_NEWS,
@@ -200,6 +201,8 @@ import {
   clearConclaveStore,
   conclaveById,
   conclavePreview,
+  conclaveUnreadCount,
+  conclaveUnreadTotal,
   invitedTrustees,
   invitableCandidates,
   joinedTrustees,
@@ -210,6 +213,7 @@ import {
   loadPendingIntros,
   listPendingIntroRequests,
   listPendingIntros,
+  markConclaveRead,
   type Conclave,
   type PendingIntro,
   type PendingIntroRequest,
@@ -531,6 +535,15 @@ export class App {
   private contacts: ContactDto[] = [];
   private rail: Rail = "chats";
   private selectedNick: string | null = null;
+  /** Every live voice room, from `/api/voice/state`. Feeds the ring prompt
+   * and the "voice live" chip on conclave cards; refreshed each poll. */
+  private voiceRooms: VoiceViewDto[] = [];
+  /** Ring prompts the user dismissed, by session id: a ring is a knock, and
+   * declining it must not re-ring on the next poll of the same session. */
+  private voiceRingDismissed = new Set<string>();
+  /** The session id the last chime was for, so a ring repeats at the poll
+   * cadence instead of stacking on every state read. */
+  private lastRingChime: string | null = null;
   /** The mounted IRC pane, kept so its store subscription is torn down when
    * the rail changes instead of patching a detached DOM. */
   private ircPane: IrcPane | null = null;
@@ -1535,7 +1548,7 @@ export class App {
     // conclave list, creation and every action here keep working unchanged.
     const intros = await api.introLists().catch(() => null);
     if (!list) return false;
-    const changed = loadConclaves(list);
+    const changed = loadConclaves(list, this.conclaveId);
     const invitesChanged = invites ? loadPendingInvites(invites) : false;
     const introsChanged = intros ? loadPendingIntros(intros) : false;
     return changed || invitesChanged || introsChanged;
@@ -1563,8 +1576,13 @@ export class App {
         fresh.some((c) => prevOnline.get(c.nickname) !== c.online);
       this.contacts = fresh;
       setKnownContacts(fresh.map((c) => c.nickname));
+      // Voice rings ride every poll: an inbound open is stamped daemon-side,
+      // so the state read is what turns it into a prompt. The ring also
+      // chimes — at the poll cadence, never per read — unless the user muted
+      // sounds, and stops the moment it is answered, dismissed, or expired.
+      const voiceChanged = await this.refreshVoiceRooms();
       if (!r) {
-        if (presenceChanged) this.scheduleBackgroundRender();
+        if (presenceChanged || voiceChanged) this.scheduleBackgroundRender();
         return;
       }
       for (const w of r.warnings) this.announce(w);
@@ -1623,7 +1641,11 @@ export class App {
         (this.conclaveTab === "paper" && paperHasFocus()) ||
         (this.rail === "zines" && (this.zinesEditing || zineEditorHasFocus()));
       if (
-        (r.messages.length || presenceChanged || mailboxChanged || conclavesChanged) &&
+        (r.messages.length ||
+          presenceChanged ||
+          mailboxChanged ||
+          conclavesChanged ||
+          voiceChanged) &&
         !editing
       ) {
         this.scheduleBackgroundRender();
@@ -1631,6 +1653,130 @@ export class App {
     } catch {
       /* daemon busy */
     }
+  }
+
+  /**
+   * Re-read the voice rooms and work the ring from what came back.
+   *
+   * Returns whether anything the UI renders changed — a room appearing,
+   * leaving, or a ring starting or stopping — so the poll can skip a repaint
+   * that would steal the caret for nothing. The chime repeats while a ring
+   * is up (the poll cadence is the ring's tempo, the daemon's 30 s deadline
+   * the ceiling) and never plays for a session the user declined.
+   */
+  private async refreshVoiceRooms(): Promise<boolean> {
+    const before = this.ringSignature();
+    try {
+      const state = await api.voiceState();
+      this.voiceRooms = state?.rooms ?? [];
+    } catch {
+      return false; /* daemon busy; the next poll re-reads */
+    }
+    const after = this.ringSignature();
+    const ring = this.activeRing();
+    if (ring) {
+      this.lastRingChime = ring.session_id;
+      if (chatSoundEnabled()) playChatSound();
+      // Re-render when the ring expires even if no poll fires: the prompt
+      // must not outlive its own deadline on screen.
+      const wait = Math.max(0, (ring.ringing_until_ms ?? 0) - Date.now()) + 250;
+      window.setTimeout(() => this.scheduleBackgroundRender(), wait);
+    } else {
+      this.lastRingChime = null;
+    }
+    return after !== before;
+  }
+
+  /** The one ring the UI would prompt for, if any: the newest live ring this
+   * vault has not answered or declined. Several trustees opening at once is
+   * the degenerate case — the newest is the one on screen, and the pill
+   * still lists every room. */
+  private activeRing(): VoiceViewDto | null {
+    const now = Date.now();
+    const rings = this.voiceRooms
+      .filter(
+        (r) =>
+          !r.i_am_in &&
+          r.joined.length <= 1 &&
+          (r.ringing_until_ms ?? 0) > now &&
+          !this.voiceRingDismissed.has(r.session_id),
+      )
+      .sort((a, b) => (b.ringing_until_ms ?? 0) - (a.ringing_until_ms ?? 0));
+    return rings[0] ?? null;
+  }
+
+  /** What a repaint of the ring UI depends on, reduced to a string. */
+  private ringSignature(): string {
+    const now = Date.now();
+    return this.voiceRooms
+      .map(
+        (r) =>
+          `${r.session_id}:${r.joined.length}:${r.i_am_in ? 1 : 0}:${
+            (r.ringing_until_ms ?? 0) > now ? 1 : 0
+          }`,
+      )
+      .join("|");
+  }
+
+  /**
+   * The incoming-voice prompt, or null when nothing is ringing.
+   *
+   * A ring is a knock, not a state change: the room's rules are untouched and
+   * the mic opens only when the user answers. Answering selects the conclave
+   * (so the answerer lands in the room) and joins through the same endpoint
+   * the pill's toggle uses; declining is local silence — the opener learns
+   * who joined, never who declined, the same rule as a conclave invite.
+   */
+  private renderVoiceRingBanner(): HTMLElement | null {
+    const ring = this.activeRing();
+    if (!ring) return null;
+    const conclave = conclaveById(ring.conclave_id);
+    const who = displayNick(ring.opener);
+    const where = conclave?.name ?? "a conclave";
+    const banner = document.createElement("div");
+    banner.className = "voice-ring";
+    banner.setAttribute("role", "alertdialog");
+    banner.setAttribute("aria-label", `Incoming voice from ${who} in ${where}`);
+    const text = document.createElement("div");
+    text.className = "voice-ring-text";
+    const title = document.createElement("div");
+    title.className = "text-15";
+    title.style.fontWeight = "600";
+    title.textContent = `${who} started voice`;
+    const sub = document.createElement("div");
+    sub.className = "text-13 muted";
+    sub.textContent = `in ${where}`;
+    text.append(title, sub);
+    const answer = document.createElement("button");
+    answer.type = "button";
+    answer.className = "btn-primary pressable";
+    answer.textContent = "Answer";
+    answer.onclick = () => {
+      this.voiceRingDismissed.add(ring.session_id);
+      this.conclaveId = ring.conclave_id;
+      this.rail = "conclaves";
+      this.scheduleRender();
+      void api
+        .voiceJoin(ring.conclave_id)
+        .then(() => showToast("You joined the voice room."))
+        .catch((e: unknown) => {
+          showToast(
+            e instanceof AppError ? e.message : "Could not join the voice room.",
+            { kind: "error" },
+          );
+        });
+    };
+    const decline = document.createElement("button");
+    decline.type = "button";
+    decline.className = "btn-secondary pressable";
+    decline.textContent = "Decline";
+    decline.onclick = () => {
+      this.voiceRingDismissed.add(ring.session_id);
+      this.lastRingChime = null;
+      this.scheduleRender();
+    };
+    banner.append(text, answer, decline);
+    return banner;
   }
 
   private async lock(): Promise<void> {
@@ -1642,6 +1788,11 @@ export class App {
     clearChatStore();
     clearMailStore();
     clearConclaveStore();
+    // The ring prompt is a live-room surface too: a locked vault cannot
+    // answer, and the stamps died daemon-side with the planes.
+    this.voiceRooms = [];
+    this.voiceRingDismissed.clear();
+    this.lastRingChime = null;
     // The paper's editor doc and its sync loop die with the session; the
     // merged state survives only inside the vault's encrypted sidecar.
     closePaper();
@@ -1768,6 +1919,19 @@ export class App {
           top: prevMsgs.scrollTop,
         }
       : null;
+    // The settings pane scrolls inside `.main-pane`, and every render rebuilds
+    // it from scratch — so a repaint of the section already on screen (an
+    // update check, a toggle, the async version read) would throw the reader
+    // back to the top. Captured here, keyed by the section the old DOM was
+    // showing: a position only means something within one section.
+    const prevSettings = this.root.querySelector<HTMLElement>(".settings-layout");
+    const settingsScroll =
+      prevSettings && prevSettings.dataset.settingsSection
+        ? {
+            section: prevSettings.dataset.settingsSection,
+            top: prevSettings.scrollTop,
+          }
+        : null;
     // Same carry for the conclave chat: was the reader pinned to the newest
     // message, or away in history? Keyed by conclave, since the pane is
     // rebuilt from scratch on every render.
@@ -1851,6 +2015,10 @@ export class App {
     if (this.rail === "chats" && this.selectedNick) {
       markRead(this.selectedNick);
     }
+    // The same read-on-paint for conclaves, keyed by the open meeting.
+    if (this.rail === "conclaves" && this.conclaveId) {
+      markConclaveRead(this.conclaveId);
+    }
     const shell = document.createElement("div");
     shell.className = "shell";
     shell.appendChild(this.renderRail());
@@ -1891,6 +2059,10 @@ export class App {
       shell.appendChild(this.renderSettings());
     }
     this.root.appendChild(shell);
+    // The ring prompt mounts above the shell like the dialogs: it is the one
+    // surface that answers a knock, so it shows on every rail.
+    const ringBanner = this.renderVoiceRingBanner();
+    if (ringBanner) this.root.appendChild(ringBanner);
     this.startTorPoll();
     setTorrentsPaneOpen(this.rail === "torrents");
     setWalletPaneOpen(this.rail === "vault" && this.walletOpen);
@@ -1937,6 +2109,17 @@ export class App {
     ) {
       liveZines.scrollTop = Math.min(this.pendingZinesScroll, liveZines.scrollHeight);
       this.pendingZinesScroll = null;
+    }
+    // Put the settings pane back where it was, but only when this rebuild is
+    // the same section as the last one. A section switch leaves the fresh pane
+    // at the top, which is where a newly chosen section should open.
+    const liveSettings = this.root.querySelector<HTMLElement>(".settings-layout");
+    if (
+      liveSettings &&
+      settingsScroll &&
+      liveSettings.dataset.settingsSection === settingsScroll.section
+    ) {
+      liveSettings.scrollTop = Math.min(settingsScroll.top, liveSettings.scrollHeight);
     }
     // Dialogs mount last, above the shell. A key the previous pass already had
     // up is a rebuild under a background refresh: repaint it in place, carrying
@@ -2536,7 +2719,9 @@ export class App {
     rail.appendChild(
       this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())),
     );
-    rail.appendChild(this.railBtn("conclaves", "Conclaves", "conclaves"));
+    rail.appendChild(
+      this.railBtn("conclaves", "Conclaves", "conclaves", conclaveUnreadTotal()),
+    );
     rail.appendChild(this.railBtn("zines", "Zines", "zines"));
     rail.appendChild(this.railBtn("reads", "Reads", "reads"));
     rail.appendChild(
@@ -4055,7 +4240,10 @@ export class App {
     return col;
   }
 
-  /** One conclave card: name, member count, and a preview of the last message. */
+  /** One conclave card: name, member count, and a preview of the last message.
+   * The right edge answers the two "should I look?" questions at a glance: a
+   * live-voice chip when the room is talking, and the unread number for
+   * messages that arrived while the conclave was not on screen. */
   private conclaveCard(m: Conclave): HTMLElement {
     const card = document.createElement("button");
     card.type = "button";
@@ -4082,6 +4270,24 @@ export class App {
       : `${joined} ${joined === 1 ? "trustee" : "trustees"}`;
     meta.append(name, sub);
     top.append(badge, meta);
+    // Voice live in this conclave: the pill is a light, not an invitation —
+    // joining still goes through the voice toggle or an answered ring.
+    if (!m.ended && this.voiceRooms.some((r) => r.conclave_id === m.id && r.joined.length > 0)) {
+      const live = document.createElement("span");
+      live.className = "conclave-live-chip";
+      live.appendChild(icon("mic"));
+      live.appendChild(document.createTextNode("Voice"));
+      live.title = "A voice session is live in this conclave";
+      top.appendChild(live);
+    }
+    const unread = conclaveUnreadCount(m.id);
+    if (unread > 0) {
+      const pill = document.createElement("span");
+      pill.className = "conclave-unread";
+      pill.textContent = unread > 9 ? "9+" : String(unread);
+      pill.title = `${unread} unread ${unread === 1 ? "message" : "messages"}`;
+      top.appendChild(pill);
+    }
     card.appendChild(top);
 
     const preview = document.createElement("div");
@@ -4447,7 +4653,11 @@ export class App {
         scroll.appendChild(sep);
       }
       const group = document.createElement("div");
-      group.className = `bubble-group ${msg.outgoing ? "out" : "in"}`;
+      // `conclave-group` is what makes an incoming message a row — the
+      // trustee's avatar beside the name-and-bubble column. Without it the
+      // base `bubble-group` column stacks avatar over bubble, which is the
+      // skewed look the class was written to prevent.
+      group.className = `bubble-group${msg.outgoing ? " out" : " in conclave-group"}`;
       // Incoming conclave messages carry the sender's identity: an initials
       // avatar and a name in the trustee's own colour, both derived from one
       // stable hue so a trustee reads as one colour everywhere.
@@ -5010,10 +5220,17 @@ export class App {
       toggle.disabled = true;
       micBtn.disabled = true;
       leave.disabled = true;
-      void p.then(() => {
-        this.announce(done);
-        refresh();
-      }).catch((e: unknown) => {
+      void p
+        .then(() => {
+          this.announce(done);
+          refresh();
+          // The room list feeds the cards' live chip and the ring prompt:
+          // a join or leave must be visible there without waiting a poll.
+          void this.refreshVoiceRooms().then((changed) => {
+            if (changed) this.scheduleBackgroundRender();
+          });
+        })
+        .catch((e: unknown) => {
         showToast(e instanceof AppError ? e.message : "Voice action failed.", {
           kind: "error",
         });
@@ -14591,6 +14808,7 @@ export class App {
    */
   private renderVoiceSettings(): HTMLElement {
     const wrap = document.createElement("div");
+    wrap.className = "voice-settings";
     wrap.innerHTML = `<h2 class="text-22">Voice</h2>`;
     const note = document.createElement("p");
     note.className = "muted text-13";
@@ -14602,6 +14820,14 @@ export class App {
     // section (and the meter poll) on every fetch.
     const status = document.createElement("div");
     wrap.appendChild(status);
+    // The two pickers are built once and held, then re-synced by `fill`.
+    // They cannot be appended per fill: `fill` runs again after every choice,
+    // so doing that stacked a fresh pair of dropdowns on each selection — and
+    // it would also drop focus off the picker the user just used.
+    const devices = document.createElement("div");
+    devices.className = "voice-devices";
+    wrap.appendChild(devices);
+    const pickers = new Map<"input" | "output", HTMLSelectElement>();
 
     const meterLabel = document.createElement("p");
     meterLabel.className = "muted";
@@ -14654,6 +14880,7 @@ export class App {
         testBtn.hidden = true;
         meter.hidden = true;
         meterLabel.hidden = true;
+        devices.hidden = true;
         return;
       }
       status.replaceChildren();
@@ -14705,41 +14932,57 @@ export class App {
         selected: string | null,
         side: "input" | "output",
       ): void => {
-        const l = document.createElement("p");
-        l.className = "muted";
-        l.style.marginTop = "var(--space-4)";
-        l.textContent = label;
-        const sel = document.createElement("select");
-        sel.className = "input-field";
-        const def = document.createElement("option");
-        def.value = "";
-        def.textContent = "System default";
-        sel.appendChild(def);
-        for (const n of names) {
-          const o = document.createElement("option");
-          o.value = n;
-          o.textContent = n;
-          sel.appendChild(o);
+        const existing = pickers.get(side);
+        const sel = existing ?? document.createElement("select");
+        if (!existing) {
+          sel.className = "input-field";
+          const l = document.createElement("p");
+          l.className = "muted";
+          l.style.marginTop = "var(--space-4)";
+          l.textContent = label;
+          sel.onchange = () => {
+            const choice = sel.value || null;
+            void api
+              .voiceSelectDevices({ [side]: choice })
+              .then((d2) => {
+                showToast(choice ? `Using ${choice}.` : `${label}: system default.`, {
+                  kind: "success",
+                });
+                fill(d2);
+              })
+              .catch((e: unknown) => {
+                showToast(e instanceof AppError ? e.message : "The choice did not save.", {
+                  kind: "error",
+                });
+              });
+          };
+          devices.append(l, sel);
+          pickers.set(side, sel);
         }
-        sel.value = selected ?? "";
-        if (sel.value !== (selected ?? "")) sel.value = "";
-        sel.onchange = () => {
-          const choice = sel.value || null;
-          void api
-            .voiceSelectDevices({ [side]: choice })
-            .then((d2) => {
-              showToast(choice ? `Using ${choice}.` : `${label}: system default.`, {
-                kind: "success",
-              });
-              fill(d2);
-            })
-            .catch((e: unknown) => {
-              showToast(e instanceof AppError ? e.message : "The choice did not save.", {
-                kind: "error",
-              });
-            });
-        };
-        wrap.appendChild(sel);
+        // The daemon re-reads the system's devices on every call, so the list
+        // can change between two fills: rebuild the options only when it did,
+        // which leaves the picker (and its focus) alone on a plain re-fill.
+        const same =
+          sel.options.length === names.length + 1 &&
+          names.every((n, i) => sel.options[i + 1].value === n);
+        if (!same) {
+          const def = document.createElement("option");
+          def.value = "";
+          def.textContent = "System default";
+          sel.replaceChildren(
+            def,
+            ...names.map((n) => {
+              const o = document.createElement("option");
+              o.value = n;
+              o.textContent = n;
+              return o;
+            }),
+          );
+        }
+        // A name the system no longer offers falls back to the default rather
+        // than leaving the picker blank.
+        const want = selected ?? "";
+        sel.value = names.includes(want) ? want : "";
       };
       pick("Microphone", d.inputs, d.selected_input, "input");
       pick("Speaker", d.outputs, d.selected_output, "output");
@@ -14810,6 +15053,10 @@ export class App {
     }
     const pane = document.createElement("div");
     pane.className = "main-pane settings-layout";
+    // Which section this pane is showing. `render` reads it back before the
+    // next wipe: a repaint of the same section restores the reader's scroll
+    // position, while switching sections leaves the new pane at the top.
+    pane.dataset.settingsSection = this.settingsSection;
     const nav = document.createElement("nav");
     nav.className = "settings-nav";
     const sections: { id: SettingsSection; label: string }[] = [

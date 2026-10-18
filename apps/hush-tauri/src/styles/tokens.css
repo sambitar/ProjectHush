@@ -1,4 +1,9 @@
 :root {
+  /* Native controls — a <select>'s option list, scrollbars, the date picker —
+     are drawn by the platform, not by these rules. Without a colour scheme
+     they stay light while the app is dark, which reads as a white menu with
+     light text on it. */
+  color-scheme: light;
   --bg: #f7f7fa;
   --surface: #ffffff;
   --surface-2: #efeff5;
@@ -37,6 +42,7 @@
 }
 
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #121218;
   --surface: #1b1b24;
   --surface-2: #262632;

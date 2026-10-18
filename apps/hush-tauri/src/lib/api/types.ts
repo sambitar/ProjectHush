@@ -520,6 +520,12 @@ export interface VoiceViewDto {
   /** Joined trustees in join order; the opener is first. */
   joined: VoiceMemberDto[];
   i_am_in: boolean;
+  /**
+   * Until when an inbound open should ring this vault, absent (or past) when
+   * there is no live ring. A daemon that predates rings omits the field, so
+   * absence is the same as "no ring".
+   */
+  ringing_until_ms?: number | null;
 }
 
 /** `GET /api/voice/state` — every live room, keyed by conclave id. */

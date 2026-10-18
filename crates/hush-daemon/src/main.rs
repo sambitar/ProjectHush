@@ -112,6 +112,12 @@ struct App {
     /// created on demand when a room opens or an offer arrives. Same contract
     /// as `paper_planes`: runtime-only, a peer-connection map, safe to lose.
     voice_planes: Mutex<HashMap<String, Arc<voice_data::VoicePlane>>>,
+    /// Conclave voice's ring stamps, keyed by session id: the deadline until
+    /// which an inbound open should ring this vault, so the UI can offer an
+    /// answer instead of a silent pill. Runtime-only and self-expiring — the
+    /// stamp is a timestamp, so it dies without a timer; a lock or restart
+    /// clears it beside the planes, and the room it names never outlives it.
+    voice_rings: Mutex<HashMap<String, u64>>,
     /// A device probe for Settings — a plane in Device mode with no peers,
     /// opened so the meter, the speaker test, and the health panel have
     /// something real to read between calls. Runtime-only; a watchdog drops
@@ -594,6 +600,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paper_planes: Mutex::new(HashMap::new()),
         voices: Mutex::new(VoiceManager::new()),
         voice_planes: Mutex::new(HashMap::new()),
+        voice_rings: Mutex::new(HashMap::new()),
         device_probe: Mutex::new(None),
     };
     let state = Arc::new(app);
@@ -6146,6 +6153,12 @@ fn voice_media_mode() -> voice_data::MediaMode {
     }
 }
 
+/// How long an inbound open keeps ringing this vault. Long enough to be heard
+/// across the ~4 s recv poll, short enough that a missed ring degrades to the
+/// pill's "Join voice" affordance — the room itself is live-only either way,
+/// so there is no missed-call record to tidy up.
+const VOICE_RING_TTL_MS: u64 = 30_000;
+
 /// The plane for `session_id`, created on demand (a room's opener never
 /// dials, so its plane stays idle until the first inbound offer). The device
 /// preference comes from the config file, so a Settings choice applies to
@@ -6184,11 +6197,14 @@ async fn voice_plane_drop(state: &Arc<App>, session_id: &str) {
 
 /// Close every voice plane. Locking the vault calls this beside
 /// `paper_planes_shutdown`: a locked vault holds no sessions and no sockets.
+/// The ring stamps go with them — a locked vault cannot answer, so there is
+/// nothing to keep ringing.
 async fn voice_planes_shutdown(state: &Arc<App>) {
     let planes: Vec<Arc<voice_data::VoicePlane>> = {
         let mut planes = state.voice_planes.lock().await;
         planes.drain().map(|(_, plane)| plane).collect()
     };
+    state.voice_rings.lock().await.clear();
     for plane in planes {
         plane.shutdown();
     }
@@ -6210,9 +6226,14 @@ struct VoiceView {
     joined: Vec<VoiceMemberView>,
     /// Whether this vault's own account is in the room right now.
     i_am_in: bool,
+    /// The deadline until which an inbound open should ring this vault,
+    /// absent when there is no live ring. It rides every view so both the
+    /// single-room and the state poll can render the same prompt.
+    ringing_until_ms: Option<u64>,
 }
 
-fn voice_view_of(session: &VoiceSession, me: &str) -> VoiceView {
+fn voice_view_of(session: &VoiceSession, me: &str, rings: &HashMap<String, u64>) -> VoiceView {
+    let now = paper_now_ms();
     VoiceView {
         session_id: session.session.session_id.clone(),
         conclave_id: session.session.conclave_id.clone(),
@@ -6227,6 +6248,10 @@ fn voice_view_of(session: &VoiceSession, me: &str) -> VoiceView {
             })
             .collect(),
         i_am_in: session.joined.iter().any(|m| m.account == me),
+        ringing_until_ms: rings
+            .get(&session.session.session_id)
+            .copied()
+            .filter(|until| *until > now),
     }
 }
 
@@ -6259,6 +6284,12 @@ async fn voice_conclaves(state: &Arc<App>) -> Vec<ConclaveRecord> {
         WorkResult::Conclaves(list) => list,
         _ => Vec::new(),
     }
+}
+
+/// A copy of the current ring stamps, so view construction never serializes
+/// under a lock it does not need.
+async fn voice_rings_of(state: &Arc<App>) -> HashMap<String, u64> {
+    state.voice_rings.lock().await.clone()
 }
 
 /// The descriptor-shaped view of a record, for the manager's authority checks.
@@ -6304,7 +6335,7 @@ async fn voice_open(
         let live = mgr
             .session(&conclave_id)
             .expect("the room was just opened");
-        let view = voice_view_of(live, &me);
+        let view = voice_view_of(live, &me, &voice_rings_of(&state).await);
         // The opener's media plane exists from the open: it has nothing to
         // dial yet, but the first joiner's offer must find it ready to
         // answer.
@@ -6363,7 +6394,12 @@ async fn voice_join(
         let live = mgr
             .session(&conclave_id)
             .expect("the join just landed");
-        (voice_view_of(live, &me), session_id, existing)
+        // Answering the knock ends it: the stamp is only ever meaningful
+        // while this vault has not joined, and a view that still rings an
+        // answered room would be a lie the UI can see.
+        state.voice_rings.lock().await.remove(&session_id);
+        let rings = voice_rings_of(&state).await;
+        (voice_view_of(live, &me, &rings), session_id, existing)
     };
     // Dial in the background. `plane.offer` gathers ICE inline — up to the
     // handshake deadline per dialed peer — and awaiting that before the join's
@@ -6441,9 +6477,10 @@ async fn voice_leave(
         eprintln!("hush-daemon: voice leave fan-out failed: {e}");
     }
     let mgr = state.voices.lock().await;
+    let rings = voice_rings_of(&state).await;
     Ok(Json(match mgr.session(&conclave_id) {
         // The room survived this leave: show it without this vault's member.
-        Some(live) => voice_view_of(live, &me),
+        Some(live) => voice_view_of(live, &me, &rings),
         // The leave ended the room (opener or below two): the honest answer
         // is the room emptied out, not an error.
         None => VoiceView {
@@ -6453,6 +6490,7 @@ async fn voice_leave(
             started_ms: before.session.started_ms,
             joined: Vec::new(),
             i_am_in: false,
+            ringing_until_ms: None,
         },
     }))
 }
@@ -6493,9 +6531,10 @@ async fn voice_mute(
         eprintln!("hush-daemon: voice mute fan-out failed: {e}");
     }
     let mgr = state.voices.lock().await;
+    let rings = voice_rings_of(&state).await;
     let view = mgr
         .session(&conclave_id)
-        .map(|s| voice_view_of(s, &me))
+        .map(|s| voice_view_of(s, &me, &rings))
         .ok_or_else(|| voice_err(Error::VoiceNoSession.to_string()))?;
     Ok(Json(view))
 }
@@ -6507,8 +6546,9 @@ async fn voice_get(
     touch(&state).await;
     let me = paper_account_id(&state).await?;
     let mgr = state.voices.lock().await;
+    let rings = voice_rings_of(&state).await;
     mgr.session(&conclave_id)
-        .map(|s| voice_view_of(s, &me))
+        .map(|s| voice_view_of(s, &me, &rings))
         .map(Json)
         .ok_or_else(|| {
             (
@@ -6532,8 +6572,13 @@ async fn voice_state(
     touch(&state).await;
     let me = paper_account_id(&state).await?;
     let mgr = state.voices.lock().await;
+    let rings = voice_rings_of(&state).await;
     Ok(Json(VoiceStateResponse {
-        rooms: mgr.rooms().iter().map(|s| voice_view_of(s, &me)).collect(),
+        rooms: mgr
+            .rooms()
+            .iter()
+            .map(|s| voice_view_of(s, &me, &rings))
+            .collect(),
     }))
 }
 
@@ -6863,6 +6908,15 @@ async fn voice_apply_inbound(
                 now,
             )
             .ok()?;
+            // Ring the vault: a peer's open is a knock the UI answers. The
+            // stamp is what every voice view reports as `ringing_until_ms`;
+            // it expires on its own, and answering or dismissing is the UI's
+            // business — the room's rules are untouched by it.
+            state
+                .voice_rings
+                .lock()
+                .await
+                .insert(session.session_id.clone(), now + VOICE_RING_TTL_MS);
             // Have the answering side ready: the joiner's offer can arrive
             // in the same batch as the open.
             voice_plane_for(state, &session.session_id).await;
@@ -6922,9 +6976,10 @@ async fn voice_apply_inbound(
                 Ok(VoiceEffect::Ended)
             );
             // The leaver's own link goes either way; a room that ended takes
-            // the whole plane with it.
+            // the whole plane — and any un-answered ring — with it.
             if ended {
                 voice_plane_drop(state, session_id).await;
+                state.voice_rings.lock().await.remove(session_id);
             } else if let Some(plane) = voice_plane_get(state, session_id).await {
                 plane.forget(who);
             }
@@ -7361,6 +7416,7 @@ mod drops_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
             voice_planes: Mutex::new(HashMap::new()),
+            voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
         })
     }
@@ -7642,6 +7698,7 @@ mod wallet_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
             voice_planes: Mutex::new(HashMap::new()),
+            voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
         });
         app.wallet
@@ -8165,6 +8222,7 @@ mod notes_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
             voice_planes: Mutex::new(HashMap::new()),
+            voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
         })
     }
@@ -9369,6 +9427,44 @@ mod voice_api_tests {
         let (status, state) = request(&router, "GET", "/api/voice/state", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(state["rooms"].as_array().unwrap().len(), 0);
+    }
+
+    /// The ring is a view concern, not a room rule: `voice_view_of` reports a
+    /// stamp that is still ahead of the clock and omits one that has passed.
+    /// The stamp itself is applied in `voice_apply_inbound` (a peer's open),
+    /// which the two-daemon dogfood exercises end to end.
+    #[test]
+    fn voice_view_reports_a_live_ring_and_drops_an_expired_one() {
+        let session = hush_core::VoiceSession {
+            session: hush_core::VoiceDescriptor {
+                session_id: "v-ring".into(),
+                conclave_id: "c-1".into(),
+                opener: "aa".into(),
+                started_ms: 1_000,
+            },
+            joined: vec![hush_core::VoiceMember {
+                account: "aa".into(),
+                muted: false,
+            }],
+        };
+        let now = paper_now_ms();
+        let mut rings = HashMap::new();
+        rings.insert("v-ring".to_string(), now + 10_000);
+
+        let view = voice_view_of(&session, "bb", &rings);
+        assert_eq!(view.ringing_until_ms, Some(now + 10_000));
+        assert!(!view.i_am_in, "the rung vault has not answered yet");
+
+        // A stamp behind the clock is not a ring: the prompt must not survive
+        // its own deadline by any route that renders the view.
+        rings.insert("v-ring".to_string(), now - 1);
+        let view = voice_view_of(&session, "bb", &rings);
+        assert_eq!(view.ringing_until_ms, None);
+
+        // The opener's own view is in the room — the UI's answer state, which
+        // stops the ring regardless of what a stale stamp says.
+        let view = voice_view_of(&session, "aa", &rings);
+        assert!(view.i_am_in);
     }
 }
 

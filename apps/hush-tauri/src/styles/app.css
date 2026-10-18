@@ -78,6 +78,8 @@
   width: 40px;
   height: 40px;
   margin: 0 auto;
+  /* Anchor for the TOR transport badge (::after, below). */
+  position: relative;
   border: none;
   border-radius: 50%;
   background: transparent;
@@ -112,6 +114,32 @@
  * full stop. */
 .relay-shield.relay-offline {
   color: var(--danger);
+}
+
+/* The transport badge: "TOR" at the mark's lower right while the relay is
+ * reachable *through Tor* (`.relay-tor`, set by `updateTorPillInto`). Clearnet
+ * and the waiting states stay unbadged, so the badge itself says "this
+ * traffic is going through Tor" — the visual half of what the shield's
+ * accessible name and tooltip already say in words. Colors are the success
+ * chip tokens so the badge and the green mark read as one status. */
+.relay-shield::after {
+  content: "TOR";
+  position: absolute;
+  right: -7px;
+  bottom: -2px;
+  display: none;
+  padding: 2px 5px;
+  border-radius: var(--radius-pill);
+  background: var(--success-soft);
+  color: var(--success-text);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1;
+}
+
+.relay-shield.relay-tor::after {
+  display: block;
 }
 
 @keyframes relay-pulse {
@@ -429,6 +457,10 @@
   max-width: min(72%, 480px);
   padding: var(--space-3) var(--space-4);
   font-size: 15px;
+  /* A long URL, a hash, or a base64 blob must wrap inside the bubble, not
+   * stretch the whole board sideways — the classic "skewed" message. */
+  overflow-wrap: anywhere;
+  min-width: 0;
   position: relative;
 }
 
@@ -796,11 +828,19 @@
 
 .settings-layout {
   display: flex;
+  /* The pane is also `.main-pane`, which sets `flex-direction: column` for the
+     long panes that stack. Settings is not one of them: without this the nav
+     became a 200px-wide strip across the top and the section content landed
+     underneath it, beside a `border-right` with nothing to its right. */
+  flex-direction: row;
   min-height: 100%;
 }
 
 .settings-nav {
   width: 200px;
+  /* Fixed, like the rail: the body is `flex: 1`, so a wide child must not be
+     able to squeeze the section list narrower than its labels. */
+  flex: none;
   border-right: 1px solid var(--border);
   padding: var(--space-4);
 }
@@ -886,6 +926,13 @@
   cursor: default;
 }
 
+/* Settings → Voice: one readable column. The device pickers are native
+   selects and `.input-field` is `width: 100%`, so uncapped they spanned the
+   whole settings pane instead of reading as a form. */
+.voice-settings {
+  max-width: 480px;
+}
+
 /* Settings → Voice: the input meter. A track the level bar fills; "dead"
    (no input device open) greys it so a still bar reads as honest. */
 .voice-meter {
@@ -936,6 +983,48 @@
   color: var(--text-dim);
   border-radius: var(--radius-pill);
   padding: var(--space-2);
+}
+
+/* The incoming-voice prompt. A knock gets attention wherever the user is, so
+   it mounts above the shell like a dialog: top center, no backdrop (nothing
+   was captured by looking), arriving with the spring the modals use. */
+.voice-ring {
+  position: fixed;
+  top: var(--space-4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: min(480px, calc(100vw - 2 * var(--space-4)));
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2), 0 0 0 3px var(--accent-soft);
+  animation: voice-ring-in var(--dur-base) var(--ease-spring);
+}
+
+.voice-ring-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.voice-ring .btn-primary,
+.voice-ring .btn-secondary {
+  flex: none;
+}
+
+@keyframes voice-ring-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -10px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
 }
 
 /* Mail rail */
@@ -2077,6 +2166,67 @@
   min-width: 0;
 }
 
+/* The live-voice chip: the room is talking in this conclave. A light, not an
+   invitation — joining still goes through the toggle or an answered ring. */
+.conclave-live-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  flex: none;
+  padding: 3px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--success-soft);
+  color: var(--success-text);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.conclave-live-chip svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* The unread number on a conclave card. Deliberately larger than the rail
+   count it sits beside in the app's grammar: the card has room, the number
+   is the one thing a glance across the list must land on, and an unread
+   count that needs squinting at is an unread count that is ignored. */
+.conclave-unread {
+  flex: none;
+  margin-left: auto;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 20px;
+  text-align: center;
+  box-shadow: 0 0 0 2px var(--surface);
+  animation: conclave-unread-in var(--dur-base) var(--ease-spring);
+}
+
+/* The chip and the number never share a card edge blindly: with both, the
+   chip keeps its own margin and the number sits beside it. */
+.conclave-unread + .conclave-unread,
+.conclave-live-chip + .conclave-unread {
+  margin-left: 0;
+}
+
+@keyframes conclave-unread-in {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 .conclave-card-icon {
   display: inline-flex;
   align-items: center;
@@ -2405,6 +2555,8 @@
  * The hue is per trustee (set inline); the lightness is per theme. */
 .conclave-sender {
   margin: 0 var(--space-2) 2px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
   color: hsl(var(--sender-h, 0), 55%, 40%);
 }
 

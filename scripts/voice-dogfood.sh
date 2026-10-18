@@ -5,7 +5,8 @@
 # This is the Phase 1+2 acceptance check from docs/tasks/conclave-voice.md,
 # scripted so it can be re-run after any change to the voice path:
 #
-#   1. Alice opens the room; the open fans out to Bob over the relay
+#   1. Alice opens the room; the open fans out to Bob over the relay and
+#      rings him (ringing_until_ms is set until he answers)
 #   2. Bob joins; the offer is the join announcement and the answer closes it
 #   3. Both ends agree on the roster: two live speakers. The mute flag is
 #      advisory and only ever moves by an explicit VoiceMute
@@ -193,12 +194,21 @@ done
   || fail "bob should read as outside the room he has not joined: $RESP"
 [[ "$(roster "$T/out.json")" == "$(jget "$T/out.json" opener):false" ]] \
   || fail "bob's copy of the room does not show alice alone and live: $RESP"
-pass "the open reached bob over the relay; he reads the room as joinable"
+# The open rings the vault it reached: an unanswered knock must read as one,
+# and answering (the join below) must end it.
+[[ -n "$(jget "$T/out.json" ringing_until_ms)" ]] \
+  || fail "an open bob did not make must ring him: $RESP"
+pass "the open reached bob over the relay; it rings, and he reads the room as joinable"
 
 # --- Bob joins; the offer is the announcement, the answer closes it ----------
 api_at "$SOCK_B" POST "/api/voice/$CONCLAVE/join" >/dev/null
 [[ "$CODE" == "200" ]] || fail "bob's join returned $CODE: $RESP"
 [[ "$(jget "$T/out.json" i_am_in)" == "true" ]] || fail "bob is not in the room after joining: $RESP"
+# A knock that was answered is no longer a knock: the answered vault's view
+# must not ring its own room.
+[[ -z "$(jget "$T/out.json" ringing_until_ms)" ]] \
+  || fail "bob's own join must end the ring: $RESP"
+pass "bob's join answered the ring; he is in the room"
 
 BOTH=""
 for _ in $(seq 1 50); do

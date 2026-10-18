@@ -103,11 +103,25 @@ let pendingInvites: PendingInvite[] = [];
 let pendingIntroRequests: PendingIntroRequest[] = [];
 let pendingIntros: PendingIntro[] = [];
 
+/**
+ * Unread message counts per conclave id, keyed the way the list renders them.
+ *
+ * Counted here rather than derived from the log: the store only ever mirrors
+ * the daemon's full message array, so "which of those have I seen" has to be
+ * remembered across polls. A conclave's own selection clears its count (the
+ * pane is the read), and the first load clears everything — a freshly opened
+ * app has no unread history, only new arrivals.
+ */
+const unread = new Map<string, number>();
+let everLoaded = false;
+
 export function clearConclaveStore(): void {
   conclaves = [];
   pendingInvites = [];
   pendingIntroRequests = [];
   pendingIntros = [];
+  unread.clear();
+  everLoaded = false;
 }
 
 function toMessage(m: ConclaveMessageDto): ConclaveMessage {
@@ -171,12 +185,53 @@ function signature(list: Conclave[]): string {
     .join("|");
 }
 
-/** Rebuild the conclave list from the daemon. Returns whether anything changed. */
-export function loadConclaves(dtos: ConclaveDto[]): boolean {
+/**
+ * Rebuild the conclave list from the daemon. Returns whether anything changed.
+ *
+ * `activeId` is the conclave the user is reading (if any): growth there is
+ * the user's own conversation, so it never counts as unread. Growth anywhere
+ * else accumulates until that conclave is selected — the notification number
+ * the list renders.
+ */
+export function loadConclaves(dtos: ConclaveDto[], activeId?: string | null): boolean {
   const next = dtos.map(toConclave);
   const before = signature(conclaves);
+  if (everLoaded) {
+    const seen = new Map(conclaves.map((m) => [m.id, m.messages.length]));
+    for (const m of next) {
+      const was = seen.get(m.id);
+      const growth = was === undefined ? m.messages.length : m.messages.length - was;
+      if (m.id === activeId) {
+        unread.delete(m.id);
+      } else if (growth > 0) {
+        unread.set(m.id, (unread.get(m.id) ?? 0) + growth);
+      }
+      seen.delete(m.id);
+    }
+    // A conclave that vanished (ended and pruned by the daemon) has nothing
+    // left to be unread.
+    for (const id of seen.keys()) unread.delete(id);
+  }
+  everLoaded = true;
   conclaves = next;
   return before !== signature(next);
+}
+
+/** The pane is the read: selecting a conclave clears its number. */
+export function markConclaveRead(id: string): void {
+  unread.delete(id);
+}
+
+/** Unread messages for one conclave, for its card's badge. */
+export function conclaveUnreadCount(id: string): number {
+  return unread.get(id) ?? 0;
+}
+
+/** Unread messages across every conclave, for the rail badge. */
+export function conclaveUnreadTotal(): number {
+  let total = 0;
+  for (const n of unread.values()) total += n;
+  return total;
 }
 
 /** Replace the pending-invite list. Returns whether anything changed. */

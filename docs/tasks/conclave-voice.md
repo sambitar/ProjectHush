@@ -92,7 +92,7 @@ Step 1 (prove it, or pivot and log it in [`DEEPSEEKPROBLEMS.MD`](../../DEEPSEEKP
 
 | # | Decision | Resolution |
 |---|---|---|
-| 1 | **Primitive / consent** | A **voice room** per conclave, **explicitly joined** per trustee — not a ring. Join is the consent act; a mic is louder than a message, so there is no passive joining |
+| 1 | **Primitive / consent** | A **voice room** per conclave, **explicitly joined** per trustee. Join is the consent act; a mic is louder than a message, so there is no passive joining. **Amended 2026-10-17 (user-approved): the open now also *rings* the other trustees** — an inbound open stamps a 30 s `ringing_until_ms` so the UI can prompt Answer/Decline — without changing the consent shape: answering **is** the join, declining is local silence, and a mic still opens only on an explicit act. See the amendment note below the table |
 | 2 | **Topology** | **Full mesh** of peer connections among joined trustees; no hub, no succession; hub-star and SFU deferred behind the cap |
 | 3 | **Cap** | **8 joined speakers** as the starting ceiling; joining at the cap **refuses with a reason** (the `notes_store` pattern); the dogfood measures and may move it |
 | 4 | **Media engine** | **Resolved 2026-10-13 by spike** (`crates/voice-spike`): **`webrtc-rs` reuse wins** — the daemon's own `webrtc` 0.21 stack carried 3 s of Opus RTP over loopback losslessly (150/150 packets, byte-exact against a codec-only reference, encode 157 µs / decode 28 µs per 20 ms frame). Amends member-calls §6 in place; the bespoke glue (capture → resample → Opus → RTP) is measured, not estimated. A pivot is no longer pending |
@@ -117,6 +117,19 @@ Reading Room both treat conclave membership as standing consent for the surface,
 explicit act. A ring would bolt Task 17's dial-tone model onto a space that already answers "who
 is allowed" with the trustee list, and it would fight the ~4 s relay poll at exactly the moment
 latency hurts most. The explicit join is the consent.
+
+**Amendment — the room also rings (2026-10-17, user-approved).** Dogfooding showed what the
+original #1 gave up: nothing tells a trustee a room is asking for them until they happen to look
+at the pill. The amendment keeps the consent model and adds the missing *knock*: applying an
+inbound `VoiceOpen` stamps `ringing_until_ms = now + 30 s` on the receiving vault (memory-only,
+keyed by session id, in `hush-daemon` — no new payload, no relay change, `VoiceOpen` already
+fans out); every voice view reports the stamp while it is ahead of the clock; the UI renders an
+Answer/Decline prompt that repeats its chime at the poll cadence and stops on answer, decline,
+expiry, or someone else joining. Answering is the existing `/join`; declining is local silence
+(the opener learns who joined, never who declined — the `ConclaveDecline` rule). A live-only
+room means a missed ring degrades to the pill's "Join voice · N" affordance with nothing to
+tidy up; a locked vault clears the stamps beside the planes and cannot answer anyway. The
+two-daemon dogfood asserts both edges (the open rings; the join un-rings).
 
 **Mesh (#2).** Small N, trusted N, trivial uplink, no hub to succeed or fail. The hub-star exists
 in the Paper because a document is one flowing object with one rendezvous; audio has no such

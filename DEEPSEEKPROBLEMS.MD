@@ -7,6 +7,177 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-17 — Conclave attention slice (ring, unread badges, chat polish)
+
+### Conclave chat misread as IRC-backed [FIXED]
+
+- Attempted: locate the chat surface that needed unread badges and polish; described the
+  conclave chat as "IRC-backed" because the repo also has a full IRC feature
+  (`features/irc/`, `irc://` events, its own socket client).
+- Symptom: the user corrected it directly ("the chat in conclave is not irc backed!"). The
+  app has three chat-ish surfaces — Chats (`chatStore.ts`, 1:1), Conclaves
+  (`conclaveStore.ts`, group fan-out over Signal sessions, vault-backed log), and the IRC
+  pane — and only the third is IRC. Wiring conclave unread tracking into `ircStore` would
+  have been dead work on the wrong surface.
+- Resolution: FIXED by re-reading ownership before editing: conclave state lives in
+  `conclaveStore.ts` fed by `/api/conclaves`; the IRC pane is a separate rail.
+- Lesson: "chat" names three different things in this repo. Identify the owning store
+  (`lib/*Store.ts`) before wiring any surface work.
+
+### `.conclave-group` was never applied — the conclave row layout was dead CSS [FIXED]
+
+- Attempted: explain the "sometimes it skews" complaint about the conclave chat board.
+- Symptom: the CSS defined `.conclave-group` (`flex-direction: row`, avatar beside the
+  name-and-bubble column) and styled `.conclave-avatar`/`.conclave-body` to match, but
+  `app.ts`'s message loop only ever wrote `bubble-group in` — no `conclave-group`. The row
+  rule never applied, so every incoming conclave message stacked avatar, sender name, and
+  bubble vertically: the skewed, unprofessional look being reported. Present since the
+  conclave chat landed; no test covered class wiring.
+- Resolution: FIXED — incoming groups now get `bubble-group in conclave-group`; the
+  avatar-sits-beside-bubble row the styles were written for finally renders. Also fixed the
+  proven overflow half of the skew: `.bubble` had no `overflow-wrap`, so a long URL or hash
+  stretched the whole board.
+- Lesson: a CSS rule set with zero TS references is a bug, not an affordance — grep both
+  directions when a layout "never looks like the CSS".
+
+## 2026-10-17 — Settings pane scroll position across re-render
+
+### Edit inserted a duplicated comment block into render() [FIXED]
+
+- Attempted: add a scroll carry-across for the settings pane in `render()`, anchored on
+  the `const prevConclaveMsgs = ...` line.
+- Symptom: the `old_string` did not include the three-line "Same carry for the conclave
+  chat" comment sitting above that line, so `new_string` re-added the comment while the
+  original stayed put — a duplicated comment block wedged between the chat and conclave
+  captures.
+- Resolution: FIXED with a second edit that collapsed the two copies into one.
+- Lesson: when anchoring an insertion on a line that carries a leading comment, include
+  the comment in `old_string`.
+- Process/tooling, not a repo problem.
+
+### Scroll fix not observed in the running app [FIXED]
+
+- Attempted: confirm that Settings → About → "Check for updates" no longer throws the
+  pane back to the top.
+- Symptom: verification first stopped at `npx tsc --noEmit` (clean) and `npm run build`
+  (clean). Reaching the About section in a real run needs an unlocked vault, and the dev
+  daemon on `127.0.0.1:9876` reports `"locked":true`, so the scroll behavior was not
+  observed end-to-end in that pass. Diagnosis was from the code: `render()` does
+  `this.root.innerHTML = ""` and rebuilds, `.settings-layout` is the scroller (`.shell`
+  is `overflow: hidden`), so the fresh pane opens at `scrollTop = 0` — and
+  `runManualUpdateCheck` renders twice.
+- Resolution: FIXED and now observed. A throwaway vault (`hush-cli init` + a daemon on
+  `127.0.0.1:9899`) drove the Vite dev server in a browser at
+  `localhost:5173/?api=http://127.0.0.1:9899`. Viewport shrunk to 1000x480 so the About
+  pane overflowed (scrollHeight 1021, clientHeight 480), scrolled to the bottom
+  (`scrollTop = 541`), then clicked "Check for updates". After both renders and the
+  outcome note appearing, `scrollTop` was still 541.
+- Control for the same run: with the pane's `data-settings-section` stamp deleted by
+  hand (which disables only the restore branch), the identical click left
+  `scrollTop = 0` — the reported bug, reproduced live. The fix is load-bearing, not
+  incidental.
+- Lesson: an unlocked vault is not actually required to reach Settings — `hush-cli init`
+  a temp vault, run the daemon with `--addr`, and point one browser tab at it with
+  `?api=`. That harness is worth reusing for any Settings/rail UI work.
+
+## 2026-10-17 — Settings pane: layout direction, Voice pickers, dark mode
+
+### The section list rendered as a strip across the top, content underneath it [FIXED]
+
+- Attempted: answer "why content is not on the right side and is on the bottom?" about
+  Settings.
+- Symptom: the pane is `class="main-pane settings-layout"`. `.settings-layout` declares
+  `display: flex; min-height: 100%` but no `flex-direction`, while `.main-pane` declares
+  `flex-direction: column`. Both are single-class rules on the same element, and only one
+  of them sets the property, so the pane kept `column`. Measured live:
+  `flexDirection: "column"`, `nav { x: 64, y: 0, w: 200, h: 535 }`,
+  `body { x: 64, y: 535, w: 982, h: 281 }` — a 200px-wide section list across the top with
+  the section's content under it, and a `border-right` on the nav with nothing to its
+  right.
+- Resolution: FIXED — `flex-direction: row` on `.settings-layout`, plus `flex: none` on
+  `.settings-nav` (mirroring `.rail { flex-shrink: 0 }`) so a wide body cannot squeeze the
+  list below its labels. Measured after: `flexDirection: "row"`,
+  `nav { x: 64, w: 200, h: 816 }`, `body { x: 264, w: 782, h: 816 }`.
+- Re-checked the previous slice's scroll fix under the new layout: the About pane
+  (scrollHeight 519, clientHeight 480) scrolled to 39, "Check for updates" clicked, and
+  `scrollTop` was still 39 with the outcome note up.
+- Lesson: a modifier class that sets `display: flex` but not `flex-direction`, stacked on a
+  base class that does, is invisible in the CSS file and only shows up as geometry. The
+  nav's `border-right` was the tell that the intended direction was row. Introduced with
+  the settings pane itself (`5faea5e`), so it predates every slice in this log.
+
+### Device pickers stacked one pair per selection [FIXED]
+
+- Attempted: fix the reported "when u choose something it creates another and another and
+  another drop downs".
+- Symptom: `renderVoiceSettings` built its device pickers inside `fill()`, and `pick()`
+  appended the label and the `<select>` to `wrap` — the outer section container, which is
+  never cleared. `fill()` runs again from the `.then()` of every `voiceSelectDevices`
+  call, so each selection appended another Microphone/Speaker pair. Confirmed live before
+  the fix path was written: two selections produced four dropdowns.
+- Resolution: FIXED. The pickers are now created once, held in a `pickers` map keyed by
+  side, and re-synced in place (options rebuilt only when the device list actually
+  changed, value re-set from `selected`). Verified live: after two selections the pane
+  still holds exactly two `<select>`s (`["pipewire","pulse"]`, 4 and 16 options), and the
+  picker the user just used keeps focus instead of being destroyed under it.
+
+### Voice section had no colour scheme, so native controls stayed light [FIXED]
+
+- Attempted: explain "it doesnt' appear good in dark mode".
+- Symptom: nothing in the stylesheets declared `color-scheme`. The theme is
+  `:root[data-theme="dark"]`, which recolours the app's own CSS variables but says
+  nothing to the platform, so a `<select>`'s option list (and scrollbars, and the date
+  picker) render light while the app is dark — the classic white-menu-with-light-text
+  result, since `base.css` sets `select { color: inherit }`.
+- Resolution: FIXED at the root, not on the one picker: `color-scheme: light` on `:root`
+  and `color-scheme: dark` on `:root[data-theme="dark"]` in `tokens.css`. Verified live in
+  dark mode: `getComputedStyle(document.documentElement).colorScheme === "dark"`, and the
+  picker computes `background rgb(27,27,36)` / `color rgb(242,242,247)`.
+- Not verified: the open popup itself could not be captured — it is a platform menu, not
+  page DOM, so `browser_select_option` sets the value without opening it. The claim rests
+  on `color-scheme` being what the platform reads, not on a screenshot of the menu.
+
+### Pickers spanned the whole settings pane [FIXED]
+
+- Symptom: "its wide af". `.input-field` is `width: 100%`, and the Voice section had no
+  cap, so on a 1000px window the selects were 967px wide (the full `.settings-body`)
+  while the meter beside them was capped at 420px.
+- Resolution: FIXED with `.voice-settings { max-width: 480px }`, matching the meter's
+  column. Measured live after the change: pane 480px, both selects 480px, against a
+  967px settings body.
+
+### The session's starting git status was stale [WORKED AROUND]
+
+- Attempted: read `git diff` on `app.ts` to review only my own edits.
+- Symptom: the session context's `git_status` snapshot listed four modified files and did
+  not include `app.ts`, but `git diff` showed a large uncommitted voice/conclave-unread
+  feature in that same file. The snapshot is documented as taken at conversation start
+  and not updated; it was also simply incomplete, which briefly made another session's
+  work look like mine.
+- Resolution: worked around by re-running `git status` before attributing any hunk.
+  No repo change; the other session's work is untouched.
+- Lesson: treat the injected `git_status` as a hint, never as the working tree.
+
+### A `/status` probe returned empty and read as "daemon down" [FIXED]
+
+- Attempted: check whether a daemon was listening and whether its vault was locked.
+- Symptom: `curl http://127.0.0.1:9899/status` printed nothing, which looked like a dead
+  daemon (the process was alive and listening). The route is `/api/status`; the 404 body
+  is empty, so a wrong path and a dead server are indistinguishable by output alone.
+- Resolution: FIXED by probing `/api/status`. Worth remembering that this daemon answers
+  an unknown path with an empty body and no status line.
+
+### CSS edit collapsed a rule onto one line [FIXED]
+
+- Attempted: insert a new rule above `.voice-meter` in `app.css`.
+- Symptom: the `old_string` ended with `.voice-meter {\n` and the `new_string` with
+  `.voice-meter {`, which joined the selector to the next declaration —
+  `.voice-meter {  width: 100%;`. Still valid CSS, but mangled formatting.
+- Resolution: FIXED with a follow-up edit that restored the line and added the new rule.
+  The same mistake as the duplicated comment above: an `old_string` that stops mid-line
+  or drops a trailing newline. Check the boundary characters, not just the anchor text.
+- Process/tooling, not a repo problem.
+
 ## 2026-10-17 — App smoothness slice (render coalescing)
 
 ### Rail search fields drop the caret after one character [OPEN]
