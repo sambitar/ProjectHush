@@ -3,14 +3,17 @@ import assert from "node:assert/strict";
 import {
   candidatesToInvite,
   clearConclaveStore,
+  conclaveListShape,
   conclaveUnreadCount,
   conclaveUnreadTotal,
   groupConclaveMessages,
   invitableCandidates,
+  invitesAreCurrent,
   loadConclaves,
   markConclaveRead,
   type Conclave,
   type ConclaveMessage,
+  type PendingInvite,
 } from "./conclaveStore.ts";
 import type { ConclaveDto } from "./api/types.ts";
 
@@ -170,7 +173,7 @@ const dto = (id: string, messageCount: number): ConclaveDto => ({
 test("unread accumulates for background conclaves and clears on selection", () => {
   clearConclaveStore();
   // First load is a fresh app: history is read, only later growth counts.
-  assert.equal(loadConclaves([dto("c1", 3), dto("c2", 0)]), true);
+  assert.equal(loadConclaves([dto("c1", 3), dto("c2", 0)]).changed, true);
   assert.equal(conclaveUnreadTotal(), 0);
 
   // Growth on a background conclave accumulates; the read one stays clean.
@@ -199,4 +202,131 @@ test("unread counts several arriving batches and drops with a vanished conclave"
   loadConclaves([]);
   assert.equal(conclaveUnreadTotal(), 0);
   clearConclaveStore();
+});
+
+// --- Arrivals only, or a real change? ---
+
+test("a first load is never arrivals only", () => {
+  clearConclaveStore();
+  const load = loadConclaves([dto("c1", 2)]);
+  assert.equal(load.changed, true);
+  assert.equal(load.grewOnly, false, "there is no list on screen to append to yet");
+  clearConclaveStore();
+});
+
+test("an arrival in a conclave that already exists is arrivals only", () => {
+  clearConclaveStore();
+  loadConclaves([dto("c1", 2)]);
+  const load = loadConclaves([dto("c1", 3)]);
+  assert.equal(load.changed, true);
+  assert.equal(load.grewOnly, true);
+  clearConclaveStore();
+});
+
+test("a renamed conclave is not arrivals only", () => {
+  clearConclaveStore();
+  loadConclaves([dto("c1", 2)]);
+  const renamed = { ...dto("c1", 2), name: "a different name" };
+  const load = loadConclaves([renamed]);
+  assert.equal(load.grewOnly, false, "the card's name is only drawn by a rebuild");
+  clearConclaveStore();
+});
+
+test("a new conclave is not arrivals only", () => {
+  clearConclaveStore();
+  loadConclaves([dto("c1", 2)]);
+  const load = loadConclaves([dto("c1", 2), dto("c2", 1)]);
+  assert.equal(load.grewOnly, false);
+  clearConclaveStore();
+});
+
+test("a pruned log is not arrivals only", () => {
+  clearConclaveStore();
+  loadConclaves([dto("c1", 5)]);
+  const load = loadConclaves([dto("c1", 2)]);
+  assert.equal(load.changed, true);
+  assert.equal(load.grewOnly, false, "messages left the log; the pane cannot be appended to");
+  clearConclaveStore();
+});
+
+test("an ended conclave is not arrivals only", () => {
+  clearConclaveStore();
+  loadConclaves([dto("c1", 2)]);
+  const ended = { ...dto("c1", 3), ended: true };
+  const load = loadConclaves([ended]);
+  assert.equal(load.grewOnly, false, "the read-only note and the dropped composer are a rebuild");
+  clearConclaveStore();
+});
+
+test("a trustee joining is not arrivals only", () => {
+  clearConclaveStore();
+  loadConclaves([dto("c1", 2)]);
+  const joined = {
+    ...dto("c1", 2),
+    trustees: [
+      { account_id: "a0", nick: "me", state: "joined" as const },
+      { account_id: "a1", nick: "alice", state: "joined" as const },
+    ],
+  };
+  const load = loadConclaves([joined]);
+  assert.equal(load.grewOnly, false, "the members row and the card's count both change");
+  clearConclaveStore();
+});
+
+// --- The invitation cards ---
+//
+// An invitation is not a conclave: it lives in its own box above the cards, and
+// the patch that paints it asks whether the box on screen is already the one the
+// store holds. These pin that read, because a false "yes" leaves a card the user
+// can no longer answer and a false "no" throws away buttons mid-press.
+
+const invite = (conclaveId: string, receivedAt = 1): PendingInvite => ({
+  conclaveId,
+  name: conclaveId,
+  convener: "a0",
+  fromAccount: "a1",
+  fromNick: "alice",
+  trustees: [],
+  receivedAt,
+});
+
+test("the invitation box is current when it holds the same invitations in order", () => {
+  assert.equal(invitesAreCurrent(["c1", "c2"], [invite("c1"), invite("c2")]), true);
+});
+
+test("a new invitation arriving makes the box out of date", () => {
+  assert.equal(invitesAreCurrent(["c1"], [invite("c2"), invite("c1")]), false);
+});
+
+test("an invitation answered makes the box out of date", () => {
+  assert.equal(invitesAreCurrent(["c1", "c2"], [invite("c1")]), false);
+});
+
+test("a different invitation in the same slot makes the box out of date", () => {
+  // The count is the same, so only the ids can tell: one invitation replaced by
+  // another must redraw, or the card left on screen names the wrong conclave.
+  assert.equal(invitesAreCurrent(["c1"], [invite("c3")]), false);
+});
+
+test("an empty box is current only when there is nothing to show", () => {
+  assert.equal(invitesAreCurrent([], []), true);
+  assert.equal(invitesAreCurrent([], [invite("c1")]), false);
+});
+
+// --- The column's shape ---
+
+test("the empty state is only for no conclaves and no invitations", () => {
+  assert.equal(conclaveListShape(0, 0), "empty");
+});
+
+test("one conclave is a list, invitations or not", () => {
+  assert.equal(conclaveListShape(1, 0), "list");
+  assert.equal(conclaveListShape(3, 2), "list");
+});
+
+test("an invitation with no conclaves is a list too", () => {
+  // The case the invitation patch turns on: the box has to appear above cards
+  // that are not there yet, so the column is a list with an empty cards
+  // container, not the empty state.
+  assert.equal(conclaveListShape(0, 1), "list");
 });

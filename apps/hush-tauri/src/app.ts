@@ -1,5 +1,5 @@
 import { groupDirectory, isFollowing, rowSubtitle, toggleFollow } from "./lib/explorePage";
-import { enterModal, leaveModal, stampModalOrigin } from "./lib/modalFx";
+import { copyModalOrigin, enterModal, leaveModal, stampModalOrigin } from "./lib/modalFx";
 import { api, AppError, getApiBase } from "./lib/api/daemon";
 import type {
   ContactDto,
@@ -57,6 +57,7 @@ import {
   noteFileName,
   notePreview,
   noteToFileText,
+  newestFirst as newestNotesFirst,
   peekNotesState,
   saveNote,
   searchNotes,
@@ -132,6 +133,7 @@ import {
   toggleReaction,
   unreadTotal,
 } from "./lib/chatStore";
+import type { ChatMessage } from "./lib/api/types";
 import {
   MAX_FILE_BYTES,
   RECV_POLL_MS,
@@ -141,6 +143,8 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { isTauriShell } from "./lib/tauriEnv";
 import { playChatSound } from "./lib/chatSound";
+import { activeRingIn, setVoiceCue, voiceCueFor } from "./lib/voiceCue";
+import { requestAttention } from "./lib/attention";
 import {
   checkForUpdates,
   discardPendingUpdate,
@@ -153,7 +157,8 @@ import {
   clearMailStore,
   draftById,
   draftPreview,
-  folderCount,
+  folderBadge,
+  dropSearchText,
   getDropById,
   getThread as getMailThread,
   hasUnreadMail,
@@ -164,13 +169,15 @@ import {
   listDropsInFolder,
   listFolder,
   loadMailbox,
+  mailAttachmentCounts,
+  mailSearchText,
   preview,
   previewText,
-  searchMessages,
   setKnownContacts,
   threadSubject,
   unreadCount,
   type DropMessage,
+  type FolderBadge,
   type MailAttachmentRef,
   type MailFlags,
   type MailFolder,
@@ -197,21 +204,76 @@ import {
   type FileBytesSource,
 } from "./lib/fileBytes";
 import { groupMessages } from "./lib/messageGroups";
+import { planAppend, planPrepend } from "./lib/messageAppend";
 import {
-  applyPaneScroll,
-  isAtBottom,
-  paneScrollTarget,
-  type PaneScrollState,
-} from "./lib/paneScroll";
+  composerEnabled,
+  composerHint,
+  composerPlaceholder,
+  composerState,
+  type ComposerState,
+} from "./lib/composer";
+import { isAtBottom, isAtTop, pinToBottom } from "./lib/paneScroll";
+import {
+  planModalSync,
+  syncRegions,
+  transplantAround,
+  updateRegionInPlace,
+  type ModalSlot,
+  type RegionSpec,
+} from "./lib/regions";
+import {
+  chatRowShapes,
+  conclaveCardShape,
+  conclavesKey,
+  convListKey,
+  dropsPaneShape,
+  mailFoldersKey,
+  railKey,
+  readsListKey,
+  readsListShape,
+  readsMainKey,
+  readsMainShape,
+  readsNavKey,
+  ringPromptKey,
+  settingsShape,
+  trustRowShape,
+  trustsKey,
+  torrentCardShape,
+  torrentLibraryShape,
+  torrentsPaneKey,
+  torrentsPaneShape,
+  vaultBodyKey,
+  zinesPageKey,
+  zinesPageShape,
+  zinesPaneShape,
+  type ConvListBody,
+  type DropsPaneFacts,
+  type ReadsListChrome,
+  type ReadsMainFacts,
+  type ReadsSourceShape,
+  type ReadsStoryShape,
+  type SettingsFacts,
+  type TorrentCardFacts,
+  type TorrentLibraryRowFacts,
+  type TorrentsPaneBody,
+  type TorrentsPaneFacts,
+  type VaultBody,
+  type ZinesPageBody,
+  type ZinesPageFacts,
+  type ZinesPaneFacts,
+} from "./lib/regionKeys";
+import { applyRowFilter, filterText } from "./lib/rowFilter";
 import {
   clearConclaveStore,
   conclaveById,
+  conclaveListShape,
   conclavePreview,
   conclaveUnreadCount,
   conclaveUnreadTotal,
   groupConclaveMessages,
   invitedTrustees,
   invitableCandidates,
+  invitesAreCurrent,
   joinedTrustees,
   listConclaves,
   listPendingInvites,
@@ -222,8 +284,12 @@ import {
   listPendingIntros,
   markConclaveRead,
   type Conclave,
+  type ConclaveLoad,
+  type ConclaveMessage,
+  type ConclaveMessageGroup,
   type PendingIntro,
   type PendingIntroRequest,
+  type PendingInvite,
 } from "./lib/conclaveStore";
 import {
   attachEditor,
@@ -234,6 +300,8 @@ import {
   paperHasFocus,
   paperPlainText,
   paperSession,
+  pausePaperSync,
+  resumePaperSync,
 } from "./lib/paperStore";
 import { toBase64 } from "./lib/paperWire";
 import { voicePill } from "./lib/voicePill";
@@ -294,7 +362,7 @@ import { icon, type IconName } from "./lib/icons";
 import { relayMark } from "./lib/logo";
 import { avatarWithPresence, createAvatarEl, initialsFor } from "./components/ui/Avatar";
 import { RichTextEditor } from "./components/ui/RichTextEditor";
-import { ContactPicker } from "./components/ui/ContactPicker";
+import { ContactPicker, type ContactPickerItem } from "./components/ui/ContactPicker";
 import { e2eMark } from "./components/ui/E2eMark";
 import { OverflowMenu, type OverflowMenuItem } from "./components/ui/OverflowMenu";
 import { bodyToDisplayHtml, isBlankHtml, sanitizeHtml } from "./lib/richText";
@@ -321,6 +389,41 @@ type Rail =
   | "drops"
   | "vault"
   | "settings";
+/**
+ * The dialogs the app can have open, one key each.
+ *
+ * The key names the dialog, and it is what the mount pairs against across
+ * renders: a dialog whose key is unchanged and whose drawn facts have not moved
+ * is left exactly as it is (see `syncModals`). The order of `openModals` is the
+ * order they stack on screen.
+ */
+type ModalKey =
+  | "palette"
+  | "addFriend"
+  | "readsAdd"
+  | "profile"
+  | "recovery"
+  | "trustDelete"
+  | "conclaveCreate"
+  | "conclaveInvite"
+  | "conclaveEnd"
+  | "conclaveDelete"
+  | "readsConfirm"
+  | "torrentsDelete"
+  | "noteView"
+  | "chatHistory"
+  | "identity"
+  | "introPicker"
+  | "introConsent"
+  | "mailNotePicker"
+  | "zinesPenName"
+  | "zinesForget"
+  | "zinesShare"
+  | "atprotoSetup"
+  | "atprotoExplore"
+  | "zinesPublish"
+  | "updatePrompt";
+
 type SettingsSection =
   | "appearance"
   | "profile"
@@ -333,6 +436,22 @@ type SettingsSection =
   | "recovery"
   | "backup"
   | "about";
+
+/**
+ * Which body the Mail rail's right-hand pane is showing.
+ *
+ * One value rather than a chain of `if`s, because two callers need to agree on
+ * it: the dispatch that builds the pane, and the region key that decides whether
+ * the pane may be rebuilt. The ids travel with the body so neither has to read
+ * the state a second time and assert what it finds.
+ */
+type MailBody =
+  | { kind: "compose" }
+  | { kind: "dropView"; id: string }
+  | { kind: "dropList" }
+  | { kind: "thread"; id: string }
+  | { kind: "drafts" }
+  | { kind: "list" };
 
 /**
  * One row in the Exchanged-files browser: a chat attachment or a mail one.
@@ -392,6 +511,19 @@ function reSubject(subject: string): string {
 
 function fwdSubject(subject: string): string {
   return /^fwd:/i.test(subject.trim()) ? subject : `Fwd: ${subject}`;
+}
+
+/**
+ * One row of the Torrents Library: what it was drawn from, and how to draw it.
+ *
+ * One definition with two readers — the pane's builder and its update — so the
+ * rows a redraw reconciles are the rows a build would have drawn. The facts are
+ * what the row's own shape compares (see `TorrentLibraryRowFacts`), and `build`
+ * is the row's three builders, one per kind.
+ */
+interface TorrentLibraryRow {
+  facts: TorrentLibraryRowFacts;
+  build: () => HTMLElement;
 }
 
 /** How many torrents still need the pipeline's attention (for the rail badge). */
@@ -462,6 +594,17 @@ function busyNote(text: string): HTMLElement {
   label.textContent = text;
   note.appendChild(label);
   return note;
+}
+
+/**
+ * A day heading for a message pane. One builder, because the first paint and
+ * the background append must produce the same element for the same day.
+ */
+function daySepEl(day: string): HTMLElement {
+  const sep = document.createElement("div");
+  sep.className = "day-sep";
+  sep.textContent = day;
+  return sep;
 }
 
 /** Human wording for the Tor state. Accurate, not reassuring. */
@@ -548,47 +691,45 @@ export class App {
   /** Ring prompts the user dismissed, by session id: a ring is a knock, and
    * declining it must not re-ring on the next poll of the same session. */
   private voiceRingDismissed = new Set<string>();
-  /** The session id the last chime was for, so a ring repeats at the poll
-   * cadence instead of stacking on every state read. */
-  private lastRingChime: string | null = null;
+  /** The session the OS was last asked to draw attention for, so a ring that
+   * lasts its whole 30 s asks once rather than at every poll. */
+  private voiceAlerted: string | null = null;
+  /** The hidden-window voice read. The recv poll stops while the window is
+   * hidden, and a ring is discovered only by reading the voice state, so this
+   * is the one poll that survives — see `startVoiceRingPoll`. */
+  private voiceRingTimer: number | null = null;
   /** The mounted IRC pane, kept so its store subscription is torn down when
    * the rail changes instead of patching a detached DOM. */
   private ircPane: IrcPane | null = null;
   /** Last IRC unread total, so the rail badge repaints only on a change. */
   private lastIrcUnread = -1;
-  /** Scroll state of the thread pane from the render that is being replaced.
-   * Keyed by the conversation the old DOM was showing: a position only makes
-   * sense within one conversation. */
-  private chatScrollPos: PaneScrollState | null = null;
-  /** Scroll state of the conclave chat pane from the render that is being
-   * replaced. Keyed by the conclave the old DOM was showing, for the same
-   * reason `chatScrollPos` is keyed by conversation. */
-  private conclaveScrollPos: PaneScrollState | null = null;
-  /** The conversation the thread pane currently shows, for that keying. */
+  /**
+   * The shell element, created once and never detached.
+   *
+   * It is the reason the message panes keep their scroll position: a detached
+   * element reports `scrollTop` 0 and stays there when it comes back (measured
+   * in a real engine — see `lib/regions.ts`), so anything that must keep its
+   * place has to keep its ancestors in the document too. Null while the vault
+   * is locked, where the unlock screen is painted into a wiped root.
+   */
+  private shellEl: HTMLElement | null = null;
+  /** The conversation the thread pane currently shows, for keying the pane. */
   private renderedNick: string | null = null;
-  /** Where the freshly built thread pane should be scrolled once it is in the
-   * document. Decided while the pane is still detached — a detached element
-   * has no layout, so setting scrollTop before attachment silently clamps to
-   * zero and the reader lands on the first message. */
-  private pendingChatScroll:
-    | { nick: string; mode: "bottom" }
-    | { nick: string; mode: "restore"; top: number }
-    | null = null;
   /** Set when the window becomes visible again: the next thread paint opens
    * on the newest message, because returning to the window is a fresh read. */
   private bottomOnNextChatRender = false;
   /** The same fresh-read rule for the conclave chat, which is repainted by the
    * same cycle and would otherwise keep a stale position. */
   private bottomOnNextConclaveRender = false;
-  /** Where the freshly built conclave chat should be scrolled once it is in
-   * the document — same mechanism as `pendingChatScroll`, same reason: a
-   * detached element has no layout, so its scrollTop silently clamps. */
-  private pendingConclaveScroll:
-    | { conclaveId: string; mode: "bottom" }
-    | { conclaveId: string; mode: "restore"; top: number }
-    | null = null;
+  /** Whether this render must land the thread on its newest message, decided
+   * by the pane's own sync and applied once the shell is back in the document.
+   * A fresh build always lands at the bottom; an in-place update only when the
+   * reader was already there. */
+  private chatToBottom = false;
+  /** The conclave twin of `chatToBottom`. */
+  private conclaveToBottom = false;
   /** The conclave whose detail pane is currently in the document, for keying
-   * the scroll capture — the twin of `renderedNick` for chats. */
+   * the pane — the twin of `renderedNick` for chats. */
   private renderedConclaveId: string | null = null;
   private pollTimer: number | null = null;
   /** Pending rAF handle for a coalesced render; null when none is queued. */
@@ -629,13 +770,6 @@ export class App {
   /** True while the Vault pane is showing the exchanged-files browser. */
   private filesOpen = false;
   private filesContactNick: string | null = null;
-  /**
-   * Keys of the dialogs the current render pass mounted, under the same names
-   * the mount block uses. Compared against what the previous pass mounted to
-   * tell a freshly opened dialog (zoom in) from one a background refresh
-   * rebuilt under the user (repaint in place) from one just closed (zoom out).
-   */
-  private modalKeys = new Set<string>();
   private filesDirection: "received" | "sent" = "received";
   private recoveryModalCode: string | null = null;
   private mailFolder: MailFolder = "inbox";
@@ -928,6 +1062,11 @@ export class App {
    * Where the front page was scrolled when a story was opened, so coming back
    * lands the reader where they left rather than at the masthead. Captured on
    * the way in, applied after the pane has layout, cleared once used.
+   *
+   * It survives the keyed regions rather than being replaced by them: opening a
+   * story replaces the front page's element, so there is nowhere for its scroll
+   * to be kept. The reader's own place needs no carry — its region key is the
+   * story, so the box is kept — and neither does the column's, which is keyed.
    */
   private pendingZinesScroll: number | null = null;
   /** The zine open in the reading pane. */
@@ -1129,10 +1268,25 @@ export class App {
         this.stopPoll();
         this.stopTorPoll();
         this.stopDropsPoll();
+        this.stopVoiceMeter();
+        pausePaperSync();
+        // Except the voice read. A ring is discovered only by polling the
+        // voice state, so stopping every timer would mean a call arriving
+        // while the window is away is never prompted for — and the daemon's
+        // 30 s stamp expires with nothing left to answer. One small read per
+        // RECV_POLL_MS is the whole cost of not missing the call.
+        this.startVoiceRingPoll();
+        // The ringtone carries on for a hidden window; the ringback does not.
+        this.updateVoiceCue();
         return;
       }
       if (!this.status || this.status.locked) return;
+      this.stopVoiceRingPoll();
       this.startPoll();
+      resumePaperSync();
+      // Coming back to the window can start the ringback again, and can stop
+      // one that was already running.
+      this.updateVoiceCue();
       if (this.rail === "drops") this.startDropsPoll();
       if (this.rail === "chats" && this.selectedNick) {
         this.bottomOnNextChatRender = true;
@@ -1175,22 +1329,26 @@ export class App {
     });
     subscribeTorrents(() => {
       if (this.rail !== "torrents") return;
-      // Never clobber the Add field while the user is typing in it.
-      const ae = document.activeElement;
-      if (ae instanceof HTMLInputElement && ae.closest(".torrents-pane")) return;
-      this.scheduleBackgroundRender();
+      // A poll paints its own pane and nothing else. That is what lets a
+      // running download tick every three seconds while the reader types in
+      // the Add field or the Library's filter: neither field is rebuilt, so
+      // neither loses its caret, and the rows keep up to date underneath.
+      if (!this.patchTorrentsPane()) this.scheduleBackgroundRender();
     });
     subscribeWallet(() => {
       if (this.rail !== "vault" || !this.walletOpen) return;
       // While an operation is in flight its own handler owns the re-render;
       // this keeps one action from painting twice.
       if (this.walletBusy) return;
-      // Never clobber a field the user is typing in, and never wipe the
-      // one-time phrase card out from under them mid-copy.
+      // The pane is a whole-body redraw, so a redraw recreates its fields. A
+      // background change that lands while the reader is typing in one would take
+      // the caret out of it, and the change is not worth that: the next render
+      // for any other reason paints it, and every wallet action renders on its
+      // own. This is the one case the region's shape cannot decide for itself —
+      // what the pane draws has moved, and the field is what must not.
       const ae = document.activeElement;
       if (ae instanceof HTMLInputElement && ae.closest(".wallet-pane")) return;
       if (ae instanceof HTMLTextAreaElement && ae.closest(".wallet-pane")) return;
-      if (this.walletPhrase) return;
       this.scheduleBackgroundRender();
     });
     // IRC: the pane patches its own DOM, so this only keeps the rail badge
@@ -1501,6 +1659,9 @@ export class App {
     this.status = status;
     if (!status || status.locked) {
       this.stopPoll();
+      // A locked vault holds no keys, so the voice read would only 401 — and
+      // must not learn a room exists.
+      this.stopVoiceRingPoll();
       return;
     }
     try {
@@ -1544,7 +1705,7 @@ export class App {
 
   /** Re-read the conclave list. Returns whether it changed, so the poll can
    *  skip a repaint that would steal the caret out of the conclave composer. */
-  private async reloadConclaves(): Promise<boolean> {
+  private async reloadConclaves(): Promise<ConclaveLoad> {
     const list = await api.conclaves();
     const invites = await api.pendingInvites();
     // The introduction endpoints are new: a daemon that predates them has no
@@ -1552,16 +1713,72 @@ export class App {
     // an addition, not a dependency — degrade to "nothing pending" so the
     // conclave list, creation and every action here keep working unchanged.
     const intros = await api.introLists().catch(() => null);
-    if (!list) return false;
-    const changed = loadConclaves(list, this.conclaveId);
+    if (!list) return { changed: false, grewOnly: false };
+    const loaded = loadConclaves(list, this.conclaveId);
     const invitesChanged = invites ? loadPendingInvites(invites) : false;
     const introsChanged = intros ? loadPendingIntros(intros) : false;
-    return changed || invitesChanged || introsChanged;
+    return {
+      changed: loaded.changed || invitesChanged || introsChanged,
+      // An invitation is a box of its own above the cards, and
+      // `patchConclaveInvites` draws it where it is, so an arrival no longer
+      // needs the shell rebuilt — it is `grewOnly` in every sense that matters.
+      // An introduction still does: the consent modal is mounted from the
+      // render, so the render is what shows it.
+      grewOnly: loaded.grewOnly && !introsChanged,
+    };
   }
 
   private stopPoll(): void {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = null;
+  }
+
+  /**
+   * Keep the voice read alive while the window is hidden.
+   *
+   * `refreshVoiceRooms` has exactly one caller — the recv poll — so stopping
+   * the recv poll stops the only read that can discover a ring. A call that
+   * arrives while the window is away would then never be prompted for: the
+   * daemon still takes it and stamps `VOICE_RING_TTL_MS` (30 s) on the session,
+   * but nothing in the UI would read the stamp, so there would be no prompt, no
+   * chime, and nothing left to answer by the time the window came back.
+   *
+   * This is the smallest read that prevents that: one voice state call per
+   * `RECV_POLL_MS`, with no recv, no presence, and no store work behind it. It
+   * runs only while the window is hidden and the vault is unlocked, and the
+   * visible branch of `visibilitychange` hands the read back to the recv poll.
+   */
+  private startVoiceRingPoll(): void {
+    if (this.voiceRingTimer !== null) return;
+    if (!this.status || this.status.locked) return;
+    this.voiceRingTimer = window.setInterval(() => {
+      // The recv poll owns this read again the moment the window is back.
+      if (document.visibilityState === "visible") {
+        this.stopVoiceRingPoll();
+        return;
+      }
+      void this.refreshVoiceRooms();
+    }, RECV_POLL_MS);
+  }
+
+  private stopVoiceRingPoll(): void {
+    if (this.voiceRingTimer !== null) clearInterval(this.voiceRingTimer);
+    this.voiceRingTimer = null;
+  }
+
+  /**
+   * Stop the Voice section's input meter.
+   *
+   * The meter is normally torn down by the next repaint (`renderSettings`),
+   * which is no help while the window is hidden: a hidden window does not
+   * repaint, so a 4 Hz probe of the daemon would run for as long as the section
+   * stays open and the window stays away. This is the same teardown, applied on
+   * the one path where no repaint is coming. The visible branch re-renders,
+   * which re-arms it.
+   */
+  private stopVoiceMeter(): void {
+    if (this.voiceMeterTimer !== null) clearInterval(this.voiceMeterTimer);
+    this.voiceMeterTimer = null;
   }
 
   private async pollRecv(): Promise<void> {
@@ -1570,24 +1787,56 @@ export class App {
       // Appear-offline: skip the heartbeat and let the relay's timestamp go
       // stale, so contacts report offline. The daemon's heartbeat loop is
       // suppressed the same way.
-      if (!uiPrefsSnapshot().appear_offline) await api.presenceHeartbeat();
-      const r = await api.recv();
-      const fresh = (await api.contacts()) ?? [];
-      const prevOnline = new Map(
-        this.contacts.map((c) => [c.nickname, c.online]),
-      );
-      const presenceChanged =
-        fresh.length !== this.contacts.length ||
-        fresh.some((c) => prevOnline.get(c.nickname) !== c.online);
-      this.contacts = fresh;
-      setKnownContacts(fresh.map((c) => c.nickname));
+      //
+      // The four reads below are independent, so they go out together: one
+      // round trip where there used to be four in series. `recv` is the one
+      // that consumes the inbox — the daemon acks the page it returns — so its
+      // response must always be used once issued. That is why the heartbeat
+      // settles on its own: a failed beat must not reject the group and
+      // discard a `recv` that already landed, or the messages in it would be
+      // drawn from the relay and never reach the UI.
+      const beat = uiPrefsSnapshot().appear_offline
+        ? Promise.resolve()
+        : api.presenceHeartbeat().catch(() => {});
       // Voice rings ride every poll: an inbound open is stamped daemon-side,
       // so the state read is what turns it into a prompt. The ring also
       // chimes — at the poll cadence, never per read — unless the user muted
       // sounds, and stops the moment it is answered, dismissed, or expired.
-      const voiceChanged = await this.refreshVoiceRooms();
+      const [r, fresh, voiceChanged] = await Promise.all([
+        api.recv(),
+        api.contacts().then((c) => c ?? []),
+        this.refreshVoiceRooms(),
+      ]);
+      await beat;
+      // Two facts, and they part company here. A presence flip is patched in
+      // place. A reach that moved is not: it rewrites the actions in a trust
+      // row's menu, in the open chat's header, and in a conclave member chip,
+      // and those are drawn once and never patched. So a reach move is a render,
+      // on purpose — and the region keys decide how little of the shell that
+      // render has to touch.
+      const contactsMoved = fresh.length !== this.contacts.length;
+      const prevOnline = new Map(
+        this.contacts.map((c) => [c.nickname, c.online]),
+      );
+      const prevReach = new Map(
+        this.contacts.map((c) => [c.nickname, c.reach]),
+      );
+      const presenceChanged =
+        contactsMoved || fresh.some((c) => prevOnline.get(c.nickname) !== c.online);
+      const reachChanged =
+        contactsMoved || fresh.some((c) => prevReach.get(c.nickname) !== c.reach);
+      this.contacts = fresh;
+      setKnownContacts(fresh.map((c) => c.nickname));
       if (!r) {
-        if (presenceChanged || voiceChanged) this.scheduleBackgroundRender();
+        // The recv read failed, but presence and the rings were read anyway.
+        // The patch covers the presence flip — the one delta that arrives
+        // without a message — and a ring still needs the shell, because its
+        // prompt mounts above it. A reach that moved needs the shell too: the
+        // menus it changes are drawn, not patched.
+        if (presenceChanged && !reachChanged && !voiceChanged && this.patchBackground())
+          return;
+        if (presenceChanged || reachChanged || voiceChanged)
+          this.scheduleBackgroundRender();
         return;
       }
       for (const w of r.warnings) this.announce(w);
@@ -1621,20 +1870,21 @@ export class App {
       // Mail also changes without an incoming message reaching this poll: the
       // daemon's Outbox flush moves a message from Queued to Sent, and another
       // device can file or delete one. While the Mail rail is up, re-read the
-      // mailbox so the list is never stale.
-      let mailboxChanged = false;
-      if (mailArrived || this.rail === "mail") {
-        mailboxChanged = await this.reloadMailbox();
-      }
-      let conclavesChanged = false;
-      if (conclaveArrived || this.rail === "conclaves") {
-        conclavesChanged = await this.reloadConclaves();
-      }
+      // mailbox so the list is never stale. The mailbox and the conclave list
+      // are separate stores, so when both are due they are read together
+      // rather than one after the other.
+      const [mailboxChanged, conclavesLoad] = await Promise.all([
+        mailArrived || this.rail === "mail" ? this.reloadMailbox() : false,
+        conclaveArrived || this.rail === "conclaves"
+          ? this.reloadConclaves()
+          : Promise.resolve<ConclaveLoad>({ changed: false, grewOnly: false }),
+      ]);
       // Never repaint over a half-written message, or over a modal that owns
       // text the user is part-way through: a repaint rebuilds the modal from
       // stored state and resets the fields being typed into. The Paper editor
-      // counts too: while its surface holds the caret, background traffic
-      // (presence flips, other chats) must not detach it and steal focus.
+      // counts too: while its surface holds the caret, a rebuild must not
+      // detach it and steal focus. Only the shell rebuilds below are gated —
+      // the patch above paints its deltas in place and touches no field.
       const editing =
         this.mailComposeOpen ||
         this.conclaveCreateOpen ||
@@ -1645,16 +1895,32 @@ export class App {
         this.trustDeleteNick !== null ||
         (this.conclaveTab === "paper" && paperHasFocus()) ||
         (this.rail === "zines" && (this.zinesEditing || zineEditorHasFocus()));
-      if (
-        (r.messages.length ||
-          presenceChanged ||
-          mailboxChanged ||
-          conclavesChanged ||
-          voiceChanged) &&
-        !editing
-      ) {
-        this.scheduleBackgroundRender();
-      }
+      const changed =
+        r.messages.length > 0 ||
+        presenceChanged ||
+        reachChanged ||
+        mailboxChanged ||
+        conclavesLoad.changed ||
+        voiceChanged;
+      if (!changed) return;
+      // A conclave whose structure moved, a reach that moved, and a voice ring
+      // all reach past what the patch covers — a card or member row a rebuild
+      // has to draw, a menu built from a reach, the ring banner above the shell.
+      // A mail reload used to be on this list for one
+      // reason, the folder counts in the Mail rail's left column, and
+      // `patchMailReload` now paints those and the rail's list or reader where
+      // they are; it says so itself when the Mail rail is showing a body it
+      // cannot bring forward, which is when a rebuild is still the answer.
+      // Everything else — presence, unread counts, a message arriving in the
+      // open conversation — is painted where it lands, so it never costs the
+      // user the surface they are using.
+      const shellNeeded =
+        reachChanged ||
+        (mailboxChanged && !this.patchMailReload()) ||
+        voiceChanged ||
+        (conclavesLoad.changed && !conclavesLoad.grewOnly);
+      if (!shellNeeded && this.patchBackground()) return;
+      if (!editing) this.scheduleBackgroundRender();
     } catch {
       /* daemon busy */
     }
@@ -1665,9 +1931,9 @@ export class App {
    *
    * Returns whether anything the UI renders changed — a room appearing,
    * leaving, or a ring starting or stopping — so the poll can skip a repaint
-   * that would steal the caret for nothing. The chime repeats while a ring
-   * is up (the poll cadence is the ring's tempo, the daemon's 30 s deadline
-   * the ceiling) and never plays for a session the user declined.
+   * that would steal the caret for nothing. The ringtone and the ringback tone
+   * follow the same read: the poll cadence is how fast a call reaches the
+   * speakers, and the daemon's 30 s deadline is the ceiling on a ring.
    */
   private async refreshVoiceRooms(): Promise<boolean> {
     const before = this.ringSignature();
@@ -1675,39 +1941,57 @@ export class App {
       const state = await api.voiceState();
       this.voiceRooms = state?.rooms ?? [];
     } catch {
+      // The room list is unknown, so nothing should be audible: a ringtone
+      // looping on a stale room is worse than a missed one, and the next poll
+      // restarts it if the room is still live.
+      setVoiceCue("none");
       return false; /* daemon busy; the next poll re-reads */
     }
+    this.updateVoiceCue();
     const after = this.ringSignature();
     const ring = this.activeRing();
     if (ring) {
-      this.lastRingChime = ring.session_id;
-      if (chatSoundEnabled()) playChatSound();
+      // A ring the user cannot see still has to reach them. The ringtone is
+      // the audio half, set above; this is the visual one, and it is asked for
+      // once per ring rather than at the poll cadence — an attention request
+      // every 4 s is a window flashing for 30 s, not an alert.
+      if (document.visibilityState !== "visible" && this.voiceAlerted !== ring.session_id) {
+        this.voiceAlerted = ring.session_id;
+        requestAttention();
+      }
       // Re-render when the ring expires even if no poll fires: the prompt
-      // must not outlive its own deadline on screen.
+      // must not outlive its own deadline on screen. The tone must not either,
+      // so the cue is re-decided here rather than waiting for the next poll —
+      // otherwise the banner goes and the ringtone keeps going.
       const wait = Math.max(0, (ring.ringing_until_ms ?? 0) - Date.now()) + 250;
-      window.setTimeout(() => this.scheduleBackgroundRender(), wait);
+      window.setTimeout(() => {
+        this.updateVoiceCue();
+        this.scheduleBackgroundRender();
+      }, wait);
     } else {
-      this.lastRingChime = null;
+      this.voiceAlerted = null;
     }
     return after !== before;
   }
 
-  /** The one ring the UI would prompt for, if any: the newest live ring this
-   * vault has not answered or declined. Several trustees opening at once is
-   * the degenerate case — the newest is the one on screen, and the pill
-   * still lists every room. */
+  /** Push what the speakers should be doing about voice. The decision itself
+   *  lives in `voiceCueFor`, where its precedence is covered by tests. */
+  private updateVoiceCue(): void {
+    setVoiceCue(
+      voiceCueFor({
+        rooms: this.voiceRooms,
+        dismissed: this.voiceRingDismissed,
+        me: this.status?.protocol_name ?? "",
+        soundsEnabled: chatSoundEnabled(),
+        windowVisible: document.visibilityState === "visible",
+        now: Date.now(),
+      }),
+    );
+  }
+
+  /** The one ring the UI would prompt for, if any. */
   private activeRing(): VoiceViewDto | null {
-    const now = Date.now();
-    const rings = this.voiceRooms
-      .filter(
-        (r) =>
-          !r.i_am_in &&
-          r.joined.length <= 1 &&
-          (r.ringing_until_ms ?? 0) > now &&
-          !this.voiceRingDismissed.has(r.session_id),
-      )
-      .sort((a, b) => (b.ringing_until_ms ?? 0) - (a.ringing_until_ms ?? 0));
-    return rings[0] ?? null;
+    return activeRingIn(this.voiceRooms, this.voiceRingDismissed, Date.now());
   }
 
   /** What a repaint of the ring UI depends on, reduced to a string. */
@@ -1732,12 +2016,52 @@ export class App {
    * the pill's toggle uses; declining is local silence — the opener learns
    * who joined, never who declined, the same rule as a conclave invite.
    */
+  /**
+   * What the ring prompt says, in one place.
+   *
+   * The builder draws these two strings and the key is made of them, so a local
+   * rename — or a conclave renamed while it rings — moves the key and redraws
+   * the prompt. Nothing else in it changes: there is no elapsed time in it, and
+   * no count of who else joined, which is why a ring can be answered without the
+   * prompt being rebuilt underneath the user.
+   */
+  private ringBannerFacts(ring: VoiceViewDto): { who: string; where: string } {
+    return {
+      who: displayNick(ring.opener),
+      where: conclaveById(ring.conclave_id)?.name ?? "a conclave",
+    };
+  }
+
+  /**
+   * Keep the ring prompt while the same ring is showing.
+   *
+   * It mounts on the root rather than inside a region, so it is synced here by
+   * hand — but for the same reason the regions exist: a render caused by
+   * something else must not take away a surface the user is using. A ring lasts
+   * up to 30 s, and during it the poll renders for other reasons (someone else
+   * joining the room, a message arriving, a click on another rail); rebuilding
+   * the prompt each time took the focus off "Answer" mid-tab and re-announced an
+   * `alertdialog` whose text had not changed.
+   */
+  private syncRingBanner(): void {
+    const ring = this.activeRing();
+    const key = ringPromptKey(
+      ring ? { sessionId: ring.session_id, ...this.ringBannerFacts(ring) } : null,
+    );
+    const live = this.root.querySelector<HTMLElement>('[data-region-key="ringBanner"]');
+    if (live && live.dataset.ringKey === key) return;
+    live?.remove();
+    const banner = this.renderVoiceRingBanner();
+    if (!banner) return;
+    banner.dataset.regionKey = "ringBanner";
+    banner.dataset.ringKey = key;
+    this.root.appendChild(banner);
+  }
+
   private renderVoiceRingBanner(): HTMLElement | null {
     const ring = this.activeRing();
     if (!ring) return null;
-    const conclave = conclaveById(ring.conclave_id);
-    const who = displayNick(ring.opener);
-    const where = conclave?.name ?? "a conclave";
+    const { who, where } = this.ringBannerFacts(ring);
     const banner = document.createElement("div");
     banner.className = "voice-ring";
     banner.setAttribute("role", "alertdialog");
@@ -1758,6 +2082,9 @@ export class App {
     answer.textContent = "Answer";
     answer.onclick = () => {
       this.voiceRingDismissed.add(ring.session_id);
+      // Answered is not ringing: silence the ringtone now rather than at the
+      // next poll, which can be 4 s of ringing after the user picked up.
+      this.updateVoiceCue();
       this.conclaveId = ring.conclave_id;
       this.rail = "conclaves";
       this.scheduleRender();
@@ -1777,7 +2104,8 @@ export class App {
     decline.textContent = "Decline";
     decline.onclick = () => {
       this.voiceRingDismissed.add(ring.session_id);
-      this.lastRingChime = null;
+      // Declined is not ringing either; same reason as answering.
+      this.updateVoiceCue();
       this.scheduleRender();
     };
     banner.append(text, answer, decline);
@@ -1797,7 +2125,9 @@ export class App {
     // answer, and the stamps died daemon-side with the planes.
     this.voiceRooms = [];
     this.voiceRingDismissed.clear();
-    this.lastRingChime = null;
+    this.voiceAlerted = null;
+    // A locked vault has no live rooms, so nothing should still be looping.
+    this.updateVoiceCue();
     // The paper's editor doc and its sync loop die with the session; the
     // merged state survives only inside the vault's encrypted sidecar.
     closePaper();
@@ -1906,82 +2236,38 @@ export class App {
     this.conclaveDeleteConfirm = "";
     this.unlockedAt = 0;
     this.stopPoll();
+    this.stopVoiceRingPoll();
     await this.refreshStatus();
     this.scheduleRender();
   }
 
   private render(): void {
-    // The thread pane is rebuilt from scratch on every render, so the reader's
-    // place in it has to be carried across. Captured before the wipe: whether
-    // the thread was scrolled to the bottom (pinned to new messages) or the
-    // user had moved away to read history (leave them there).
-    const prevMsgs = this.root.querySelector<HTMLElement>(".chat-messages");
-    this.chatScrollPos = prevMsgs
-      ? {
-          key: this.renderedNick,
-          atBottom: isAtBottom(prevMsgs),
-          top: prevMsgs.scrollTop,
-        }
-      : null;
-    // The settings pane scrolls inside `.main-pane`, and every render rebuilds
-    // it from scratch — so a repaint of the section already on screen (an
-    // update check, a toggle, the async version read) would throw the reader
-    // back to the top. Captured here, keyed by the section the old DOM was
-    // showing: a position only means something within one section.
-    const prevSettings = this.root.querySelector<HTMLElement>(".settings-layout");
-    const settingsScroll =
-      prevSettings && prevSettings.dataset.settingsSection
-        ? {
-            section: prevSettings.dataset.settingsSection,
-            top: prevSettings.scrollTop,
-          }
-        : null;
-    // Same carry for the conclave chat: was the reader pinned to the newest
-    // message, or away in history? Keyed by conclave, since the pane is
-    // rebuilt from scratch on every render.
-    const prevConclaveMsgs = this.root.querySelector<HTMLElement>(".conclave-messages");
-    this.conclaveScrollPos = prevConclaveMsgs
-      ? {
-          key: this.renderedConclaveId,
-          atBottom: isAtBottom(prevConclaveMsgs),
-          top: prevConclaveMsgs.scrollTop,
-        }
-      : null;
+    // The smoothness checks count rebuilds: idle means this does not move. A
+    // counter rather than a timer, because the claim is about *what* caused a
+    // repaint, and only the webview console can answer that (see the doc).
+    window.__HUSH_RENDER_COUNT__ = (window.__HUSH_RENDER_COUNT__ ?? 0) + 1;
+    // The message panes are keyed regions now: they are not rebuilt, so there
+    // is no position to read out of them. The only scroll decision left is
+    // whether this render must land on the newest message, which each pane's
+    // own sync sets below.
+    this.chatToBottom = false;
+    this.conclaveToBottom = false;
     // The IRC pane holds a live store subscription; tear it down before its
     // DOM is discarded, or it would keep patching a detached tree.
     this.ircPane?.unmount();
     this.ircPane = null;
-    // Take the dialogs the previous render mounted before the wipe. Their
-    // elements drive the zoom choreography: kept for the close zoom, copied
-    // from for a silent rebuild, absent for a fresh open.
-    const prevModals = new Map<string, HTMLElement>();
-    this.root.querySelectorAll<HTMLElement>("[data-modal-key]").forEach((back) => {
-      const key = back.dataset.modalKey;
-      if (key) prevModals.set(key, back);
-    });
-    this.modalKeys = new Set();
-    // Focus carried across the wipe: the composer is the one place a repaint
-    // may not interrupt, because the user is mid-sentence. Captured before
-    // the tree dies — value, caret, and which composer it belongs to (the
-    // composers stamp themselves with `data-composer-key`) — so the new
-    // tree's matching box can be found without depending on DOM order. After
-    // a send the box is empty and the caret returns to it; a repaint that
-    // lands mid-typing puts both the draft and the caret back.
-    const focused = document.activeElement;
-    const composerKey =
-      focused instanceof HTMLTextAreaElement
-        ? focused.getAttribute("data-composer-key")
-        : null;
-    const composerState =
-      focused instanceof HTMLTextAreaElement && composerKey
-        ? {
-            value: focused.value,
-            start: focused.selectionStart ?? focused.value.length,
-            end: focused.selectionEnd ?? focused.value.length,
-          }
-        : null;
-    this.root.innerHTML = "";
+    // Take the dialogs the previous render mounted, before the shell is synced.
+    // Their elements drive the zoom choreography: kept for the close zoom,
+    // copied from for a silent rebuild, absent for a fresh open.
+    const prevModals = Array.from(
+      this.root.querySelectorAll<HTMLElement>("[data-modal-key]"),
+    );
     if (!this.status || this.status.locked) {
+      // The unlock screen is not keyed and has nothing worth preserving, so it
+      // is painted into a wiped root — and the shell goes with it. The next
+      // unlock builds a fresh one; nothing that was on screen outlives a lock.
+      this.root.innerHTML = "";
+      this.shellEl = null;
       this.stopDropsPoll();
       this.stopTorPoll();
       setTorrentsPaneOpen(false);
@@ -1995,7 +2281,7 @@ export class App {
       );
       // Locking can land while a dialog is up: its element was wiped with the
       // tree, so still give it the zoom-out over the unlock screen.
-      for (const back of prevModals.values()) leaveModal(back);
+      for (const back of prevModals) leaveModal(back);
       return;
     }
     // A conversation the rail cannot list cannot stay open. Reach narrows from
@@ -2019,81 +2305,39 @@ export class App {
     if (this.rail === "conclaves" && this.conclaveId) {
       markConclaveRead(this.conclaveId);
     }
-    const shell = document.createElement("div");
-    shell.className = "shell";
-    shell.appendChild(this.renderRail());
-    if (this.rail === "chats") {
-      shell.appendChild(this.renderConvList());
-      shell.appendChild(this.renderMainChat());
-    } else if (this.rail === "trusts") {
-      shell.appendChild(this.renderTrusts());
-    } else if (this.rail === "conclaves") {
-      shell.appendChild(this.renderConclaves());
-    } else if (this.rail === "zines") {
-      shell.appendChild(this.renderZinesPane());
-      shell.appendChild(this.renderZinesPage());
-    } else if (this.rail === "reads") {
-      shell.appendChild(this.renderReadsNav());
-      shell.appendChild(this.renderReadsList());
-      shell.appendChild(this.renderReadsMain());
-    } else if (this.rail === "torrents") {
-      shell.appendChild(this.renderTorrents());
-    } else if (this.rail === "irc") {
-      shell.appendChild(this.renderIrc());
-    } else if (this.rail === "mail") {
-      shell.appendChild(this.renderMailFolders());
-      shell.appendChild(this.renderMailMain());
-    } else if (this.rail === "drops") {
-      shell.appendChild(this.renderDrops());
-    } else if (this.rail === "vault") {
-      shell.appendChild(
-        this.walletOpen
-          ? this.renderWallet()
-          : this.notesOpen
-            ? this.renderNotes()
-            : this.filesOpen
-              ? this.renderFiles()
-              : this.renderVault(),
-      );
-    } else {
-      shell.appendChild(this.renderSettings());
-    }
-    this.root.appendChild(shell);
+    const shell = this.ensureShell();
+    this.syncShell(shell);
     // The ring prompt mounts above the shell like the dialogs: it is the one
-    // surface that answers a knock, so it shows on every rail.
-    const ringBanner = this.renderVoiceRingBanner();
-    if (ringBanner) this.root.appendChild(ringBanner);
+    // surface that answers a knock, so it shows on every rail. It is kept while
+    // the same ring is showing rather than rebuilt per render — see
+    // `syncRingBanner` for what that cost.
+    this.syncRingBanner();
     this.startTorPoll();
     setTorrentsPaneOpen(this.rail === "torrents");
     setWalletPaneOpen(this.rail === "vault" && this.walletOpen);
     this.renderedNick = this.rail === "chats" ? this.selectedNick : null;
     this.renderedConclaveId = this.rail === "conclaves" ? this.conclaveId : null;
-    // Now that the thread pane is in the document and has layout, put the
-    // reader where the conversation should open: the newest message, or their
-    // place in the history of this same conversation.
-    const liveMsgs = this.root.querySelector<HTMLElement>(".chat-messages");
-    const pending = this.pendingChatScroll;
-    this.pendingChatScroll = null;
-    if (liveMsgs && pending && pending.nick === this.renderedNick) {
-      applyPaneScroll(liveMsgs, pending);
+    // Each pane decided its own landing while it was being built or updated;
+    // the shell is in the document now, so they have layout to land in.
+    if (this.chatToBottom) {
+      this.chatToBottom = false;
+      const msgs = this.root.querySelector<HTMLElement>(".chat-messages");
+      if (msgs) pinToBottom(msgs);
     }
-    // The conclave chat scrolls by the same contract, same reason: the intent
-    // was decided while the pane was detached and has only now got layout.
-    const liveConclaveMsgs = this.root.querySelector<HTMLElement>(".conclave-messages");
-    const conclavePending = this.pendingConclaveScroll;
-    this.pendingConclaveScroll = null;
-    if (
-      liveConclaveMsgs &&
-      conclavePending &&
-      conclavePending.conclaveId === this.renderedConclaveId
-    ) {
-      applyPaneScroll(liveConclaveMsgs, conclavePending);
+    if (this.conclaveToBottom) {
+      this.conclaveToBottom = false;
+      const msgs = this.root.querySelector<HTMLElement>(".conclave-messages");
+      if (msgs) pinToBottom(msgs);
     }
-    // The front page scrolls like any long page, so a story opened from halfway
-    // down it puts the reader back at that point on the way out — the same
-    // carry-across as the thread pane above, and for the same reason. Only the
-    // front page consumes it: a story is also a `.zines-page`, and consuming
-    // the position there would throw it away before the reader came back.
+    // The front page scrolls like any long page, and a story opened from halfway
+    // down it should put the reader back at that point on the way out. The region
+    // key cannot do that for it: opening a story is a different body, so the
+    // front page's element — and the scroll it was holding — is replaced, and the
+    // page comes back at the masthead. Only the front page consumes the position:
+    // a story is also a `.zines-page`, and consuming it there would throw it away
+    // before the reader came back. The reader's own scroll needs no carry — its
+    // key is the story, so its box is kept across renders — and neither does the
+    // column's, which is kept outright.
     const liveZines = this.root.querySelector<HTMLElement>(".zines-page");
     if (
       liveZines &&
@@ -2103,100 +2347,678 @@ export class App {
       liveZines.scrollTop = Math.min(this.pendingZinesScroll, liveZines.scrollHeight);
       this.pendingZinesScroll = null;
     }
-    // Put the settings pane back where it was, but only when this rebuild is
-    // the same section as the last one. A section switch leaves the fresh pane
-    // at the top, which is where a newly chosen section should open.
-    const liveSettings = this.root.querySelector<HTMLElement>(".settings-layout");
-    if (
-      liveSettings &&
-      settingsScroll &&
-      liveSettings.dataset.settingsSection === settingsScroll.section
-    ) {
-      liveSettings.scrollTop = Math.min(settingsScroll.top, liveSettings.scrollHeight);
+    // Dialogs mount last, above the shell — and only the ones whose drawn facts
+    // moved are rebuilt; see `syncModals`.
+    this.syncModals(prevModals);
+  }
+
+  /**
+   * The shell, created once and never detached.
+   *
+   * Every render used to start by wiping the root. That is what made the
+   * message panes re-parse their whole history and lose the reader's place on
+   * unrelated changes — a detached scroll box reports `scrollTop` 0 and keeps
+   * reporting it once it is back (measured in a real engine; see
+   * `lib/regions.ts`). So the shell survives, and the render swaps regions
+   * inside it instead of the shell itself.
+   */
+  private ensureShell(): HTMLElement {
+    if (this.shellEl && this.shellEl.parentElement === this.root) return this.shellEl;
+    // No shell means the last frame was not a shell — the unlock screen, or the
+    // vault-setup screen. Nothing there is worth keeping, and leaving it would
+    // strand it under the new shell, so the root is cleared first.
+    this.root.replaceChildren();
+    const shell = document.createElement("div");
+    shell.className = "shell";
+    this.shellEl = shell;
+    // First child, so the shell stays under the banner and the dialogs that
+    // mount above it.
+    this.root.insertBefore(shell, this.root.firstChild);
+    return shell;
+  }
+
+  /**
+   * Bring the shell's regions up to date for the current rail.
+   *
+   * A region carries a key when something inside it must not be detached, and
+   * each key names what it is made of (see `regionKeys.ts`). The rail's badges
+   * are patched in place, so a count moving must not rebuild it; the Chats list
+   * and the Trusts pane keep their search fields and the carets in them; the
+   * 1:1 thread keeps its scroll box and its composer; the conclaves pane keeps
+   * the open meeting's chat; the Mail list keeps the folder's search field and
+   * its scroll box; the Drops folder keeps its search field and its reader; and
+   * the Drops rail keeps the directory's place and the switches over it.
+   * Everything else is rebuilt, which is the honest default — a rebuilt region
+   * cannot go stale, and the panes left are cheap.
+   */
+  private syncShell(shell: HTMLElement): void {
+    const regions: RegionSpec[] = [
+      { key: this.railKey(), build: () => this.renderRail() },
+    ];
+    if (this.rail === "chats") {
+      regions.push({
+        key: this.convListKey(),
+        build: () => this.renderConvList(),
+        update: (el) => this.syncConvList(el),
+      });
+      regions.push({
+        key: this.chatPaneKey(),
+        build: () => this.renderMainChat(),
+        update: (el) => this.updateMainChat(el),
+      });
+    } else if (this.rail === "trusts") {
+      regions.push({
+        key: this.trustsKey(),
+        build: () => this.renderTrusts(),
+        update: (el) => this.syncTrustsPane(el),
+      });
+    } else if (this.rail === "conclaves") {
+      regions.push({
+        key: "conclavesPane",
+        build: () => this.renderConclaves(),
+        update: (el) => this.syncConclavesPane(el),
+      });
+    } else if (this.rail === "zines") {
+      regions.push({
+        // The column has no identity of its own to switch — it is the same
+        // column whatever the page beside it shows — so the shape is what
+        // decides when it is redrawn, and a background tick leaves it, its
+        // scroll and the focus in its switches alone.
+        key: "zinesPane",
+        shape: () => zinesPaneShape(this.zinesPaneFacts()),
+        build: () => this.renderZinesPane(),
+        update: (el) => this.fillZinesPane(el),
+      });
+      regions.push({
+        key: zinesPageKey(this.zinesPageBody()),
+        shape: () => zinesPageShape(this.zinesPageFacts()),
+        build: () => this.renderZinesPage(),
+        update: (el) => this.fillZinesPage(el),
+      });
+    } else if (this.rail === "reads") {
+      regions.push({
+        key: readsNavKey(this.readsSourceShapes()),
+        build: () => this.renderReadsNav(),
+        update: (el) => this.syncReadsNav(el),
+      });
+      regions.push({
+        key: readsListKey(this.readsMode, this.readsSource),
+        shape: () => readsListShape(this.readsListChrome(), this.readsStoryShapes()),
+        build: () => this.renderReadsList(),
+        update: (el) => this.fillReadsList(el),
+      });
+      regions.push({
+        key: readsMainKey(this.readsOpenId, this.readsView),
+        shape: () => readsMainShape(this.readsMainFacts()),
+        build: () => this.renderReadsMain(),
+        update: (el) => this.fillReadsMain(el),
+      });
+    } else if (this.rail === "torrents") {
+      regions.push(this.torrentsPaneRegion());
+    } else if (this.rail === "irc") {
+      regions.push({ key: null, build: () => this.renderIrc() });
+    } else if (this.rail === "mail") {
+      regions.push({
+        key: mailFoldersKey(this.mailAddress()),
+        build: () => this.renderMailFolders(),
+        update: (el) => this.syncMailFolders(el),
+      });
+      regions.push(this.mailMainRegion());
+    } else if (this.rail === "drops") {
+      regions.push(this.dropsPaneRegion());
+    } else if (this.rail === "vault") {
+      regions.push(this.vaultBodyRegion());
+    } else {
+      regions.push(this.settingsPaneRegion());
     }
-    // Dialogs mount last, above the shell. A key the previous pass already had
-    // up is a rebuild under a background refresh: repaint it in place, carrying
-    // its launch point across so a later close still zooms to where it began.
-    // A new key is an open: zoom in from what the user pressed. A key the
-    // previous pass showed but this one drops was just closed: zoom its wiped
-    // element back out over the fresh UI.
-    const mountModal = (key: string, back: HTMLElement): void => {
-      back.dataset.modalKey = key;
-      const prev = prevModals.get(key);
-      if (prev) {
-        const ox = prev.style.getPropertyValue("--fx-ox");
-        const oy = prev.style.getPropertyValue("--fx-oy");
-        if (ox) back.style.setProperty("--fx-ox", ox);
-        if (oy) back.style.setProperty("--fx-oy", oy);
+    syncRegions(shell, regions);
+  }
+
+  /**
+   * Bring the dialog layer up to date for this pass.
+   *
+   * Dialogs are not regions: they are a sparse set of overlays, and one of them
+   * closing moves every one behind it up a place, so `planModalSync` pairs them
+   * by key and this walks the plan.
+   *
+   * A dialog whose drawn facts have not moved is left exactly where it is, and
+   * that is the point of the whole thing: a dialog holds fields, the caret in
+   * one of them, and the focus ring on the control the reader was about to
+   * press. A background tick — a message arriving, a presence flip, a poll —
+   * used to rebuild every open dialog, which dropped the caret, reset the focus
+   * to the top of the dialog and could scroll it. Now a tick that changes
+   * nothing a dialog draws touches nothing, and a dialog is rebuilt only when
+   * what it draws has actually moved: the wallet's balance arriving, a torrent's
+   * file count changing, an error appearing.
+   *
+   * The two other cases keep their choreography. A rebuild carries the launch
+   * point across, so a close after any number of rebuilds still zooms back to
+   * the control that opened it, and repaints without the zoom because the reader
+   * is already here. A dialog the pass dropped was just closed: its element
+   * plays the reverse zoom over the fresh UI. A dialog that is here for the
+   * first time zooms in from what the reader pressed.
+   */
+  private syncModals(prev: readonly HTMLElement[]): void {
+    const live: ModalSlot[] = prev.map((el) => ({
+      key: el.dataset.modalKey ?? "",
+      shape: el.dataset.modalShape ?? "",
+    }));
+    const want = this.openModals();
+    const ops = planModalSync(live, want);
+    // Where a rebuilt or new dialog goes: after the previous slot's element when
+    // there is one, otherwise before the next slot that is being kept. Both keep
+    // the stack in the order of the list above without moving anything that was
+    // kept — the first case covers a dialog that opened behind another, the
+    // second a dialog that opened *in front* of one already up.
+    const nextKept: (HTMLElement | null)[] = new Array<HTMLElement | null>(
+      want.length,
+    ).fill(null);
+    let keptAfter: HTMLElement | null = null;
+    for (let i = want.length - 1; i >= 0; i -= 1) {
+      nextKept[i] = keptAfter;
+      const op = ops[i];
+      if (op.kind === "keep") keptAfter = prev[op.live];
+    }
+    // The element the previous slot put in the document.
+    let placed: HTMLElement | null = null;
+    for (let i = 0; i < want.length; i += 1) {
+      const spec = want[i];
+      const op = ops[i];
+      if (op.kind === "keep") {
+        placed = prev[op.live];
+        continue;
+      }
+      const at = op.live === null ? null : prev[op.live];
+      const back = spec.build();
+      back.dataset.modalKey = spec.key;
+      back.dataset.modalShape = spec.shape;
+      if (at) {
+        // A rebuild: the launch point travels across, and the element it came
+        // from is taken out by hand — the root is not wiped any more, so leaving
+        // it would stack a copy per pass. Removing it (rather than letting it be
+        // wiped) is what `enterModal(back, false)` assumes.
+        copyModalOrigin(at, back);
+        at.remove();
       } else {
         stampModalOrigin(back);
       }
-      this.root.appendChild(back);
-      this.modalKeys.add(key);
-      enterModal(back, !prev);
-    };
-    if (this.paletteOpen) mountModal("palette", this.renderPalette());
-    if (this.addFriendOpen) mountModal("addFriend", this.renderAddFriend());
-    if (this.readsAddOpen) mountModal("readsAdd", this.renderReadsAddModal());
-    if (this.profileNick) mountModal("profile", this.renderProfile());
-    if (this.recoveryModalCode) mountModal("recovery", this.renderRecoveryModal());
-    if (this.trustDeleteNick) mountModal("trustDelete", this.renderTrustDeleteModal());
-    if (this.conclaveCreateOpen)
-      mountModal("conclaveCreate", this.renderConclaveCreateModal());
-    if (this.conclaveInviteOpen)
-      mountModal("conclaveInvite", this.renderConclaveInviteModal());
-    if (this.conclaveEndId) mountModal("conclaveEnd", this.renderConclaveEndModal());
-    if (this.conclaveDeleteId)
-      mountModal("conclaveDelete", this.renderConclaveDeleteModal());
-    if (this.readsConfirmUrl) mountModal("readsConfirm", this.renderReadsConfirm());
-    if (this.torrentsDeleteId)
-      mountModal("torrentsDelete", this.renderTorrentsDeleteModal());
-    if (this.notesViewingId) mountModal("noteView", this.renderNoteViewModal());
-    if (this.chatHistoryNick)
-      mountModal("chatHistory", this.renderChatHistoryModal());
-    if (this.identityTarget) mountModal("identity", this.renderIdentityModal());
-    if (this.introPicker) mountModal("introPicker", this.renderIntroPicker());
-    if (this.pendingIntroConsent())
-      mountModal("introConsent", this.renderIntroConsent());
-    if (this.mailNotePickerOpen)
-      mountModal("mailNotePicker", this.renderMailNotePicker());
-    if (this.zinesPenNameOpen)
-      mountModal("zinesPenName", this.renderZinesPenNameModal());
-    if (this.zinesForgetId) mountModal("zinesForget", this.renderZinesForgetModal());
-    if (this.zinesShareId) mountModal("zinesShare", this.renderZinesShareModal());
-    if (this.atprotoSetupOpen)
-      mountModal("atprotoSetup", this.renderAtprotoModal());
-    if (this.atprotoExploreOpen)
-      mountModal("atprotoExplore", this.renderAtprotoExploreModal());
-    if (this.zinesPublishId)
-      mountModal("zinesPublish", this.renderZinesPublishModal());
-    if (this.pendingUpdate) mountModal("updatePrompt", this.renderUpdatePrompt());
-    for (const [key, back] of prevModals) {
-      if (!this.modalKeys.has(key)) leaveModal(back);
+      const after = placed && placed.parentElement === this.root ? placed : null;
+      const before = nextKept[i];
+      if (after) {
+        this.root.insertBefore(back, after.nextSibling);
+      } else if (before && before.parentElement === this.root) {
+        this.root.insertBefore(back, before);
+      } else {
+        this.root.appendChild(back);
+      }
+      placed = back;
+      enterModal(back, !at);
     }
-    // Hand the caret back to the composer the wipe took it from. After a
-    // send the box is empty and the caret goes to the start, ready for the
-    // next message; a repaint that landed mid-typing puts the draft and the
-    // caret back exactly where they were.
-    if (composerKey) {
-      const next = this.root.querySelector<HTMLTextAreaElement>(
-        `[data-composer-key="${CSS.escape(composerKey)}"]`,
-      );
-      if (next) {
-        if (composerState && !next.value && composerState.value) {
-          next.value = composerState.value;
-          next.dispatchEvent(new Event("input"));
-        }
-        next.focus();
-        if (composerState) {
-          const len = next.value.length;
-          next.setSelectionRange(
-            Math.min(composerState.start, len),
-            Math.min(composerState.end, len),
-          );
-        }
+    for (let i = want.length; i < ops.length; i += 1) {
+      const op = ops[i];
+      if (op.kind === "drop") leaveModal(prev[op.live]);
+    }
+  }
+
+  /**
+   * The dialogs this pass wants up, in the order they stack.
+   *
+   * One list with three readers — the mount above, `modalShape` for what each
+   * one draws, and the builders themselves — so a dialog cannot be added to one
+   * and forgotten in another. The order here is the order on screen.
+   */
+  private openModals(): (ModalSlot & { build: () => HTMLElement })[] {
+    const out: (ModalSlot & { build: () => HTMLElement })[] = [];
+    const add = (key: ModalKey, build: () => HTMLElement): void => {
+      out.push({ key, shape: this.modalShape(key), build });
+    };
+    if (this.paletteOpen) add("palette", () => this.renderPalette());
+    if (this.addFriendOpen) add("addFriend", () => this.renderAddFriend());
+    if (this.readsAddOpen) add("readsAdd", () => this.renderReadsAddModal());
+    if (this.profileNick) add("profile", () => this.renderProfile());
+    if (this.recoveryModalCode) add("recovery", () => this.renderRecoveryModal());
+    if (this.trustDeleteNick) add("trustDelete", () => this.renderTrustDeleteModal());
+    if (this.conclaveCreateOpen) {
+      add("conclaveCreate", () => this.renderConclaveCreateModal());
+    }
+    if (this.conclaveInviteOpen) {
+      add("conclaveInvite", () => this.renderConclaveInviteModal());
+    }
+    if (this.conclaveEndId) add("conclaveEnd", () => this.renderConclaveEndModal());
+    if (this.conclaveDeleteId) {
+      add("conclaveDelete", () => this.renderConclaveDeleteModal());
+    }
+    if (this.readsConfirmUrl) add("readsConfirm", () => this.renderReadsConfirm());
+    if (this.torrentsDeleteId) {
+      add("torrentsDelete", () => this.renderTorrentsDeleteModal());
+    }
+    if (this.notesViewingId) add("noteView", () => this.renderNoteViewModal());
+    if (this.chatHistoryNick) add("chatHistory", () => this.renderChatHistoryModal());
+    if (this.identityTarget) add("identity", () => this.renderIdentityModal());
+    if (this.introPicker) add("introPicker", () => this.renderIntroPicker());
+    if (this.pendingIntroConsent()) add("introConsent", () => this.renderIntroConsent());
+    if (this.mailNotePickerOpen) {
+      add("mailNotePicker", () => this.renderMailNotePicker());
+    }
+    if (this.zinesPenNameOpen) {
+      add("zinesPenName", () => this.renderZinesPenNameModal());
+    }
+    if (this.zinesForgetId) add("zinesForget", () => this.renderZinesForgetModal());
+    if (this.zinesShareId) add("zinesShare", () => this.renderZinesShareModal());
+    if (this.atprotoSetupOpen) add("atprotoSetup", () => this.renderAtprotoModal());
+    if (this.atprotoExploreOpen) {
+      add("atprotoExplore", () => this.renderAtprotoExploreModal());
+    }
+    if (this.zinesPublishId) add("zinesPublish", () => this.renderZinesPublishModal());
+    if (this.pendingUpdate) add("updatePrompt", () => this.renderUpdatePrompt());
+    return out;
+  }
+
+  /**
+   * Everything one open dialog draws, in one string.
+   *
+   * The same rule as a region's shape, with a sharper edge: what a dialog draws
+   * and what a field merely *holds* are different things, and only the first
+   * belongs here. A field the reader is typing in is excluded even when the
+   * builder writes its value out of state — the wallet's restore and send
+   * drafts, the note picker's query, the confirmation fields — because the
+   * reader's own typing must never become a reason to rebuild the field they are
+   * typing in. Those fields patch what depends on them in place instead (a
+   * button's disabled state, the filtered list under a search box).
+   *
+   * So the shape is the drawn facts: the text of a confirmation, a busy flag on
+   * a button, a store's rows, an error line, a relative time. A dialog that has
+   * no drawn facts at all — `addFriend` fills its card from an async call and
+   * its fields own their drafts — says so with a constant, and is then never
+   * rebuilt while it is open.
+   *
+   * Exhaustive on purpose, with no `default`: a new key in `ModalKey` has to be
+   * given a shape here, and a new dialog has to be added to `openModals`.
+   */
+  private modalShape(key: ModalKey): string {
+    switch (key) {
+      // The labels are the contacts, by name and reach: a trust added while the
+      // palette is up should appear in it. The query is the field's own.
+      case "palette":
+        return this.contacts
+          .map((c) => [c.nickname, c.reach, displayNick(c.nickname)].join("\n"))
+          .join("\n\n");
+      // Nothing drawn from state: the invite card is filled by `api.invite()`
+      // when it lands, and the fields hold their own drafts.
+      case "addFriend":
+        return "static";
+      case "readsAdd":
+        return [this.readsAddError ?? "", this.readsSourceBusy ? "busy" : "idle"].join(
+          "\n",
+        );
+      // The avatar and the name the field starts from. The field itself is the
+      // draft, and the name only changes when this dialog saves it.
+      case "profile":
+        return [
+          this.contacts.find((x) => x.nickname === this.profileNick)?.protocol_name ??
+            "",
+          displayNick(this.profileNick ?? ""),
+        ].join("\n");
+      case "recovery":
+        return this.recoveryModalCode ?? "";
+      case "trustDelete":
+        return [this.trustDeleteNick ?? "", displayNick(this.trustDeleteNick ?? "")].join(
+          "\n",
+        );
+      // The picker's items, and whether there is anyone at all to offer — the
+      // two decide its empty message as well as its rows. The name field and the
+      // chosen trustees are drafts.
+      case "conclaveCreate":
+        return [
+          String(this.contacts.length),
+          ...this.contacts
+            .filter((c) => c.reach === "full")
+            .map((c) => this.pickerItemFacts(c)),
+        ].join("\n\n");
+      // The conclave's name, and who is left to invite: a trustee joining or
+      // leaving changes the list, and a switch of conclave changes the name.
+      case "conclaveInvite": {
+        const conclave = this.conclaveId ? conclaveById(this.conclaveId) : undefined;
+        return [
+          conclave?.name ?? "",
+          ...(conclave ? invitableCandidates(conclave, this.contacts) : []).map((nick) =>
+            this.pickerItemFacts(this.contacts.find((c) => c.nickname === nick)),
+          ),
+        ].join("\n\n");
+      }
+      // The name in the heading, and the word typed to confirm it is a draft.
+      case "conclaveEnd": {
+        const conclave = this.conclaveEndId ? conclaveById(this.conclaveEndId) : undefined;
+        return [this.conclaveEndId ?? "", conclave?.name ?? ""].join("\n");
+      }
+      case "conclaveDelete": {
+        const conclave = this.conclaveDeleteId
+          ? conclaveById(this.conclaveDeleteId)
+          : undefined;
+        return [this.conclaveDeleteId ?? "", conclave?.name ?? ""].join("\n");
+      }
+      case "readsConfirm": {
+        const url = this.readsConfirmUrl ?? "";
+        return [url, this.readsHostOf(url)].join("\n");
+      }
+      // The name and the file count the sentence is built from.
+      case "torrentsDelete": {
+        const entry = getTorrentsState().library.find(
+          (e) => e.id === this.torrentsDeleteId,
+        );
+        return [
+          this.torrentsDeleteId ?? "",
+          entry?.name ?? "",
+          String(entry?.files.length ?? 0),
+        ].join("\n");
+      }
+      // One note as the popup draws it, and whether its inline delete is armed.
+      case "noteView": {
+        const note = (this.notesState?.notes ?? []).find(
+          (n) => n.id === this.notesViewingId,
+        );
+        return note
+          ? [
+              note.id,
+              note.color,
+              this.noteRowTitle(note),
+              note.body,
+              this.noteRowText(note).age,
+              this.notesDeleteId === note.id ? "confirming" : "idle",
+            ].join("\n")
+          : "gone";
+      }
+      // The name in the subtitle, and the rules the radios and the number field
+      // are drawn from — saving them moves the shape, so the dialog redraws to
+      // show what was saved. The dates and the primed delete are the fields'.
+      case "chatHistory": {
+        const prefs = uiPrefsSnapshot().chat_auto_delete;
+        const mode = prefs.daily ? "daily" : prefs.keep_lines != null ? "lines" : "off";
+        return [
+          this.chatHistoryNick ?? "",
+          displayNick(this.chatHistoryNick ?? ""),
+          mode,
+          String(prefs.keep_lines ?? ""),
+        ].join("\n");
+      }
+      // The name, the account id and the mail address: all three are printed.
+      case "identity": {
+        const target = this.identityTarget;
+        if (!target) return "";
+        const c = this.contacts.find((x) => x.nickname === target.nick);
+        return [
+          target.nick ?? "",
+          target.accountId,
+          target.nick ? displayNick(target.nick) : "You",
+          c ? this.contactAddress(c) : "",
+        ].join("\n");
+      }
+      // Who the introduction is for, and who can carry it — a member joining or
+      // a trust being added changes the list.
+      case "introPicker": {
+        const pick = this.introPicker;
+        if (!pick) return "";
+        const me = this.status?.protocol_name ?? "";
+        const conclave = conclaveById(pick.conclaveId);
+        const candidates = (conclave?.trustees ?? []).filter(
+          (t) =>
+            t.accountId !== me &&
+            t.accountId !== pick.target &&
+            t.state === "joined" &&
+            this.contacts.some((c) => c.nickname === t.nick),
+        );
+        return [
+          pick.conclaveId,
+          pick.target,
+          this.trusteeDisplayName(pick.conclaveId, pick.target, pick.targetNick),
+          ...candidates.map((t) =>
+            [
+              t.accountId,
+              this.trusteeDisplayName(pick.conclaveId, t.accountId, t.nick),
+            ].join("\n"),
+          ),
+        ].join("\n\n");
+      }
+      // The request itself: a second one arriving while this is up is a
+      // different request, and every word of the dialog is drawn from it.
+      case "introConsent": {
+        const r = this.pendingIntroConsent();
+        if (!r) return "";
+        return [
+          r.conclaveId,
+          r.conclaveName,
+          r.seeker,
+          r.seekerNick,
+          r.via,
+          this.trusteeDisplayName(r.conclaveId, r.seeker, r.seekerNick),
+          this.trusteeDisplayName(r.conclaveId, r.via, ""),
+        ].join("\n");
+      }
+      // The list the picker draws. The query is the field's own, and the field
+      // patches the list in place as it is typed.
+      case "mailNotePicker":
+        return this.notesListFacts();
+      case "zinesPenName":
+        return [
+          this.zinesView?.pen_name ?? "",
+          this.zinesPenNameBusy ? "busy" : "idle",
+          this.zinesPenNameError ?? "",
+        ].join("\n");
+      case "zinesForget": {
+        const row = this.zinesView?.zines.find((z) => z.zine_id === this.zinesForgetId);
+        return [this.zinesForgetId ?? "", row?.title ?? ""].join("\n");
+      }
+      // The title in the sentence, the contacts the picker offers, the error and
+      // the busy label. The chosen contact is the picker's, and it patches the
+      // send button in place.
+      case "zinesShare": {
+        const row = this.zinesView?.zines.find((z) => z.zine_id === this.zinesShareId);
+        return [
+          this.zinesShareId ?? "",
+          row?.title ?? "",
+          this.zinesShareError ?? "",
+          this.zinesShareBusy ? "busy" : "idle",
+          ...this.contacts.map((c) => this.pickerItemFacts(c)),
+        ].join("\n\n");
+      }
+      // Whether an account is connected (the card and the form are different
+      // dialogs), the account it is signed in as, and the three busy flags. The
+      // fields below them hold their own drafts.
+      case "atprotoSetup": {
+        const account = this.atprotoView?.account ?? null;
+        return [
+          this.atprotoSetupError ?? "",
+          account ? [account.handle, account.did, account.pds].join("\n") : "none",
+          this.atprotoConnectBusy ? "connecting" : "idle",
+          this.atprotoPublicationBusy ? "saving" : "idle",
+          this.atprotoFollowsBusy ? "saving" : "idle",
+        ].join("\n");
+      }
+      // The directory as drawn: every row, whether it is followed, and which
+      // row is mid-follow. The filter is the search field's, and the field
+      // redraws the list in place as it is typed.
+      case "atprotoExplore": {
+        const view = this.atprotoExploreView;
+        const entries = view?.directory ?? [];
+        const follows = this.atprotoView?.follows ?? [];
+        return [
+          this.atprotoExploreError ?? "",
+          this.atprotoExploreBusy ? "looking" : "idle",
+          this.atprotoExploreBusyDid ?? "",
+          view?.crawled_unix ? formatRelative(view.crawled_unix * 1000) : "",
+          ...entries.map((e) =>
+            [
+              e.did,
+              e.name,
+              e.uri,
+              rowSubtitle(e),
+              isFollowing(follows, e.did) ? "following" : "not",
+            ].join("\n"),
+          ),
+        ].join("\n\n");
+      }
+      // The sentence depends on all four: the title, whether it is already
+      // public, and whether a publish came back — and how, if it was refused.
+      case "zinesPublish": {
+        const row = this.zinesView?.zines.find((z) => z.zine_id === this.zinesPublishId);
+        const result = this.zinesPublishResult;
+        return [
+          this.zinesPublishId ?? "",
+          row?.title ?? "",
+          row?.public ? "public" : "private",
+          this.zinesPublishError ?? "",
+          this.zinesPublishBusy ? "busy" : "idle",
+          result
+            ? [
+                result.published ? "published" : "refused",
+                result.uri,
+                result.url ?? "",
+                result.publish_error ?? "",
+              ].join("\n")
+            : "none",
+        ].join("\n\n");
+      }
+      // The version, the notes, and which half is up. The percentage is not
+      // here: `patchUpdateProgress` moves the bar and the label in place, and
+      // putting them in would rebuild the dialog on every chunk.
+      case "updatePrompt": {
+        const update = this.pendingUpdate;
+        if (!update) return "";
+        return [
+          update.version,
+          update.currentVersion,
+          update.notes ?? "",
+          this.updateProgress ? "progress" : "buttons",
+        ].join("\n");
       }
     }
+  }
+
+  /**
+   * One contact as a picker draws it.
+   *
+   * One definition with six readers — the conclave creator, the invite dialog
+   * and the zine share dialog, each in its builder and in its shape — so the
+   * label a picker prints and the label its shape compares cannot drift apart.
+   * `nick` is for a caller that has a nickname but no contact (the invite
+   * dialog's candidates), where the label is still the nickname's.
+   */
+  private pickerItem(
+    c: ContactDto | undefined,
+    nick = c?.nickname ?? "",
+  ): ContactPickerItem {
+    return {
+      nickname: nick,
+      label: c?.mail_handle
+        ? `${displayNick(nick)} (${this.contactAddress(c)})`
+        : displayNick(nick),
+      keywords: nick,
+    };
+  }
+
+  /** What `pickerItem` prints, as a shape compares it. */
+  private pickerItemFacts(c: ContactDto | undefined, nick?: string): string {
+    const item = this.pickerItem(c, nick);
+    return [item.nickname, item.label, item.keywords ?? ""].join("\n");
+  }
+
+  /**
+   * The Vault rail's four interchangeable bodies, in one keyed region.
+   *
+   * The pane *is* the rail's scroll box (`.main-pane`), so keeping the element
+   * across a repaint is what keeps the reader's place: the Wallet's cards, the
+   * Notes board and the Files browser all scroll, and the tile is drawn under the
+   * same pane. The key is which body is up (`vaultBodyKey`), the shape is
+   * everything that body draws (`vaultBodyFacts`), and the update redraws the
+   * body inside the pane it already has.
+   *
+   * Nothing in this rail is patched piecewise, so the shape does the whole job:
+   * it is what keeps a background tick — a message arriving, a presence flip, a
+   * TorBox poll — from rebuilding a body whose own facts did not move. Before
+   * this, every one of those ticks rebuilt the pane, which is how the reader lost
+   * their place in the Wallet, the board and the Files browser.
+   */
+  private vaultBodyRegion(): RegionSpec {
+    return {
+      key: vaultBodyKey(this.vaultBody()),
+      shape: () => this.vaultBodyFacts(),
+      build: () => this.renderVaultBody(),
+      update: (el) => this.fillVaultBody(el),
+    };
+  }
+
+  /**
+   * Which of the rail's four bodies is up.
+   *
+   * One definition with two readers — the dispatch below and the region key — so
+   * the two cannot disagree about which body is showing, the way `mailBody`
+   * keeps the Mail rail's dispatch and its key together.
+   */
+  private vaultBody(): VaultBody {
+    if (this.walletOpen) return { kind: "wallet" };
+    if (this.notesOpen) {
+      return {
+        kind: "notes",
+        editor: this.notesEditorOpen ? (this.notesEditingId ?? "new") : null,
+      };
+    }
+    if (this.filesOpen) return { kind: "files", nick: this.filesContactNick };
+    return { kind: "tile" };
+  }
+
+  private renderVaultBody(): HTMLElement {
+    // Exhaustive on purpose, with no `default`: a new body has to be given a
+    // case here, a kind in `VaultBody`, and a branch in `vaultBodyFacts`.
+    const body = this.vaultBody();
+    switch (body.kind) {
+      case "wallet":
+        return this.renderWallet();
+      case "notes":
+        return this.renderNotes();
+      case "files":
+        return this.renderFiles();
+      case "tile":
+        return this.renderVault();
+    }
+  }
+
+  /**
+   * Everything the body on screen draws, in one string.
+   *
+   * Per body, and deliberately without the fields the reader is typing in — the
+   * wallet's five drafts, the notes editor's title and body, the notes search.
+   * Those live in state and the redraw writes them back, so leaving them out
+   * loses nothing; putting them in would turn the reader's own typing into a
+   * reason to rebuild the field they are typing in, on the next tick from
+   * anywhere. What a body draws and a field merely holds is the line.
+   *
+   * Each body's entry below says what is in it, and which of its parts are
+   * deliberately absent because something else owns them.
+   */
+  private vaultBodyFacts(): string {
+    const body = this.vaultBody();
+    switch (body.kind) {
+      case "wallet":
+        return this.walletBodyFacts();
+      case "notes":
+        return this.notesBodyFacts();
+      case "files":
+        return this.filesBodyFacts();
+      case "tile":
+        return this.vaultTileFacts();
+    }
+  }
+
+  /**
+   * Redraw the body inside the pane it already has.
+   *
+   * A body change is a key change and replaces the pane, so this only ever runs
+   * for a body whose facts moved: the tile's counts, the Wallet's cards, the
+   * board's rows. Nothing here is patched piecewise, so this is the whole update
+   * — and the pane, its scroll and the rail's layout around it are untouched.
+   */
+  private fillVaultBody(el: HTMLElement): void {
+    el.replaceChildren(...Array.from(this.renderVaultBody().childNodes));
   }
 
   /**
@@ -2239,6 +3061,504 @@ export class App {
       }
       this.render();
     });
+  }
+
+  /**
+   * Background traffic, painted where it lands.
+   *
+   * The `updateTorPill` pattern, generalised. A presence flip, a new unread
+   * count, or a message arriving in the open conversation changes one small
+   * part of the surface — and a full rebuild is the only thing that can damage
+   * the parts it does not change: hover states, text selections, the draft in
+   * the composer, the reader's place in a long thread, and the row heights the
+   * containment rule has already measured.
+   *
+   * Returns false when the delta is not patchable — a rail this does not cover,
+   * a list that has moved on, a trust whose reach changed — which is the
+   * caller's cue to rebuild the shell instead. A false return may come after
+   * some patches have landed; the rebuild paints over them, and when the
+   * editing gate holds that rebuild back, the surface is only as stale as it
+   * was before the poll, which the next poll repairs.
+   */
+  private patchBackground(): boolean {
+    // A rebuild is already queued: it paints this delta too, and patching
+    // first would only be undone by it.
+    if (this.renderRaf !== null || this.renderDelayTimer !== null) return true;
+    if (this.rail === "chats") {
+      if (!this.patchConvRows()) return false;
+      if (!this.patchOpenChat()) return false;
+    } else if (this.rail === "trusts") {
+      if (!this.patchTrustRows()) return false;
+    } else if (this.rail === "conclaves") {
+      if (!this.patchConclaveCards()) return false;
+      if (!this.patchConclaveInvites()) return false;
+      if (!this.patchOpenConclave()) return false;
+    }
+    // Last, and the one patch that cannot fail: the rail is on every surface.
+    this.patchRailBadges();
+    return true;
+  }
+
+  /**
+   * The rail's region key: which button is current, and the torrent count.
+   *
+   * See `railKey` for what is in it and what the badges that are not in it are
+   * kept by instead.
+   */
+  private railKey(): string {
+    return railKey(this.rail, activeTorrentCount(getTorrentsState()));
+  }
+
+  /**
+   * The rail's unread badges, repainted from the stores. IRC is not here: its
+   * badge carries a mention dot as well, and its store subscription owns it.
+   *
+   * This is what keeps the rail's key free of the counts: the three badges below
+   * are rewritten where they stand, so a count moving must not rebuild the rail
+   * and take the hover under the pointer with it.
+   */
+  private patchRailBadges(): void {
+    const badges: [Rail, boolean | number][] = [
+      ["chats", unreadTotal()],
+      ["mail", unreadCount(this.mailPrefs())],
+      ["conclaves", conclaveUnreadTotal()],
+    ];
+    for (const [rail, badge] of badges) {
+      const btn = this.root.querySelector<HTMLElement>(
+        `.rail-btn[data-rail="${rail}"]`,
+      );
+      if (!btn) continue;
+      btn.querySelector(".rail-count")?.remove();
+      btn.querySelector(".rail-badge")?.remove();
+      const el = this.railBadgeEl(badge);
+      if (el) btn.appendChild(el);
+    }
+  }
+
+  /**
+   * What the Chats list draws where rows would go, when it draws no rows.
+   *
+   * Read by both the builder and the region key, so the two cannot disagree
+   * about which of the two nothings is on screen: they are different sentences,
+   * and a key that could not tell them apart would keep one where the other
+   * belongs.
+   */
+  private convListBody(): ConvListBody {
+    if (this.chatContacts().length) return "rows";
+    return this.contacts.length ? "mail-only" : "no-trusts";
+  }
+
+  /**
+   * The Chats list's region key. See `convListKey` for what is in it and what
+   * `patchConvRows` keeps up to date instead.
+   */
+  private convListKey(): string {
+    // The name the row shows, not the nickname behind it: a local rename is
+    // drawn text and the row's search haystack, so the key has to move for it.
+    // The reach is handed over and deliberately not read — see `chatRowShapes`.
+    return convListKey(
+      chatRowShapes(
+        this.chatContacts().map((c) => ({
+          shownName: displayNick(c.nickname),
+          protocol: c.protocol_name,
+          reach: c.reach,
+        })),
+      ),
+      this.convListBody(),
+      uiPrefsSnapshot().appear_offline,
+    );
+  }
+
+  /**
+   * Bring a kept Chats list forward in place: the rows' presence, rings,
+   * previews and times, with the search field and the scroll box around it left
+   * exactly as they are.
+   *
+   * The patch is the one the poll runs, and it checks the same two things the
+   * key is made of, so a kept region is one it can account for. The fallback is
+   * the honest answer to a state this cannot explain, not a path the key is
+   * expected to leave open.
+   */
+  private syncConvList(el: HTMLElement): void {
+    if (this.patchConvRows()) return;
+    el.replaceChildren(...Array.from(this.renderConvList().childNodes));
+  }
+
+  /**
+   * The Chats list, in place: presence dots, unread rings, previews, times and
+   * the selected mark.
+   *
+   * False when the list itself has moved on — a trust added, deleted or
+   * narrowed — because a row the patch cannot account for is a row a rebuild
+   * has to draw. The search box is not one of those: it hides rows, it does not
+   * change which ones are drawn, so every chat has a row here whether or not the
+   * query is showing it.
+   *
+   * The region's key is made of the same two things this checks, which is what
+   * lets a kept list be handed to it: a key that matched is a list whose rows
+   * are still the rows this is about to rewrite.
+   */
+  private patchConvRows(): boolean {
+    // Scoped to the Chats list: the Vault's file pane draws rows of its own
+    // with the same class, and they have nothing to do with this patch.
+    const rows = Array.from(
+      this.root.querySelectorAll<HTMLElement>(".conv-rows > .conv-row"),
+    );
+    const list = this.chatContacts();
+    // A different number of rows is a list that has moved on: a trust added,
+    // deleted or narrowed, or the empty state standing where rows should be.
+    if (list.length !== rows.length) return false;
+    for (let i = 0; i < list.length; i += 1) {
+      const row = rows[i];
+      const c = list[i];
+      if (row.dataset.nick !== c.nickname) return false;
+      // The selected mark is here rather than in the key: which row is open is a
+      // user action, and a key that carried it would rebuild this column — and
+      // take the caret out of its search field — every time a row is clicked.
+      row.classList.toggle("selected", this.selectedNick === c.nickname);
+      row
+        .querySelector(".avatar-presence-wrap")
+        ?.classList.toggle("is-online", c.online && c.reach === "full");
+      row
+        .querySelector(".avatar")
+        ?.classList.toggle("avatar-ring", hasUnread(c.nickname));
+      const prev = lastPreview(c.nickname);
+      const preview = row.querySelector<HTMLElement>("[data-conv-preview]");
+      if (preview) {
+        preview.textContent =
+          prev?.text ?? (c.inbound_ready ? "Ready to chat" : "Waiting for them to add you");
+      }
+      const time = row.querySelector<HTMLElement>("[data-conv-time]");
+      if (time) time.textContent = prev ? formatRelative(prev.time) : "";
+    }
+    return true;
+  }
+
+  /**
+   * The Trusts pane, in place: the presence dot on each row.
+   *
+   * False when the rows no longer line up with the contacts — and in
+   * particular when a reach moved, because that rewrites the row's badge and
+   * the actions in its menu, which only a rebuild draws.
+   *
+   * The region's key is made of the same two things this checks, so a kept pane
+   * is one this can account for. The reach is in both because a menu is drawn
+   * once and never patched: the only thing that redraws it is the rebuild the
+   * key asks for.
+   */
+  private patchTrustRows(): boolean {
+    const rows = Array.from(this.root.querySelectorAll<HTMLElement>(".trust-row"));
+    const ordered = this.orderedTrusts();
+    if (ordered.length !== rows.length) return false;
+    for (let i = 0; i < ordered.length; i += 1) {
+      const row = rows[i];
+      const c = ordered[i];
+      if (row.dataset.trustName !== displayNick(c.nickname)) return false;
+      if (row.dataset.trustShape !== trustRowShape(c)) return false;
+      row
+        .querySelector(".avatar-presence-wrap")
+        ?.classList.toggle("is-online", c.online && c.reach === "full");
+    }
+    return true;
+  }
+
+  /**
+   * The Trusts pane's region key: every row's shown name and its shape.
+   *
+   * See `trustsKey` for why the shape is per row rather than only for the row
+   * that moved, and what the filter and the presence dot are kept by instead.
+   */
+  private trustsKey(): string {
+    return trustsKey(
+      this.orderedTrusts().map((c) => ({
+        name: displayNick(c.nickname),
+        shape: trustRowShape(c),
+      })),
+    );
+  }
+
+  /**
+   * Bring a kept Trusts pane forward in place: the presence dot on each row,
+   * with the filter field, the caret in it, and the scroll box left alone.
+   *
+   * Same shape as `syncConvList`: the patch checks what the key is made of, so a
+   * kept pane is one it can account for, and the fallback answers a state that
+   * should not be reachable rather than a path the key leaves open.
+   */
+  private syncTrustsPane(el: HTMLElement): void {
+    if (this.patchTrustRows()) return;
+    el.replaceChildren(...Array.from(this.renderTrusts().childNodes));
+  }
+
+  /**
+   * The open conversation: the thread's arrivals, the header's presence line,
+   * and the composer's enabled state.
+   *
+   * The thread is appended to, never re-laid out, so the reader's place in it
+   * survives an arrival. False when the pane has drifted from the store, or the
+   * selection is about to be dropped — both of which are the rebuild's business.
+   */
+  private patchOpenChat(): boolean {
+    const nick = this.selectedNick;
+    if (!nick) return true;
+    const contact = this.contacts.find((c) => c.nickname === nick);
+    if (!contact) return false;
+    const header = this.root.querySelector<HTMLElement>(".chat-header");
+    if (!header) return false;
+    const scroll = this.root.querySelector<HTMLElement>(".chat-messages");
+    // No thread on screen (the empty state is up): the header is all there is.
+    if (!scroll) return true;
+    if (this.renderedNick !== nick) return false;
+    header
+      .querySelector(".avatar-presence-wrap")
+      ?.classList.toggle("is-online", contact.online);
+    const label = header.querySelector<HTMLElement>(".presence-label");
+    if (label) {
+      label.classList.toggle("online", contact.online);
+      label.textContent = contact.online ? "Online" : "Offline";
+    }
+    // The composer's presence half, on the patch path: `patchBackground` handles
+    // a presence flip without a render, so the box has to be brought forward
+    // here too. It goes through the same `updateComposer` the region's update
+    // uses, so there is one writer either way — and the stamp is the handle,
+    // because `renderComposer` is the only thing that writes it, which keeps
+    // this off the conclave's box.
+    const composer = this.root.querySelector<HTMLElement>("[data-composer-state]");
+    if (composer) this.updateComposer(composer, nick, contact);
+    return this.appendChatMessages(nick, scroll);
+  }
+
+  /**
+   * Bring a kept composer up to date in place.
+   *
+   * The box is the one place a repaint may not interrupt — the draft, its caret,
+   * its undo history and its grown height all live in the element — so presence
+   * is patched rather than keyed: a contact going offline changes the hint, the
+   * placeholder and three flags, and nothing else. `renderComposer` and this
+   * read the same decisions from `lib/composer`, so the two cannot disagree
+   * about what an offline contact's box looks like. That shared reading is what
+   * the old rebuild-and-carry was for, and it no longer needs a rebuild.
+   *
+   * The reach is not patched here: a mail-only trust has no box at all, so the
+   * region key watches it instead and this only ever runs on a box that stays.
+   */
+  private updateComposer(el: HTMLElement, nick: string, contact: ContactDto): void {
+    const state = composerState(contact.online, contact.reach === "full");
+    // Presence only: rewriting for a change that does not touch this box would
+    // be a needless write into a box the user is typing in.
+    if (el.dataset.composerState === state) return;
+    el.dataset.composerState = state;
+    this.writeComposerHint(el, nick, state);
+    const inner = el.querySelector<HTMLElement>(".composer-inner");
+    // Mail only: the hint is the whole box and there is nothing else to write.
+    if (!inner) return;
+    const enabled = composerEnabled(state);
+    inner.classList.toggle("composer-disabled", !enabled);
+    const ta = inner.querySelector<HTMLTextAreaElement>("textarea");
+    if (ta) {
+      ta.placeholder = composerPlaceholder(state);
+      ta.disabled = !enabled;
+    }
+    const send = inner.querySelector<HTMLButtonElement>(".composer-send");
+    if (send) send.disabled = !enabled;
+    const attach = inner.querySelector<HTMLButtonElement>(".composer-attach");
+    if (attach) attach.disabled = !enabled;
+  }
+
+  /**
+   * The one writer of the line above the box: the reason a trust cannot be
+   * chatted with, the reason a contact cannot be reached, or nothing.
+   *
+   * The element is always there and hidden when it has nothing to say — a hint
+   * that comes and goes is a structure change, and a structure change is what
+   * detaches the box mid-sentence.
+   */
+  private writeComposerHint(
+    el: HTMLElement,
+    nick: string,
+    state: ComposerState,
+  ): void {
+    const hint = el.querySelector<HTMLElement>(".composer-offline-hint");
+    if (!hint) return;
+    const text = composerHint(displayNick(nick), state);
+    hint.hidden = text === null;
+    if (text !== null) hint.textContent = text;
+  }
+
+  /**
+   * Append the thread's new messages to the pane already on screen.
+   *
+   * Append-only: the rows already there are left alone, so hover, selection and
+   * the reader's scroll position survive an arrival, and the rows the
+   * containment rule has measured keep their remembered heights. The pane
+   * follows the newest message only when the reader was already at the bottom,
+   * which is the rule the rebuild applies too.
+   *
+   * False when the pane has drifted from the store (a reload, a prune): a stale
+   * pane must never be patched into looking current.
+   */
+  private appendChatMessages(nick: string, scroll: HTMLElement): boolean {
+    const rendered = Array.from(
+      scroll.querySelectorAll<HTMLElement>("[data-msg-id]"),
+    ).map((el) => el.dataset.msgId ?? "");
+    const plan = planAppend(rendered, getThread(nick));
+    if (!plan) return false;
+    if (!plan.fresh.length) return true;
+    const atBottom = isAtBottom(scroll);
+    if (plan.daySep !== null) scroll.appendChild(daySepEl(plan.daySep));
+    let group = plan.continuesRun
+      ? (scroll.lastElementChild as HTMLElement | null)
+      : null;
+    if (group) {
+      // The run has a new last bubble, so the one before it loses its tail.
+      group.lastElementChild?.classList.remove("tail");
+    } else {
+      group = document.createElement("div");
+      group.className = `bubble-group ${plan.fresh[0].outgoing ? "out" : "in"}`;
+      scroll.appendChild(group);
+    }
+    const last = plan.fresh.length - 1;
+    plan.fresh.forEach((m, i) => group.appendChild(this.chatBubble(m, i === last)));
+    if (atBottom) pinToBottom(scroll);
+    return true;
+  }
+
+  /**
+   * The Conclaves list, in place: unread numbers and last-message previews.
+   *
+   * Only ever reached for a load that was arrivals, or an invitation that moved
+   * — the invitation box is patched by `patchConclaveInvites`, so it is not this
+   * method's to draw. The structure checks here are a guard against a racing
+   * render rather than the main gate: false when the cards no longer line up,
+   * which is a conclave added, pruned or renamed, and a rebuild has to draw it.
+   */
+  private patchConclaveCards(): boolean {
+    const cards = Array.from(
+      this.root.querySelectorAll<HTMLElement>(".conclave-card"),
+    );
+    const list = listConclaves();
+    if (list.length !== cards.length) return false;
+    for (let i = 0; i < list.length; i += 1) {
+      const card = cards[i];
+      const m = list[i];
+      if (card.dataset.conclaveId !== m.id) return false;
+      const top = card.querySelector<HTMLElement>(".conclave-card-top");
+      if (top) {
+        top.querySelector(".conclave-unread")?.remove();
+        const pill = this.conclaveUnreadEl(conclaveUnreadCount(m.id));
+        if (pill) top.appendChild(pill);
+      }
+      const preview = card.querySelector<HTMLElement>("[data-conclave-preview]");
+      if (preview) preview.textContent = conclavePreview(m);
+      // The open meeting's mark, on the same rule the Chats rows use: a click
+      // repaints the mark here instead of rebuilding the column, which would
+      // take the caret out of the filter field.
+      card.classList.toggle("selected", this.conclaveId === m.id);
+    }
+    return true;
+  }
+
+  /**
+   * The pending invitations, in place: the box that used to force a rebuild.
+   *
+   * An invitation arriving is not a conclave appearing, so it is not a card, and
+   * it used to be the one thing `patchConclaveCards` could not account for: the
+   * box above the cards has to appear, and disappear again when the invitation
+   * is answered, and a rebuild was the only thing that drew it. It is now drawn
+   * here instead — the whole box at once, which is honest, because it holds
+   * nothing the user can be part-way through: no caret, no scroll, no selection,
+   * just two buttons.
+   *
+   * The box is left exactly where it is when the store is holding the same
+   * invitations, because this runs on every background delta and only
+   * occasionally has anything to do: a presence flip must not take the Accept
+   * button out from under the pointer.
+   *
+   * False when the column is not the shape this patches — the empty state stands
+   * where the filter, the box and the cards would be, so an invitation arriving
+   * there is a structure a rebuild has to draw.
+   */
+  private patchConclaveInvites(): boolean {
+    const invites = listPendingInvites();
+    const shape = conclaveListShape(listConclaves().length, invites.length);
+    const cards = this.root.querySelector<HTMLElement>(".conclaves-cards");
+    // No cards container means the empty state is standing where the filter, the
+    // box and the cards would be. It is current while it is still the right
+    // shape, and anything else arriving there — an invitation, or a first
+    // conclave — is a structure a rebuild has to draw.
+    if (!cards) return shape === "empty";
+    // The list is up, but the store now wants the empty state: the last
+    // invitation answered and no conclave left. A rebuild draws it.
+    if (shape === "empty") return false;
+    const live = this.root.querySelector<HTMLElement>(".conclave-invites");
+    const rendered = live
+      ? Array.from(live.querySelectorAll<HTMLElement>(".conclave-invite-card")).map(
+          (card) => card.dataset.invite ?? "",
+        )
+      : [];
+    if (live && invitesAreCurrent(rendered, invites)) return true;
+    const fresh = invites.length ? this.conclaveInvitesBox(invites) : null;
+    if (fresh) {
+      // Immediately before the cards, which is where the first paint puts it.
+      if (live) live.replaceWith(fresh);
+      else cards.before(fresh);
+    } else {
+      live?.remove();
+    }
+    return true;
+  }
+
+  /** The open conclave's chat: the same append the 1:1 thread gets. */
+  private patchOpenConclave(): boolean {
+    const id = this.conclaveId;
+    if (!id) return true;
+    const scroll = this.root.querySelector<HTMLElement>(".conclave-messages");
+    if (!scroll) return true;
+    if (this.renderedConclaveId !== id) return false;
+    const conclave = conclaveById(id);
+    if (!conclave) return false;
+    return this.appendConclaveMessages(conclave, scroll);
+  }
+
+  /**
+   * Append a conclave chat's new messages to the pane already on screen. The
+   * 1:1 rule, on the pane that shows more than two voices: a run is a stretch
+   * from one sender on one day, and only its last bubble carries the tail.
+   */
+  private appendConclaveMessages(conclave: Conclave, scroll: HTMLElement): boolean {
+    const rendered = Array.from(
+      scroll.querySelectorAll<HTMLElement>("[data-msg-id]"),
+    ).map((el) => el.dataset.msgId ?? "");
+    const plan = planAppend(rendered, conclave.messages);
+    if (!plan) return false;
+    if (!plan.fresh.length) return true;
+    const atBottom = isAtBottom(scroll);
+    // The first message into an empty chat replaces its "say hello" note.
+    scroll.querySelector(".conclave-no-messages")?.remove();
+    if (plan.daySep !== null) scroll.appendChild(daySepEl(plan.daySep));
+    let body: HTMLElement;
+    // Resolved before anything is written: a run that continues an on-screen
+    // group appends into it, and anything else is a fresh group — the same
+    // fallback the 1:1 append uses, so a missing group can never leave the pane
+    // half-written.
+    const run = plan.continuesRun
+      ? (scroll.lastElementChild as HTMLElement | null)
+      : null;
+    if (run) {
+      run.lastElementChild?.classList.remove("tail");
+      body = run.querySelector<HTMLElement>(":scope > .conclave-body") ?? run;
+    } else {
+      const fresh = this.conclaveGroupEl({
+        outgoing: plan.fresh[0].outgoing,
+        from: plan.fresh[0].from ?? "",
+      });
+      body = fresh.body;
+      scroll.appendChild(fresh.el);
+    }
+    const last = plan.fresh.length - 1;
+    plan.fresh.forEach((m, i) => body.appendChild(this.conclaveBubble(m, i === last)));
+    if (atBottom) pinToBottom(scroll);
+    return true;
   }
 
   private async maybeShowRecoveryCode(): Promise<void> {
@@ -2594,6 +3914,28 @@ export class App {
   }
 
   /**
+   * The unread badge for a rail button: a count pill, a bare dot, or nothing.
+   * One builder, because the rail's first paint and the background patch must
+   * agree on which of the three it is — and on which element it replaces.
+   */
+  private railBadgeEl(badge: boolean | number): HTMLElement | null {
+    if (typeof badge === "number" && badge > 0) {
+      const pill = document.createElement("span");
+      pill.className = "rail-count";
+      pill.textContent = badge > 99 ? "99+" : String(badge);
+      pill.setAttribute("aria-label", `${badge} unread`);
+      return pill;
+    }
+    if (badge) {
+      const dot = document.createElement("span");
+      dot.className = "rail-badge";
+      dot.setAttribute("aria-label", "Unread");
+      return dot;
+    }
+    return null;
+  }
+
+  /**
    * A left-rail button. `badge` is either a plain unread dot (`true`) or, when
    * a number, a pill carrying the unread count — chats and mail show how many
    * messages wait, the other rails stay quiet.
@@ -2606,18 +3948,8 @@ export class App {
     const span = document.createElement("span");
     span.textContent = label;
     b.appendChild(span);
-    if (typeof badge === "number" && badge > 0) {
-      const pill = document.createElement("span");
-      pill.className = "rail-count";
-      pill.textContent = badge > 99 ? "99+" : String(badge);
-      pill.setAttribute("aria-label", `${badge} unread`);
-      b.appendChild(pill);
-    } else if (badge) {
-      const dot = document.createElement("span");
-      dot.className = "rail-badge";
-      dot.setAttribute("aria-label", "Unread");
-      b.appendChild(dot);
-    }
+    const badgeEl = this.railBadgeEl(badge);
+    if (badgeEl) b.appendChild(badgeEl);
     b.onclick = () => {
       const wasConclaves = this.rail === "conclaves";
       this.rail = id;
@@ -2636,8 +3968,8 @@ export class App {
         });
       }
       if (id === "conclaves") {
-        void this.reloadConclaves().then((changed) => {
-          if (changed && this.rail === "conclaves" && !this.conclaveCreateOpen)
+        void this.reloadConclaves().then((loaded) => {
+          if (loaded.changed && this.rail === "conclaves" && !this.conclaveCreateOpen)
             this.scheduleBackgroundRender();
         });
       }
@@ -2725,7 +4057,11 @@ export class App {
         activeTorrentCount(getTorrentsState()),
       ),
     );
-    rail.appendChild(this.railBtn("irc", "IRC", "irc", ircUnreadTotal()));
+    // The IRC badge has two parts, so it has one writer: the same one the store
+    // subscription uses while the rail is up.
+    const irc = this.railBtn("irc", "IRC", "irc");
+    this.updateIrcRailBadge(ircUnreadTotal(), ircMentionCount(), irc);
+    rail.appendChild(irc);
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
@@ -2779,77 +4115,104 @@ export class App {
     const inp = document.createElement("input");
     inp.placeholder = "Search or press Ctrl+K";
     inp.value = this.search;
-    inp.oninput = () => {
-      this.search = inp.value;
-      // Synchronous, as before: the rebuilt field's focus/caret survival is
-      // only guaranteed with the wipe in the same tick. (Search fields stop
-      // rebuilding the shell once pane-scoped renders land.)
-      this.render();
-    };
     search.appendChild(inp);
     const rows = document.createElement("div");
     rows.className = "conv-rows";
-    const q = this.search.toLowerCase();
     // Only the trusts with a live chat are listed (Task 24): a mail-only one
     // has no chat to open, so a row for it would reach nothing but a composer
     // notice saying so. It keeps its place in Trusts and in Mail, and widening
     // the reach puts the row — and its history — back.
-    const list = this.chatContacts().filter((c) =>
-      displayNick(c.nickname).toLowerCase().includes(q),
-    );
-    if (!list.length) {
+    const chats = this.chatContacts();
+    const body = this.convListBody();
+    if (body !== "rows") {
+      // Two nothings with nothing between them to narrow: no trusts at all, and
+      // trusts that are all mail only. There is no row for the search to hide,
+      // so it only records the query for the next render.
       const empty = document.createElement("p");
       empty.className = "muted";
       empty.style.padding = "var(--space-4)";
-      // Three different nothings, told apart: no trusts at all, a search that
-      // matched no chat, and trusts that are all mail only.
-      empty.textContent = !this.contacts.length
-        ? "No chats yet"
-        : this.chatContacts().length
-          ? "No chats match your search"
-          : "Everyone you know is mail only.";
+      empty.textContent =
+        body === "mail-only"
+          ? "Everyone you know is mail only."
+          : "No chats yet";
       rows.appendChild(empty);
-    }
-    for (const c of list) {
-      const row = document.createElement("button");
-      row.className = `conv-row pressable${this.selectedNick === c.nickname ? " selected" : ""}`;
-      const av = avatarWithPresence(
-        c.protocol_name,
-        // Same rule as the Trusts row (Task 24): a mail-only trust has no live
-        // chat, so an online dot would promise a surface that is off.
-        c.online && c.reach === "full",
-        "sm",
-        hasUnread(c.nickname),
-        displayNick(c.nickname),
-      );
-      const meta = document.createElement("div");
-      meta.style.flex = "1";
-      meta.style.minWidth = "0";
-      const name = document.createElement("div");
-      name.className = "text-15";
-      name.style.fontWeight = "500";
-      name.textContent = displayNick(c.nickname);
-      const prev = lastPreview(c.nickname);
-      const sub = document.createElement("div");
-      sub.className = "text-13 muted";
-      sub.style.overflow = "hidden";
-      sub.style.textOverflow = "ellipsis";
-      sub.style.whiteSpace = "nowrap";
-      sub.textContent = prev?.text ?? (c.inbound_ready ? "Ready to chat" : "Waiting for them to add you");
-      meta.append(name, sub);
-      const time = document.createElement("span");
-      time.className = "text-12 faint";
-      time.textContent = prev ? formatRelative(prev.time) : "";
-      row.append(av, meta, time);
-      row.onclick = () => {
-        this.selectedNick = c.nickname;
-        markRead(c.nickname);
-        this.scheduleRender();
+      inp.oninput = () => {
+        this.search = inp.value;
       };
-      rows.appendChild(row);
+    } else {
+      for (const c of chats) rows.appendChild(this.convRow(c));
+      const noMatch = document.createElement("p");
+      noMatch.className = "muted";
+      noMatch.style.padding = "var(--space-4)";
+      noMatch.textContent = "No chats match your search";
+      rows.appendChild(noMatch);
+      // Every chat is drawn and the query hides the ones that do not match, so
+      // a keystroke never rebuilds the list. Rebuilding is what used to replace
+      // this very field, which dropped the caret after one character.
+      const narrow = () => {
+        noMatch.hidden = applyRowFilter(rows, this.search) > 0;
+      };
+      inp.oninput = () => {
+        this.search = inp.value;
+        narrow();
+      };
+      narrow();
     }
     col.append(head, offlineRow, search, rows);
     return col;
+  }
+
+  /**
+   * One conversation row: the avatar with its presence dot and unread ring, the
+   * name, and the last message's preview and time.
+   *
+   * The parts the background patch repaints in place are marked on the row —
+   * the nick it shows, the preview line, the time — so the patch can find them
+   * again without depending on DOM order, which a re-render is free to change.
+   * The name is also the row's search haystack, because the search narrows the
+   * list by hiding rows rather than by drawing a different set of them.
+   */
+  private convRow(c: ContactDto): HTMLElement {
+    const row = document.createElement("button");
+    row.className = `conv-row pressable${this.selectedNick === c.nickname ? " selected" : ""}`;
+    row.dataset.nick = c.nickname;
+    row.dataset.filterText = filterText(displayNick(c.nickname));
+    const av = avatarWithPresence(
+      c.protocol_name,
+      // Same rule as the Trusts row (Task 24): a mail-only trust has no live
+      // chat, so an online dot would promise a surface that is off.
+      c.online && c.reach === "full",
+      "sm",
+      hasUnread(c.nickname),
+      displayNick(c.nickname),
+    );
+    const meta = document.createElement("div");
+    meta.style.flex = "1";
+    meta.style.minWidth = "0";
+    const name = document.createElement("div");
+    name.className = "text-15";
+    name.style.fontWeight = "500";
+    name.textContent = displayNick(c.nickname);
+    const prev = lastPreview(c.nickname);
+    const sub = document.createElement("div");
+    sub.className = "text-13 muted";
+    sub.style.overflow = "hidden";
+    sub.style.textOverflow = "ellipsis";
+    sub.style.whiteSpace = "nowrap";
+    sub.dataset.convPreview = "1";
+    sub.textContent = prev?.text ?? (c.inbound_ready ? "Ready to chat" : "Waiting for them to add you");
+    meta.append(name, sub);
+    const time = document.createElement("span");
+    time.className = "text-12 faint";
+    time.dataset.convTime = "1";
+    time.textContent = prev ? formatRelative(prev.time) : "";
+    row.append(av, meta, time);
+    row.onclick = () => {
+      this.selectedNick = c.nickname;
+      markRead(c.nickname);
+      this.scheduleRender();
+    };
+    return row;
   }
 
   /**
@@ -2879,7 +4242,7 @@ export class App {
     pane.className = "main-pane";
     pane.style.position = "relative";
     const nick = this.selectedNick;
-    const contact = this.contacts.find((c) => c.nickname === nick);
+    const contact = nick ? this.contacts.find((c) => c.nickname === nick) : undefined;
     if (!contact || !nick) {
       const empty = document.createElement("div");
       empty.className = "empty-state";
@@ -2908,7 +4271,94 @@ export class App {
       pane.appendChild(empty);
       return pane;
     }
+    this.syncChatPane(pane, nick, contact);
+    // The drop target belongs to the pane, and the pane outlives a render now,
+    // so it is set once — on the build that made this pane for this nick. The
+    // key carries the nick, so a handler closing over it cannot go stale.
+    pane.ondragover = (e) => {
+      e.preventDefault();
+    };
+    pane.ondrop = async (e) => {
+      e.preventDefault();
+      const f = e.dataTransfer?.files?.[0];
+      if (f) await this.sendFile(nick, f);
+    };
+    return pane;
+  }
 
+  /**
+   * What the Chats rail's main pane is, as one string.
+   *
+   * The open thread is keyed by its conversation, and only by it: everything
+   * else about the thread is drawn by parts that carry keys of their own. The
+   * empty pane has no such parts, so which of its three different nothings it
+   * shows belongs in the key — a trust added, or narrowed to mail, has to
+   * redraw it.
+   */
+  private chatPaneKey(): string {
+    const nick = this.selectedNick;
+    if (nick && this.contacts.some((c) => c.nickname === nick)) return `chat:${nick}`;
+    if (!this.contacts.length) return "chat::none";
+    return this.chatContacts().length ? "chat::pick" : "chat::mail_only";
+  }
+
+  /**
+   * Bring the open thread up to date without rebuilding it.
+   *
+   * Reached only when the pane's key is unchanged, so the pane already shows
+   * this conversation and holds the scroll box the reader is using. Refreshing
+   * its parts is the whole job.
+   */
+  private updateMainChat(pane: HTMLElement): void {
+    const nick = this.selectedNick;
+    const contact = nick ? this.contacts.find((c) => c.nickname === nick) : undefined;
+    // A missing half would have changed the key, so this guards against a
+    // caller that paired the pane with the wrong state, not a real branch.
+    if (!nick || !contact) return;
+    this.syncChatPane(pane, nick, contact);
+  }
+
+  /**
+   * The thread pane's three parts, each keyed by what it draws from.
+   *
+   * The header is small and its inputs are the arguments its builder takes, so a
+   * change to any of them rebuilds just that part. The composer is keyed by the
+   * two facts its *structure* is drawn from — the conversation and the reach —
+   * and its presence half is patched in place by `updateComposer`, so a peer
+   * going offline no longer detaches a box the user is typing in.
+   *
+   * The message list is keyed by the conversation alone and patched in place.
+   * It is the part that must never be detached: rebuilding a long history is a
+   * full re-parse of every bubble, and the reader's place in it lives in the
+   * element itself — a detached scroll box reports 0 and stays there.
+   */
+  private syncChatPane(pane: HTMLElement, nick: string, contact: ContactDto): void {
+    syncRegions(pane, [
+      {
+        key: `chatHeader:${nick}:${displayNick(nick)}:${contact.protocol_name}:${contact.online}:${contact.reach}:${isChatSoundMuted(nick)}`,
+        build: () => this.chatHeaderEl(nick, contact),
+      },
+      {
+        key: `chatMessages:${nick}`,
+        build: () => this.chatMessagesEl(nick),
+        update: (el) => this.patchChatMessages(el, nick),
+      },
+      {
+        // Keyed by the conversation and the reach, which are the two facts its
+        // *structure* is drawn from: a mail-only trust has the reason instead of
+        // a box. Presence is deliberately not here — it changes a hint, a
+        // placeholder and three flags inside a box that stays, and
+        // `updateComposer` writes those in place. A peer going offline must not
+        // detach a box the user is typing in.
+        key: `chatComposer:${nick}:${contact.reach}`,
+        build: () => this.renderComposer(nick, contact.online, contact.reach === "full"),
+        update: (el) => this.updateComposer(el, nick, contact),
+      },
+    ]);
+  }
+
+  /** The thread's header: who this is, whether they are on, and the actions. */
+  private chatHeaderEl(nick: string, contact: ContactDto): HTMLElement {
     const header = document.createElement("div");
     header.className = "chat-header";
     const left = document.createElement("div");
@@ -2978,116 +4428,138 @@ export class App {
       ],
     });
     header.append(left, menu.element);
+    return header;
+  }
 
+  /**
+   * A freshly drawn thread history.
+   *
+   * A fresh list is a conversation being opened, or one coming back on screen
+   * after the rail left it, so it lands on the newest message. An in-place
+   * patch decides the same thing from where the reader already is.
+   */
+  private chatMessagesEl(nick: string): HTMLElement {
     const scroll = document.createElement("div");
     scroll.className = "chat-messages";
-    const msgs = getThread(nick);
+    this.fillChatMessages(scroll, nick);
+    // Consumed here rather than left set: this list lands at the bottom anyway,
+    // and leaving the flag up would force a later patch to the bottom too.
+    this.bottomOnNextChatRender = false;
+    this.chatToBottom = true;
+    return scroll;
+  }
+
+  /** Draw the whole thread into `scroll`, replacing whatever it held. */
+  private fillChatMessages(scroll: HTMLElement, nick: string): void {
+    scroll.replaceChildren();
     let lastDay = "";
-    for (const group of groupMessages(msgs)) {
+    for (const group of groupMessages(getThread(nick))) {
       if (group.day !== lastDay) {
         lastDay = group.day;
-        const sep = document.createElement("div");
-        sep.className = "day-sep";
-        sep.textContent = group.day;
-        scroll.appendChild(sep);
+        scroll.appendChild(daySepEl(group.day));
       }
       const gEl = document.createElement("div");
       gEl.className = `bubble-group ${group.outgoing ? "out" : "in"}`;
       group.messages.forEach((m, i) => {
-        const tail = i === group.messages.length - 1;
-        const b = document.createElement("div");
-        b.className = `bubble ${group.outgoing ? "out" : "in"}${tail ? " tail" : ""}`;
-        if (m.kind === "text") b.textContent = m.text ?? "";
-        else {
-          const fc = document.createElement("div");
-          fc.className = "file-card";
-          fc.innerHTML = `<div class="text-15" style="font-weight:500">${m.fileName}</div><div class="text-13 muted">${formatBytes(m.fileSize ?? 0)}</div><div class="text-12" style="color:var(--success-text);background:var(--success-soft);display:inline-block;padding:2px 8px;border-radius:var(--radius-pill);margin-top:8px">Sealed on your device</div>`;
-          if (m.sendProgress !== undefined) {
-            const bar = document.createElement("div");
-            bar.style.height = "3px";
-            bar.style.background = "var(--border)";
-            bar.style.marginTop = "8px";
-            bar.style.borderRadius = "2px";
-            const fill = document.createElement("div");
-            fill.style.height = "100%";
-            fill.style.width = `${m.sendProgress}%`;
-            fill.style.background = "var(--accent)";
-            bar.appendChild(fill);
-            fc.appendChild(bar);
-          }
-          const uploading =
-            m.sendProgress !== undefined && m.sendProgress < 100;
-          if (!uploading && (m.fileData || m.blobId)) {
-            attachFileActions(
-              fc,
-              m.fileName ?? "file",
-              () => resolveMessageFileBytes(m),
-              m.blobId,
-            );
-          } else if (!uploading && !m.fileData && !m.blobId) {
-            const hint = document.createElement("p");
-            hint.className = "text-12 muted";
-            hint.style.marginTop = "var(--space-2)";
-            hint.textContent =
-              "File bytes are not on this device. Ask your contact to send again.";
-            fc.appendChild(hint);
-          }
-          b.appendChild(fc);
-        }
-        if (m.reactions.length) {
-          const pills = document.createElement("div");
-          pills.style.display = "flex";
-          pills.style.gap = "4px";
-          pills.style.marginTop = "4px";
-          m.reactions.forEach((r) => {
-            const p = document.createElement("span");
-            p.className = "text-12";
-            p.style.background = "var(--surface)";
-            p.style.padding = "2px 6px";
-            p.style.borderRadius = "var(--radius-pill)";
-            p.textContent = r;
-            pills.appendChild(p);
-          });
-          b.appendChild(pills);
-        }
-        b.onmouseenter = () => {
-          /* reaction bar simplified: double-click heart */
-        };
-        b.ondblclick = () => {
-          toggleReaction(m.id, "❤");
-          this.scheduleRender();
-        };
-        gEl.appendChild(b);
+        gEl.appendChild(this.chatBubble(m, i === group.messages.length - 1));
       });
       scroll.appendChild(gEl);
     }
-    // Follow new messages only while the reader is already at the bottom;
-    // someone scrolled up reading history stays where they are. A position
-    // from a DIFFERENT conversation is not restored: opening a chat always
-    // lands on the latest message. Applied after attachment (see render).
-    const prev = this.chatScrollPos;
-    this.chatScrollPos = null;
-    const forceBottom = this.bottomOnNextChatRender;
+  }
+
+  /**
+   * Bring the thread already on screen up to date, in place.
+   *
+   * The append keeps the reader's position: at the bottom they follow the new
+   * message, away in history they keep their place. `planAppend` returns null
+   * when the pane has drifted from the store — a reload, a prune — and then the
+   * list is redrawn rather than patched into looking current.
+   */
+  private patchChatMessages(scroll: HTMLElement, nick: string): void {
+    // Returning to the window is a fresh read: the newest message wins even
+    // over a reader who had scrolled away.
+    const force = this.bottomOnNextChatRender;
     this.bottomOnNextChatRender = false;
-    const target = paneScrollTarget(prev, nick, forceBottom);
-    this.pendingChatScroll =
-      target.mode === "bottom"
-        ? { nick, mode: "bottom" }
-        : { nick, mode: "restore", top: target.top };
+    if (!this.appendChatMessages(nick, scroll)) {
+      this.fillChatMessages(scroll, nick);
+      this.chatToBottom = true;
+      return;
+    }
+    if (force) this.chatToBottom = true;
+  }
 
-    const composer = this.renderComposer(nick, contact.online, contact.reach === "full");
-    pane.append(header, scroll, composer);
-
-    pane.ondragover = (e) => {
-      e.preventDefault();
+  /**
+   * One message bubble in the 1:1 thread.
+   *
+   * Shared by the thread's first paint and the background append, so an
+   * arriving message is drawn by the same code as a rebuilt thread and the two
+   * cannot drift. The bubble carries the id it was drawn for, which is what
+   * lets the append find the pane's place without guessing.
+   */
+  private chatBubble(m: ChatMessage, tail: boolean): HTMLElement {
+    const b = document.createElement("div");
+    b.className = `bubble ${m.outgoing ? "out" : "in"}${tail ? " tail" : ""}`;
+    b.dataset.msgId = m.id;
+    if (m.kind === "text") b.textContent = m.text ?? "";
+    else {
+      const fc = document.createElement("div");
+      fc.className = "file-card";
+      fc.innerHTML = `<div class="text-15" style="font-weight:500">${m.fileName}</div><div class="text-13 muted">${formatBytes(m.fileSize ?? 0)}</div><div class="text-12" style="color:var(--success-text);background:var(--success-soft);display:inline-block;padding:2px 8px;border-radius:var(--radius-pill);margin-top:8px">Sealed on your device</div>`;
+      if (m.sendProgress !== undefined) {
+        const bar = document.createElement("div");
+        bar.style.height = "3px";
+        bar.style.background = "var(--border)";
+        bar.style.marginTop = "8px";
+        bar.style.borderRadius = "2px";
+        const fill = document.createElement("div");
+        fill.style.height = "100%";
+        fill.style.width = `${m.sendProgress}%`;
+        fill.style.background = "var(--accent)";
+        bar.appendChild(fill);
+        fc.appendChild(bar);
+      }
+      const uploading = m.sendProgress !== undefined && m.sendProgress < 100;
+      if (!uploading && (m.fileData || m.blobId)) {
+        attachFileActions(
+          fc,
+          m.fileName ?? "file",
+          () => resolveMessageFileBytes(m),
+          m.blobId,
+        );
+      } else if (!uploading && !m.fileData && !m.blobId) {
+        const hint = document.createElement("p");
+        hint.className = "text-12 muted";
+        hint.style.marginTop = "var(--space-2)";
+        hint.textContent =
+          "File bytes are not on this device. Ask your contact to send again.";
+        fc.appendChild(hint);
+      }
+      b.appendChild(fc);
+    }
+    if (m.reactions.length) {
+      const pills = document.createElement("div");
+      pills.style.display = "flex";
+      pills.style.gap = "4px";
+      pills.style.marginTop = "4px";
+      m.reactions.forEach((r) => {
+        const p = document.createElement("span");
+        p.className = "text-12";
+        p.style.background = "var(--surface)";
+        p.style.padding = "2px 6px";
+        p.style.borderRadius = "var(--radius-pill)";
+        p.textContent = r;
+        pills.appendChild(p);
+      });
+      b.appendChild(pills);
+    }
+    b.onmouseenter = () => {
+      /* reaction bar simplified: double-click heart */
     };
-    pane.ondrop = async (e) => {
-      e.preventDefault();
-      const f = e.dataTransfer?.files?.[0];
-      if (f) await this.sendFile(nick, f);
+    b.ondblclick = () => {
+      toggleReaction(m.id, "❤");
+      this.scheduleRender();
     };
-
-    return pane;
+    return b;
   }
 
   private renderComposer(
@@ -3095,32 +4567,36 @@ export class App {
     contactOnline: boolean,
     canChat: boolean,
   ): HTMLElement {
+    const state = composerState(contactOnline, canChat);
     const wrap = document.createElement("div");
     wrap.className = "composer";
+    // What this box was drawn for. The reach is the half the region key watches,
+    // because a mail-only trust has no box at all. Presence is not: it changes
+    // the hint, the placeholder and three flags inside a box that stays, and
+    // `updateComposer` writes those in place — a box the user is typing in must
+    // not be detached by a peer going offline.
+    wrap.dataset.composerState = state;
     // A mail-only trust has no chat at all (Task 24): the composer is not shown
     // disabled, it is replaced by the reason and the way out. A disabled field
     // invites the user to look for the switch that enables it; there is none
     // here — the switch is in the trust's menu, and the hint says so.
+    const hint = document.createElement("p");
+    hint.className = "text-13 muted composer-offline-hint";
+    hint.hidden = true;
+    wrap.appendChild(hint);
     if (!canChat) {
-      const hint = document.createElement("p");
-      hint.className = "text-13 muted composer-offline-hint";
-      hint.textContent =
-        `${displayNick(nick)} is mail only — chat and conclaves are off for this trust. Use Mail, or change this in their menu in Trusts.`;
-      wrap.appendChild(hint);
+      // Rendered through the same writer the patch uses, so the first paint and
+      // every update after it cannot disagree.
+      this.writeComposerHint(wrap, nick, state);
       return wrap;
     }
-    if (!contactOnline) {
-      const hint = document.createElement("p");
-      hint.className = "text-13 muted composer-offline-hint";
-      hint.textContent =
-        `${displayNick(nick)} is offline. Chat and files need you both online — use Mail to reach them later.`;
-      wrap.appendChild(hint);
-    }
+    this.writeComposerHint(wrap, nick, state);
     const inner = document.createElement("div");
     inner.className = "composer-inner";
     if (!contactOnline) inner.classList.add("composer-disabled");
     const attach = document.createElement("button");
-    attach.className = "pressable";
+    // Named so `updateComposer` can find it without counting children.
+    attach.className = "composer-attach pressable";
     attach.appendChild(icon("attach"));
     const fileIn = document.createElement("input");
     fileIn.type = "file";
@@ -3133,13 +4609,10 @@ export class App {
     };
     const ta = document.createElement("textarea");
     ta.rows = 1;
-    // The focus carrier: a repaint can put the caret back in THIS box (not
-    // just any box), keyed by who it belongs to.
-    ta.dataset.composerKey = `chat:${nick}`;
-    ta.placeholder = contactOnline ? "Message" : "Waiting for them to come online…";
+    ta.placeholder = composerPlaceholder(state);
     ta.disabled = !contactOnline;
     const send = document.createElement("button");
-    send.className = "send-fab btn-icon-round pressable";
+    send.className = "composer-send send-fab btn-icon-round pressable";
     send.appendChild(icon("send"));
     const syncSend = () => {
       send.classList.toggle("ready", ta.value.trim().length > 0);
@@ -3488,7 +4961,70 @@ export class App {
     this.dropsTor = tor;
     this.dropsOpenId = openId;
     this.dropsDevAllowed = dev;
-    if (changed && this.rail === "drops") this.scheduleBackgroundRender();
+    if (changed && this.rail === "drops" && !this.patchDropsPane()) {
+      this.scheduleBackgroundRender();
+    }
+  }
+
+  /**
+   * The Drops rail's one region.
+   *
+   * A constant key, because the pane has no identity of its own to switch — it
+   * is the same pane whatever it is showing — so the shape is what decides when
+   * it is redrawn (`dropsPaneShape` names what it is made of). The pane is the
+   * rail's scroll box and holds the only switches on the rail, so keeping it is
+   * what keeps the reader's place in a long directory and the focus on a toggle
+   * pressed with the keyboard.
+   */
+  private dropsPaneRegion(): RegionSpec {
+    return {
+      key: "dropsPane",
+      shape: () => dropsPaneShape(this.dropsPaneFacts()),
+      build: () => this.renderDrops(),
+      update: (el) => this.fillDropsPane(el),
+    };
+  }
+
+  /**
+   * Everything the Drops pane draws, in the terms its shape compares. See
+   * `dropsPaneShape` for what is deliberately not here and who owns it.
+   */
+  private dropsPaneFacts(): DropsPaneFacts {
+    return {
+      verified: verifiedCount(),
+      shell: dropsAvailable(),
+      phase: this.dropsTor.phase,
+      message: this.dropsTor.message,
+      openId: this.dropsOpenId,
+      openingId: this.dropsOpeningId,
+      torBusy: this.dropsTorBusy,
+      error: this.dropsError,
+      showUnverified: this.dropsShowUnverified,
+      devAllowed: this.dropsDevAllowed,
+    };
+  }
+
+  /** Redraw the pane under its own element: that pane is the rail's scroll box. */
+  private fillDropsPane(el: HTMLElement): void {
+    el.replaceChildren(...Array.from(this.renderDrops().childNodes));
+  }
+
+  /**
+   * Paint a Drops-rail delta where it lands, or say that it cannot be.
+   *
+   * Tor's phase, the open window, the development switch and the request in
+   * flight are all this rail's own state, and every one of them is drawn in the
+   * pane — so the region's update is the whole patch, and the delta costs a
+   * repaint of one pane instead of a rebuild of the shell. Returns false when
+   * the pane is not on screen to paint, which is the caller's cue to rebuild.
+   */
+  private patchDropsPane(): boolean {
+    // A rebuild is already queued: it paints this delta too, and patching first
+    // would only be undone by it.
+    if (this.renderRaf !== null || this.renderDelayTimer !== null) return true;
+    const shell = this.shellEl;
+    if (!shell) return false;
+    return updateRegionInPlace(shell, this.dropsPaneRegion());
   }
 
   /** Bring Tor up explicitly and surface the reason if it cannot. */
@@ -3496,7 +5032,7 @@ export class App {
     if (this.dropsTorBusy) return;
     this.dropsTorBusy = true;
     this.dropsError = null;
-    this.scheduleRender();
+    if (!this.patchDropsPane()) this.scheduleRender();
     try {
       const status = await torStart(120_000);
       this.dropsTor = status;
@@ -3507,7 +5043,7 @@ export class App {
       }
     } finally {
       this.dropsTorBusy = false;
-      if (this.rail === "drops") this.scheduleRender();
+      if (this.rail === "drops" && !this.patchDropsPane()) this.scheduleRender();
     }
   }
 
@@ -3771,7 +5307,7 @@ export class App {
     if (this.dropsOpeningId) return;
     this.dropsOpeningId = d.id;
     this.dropsError = null;
-    this.scheduleRender();
+    if (!this.patchDropsPane()) this.scheduleRender();
     try {
       if (!dropsAvailable()) {
         throw new Error("Opening Drops needs the Hush desktop app.");
@@ -3784,7 +5320,7 @@ export class App {
       this.dropsError = e instanceof Error ? e.message : String(e);
     } finally {
       this.dropsOpeningId = null;
-      if (this.rail === "drops") this.scheduleRender();
+      if (this.rail === "drops" && !this.patchDropsPane()) this.scheduleRender();
     }
   }
 
@@ -3795,7 +5331,7 @@ export class App {
       this.dropsError = e instanceof Error ? e.message : String(e);
     }
     this.dropsOpenId = null;
-    if (this.rail === "drops") this.scheduleRender();
+    if (this.rail === "drops" && !this.patchDropsPane()) this.scheduleRender();
   }
 
   // --------------------------------------------------------------- trusts
@@ -3871,11 +5407,7 @@ export class App {
     // Ordered by the name the card actually shows, so the grid stays scannable
     // as it grows. Sorted on a copy: the contact array's order is not ours to
     // change, and a comparison by nickname could not see the decoration.
-    const ordered = [...this.contacts].sort((a, b) =>
-      displayNick(a.nickname).localeCompare(displayNick(b.nickname), undefined, {
-        sensitivity: "base",
-      }),
-    );
+    const ordered = this.orderedTrusts();
     const rows = document.createElement("div");
     rows.className = "trust-rows";
     for (const c of ordered) rows.appendChild(this.trustRow(c));
@@ -3886,19 +5418,27 @@ export class App {
     noMatch.textContent = "No contacts match that filter.";
 
     filterInput.oninput = () => {
-      const q = filterInput.value.trim().toLocaleLowerCase();
-      let shown = 0;
-      for (const el of Array.from(rows.children) as HTMLElement[]) {
-        const match =
-          !q || (el.dataset.trustName ?? "").toLocaleLowerCase().includes(q);
-        el.hidden = !match;
-        if (match) shown++;
-      }
-      noMatch.hidden = shown > 0;
+      noMatch.hidden = applyRowFilter(rows, filterInput.value) > 0;
     };
 
     pane.append(filter, rows, noMatch);
     return pane;
+  }
+
+  /**
+   * The contacts the Trusts pane lists, in the order it lists them: by the name
+   * each row shows, so the grid stays scannable as it grows. Shared with the
+   * background patch, which walks this list against the rows on screen.
+   *
+   * Sorted on a copy: the contact array's order is not ours to change, and a
+   * comparison by nickname could not see the decoration.
+   */
+  private orderedTrusts(): ContactDto[] {
+    return [...this.contacts].sort((a, b) =>
+      displayNick(a.nickname).localeCompare(displayNick(b.nickname), undefined, {
+        sensitivity: "base",
+      }),
+    );
   }
 
   /**
@@ -3907,12 +5447,21 @@ export class App {
    * anywhere on the row opens it, as a right-click would on a list item, and
    * the menu carries chat, mail and the destructive ones, so the row never
    * has to guess which action a click meant.
+   *
+   * The row records the shape it was drawn for: the patch may toggle the
+   * presence dot, but anything else in that shape rewrites the badge or the
+   * menu, which is the rebuild's business.
    */
   private trustRow(c: ContactDto): HTMLElement {
     const row = document.createElement("div");
     row.className = "trust-row pressable";
     // The name as shown, so the filter matches what the user can see.
     row.dataset.trustName = displayNick(c.nickname);
+    row.dataset.trustShape = trustRowShape(c);
+    // The filter's haystack, which is the same name — kept separate from
+    // `trustName` because that one is the background patch's identity check for
+    // "is this row the contact I am looking for", not a search field.
+    row.dataset.filterText = filterText(displayNick(c.nickname));
 
     row.appendChild(
       avatarWithPresence(
@@ -4113,9 +5662,88 @@ export class App {
   private renderConclaves(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "conclaves-pane";
-    pane.appendChild(this.renderConclavesList());
-    pane.appendChild(this.renderConclaveDetail());
+    this.syncConclavesPane(pane);
     return pane;
+  }
+
+  /**
+   * The Conclaves rail's two columns: the list, rebuilt, and the open meeting,
+   * kept.
+   *
+   * The detail pane is keyed so the open chat is not rebuilt when nothing about
+   * it changed — a repaint of the list, or of anything else on screen, must not
+   * cost the reader their place in the meeting's history.
+   */
+  private syncConclavesPane(pane: HTMLElement): void {
+    syncRegions(pane, [
+      {
+        key: this.conclavesListKey(),
+        build: () => this.renderConclavesList(),
+        update: (el) => this.syncConclavesList(el),
+      },
+      {
+        key: this.conclaveDetailKey(),
+        build: () => this.renderConclaveDetail(),
+        update: (el) => this.updateConclaveDetail(el),
+      },
+    ]);
+  }
+
+  /**
+   * The Conclaves column's region key.
+   *
+   * See `conclavesKey` for what is in it and what the two patches keep up to
+   * date instead. The card's shape is written out here rather than in a helper
+   * because the builder draws those parts directly, so the two have to agree by
+   * reading — the tests pin what the shape covers, not that the builder draws
+   * the same things.
+   */
+  private conclavesListKey(): string {
+    const conclaves = listConclaves();
+    return conclavesKey(
+      conclaveListShape(conclaves.length, listPendingInvites().length),
+      this.contacts.length > 0,
+      conclaves.map((m) => ({
+        name: m.name,
+        shape: conclaveCardShape({
+          ended: m.ended,
+          trustees: joinedTrustees(m).length,
+          voiceLive: this.voiceRooms.some(
+            (r) => r.conclave_id === m.id && r.joined.length > 0,
+          ),
+        }),
+      })),
+    );
+  }
+
+  /**
+   * The Conclaves column, in place: the invitation box and the cards.
+   *
+   * The filter field is what this is for — the query hides cards, it does not
+   * change which ones are drawn, so the field and the caret in it outlive every
+   * delta that does not move the key. The fallback rebuild is for a column the
+   * patches have declined (see `patchConclaveInvites`), which the key is meant to
+   * have caught first.
+   */
+  private syncConclavesList(el: HTMLElement): void {
+    if (this.patchConclaveInvites() && this.patchConclaveCards()) return;
+    el.replaceChildren(...Array.from(this.renderConclavesList().childNodes));
+  }
+
+  /**
+   * What the open meeting's pane is, as one string.
+   *
+   * The parts the pane is made of depend on which surface is up and whether the
+   * meeting has ended — a Paper tab has no chat, an ended one has no composer —
+   * so those belong in the key. Everything else about the meeting is drawn by
+   * parts that are rebuilt anyway.
+   */
+  private conclaveDetailKey(): string {
+    const id = this.conclaveId;
+    if (!id) return "conclaveDetail:";
+    const conclave = conclaveById(id);
+    if (!conclave) return "conclaveDetail:";
+    return `conclaveDetail:${id}:${this.conclaveTab}:${conclave.ended ? 1 : 0}`;
   }
 
   /** The left column: a filter over conclave cards, newest first. */
@@ -4142,7 +5770,7 @@ export class App {
 
     const conclaves = listConclaves();
     const invites = listPendingInvites();
-    if (!conclaves.length && !invites.length) {
+    if (conclaveListShape(conclaves.length, invites.length) === "empty") {
       const empty = document.createElement("div");
       empty.className = "empty-state conclaves-empty";
       const t = document.createElement("h2");
@@ -4177,36 +5805,7 @@ export class App {
     // Invitations waiting on an accept or decline, above the conclave cards. A
     // pending invite is not a conclave yet: nothing is materialised until it is
     // accepted.
-    if (invites.length) {
-      const box = document.createElement("div");
-      box.className = "conclave-invites";
-      for (const invite of invites) {
-        const card = document.createElement("div");
-        card.className = "conclave-invite-card";
-        const title = document.createElement("div");
-        title.className = "text-15";
-        title.textContent = invite.name;
-        const from = document.createElement("div");
-        from.className = "muted text-12";
-        from.textContent = `${displayNick(invite.fromNick)} invited you`;
-        const row = document.createElement("div");
-        row.className = "conclave-invite-actions";
-        const accept = document.createElement("button");
-        accept.type = "button";
-        accept.className = "btn-primary pressable";
-        accept.textContent = "Accept";
-        accept.onclick = () => void this.acceptConclaveInvite(invite.conclaveId);
-        const decline = document.createElement("button");
-        decline.type = "button";
-        decline.className = "btn-secondary pressable";
-        decline.textContent = "Decline";
-        decline.onclick = () => void this.declineConclaveInvite(invite.conclaveId);
-        row.append(accept, decline);
-        card.append(title, from, row);
-        box.appendChild(card);
-      }
-      col.appendChild(box);
-    }
+    if (invites.length) col.appendChild(this.conclaveInvitesBox(invites));
 
     const cards = document.createElement("div");
     cards.className = "conclaves-cards";
@@ -4217,19 +5816,64 @@ export class App {
     noMatch.hidden = true;
     noMatch.textContent = "No conclaves match that filter.";
     filterInput.oninput = () => {
-      const q = filterInput.value.trim().toLocaleLowerCase();
-      let shown = 0;
-      for (const el of Array.from(cards.children) as HTMLElement[]) {
-        const match =
-          !q || (el.dataset.conclaveName ?? "").toLocaleLowerCase().includes(q);
-        el.hidden = !match;
-        if (match) shown++;
-      }
-      noMatch.hidden = shown > 0;
+      noMatch.hidden = applyRowFilter(cards, filterInput.value) > 0;
     };
 
     col.append(cards, noMatch);
     return col;
+  }
+
+  /**
+   * The pending invitations, in their own box above the cards.
+   *
+   * Drawn by the list's first paint and by the patch a background delta runs, so
+   * the two cannot disagree about what an invitation card looks like. Each card
+   * carries the conclave it belongs to, which is how the patch knows whether the
+   * box on screen is still the one the store is holding.
+   */
+  private conclaveInvitesBox(invites: PendingInvite[]): HTMLElement {
+    const box = document.createElement("div");
+    box.className = "conclave-invites";
+    for (const invite of invites) {
+      const card = document.createElement("div");
+      card.className = "conclave-invite-card";
+      card.dataset.invite = invite.conclaveId;
+      const title = document.createElement("div");
+      title.className = "text-15";
+      title.textContent = invite.name;
+      const from = document.createElement("div");
+      from.className = "muted text-12";
+      from.textContent = `${displayNick(invite.fromNick)} invited you`;
+      const row = document.createElement("div");
+      row.className = "conclave-invite-actions";
+      const accept = document.createElement("button");
+      accept.type = "button";
+      accept.className = "btn-primary pressable";
+      accept.textContent = "Accept";
+      accept.onclick = () => void this.acceptConclaveInvite(invite.conclaveId);
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "btn-secondary pressable";
+      decline.textContent = "Decline";
+      decline.onclick = () => void this.declineConclaveInvite(invite.conclaveId);
+      row.append(accept, decline);
+      card.append(title, from, row);
+      box.appendChild(card);
+    }
+    return box;
+  }
+
+  /**
+   * The unread pill for a conclave card, or null when there is nothing waiting.
+   * One builder, because the card's first paint and the background patch must
+   * agree on the element they replace.
+   */
+  private conclaveUnreadEl(unread: number): HTMLElement | null {    if (unread <= 0) return null;
+    const pill = document.createElement("span");
+    pill.className = "conclave-unread";
+    pill.textContent = unread > 9 ? "9+" : String(unread);
+    pill.title = `${unread} unread ${unread === 1 ? "message" : "messages"}`;
+    return pill;
   }
 
   /** One conclave card: name, member count, and a preview of the last message.
@@ -4242,7 +5886,8 @@ export class App {
     card.className = `tile conclave-card pressable${
       this.conclaveId === m.id ? " selected" : ""
     }`;
-    card.dataset.conclaveName = m.name;
+    card.dataset.conclaveId = m.id;
+    card.dataset.filterText = filterText(m.name);
 
     const top = document.createElement("div");
     top.className = "conclave-card-top";
@@ -4273,17 +5918,13 @@ export class App {
       top.appendChild(live);
     }
     const unread = conclaveUnreadCount(m.id);
-    if (unread > 0) {
-      const pill = document.createElement("span");
-      pill.className = "conclave-unread";
-      pill.textContent = unread > 9 ? "9+" : String(unread);
-      pill.title = `${unread} unread ${unread === 1 ? "message" : "messages"}`;
-      top.appendChild(pill);
-    }
+    const unreadEl = this.conclaveUnreadEl(unread);
+    if (unreadEl) top.appendChild(unreadEl);
     card.appendChild(top);
 
     const preview = document.createElement("div");
     preview.className = "conclave-card-preview muted text-13";
+    preview.dataset.conclavePreview = "1";
     preview.textContent = conclavePreview(m);
     card.appendChild(preview);
 
@@ -4298,8 +5939,93 @@ export class App {
     return card;
   }
 
+  /**
+   * One run of conclave messages: the group element and the column its bubbles
+   * go into.
+   *
+   * Shared by the chat's first paint and the background append, so an arriving
+   * message is drawn by the same code as a rebuilt chat. The group carries the
+   * sender's identity once — an initials avatar and a name in the trustee's own
+   * colour, both derived from one stable hue so a trustee reads as one colour
+   * everywhere. Repeating them per message made three messages in a row read as
+   * three separate people.
+   */
+  private conclaveGroupEl(group: Pick<ConclaveMessageGroup, "outgoing" | "from">): {
+    el: HTMLElement;
+    body: HTMLElement;
+  } {
+    const gEl = document.createElement("div");
+    // `conclave-group` is what makes an incoming run a row — the trustee's
+    // avatar beside the name-and-bubble column. Without it the base
+    // `bubble-group` column stacks avatar over bubble, which is the skewed
+    // look the class was written to prevent.
+    gEl.className = `bubble-group${group.outgoing ? " out" : " in conclave-group"}`;
+    let body: HTMLElement = gEl;
+    if (!group.outgoing) {
+      const name = group.from ? displayNick(group.from) : "Unknown";
+      const key =
+        this.contacts.find((c) => c.nickname === group.from)?.protocol_name ??
+        group.from ??
+        "unknown";
+      const av = createAvatarEl(key, "sm", false, name);
+      av.classList.add("conclave-avatar");
+      av.setAttribute("aria-hidden", "true");
+      const who = document.createElement("div");
+      who.className = "conclave-sender text-12";
+      if (group.from) {
+        // The lightness is theme's business: the hue is per trustee, the
+        // CSS picks a readable tone for light and dark. The var sits on
+        // the group so the bubble tint reads it too.
+        gEl.style.setProperty("--sender-h", String(hueFromKey(key)));
+      } else {
+        who.classList.add("muted");
+      }
+      who.textContent = name;
+      body = document.createElement("div");
+      body.className = "conclave-body";
+      body.appendChild(who);
+      gEl.append(av, body);
+    }
+    return { el: gEl, body };
+  }
+
+  /**
+   * One bubble in the conclave chat. Only the last bubble of a run carries the
+   * tail, the same rule the 1:1 thread's bubbles follow. The bubble records the
+   * message it was drawn for, so the append can find the chat's place.
+   */
+  private conclaveBubble(msg: ConclaveMessage, tail: boolean): HTMLElement {
+    const b = document.createElement("div");
+    b.className = `bubble ${msg.outgoing ? "out" : "in"}${tail ? " tail" : ""}`;
+    b.dataset.msgId = msg.id;
+    if (msg.file) {
+      // A shared file is a file card, not a body: `body` is empty for one.
+      const file = msg.file;
+      const fc = document.createElement("div");
+      fc.className = "file-card";
+      const nameEl = document.createElement("div");
+      nameEl.className = "text-15";
+      nameEl.style.fontWeight = "500";
+      nameEl.textContent = file.name;
+      const sizeEl = document.createElement("div");
+      sizeEl.className = "text-13 muted";
+      sizeEl.textContent = formatBytes(file.size);
+      fc.append(nameEl, sizeEl);
+      attachFileActions(
+        fc,
+        file.name,
+        () => resolveMessageFileBytes(file),
+        file.blobId,
+      );
+      b.appendChild(fc);
+    } else {
+      b.textContent = msg.body;
+    }
+    return b;
+  }
+
   /** The right column: the selected conclave's members and group chat. */
-  private renderConclaveDetail(): HTMLElement {
+  private renderConclaveDetail(skipMessages = false): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "conclaves-detail";
     const conclave = this.conclaveId ? conclaveById(this.conclaveId) : undefined;
@@ -4628,103 +6354,18 @@ export class App {
 
     const scroll = document.createElement("div");
     scroll.className = "conclave-messages";
-    if (!conclave.messages.length) {
-      const hint = document.createElement("p");
-      hint.className = "muted text-13 conclave-no-messages";
-      hint.textContent = "No messages yet. Say hello.";
-      scroll.appendChild(hint);
+    // On an update this element is a scaffold, not a list: the live chat is
+    // transplanted into its place by `updateConclaveDetail`, so drawing the
+    // bubbles here would be work thrown away. The element still has to exist,
+    // because it is the seam the live list is swapped in at.
+    if (!skipMessages) {
+      this.fillConclaveMessages(scroll, conclave);
+      // A freshly drawn list is a meeting being opened, so it lands on the
+      // newest message once the shell gives it layout. Consumed rather than
+      // left set, for the same reason the thread's fresh list consumes it.
+      this.bottomOnNextConclaveRender = false;
+      this.conclaveToBottom = true;
     }
-    let lastDay = "";
-    for (const group of groupConclaveMessages(conclave.messages)) {
-      if (group.day !== lastDay) {
-        lastDay = group.day;
-        const sep = document.createElement("div");
-        sep.className = "day-sep";
-        sep.textContent = group.day;
-        scroll.appendChild(sep);
-      }
-      const gEl = document.createElement("div");
-      // `conclave-group` is what makes an incoming run a row — the trustee's
-      // avatar beside the name-and-bubble column. Without it the base
-      // `bubble-group` column stacks avatar over bubble, which is the skewed
-      // look the class was written to prevent.
-      gEl.className = `bubble-group${group.outgoing ? " out" : " in conclave-group"}`;
-      // A run carries the sender's identity once: an initials avatar and a name
-      // in the trustee's own colour, both derived from one stable hue so a
-      // trustee reads as one colour everywhere. Repeating them per message made
-      // three messages in a row read as three separate people.
-      let body: HTMLElement = gEl;
-      if (!group.outgoing) {
-        const name = group.from ? displayNick(group.from) : "Unknown";
-        const key =
-          this.contacts.find((c) => c.nickname === group.from)?.protocol_name ??
-          group.from ??
-          "unknown";
-        const av = createAvatarEl(key, "sm", false, name);
-        av.classList.add("conclave-avatar");
-        av.setAttribute("aria-hidden", "true");
-        const who = document.createElement("div");
-        who.className = "conclave-sender text-12";
-        if (group.from) {
-          // The lightness is theme's business: the hue is per trustee, the
-          // CSS picks a readable tone for light and dark. The var sits on
-          // the group so the bubble tint reads it too.
-          gEl.style.setProperty("--sender-h", String(hueFromKey(key)));
-        } else {
-          who.classList.add("muted");
-        }
-        who.textContent = name;
-        body = document.createElement("div");
-        body.className = "conclave-body";
-        body.appendChild(who);
-        gEl.append(av, body);
-      }
-      group.messages.forEach((msg, i) => {
-        // Only the last bubble of a run carries the tail, the same rule the
-        // 1:1 thread's bubbles follow.
-        const tail = i === group.messages.length - 1;
-        const b = document.createElement("div");
-        b.className = `bubble ${group.outgoing ? "out" : "in"}${tail ? " tail" : ""}`;
-        if (msg.file) {
-          // A shared file is a file card, not a body: `body` is empty for one.
-          const file = msg.file;
-          const fc = document.createElement("div");
-          fc.className = "file-card";
-          const nameEl = document.createElement("div");
-          nameEl.className = "text-15";
-          nameEl.style.fontWeight = "500";
-          nameEl.textContent = file.name;
-          const sizeEl = document.createElement("div");
-          sizeEl.className = "text-13 muted";
-          sizeEl.textContent = formatBytes(file.size);
-          fc.append(nameEl, sizeEl);
-          attachFileActions(
-            fc,
-            file.name,
-            () => resolveMessageFileBytes(file),
-            file.blobId,
-          );
-          b.appendChild(fc);
-        } else {
-          b.textContent = msg.body;
-        }
-        body.appendChild(b);
-      });
-      scroll.appendChild(gEl);
-    }
-    // Decided while detached, applied after attachment (see render()): the
-    // reader pinned to the bottom — or opening fresh, or opening a different
-    // conclave — rides the newest message; a reader away in history of this
-    // same conclave keeps their place.
-    const prev = this.conclaveScrollPos;
-    this.conclaveScrollPos = null;
-    const forceBottom = this.bottomOnNextConclaveRender;
-    this.bottomOnNextConclaveRender = false;
-    const target = paneScrollTarget(prev, conclave.id, forceBottom);
-    this.pendingConclaveScroll =
-      target.mode === "bottom"
-        ? { conclaveId: conclave.id, mode: "bottom" }
-        : { conclaveId: conclave.id, mode: "restore", top: target.top };
 
     // Chat and Paper are the two surfaces of the same meeting; the pill swaps
     // between them without touching the header or the members row. Built before
@@ -4774,7 +6415,6 @@ export class App {
     };
     const ta = document.createElement("textarea");
     ta.rows = 1;
-    ta.dataset.composerKey = `conclave:${conclave.id}`;
     ta.placeholder = "Message conclave";
     const send = document.createElement("button");
     send.className = "send-fab btn-icon-round pressable";
@@ -4816,6 +6456,72 @@ export class App {
     if (banners) pane.append(banners);
     pane.append(scroll, composer);
     return pane;
+  }
+
+  /**
+   * Bring the open meeting's pane up to date without rebuilding its chat.
+   *
+   * The live `.conclave-messages` is the one thing here that must not be
+   * detached, so the pane is rebuilt around it: a fresh pane is drawn as a
+   * scaffold (no bubbles — they would be thrown away), its parts are lifted out
+   * from either side of the seam, and they replace the live pane's parts with
+   * the live list left exactly where it stands.
+   *
+   * When there is no live list to keep — the Paper tab, an ended meeting, the
+   * empty state — there is nothing to preserve and the fresh contents simply
+   * move in.
+   */
+  private updateConclaveDetail(pane: HTMLElement): void {
+    const anchor = pane.querySelector<HTMLElement>(".conclave-messages");
+    const usable = anchor !== null && anchor.parentElement === pane;
+    const fresh = this.renderConclaveDetail(usable);
+    if (!anchor || !usable || !transplantAround(pane, anchor, fresh, ".conclave-messages")) {
+      pane.replaceChildren(...Array.from(fresh.childNodes));
+      return;
+    }
+    this.patchConclaveMessages(anchor);
+  }
+
+  /** Draw the whole meeting history into `scroll`, replacing what it held. */
+  private fillConclaveMessages(scroll: HTMLElement, conclave: Conclave): void {
+    scroll.replaceChildren();
+    if (!conclave.messages.length) {
+      const hint = document.createElement("p");
+      hint.className = "muted text-13 conclave-no-messages";
+      hint.textContent = "No messages yet. Say hello.";
+      scroll.appendChild(hint);
+      return;
+    }
+    let lastDay = "";
+    for (const group of groupConclaveMessages(conclave.messages)) {
+      if (group.day !== lastDay) {
+        lastDay = group.day;
+        scroll.appendChild(daySepEl(group.day));
+      }
+      const { el, body } = this.conclaveGroupEl(group);
+      group.messages.forEach((msg, i) => {
+        body.appendChild(this.conclaveBubble(msg, i === group.messages.length - 1));
+      });
+      scroll.appendChild(el);
+    }
+  }
+
+  /**
+   * Bring the meeting chat on screen up to date, in place — the 1:1 rule on the
+   * pane that shows more than two voices. `planAppend` returns null when the
+   * pane has drifted from the store, and then the history is redrawn.
+   */
+  private patchConclaveMessages(scroll: HTMLElement): void {
+    const conclave = this.conclaveId ? conclaveById(this.conclaveId) : undefined;
+    if (!conclave) return;
+    const force = this.bottomOnNextConclaveRender;
+    this.bottomOnNextConclaveRender = false;
+    if (!this.appendConclaveMessages(conclave, scroll)) {
+      this.fillConclaveMessages(scroll, conclave);
+      this.conclaveToBottom = true;
+      return;
+    }
+    if (force) this.conclaveToBottom = true;
   }
 
   /** The raw roster nickname for a trustee, empty when the roster lacks them. */
@@ -5520,13 +7226,7 @@ export class App {
       // the rule.
       items: this.contacts
         .filter((c) => c.reach === "full")
-        .map((c) => ({
-          nickname: c.nickname,
-          label: c.mail_handle
-            ? `${displayNick(c.nickname)} (${this.contactAddress(c)})`
-            : displayNick(c.nickname),
-          keywords: c.nickname,
-        })),
+        .map((c) => this.pickerItem(c)),
       multiple: true,
       values: this.conclaveCreateTrustees,
       // The dialog's own scrolling box would clip a list opened above the field
@@ -5610,16 +7310,12 @@ export class App {
     // actual rule).
     const remaining = conclave ? invitableCandidates(conclave, this.contacts) : [];
     const picker = new ContactPicker({
-      items: remaining.map((nick) => {
-        const c = this.contacts.find((x) => x.nickname === nick);
-        return {
-          nickname: nick,
-          label: c?.mail_handle
-            ? `${displayNick(nick)} (${this.contactAddress(c)})`
-            : displayNick(nick),
-          keywords: nick,
-        };
-      }),
+      items: remaining.map((nick) =>
+        this.pickerItem(
+          this.contacts.find((x) => x.nickname === nick),
+          nick,
+        ),
+      ),
       multiple: true,
       values: this.conclaveInviteTrustees,
       // Same as the creator: the dialog would clip an upward list and the
@@ -6291,13 +7987,6 @@ export class App {
     return out;
   }
 
-  private mailAttachmentCount(nick: string): number {
-    return this.exchangedMailMessages(nick).reduce(
-      (n, m) => n + m.attachments.length,
-      0,
-    );
-  }
-
   /** Open the browser from the Vault tile: full-bleed, contact list first. */
   private filesOpenFiles(): void {
     this.filesOpen = true;
@@ -6320,6 +8009,87 @@ export class App {
       return this.renderFilesForContact(this.filesContactNick);
     }
     return this.renderFilesContactList();
+  }
+
+  /**
+   * Everything the Files browser draws, whichever half of it is up.
+   *
+   * Both halves are lists of rows with nothing else that moves, so this is the
+   * rows: the contact list's names and counts, or one contact's exchanged files
+   * with the line under each. The search the browser does not have, the contact
+   * being browsed and the direction are the key's and the elements' own business
+   * — the direction *is* drawn, but it is a tab the reader just pressed, and it
+   * arrives with a row set that moved with it.
+   */
+  private filesBodyFacts(): string {
+    if (this.filesContactNick) return this.filesContactFacts(this.filesContactNick);
+    return this.filesContactRows()
+      .map((r) => [r.nick, r.protocol, r.count].join("\n"))
+      .join("\n\n");
+  }
+
+  /**
+   * The contact list's rows: who has files, then everyone else.
+   *
+   * One definition with two readers — the list's builder and its shape — so the
+   * row order and the counts the shape compares are the ones on screen. The mail
+   * counts are one pass for every contact rather than one per row, which is item
+   * 8's fix; `fileCountForContact` reads the contact's own thread, not the store.
+   */
+  private filesContactRows(): { nick: string; protocol: string; count: number }[] {
+    const nicks = contactsWithFiles(this.contacts.map((c) => c.nickname));
+    const also = this.contacts.filter((c) => !nicks.includes(c.nickname));
+    const mailAttachments = mailAttachmentCounts(this.mailPrefs());
+    const rows: { nick: string; protocol: string; count: number }[] = [];
+    for (const nick of [...nicks, ...also.map((c) => c.nickname)]) {
+      const c = this.contacts.find((x) => x.nickname === nick);
+      if (!c) continue;
+      rows.push({
+        nick,
+        protocol: c.protocol_name,
+        count: fileCountForContact(nick) + (mailAttachments.get(nick) ?? 0),
+      });
+    }
+    return rows;
+  }
+
+  /** The line under a contact's name in the Files browser. */
+  private filesContactSub(count: number): string {
+    return count > 0
+      ? `${count} file${count === 1 ? "" : "s"} exchanged`
+      : "No files yet — open to send";
+  }
+
+  /**
+   * One contact's exchanged files, as the rows draw them.
+   *
+   * The age is here in the form it is printed, for the reason the Library's rows
+   * are: it moves on its own, and the shape has to move with it or the row keeps
+   * saying "3 min ago" until something else happens to redraw the pane. Whether a
+   * row draws its link, and which one, is drawn from two stores — the mail
+   * message behind it, and whether the contact is still a chat contact — so it is
+   * here rather than left to the builder.
+   */
+  private filesContactFacts(nick: string): string {
+    const chatTarget = this.chatContacts().some((c) => c.nickname === nick);
+    return this.exchangedRowsFor(nick, this.filesDirection)
+      .map((f) =>
+        [
+          f.name,
+          this.fileRowMeta(f),
+          f.blobId ?? "",
+          f.mail ? "mail" : chatTarget ? "chat" : "none",
+        ].join("\n"),
+      )
+      .join("\n\n");
+  }
+
+  /** The line under an exchanged file's name: size, age, and how it arrived. */
+  private fileRowMeta(f: ExchangedFileRow): string {
+    return (
+      `${formatBytes(f.size)} · ${formatRelative(f.at)} · via ${f.via === "mail" ? "Mail" : "chat"}` +
+      (f.subject ? ` — ${f.subject}` : "")
+    );
   }
 
   private renderFilesContactList(): HTMLElement {
@@ -6348,25 +8118,18 @@ export class App {
     list.style.flexDirection = "column";
     list.style.gap = "var(--space-2)";
 
-    const nicks = contactsWithFiles(
-      this.contacts.map((c) => c.nickname),
-    );
-    const also = this.contacts.filter((c) => !nicks.includes(c.nickname));
-
-    for (const nick of [...nicks, ...also.map((c) => c.nickname)]) {
-      const c = this.contacts.find((x) => x.nickname === nick);
-      if (!c) continue;
-      const count = fileCountForContact(nick) + this.mailAttachmentCount(nick);
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "conv-row pressable";
-      row.style.width = "100%";
-      row.style.textAlign = "left";
+    for (const row of this.filesContactRows()) {
+      const nick = row.nick;
+      const rowEl = document.createElement("button");
+      rowEl.type = "button";
+      rowEl.className = "conv-row pressable";
+      rowEl.style.width = "100%";
+      rowEl.style.textAlign = "left";
       const left = document.createElement("div");
       left.style.display = "flex";
       left.style.gap = "var(--space-3)";
       left.style.alignItems = "center";
-      left.appendChild(createAvatarEl(c.protocol_name, "sm", false, displayNick(nick)));
+      left.appendChild(createAvatarEl(row.protocol, "sm", false, displayNick(nick)));
       const meta = document.createElement("div");
       const title = document.createElement("div");
       title.className = "text-15";
@@ -6374,19 +8137,16 @@ export class App {
       title.textContent = displayNick(nick);
       const sub = document.createElement("div");
       sub.className = "text-13 muted";
-      sub.textContent =
-        count > 0
-          ? `${count} file${count === 1 ? "" : "s"} exchanged`
-          : "No files yet — open to send";
+      sub.textContent = this.filesContactSub(row.count);
       meta.append(title, sub);
       left.append(meta);
-      row.append(left);
-      row.onclick = () => {
+      rowEl.append(left);
+      rowEl.onclick = () => {
         this.filesContactNick = nick;
         this.filesDirection = "received";
         this.scheduleRender();
       };
-      list.appendChild(row);
+      list.appendChild(rowEl);
     }
 
     if (!this.contacts.length) {
@@ -6477,9 +8237,7 @@ export class App {
       nameEl.textContent = f.name;
       const sub = document.createElement("div");
       sub.className = "text-13 muted";
-      sub.textContent =
-        `${formatBytes(f.size)} · ${formatRelative(f.at)} · via ${f.via === "mail" ? "Mail" : "chat"}` +
-        (f.subject ? ` — ${f.subject}` : "");
+      sub.textContent = this.fileRowMeta(f);
       card.append(nameEl, sub);
       const bytes = f.bytes;
       if (bytes) {
@@ -7075,17 +8833,10 @@ export class App {
       search.setAttribute("aria-label", "Filter publications");
       search.oninput = () => {
         this.atprotoExploreFilter = search.value;
-        // Synchronous: the re-queried input below must be the new tree's,
-        // so the caret survives the keystroke. (Deferred until the render
-        // itself stops rebuilding the modal — pane-scoped renders.)
-        this.render();
-        const next = this.root.querySelector<HTMLInputElement>(
-          ".atproto-explore-search",
-        );
-        if (next) {
-          next.focus();
-          next.setSelectionRange(next.value.length, next.value.length);
-        }
+        // The list is redrawn under the field, in place, like every other
+        // search in the app: a full render here would rebuild the dialog and
+        // take the caret out of the field being typed in.
+        fillList();
       };
       bar.appendChild(search);
 
@@ -7095,25 +8846,29 @@ export class App {
       bar.appendChild(meta);
       modal.appendChild(bar);
 
-      const groups = groupDirectory(entries, this.atprotoExploreFilter);
       const list = document.createElement("div");
       list.className = "atproto-explore-list";
-      if (!groups.length) {
-        const none = document.createElement("p");
-        none.className = "muted text-13 atproto-explore-empty";
-        none.textContent = `Nothing matches “${this.atprotoExploreFilter.trim()}”.`;
-        list.appendChild(none);
-      }
-      for (const group of groups) {
-        const heading = document.createElement("h3");
-        heading.className = "atproto-explore-group text-12 muted";
-        heading.textContent = `via ${group.via} · ${group.entries.length}`;
-        heading.title = `Reached by following ${group.via}.`;
-        list.appendChild(heading);
-        for (const entry of group.entries) {
-          list.appendChild(this.atprotoExploreRow(entry));
+      const fillList = (): void => {
+        list.replaceChildren();
+        const groups = groupDirectory(entries, this.atprotoExploreFilter);
+        if (!groups.length) {
+          const none = document.createElement("p");
+          none.className = "muted text-13 atproto-explore-empty";
+          none.textContent = `Nothing matches “${this.atprotoExploreFilter.trim()}”.`;
+          list.appendChild(none);
         }
-      }
+        for (const group of groups) {
+          const heading = document.createElement("h3");
+          heading.className = "atproto-explore-group text-12 muted";
+          heading.textContent = `via ${group.via} · ${group.entries.length}`;
+          heading.title = `Reached by following ${group.via}.`;
+          list.appendChild(heading);
+          for (const entry of group.entries) {
+            list.appendChild(this.atprotoExploreRow(entry));
+          }
+        }
+      };
+      fillList();
       modal.appendChild(list);
     }
 
@@ -7696,6 +9451,198 @@ export class App {
    * left is what a reader *does*: who they publish as, writing, and the two
    * switches over what the front page shows.
    */
+  /**
+   * What the Zines column's shape compares: the pen it shows, the three
+   * switches, and the public lane's state.
+   *
+   * Every one of them is drawn and none is patched, and the switches are
+   * checkboxes — so redrawing them takes the focus off one the user may have
+   * just pressed with the keyboard. The shape is what keeps a background tick
+   * from doing that.
+   */
+  private zinesPaneFacts(): ZinesPaneFacts {
+    const pen = this.zinesView?.pen_name ?? null;
+    return {
+      pen: pen ? [pen.id, penNameLabel(pen)].join("\n") : null,
+      editing: this.zinesEditing,
+      mineOnly: this.zinesMineOnly,
+      showMuted: this.zinesShowMuted,
+      publicShown: this.atprotoShown,
+      publicError: this.atprotoError,
+      publicLoading: this.atprotoLoading,
+    };
+  }
+
+  /**
+   * Which of the page's three bodies is up, as one value.
+   *
+   * Read by the region key, the region shape and the dispatch in `renderZinesPage`,
+   * so the three cannot disagree about which body is showing — the same reason
+   * `mailBody` exists on the Mail rail. The front page's filters travel with it
+   * because they are what its identity is made of.
+   */
+  private zinesPageBody(): ZinesPageBody {
+    if (this.zinesEditing) return { kind: "draft", zineId: this.zinesDraftZineId };
+    if (this.zinesOpenId) {
+      return {
+        kind: "story",
+        id: this.zinesOpenId,
+        source: this.zinesOpenSource ?? "zine",
+      };
+    }
+    return {
+      kind: "front",
+      lane: this.atprotoShown ? "public" : "private",
+      section: this.zinesSection,
+      pen: this.zinesPen,
+      mineOnly: this.zinesMineOnly,
+      showMuted: this.zinesShowMuted,
+    };
+  }
+
+  /**
+   * The front page's corpus, as its shape sees it.
+   *
+   * The two numbers the corpus note prints, the section strip's names and counts,
+   * how many public posts are held (which is what the two offers are drawn from),
+   * the empty note, and the ids the filter left standing in the order they are
+   * drawn — a re-order is a different page.
+   */
+  private zinesCorpusFacts(): string {
+    const view = this.zinesView;
+    return [
+      view ? `${view.held_blobs}/${view.unreadable_blobs}` : "",
+      String(this.zinesHeld().length),
+      this.zinesSections()
+        .map((s) => `${s.name}:${s.count}`)
+        .join(","),
+      String(this.atprotoView?.documents.length ?? 0),
+      this.zinesEmptyNote(),
+      this.zinesFiltered()
+        .map((s) => s.id)
+        .join(","),
+    ].join("\n");
+  }
+
+  /**
+   * The meta line under a front-page card, as text.
+   *
+   * One definition with two readers, the card and the region shape: the line
+   * carries a relative time, so a shape that could not see the rendered text
+   * would leave "3 hours ago" on the page while it aged.
+   */
+  private zineCardBits(story: FrontPageStory): string {
+    const zine = story.zine;
+    const bits: string[] = [];
+    // A story whose blob has not been opened has no byline to click, but the
+    // line still has to say so rather than start with a separator.
+    if (story.source === "zine" && !story.byline) bits.push(bylineOf(story));
+    if (zine) {
+      if (zine.revision > 1) bits.push(`rev ${zine.revision}`);
+      if (zine.comments) {
+        bits.push(`${zine.comments} comment${zine.comments === 1 ? "" : "s"}`);
+      }
+      if (zine.pending) {
+        bits.push(`${zine.pending} waiting for you`);
+      }
+      bits.push(readsTimeAgo(Math.floor(zine.updated_ms / 1000)));
+      if (zine.muted) bits.push("muted");
+      if (zine.unreadable) bits.push("unreadable");
+    } else if (story.post) {
+      bits.push(readsTimeAgo(story.post.published_secs));
+      if (story.post.path) bits.push(story.post.path);
+    }
+    return bits.join(" · ");
+  }
+
+  /** Everything one front-page card draws from, as its shape sees it. */
+  private zineCardFacts(story: FrontPageStory): string {
+    const zine = story.zine;
+    return [
+      story.id,
+      story.source,
+      story.title,
+      badgeOf(story) ?? "",
+      story.muted ? "muted" : "",
+      story.byline ?? "",
+      story.sections.join(","),
+      zine?.authored ? "mine" : "",
+      zine?.preview ?? story.post?.preview ?? "",
+      this.zineCardBits(story),
+    ].join("\n");
+  }
+
+  /**
+   * What the page's shape compares, for whichever body is showing.
+   *
+   * Only the body that is up is filled; the other two are left empty on purpose,
+   * so that a corpus arriving in the background cannot redraw the reader, and a
+   * story's detail cannot redraw the front page behind it.
+   */
+  private zinesPageFacts(): ZinesPageFacts {
+    const body = this.zinesPageBody();
+    const empty: ZinesPageFacts = {
+      dateLine: "",
+      front: { error: null, loading: false, corpus: "", cards: "" },
+      story: { zine: "", post: "", error: null, loading: false },
+      draft: { zineId: null },
+    };
+    if (body.kind === "front") {
+      return {
+        ...empty,
+        dateLine: zinesDateLine(),
+        front: {
+          error: this.zinesError,
+          loading: this.zinesLoading,
+          corpus: this.zinesCorpusFacts(),
+          cards: this.zinesFiltered()
+            .map((s) => this.zineCardFacts(s))
+            .join("\n\n"),
+        },
+      };
+    }
+    if (body.kind === "story") {
+      const post = this.zinesOpenSource === "post";
+      const zine = post ? undefined : this.zinesDetail?.zine;
+      const doc = post ? this.atprotoDetail : null;
+      return {
+        ...empty,
+        story: {
+          zine:
+            zine && zine.descriptor.zine_id === body.id
+              ? [
+                  zine.descriptor.zine_id,
+                  String(zine.updated_ms),
+                  String(zine.history.length),
+                  zine.muted ? "muted" : "unmuted",
+                  zine.unreadable ? "sealed" : "open",
+                ].join("\n")
+              : "",
+          post: doc ? [doc.uri, doc.title ?? ""].join("\n") : "",
+          error: post ? this.atprotoDetailError : this.zinesDetailError,
+          loading: post ? !doc : !zine,
+        },
+      };
+    }
+    return { ...empty, draft: { zineId: body.zineId } };
+  }
+
+  /**
+   * Redraw the Zines column under its own element, which is its scroll box.
+   *
+   * The shape decides whether this runs at all, so a poll tick that changed
+   * nothing drawn leaves the column — and the focus in one of its switches —
+   * exactly as it was.
+   */
+  private fillZinesPane(el: HTMLElement): void {
+    el.replaceChildren(...Array.from(this.renderZinesPane().childNodes));
+  }
+
+  /** Redraw the page under its own element: that pane is the page's scroll box. */
+  private fillZinesPage(el: HTMLElement): void {
+    el.replaceChildren(...Array.from(this.renderZinesPage().childNodes));
+  }
+
   private renderZinesPane(): HTMLElement {
     const col = document.createElement("div");
     col.className = "zines-pane";
@@ -7861,11 +9808,18 @@ export class App {
   private renderZinesPage(): HTMLElement {
     const page = document.createElement("div");
     page.className = "zines-page";
-    if (this.zinesEditing) return this.renderZinesDraft(page);
-
-    const id = this.zinesOpenId;
-    if (id) return this.renderZinesReader(page, id);
-    return this.renderZinesFront(page);
+    // Exhaustive on purpose, with no `default`: a new body has to be given a
+    // case here and a kind in `zinesPageBody`, and the region table treats it as
+    // unkeyed until someone decides otherwise.
+    const body = this.zinesPageBody();
+    switch (body.kind) {
+      case "draft":
+        return this.renderZinesDraft(page);
+      case "story":
+        return this.renderZinesReader(page, body.id);
+      case "front":
+        return this.renderZinesFront(page);
+    }
   }
 
   /**
@@ -8198,29 +10152,11 @@ export class App {
       byline.onclick = () => this.zinesFilterByByline(story.byline);
       meta.appendChild(byline);
     }
-    const bits: string[] = [];
-    // A story whose blob has not been opened has no byline to click, but the
-    // line still has to say so rather than start with a separator.
-    if (story.source === "zine" && !story.byline) bits.push(bylineOf(story));
-    if (zine) {
-      if (zine.revision > 1) bits.push(`rev ${zine.revision}`);
-      if (zine.comments) {
-        bits.push(`${zine.comments} comment${zine.comments === 1 ? "" : "s"}`);
-      }
-      if (zine.pending) {
-        bits.push(`${zine.pending} waiting for you`);
-      }
-      bits.push(readsTimeAgo(Math.floor(zine.updated_ms / 1000)));
-      if (zine.muted) bits.push("muted");
-      if (zine.unreadable) bits.push("unreadable");
-    } else if (story.post) {
-      bits.push(readsTimeAgo(story.post.published_secs));
-      if (story.post.path) bits.push(story.post.path);
-    }
+    const bits = this.zineCardBits(story);
     if (bits.length) {
       const rest = document.createElement("span");
       rest.className = "zine-card-meta-rest";
-      rest.textContent = bits.join(" · ");
+      rest.textContent = bits;
       meta.appendChild(rest);
     }
     card.appendChild(meta);
@@ -9493,8 +11429,13 @@ export class App {
     return box;
   }
 
-  /** One labelled field, held in app state rather than read back out of the
-   *  DOM, because a re-render rebuilds the dialog. */
+  /**
+   * One labelled field, held in app state rather than read back out of the DOM,
+   * because the save path reads the state and the dialog can still be rebuilt —
+   * when one of its drawn facts moves, which is not the same as every tick.
+   * The fields themselves are the drafts, and the dialog's shape leaves them out
+   * so the reader's own typing is never a reason to rebuild them.
+   */
   private atprotoField(
     label: string,
     value: string,
@@ -9710,13 +11651,7 @@ export class App {
     label.className = "text-13";
     label.textContent = "Contact";
     const picker = new ContactPicker({
-      items: this.contacts.map((c) => ({
-        nickname: c.nickname,
-        label: c.mail_handle
-          ? `${displayNick(c.nickname)} (${this.contactAddress(c)})`
-          : displayNick(c.nickname),
-        keywords: c.nickname,
-      })),
+      items: this.contacts.map((c) => this.pickerItem(c)),
       value: this.zinesShareContact,
       // Same as the conclave dialogs: grow the dialog rather than clip.
       expand: true,
@@ -9771,6 +11706,140 @@ export class App {
     return back;
   }
 
+  /**
+   * The line under a story's title: who wrote it, how long ago, and — for a
+   * story that has a discussion — what the discussion holds.
+   *
+   * One definition with four readers: the list row, the reader's head, and the
+   * shapes the two regions compare against. The age is why they have to agree:
+   * it moves without the store moving, so a shape that could not see the
+   * rendered text would leave "2 min ago" on screen all afternoon.
+   */
+  private readsMetaText(s: ReadsStoryDto): string {
+    const parts: string[] = [s.author, readsTimeAgo(s.created_at)];
+    if (s.hn_url) {
+      // HN story: points and discussion size mean something here.
+      parts.unshift(`${s.points} points`);
+      parts.push(`${s.num_comments} comment${s.num_comments === 1 ? "" : "s"}`);
+    }
+    if (s.domain) parts.push(s.domain);
+    return parts.join(" · ");
+  }
+
+  private readsSourceShapes(): ReadsSourceShape[] {
+    return this.readsSources.map((s) => ({
+      id: s.id,
+      title: s.title,
+      url: s.url,
+      builtIn: s.built_in,
+    }));
+  }
+
+  private readsStoryShapes(): ReadsStoryShape[] {
+    return this.readsStories.map((s) => ({
+      id: s.id,
+      title: s.title,
+      meta: this.readsMetaText(s),
+      read: s.read,
+      saved: s.saved,
+      open: this.readsOpenId === s.id,
+    }));
+  }
+
+  private readsListChrome(): ReadsListChrome {
+    return {
+      error: this.readsError,
+      loading: this.readsLoading,
+      done: this.readsDone,
+    };
+  }
+
+  /**
+   * Everything the reader draws, in the terms its shape compares.
+   *
+   * The article body is reduced to whether it is there: the update re-sanitizes
+   * that HTML, so a shape carrying it would compare two large strings to decide
+   * whether to do the expensive thing it exists to avoid. The body for a story is
+   * drawn once and cleared when another story opens, which is enough to tell them
+   * apart — and the comment tree, which is rebuilt the same way, is reduced to
+   * its size and its first id for the same reason.
+   */
+  private readsMainFacts(): ReadsMainFacts {
+    const id = this.readsOpenId;
+    const detail = this.readsDetail;
+    const s =
+      detail?.story ?? (id ? this.readsStories.find((x) => x.id === id) : undefined);
+    return {
+      id,
+      view: this.readsView,
+      title: s?.title ?? "",
+      meta: s ? this.readsMetaText(s) : "",
+      saved: s ? (this.readsStories.find((x) => x.id === s.id)?.saved ?? false) : false,
+      hasUrl: Boolean(s?.url),
+      hasDiscussion: Boolean(s?.hn_url),
+      readerLoading: this.readsReaderLoading,
+      readerError: this.readsReaderError,
+      readerHtml: this.readsReaderHtml !== null,
+      detailLoading: this.readsDetailLoading,
+      comments: detail?.comments.length ?? 0,
+      firstComment: detail?.comments[0]?.id ?? null,
+    };
+  }
+
+  /**
+   * The Reads rail's feed column, kept: the current mark and the Saved count.
+   *
+   * Both are rewritten here rather than keyed. The mark is on the button that was
+   * clicked, so keying it would rebuild the column on every feed switch and take
+   * the focus with it; the count is not known when the column is drawn, so the
+   * build starts the read and this keeps it current.
+   */
+  private syncReadsNav(el: HTMLElement): void {
+    const onFeed = this.readsMode === "feed";
+    for (const btn of el.querySelectorAll<HTMLElement>(".reads-nav-btn[data-source]")) {
+      btn.classList.toggle("active", onFeed && btn.dataset.source === this.readsSource);
+    }
+    el.querySelector<HTMLElement>('.reads-nav-btn[data-nav="saved"]')?.classList.toggle(
+      "active",
+      this.readsMode === "saved",
+    );
+    this.syncReadsSavedCount(el);
+  }
+
+  /**
+   * How many stories are saved, onto the Saved button.
+   *
+   * Called by the column's build and by its update, because the count is not in
+   * the state the column is drawn from — it comes from the store, which resolves
+   * from cache after the first read. It writes the empty string rather than
+   * nothing when the count is zero: unstarring the last story has to take the
+   * number away, and the element is the same one the build made.
+   */
+  private syncReadsSavedCount(el: HTMLElement): void {
+    void getReadsState().then((state) => {
+      const count = el.querySelector<HTMLElement>(".reads-nav-count");
+      if (!count || this.rail !== "reads") return;
+      count.textContent = state.saved.length > 0 ? String(state.saved.length) : "";
+    });
+  }
+
+  /**
+   * Redraw the Reads list inside the element that is already there.
+   *
+   * The element is the list's scroll box, so the rows are replaced and the box is
+   * not: coming back from an article, or from a page of "More", finds the reader
+   * where they were. The region's shape decides whether this runs at all, so a
+   * poll tick that changed nothing drawn does not reach here.
+   */
+  private fillReadsList(el: HTMLElement): void {
+    el.replaceChildren(...Array.from(this.renderReadsList().childNodes));
+  }
+
+  /** The reader, redrawn under its own element: that pane is its scroll box. */
+  private fillReadsMain(el: HTMLElement): void {
+    el.replaceChildren(...Array.from(this.renderReadsMain().childNodes));
+  }
+
   private renderReadsNav(): HTMLElement {
     const col = document.createElement("div");
     col.className = "reads-nav";
@@ -9792,6 +11861,9 @@ export class App {
       btn.type = "button";
       const active = this.readsMode === "feed" && this.readsSource === s.id;
       btn.className = `reads-nav-btn pressable${active ? " active" : ""}`;
+      // Carries the feed it was drawn for, which is how the in-place update
+      // finds it without depending on the column's order.
+      btn.dataset.source = s.id;
       btn.textContent = s.title;
       btn.title = s.url;
       btn.onclick = () => this.readsOpenSource(s.id);
@@ -9827,20 +11899,17 @@ export class App {
     const savedBtn = document.createElement("button");
     savedBtn.type = "button";
     savedBtn.className = `reads-nav-btn pressable${this.readsMode === "saved" ? " active" : ""}`;
+    savedBtn.dataset.nav = "saved";
     savedBtn.textContent = "Saved";
-    void getReadsState().then((state) => {
-      const n = state.saved.length;
-      if (n > 0 && this.rail === "reads") {
-        const count = savedBtn.querySelector(".reads-nav-count");
-        if (count) count.textContent = String(n);
-      }
-    });
     const savedCount = document.createElement("span");
     savedCount.className = "reads-nav-count";
     savedBtn.appendChild(savedCount);
     savedBtn.onclick = () => this.readsOpenSaved();
     list.appendChild(savedBtn);
     col.appendChild(list);
+    // The count comes from the store rather than from anything drawn above, so
+    // it is filled the same way the column's update fills it.
+    this.syncReadsSavedCount(col);
     return col;
   }
 
@@ -9940,15 +12009,8 @@ export class App {
 
     const meta = document.createElement("div");
     meta.className = "reads-row-meta text-12 muted";
-    const parts: string[] = [s.author, readsTimeAgo(s.created_at)];
-    if (s.hn_url) {
-      // HN story: points and discussion size mean something here.
-      parts.unshift(`${s.points} points`);
-      parts.push(`${s.num_comments} comment${s.num_comments === 1 ? "" : "s"}`);
-    }
-    if (s.domain) parts.push(s.domain);
     const metaText = document.createElement("span");
-    metaText.textContent = parts.join(" · ");
+    metaText.textContent = this.readsMetaText(s);
     meta.appendChild(metaText);
     row.appendChild(meta);
     return row;
@@ -10000,12 +12062,7 @@ export class App {
 
     const meta = document.createElement("p");
     meta.className = "reads-row-meta text-12 muted";
-    const parts: string[] = [s.author, readsTimeAgo(s.created_at)];
-    if (s.hn_url) {
-      parts.unshift(`${s.points} points`);
-      parts.push(`${s.num_comments} comment${s.num_comments === 1 ? "" : "s"}`);
-    }
-    meta.textContent = parts.join(" · ");
+    meta.textContent = this.readsMetaText(s);
     head.appendChild(meta);
 
     const actions = document.createElement("div");
@@ -10352,6 +12409,9 @@ export class App {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = `mail-folder pressable${this.mailFolder === f.id ? " active" : ""}`;
+      // Carries the folder it was drawn for, which is how the in-place patch
+      // finds it without depending on the column's order.
+      btn.dataset.folder = f.id;
       btn.appendChild(icon(f.ic));
       const label = document.createElement("span");
       label.className = "mail-folder-name";
@@ -10360,24 +12420,99 @@ export class App {
 
       // Inbox shows how much is unread; Drops likewise (unopened, and only
       // what the folder shows); the rest show how much is in them.
-      const unread =
-        f.id === "inbox"
-          ? unreadCount(flags)
-          : f.id === "drops"
-            ? listDropInbox(flags).filter((d) => isDropUnread(d, flags)).length
-            : 0;
-      const count = unread > 0 ? unread : folderCount(f.id, flags);
-      if (count > 0) {
-        const badge = document.createElement("span");
-        badge.className = unread > 0 ? "mail-folder-count unread" : "mail-folder-count";
-        badge.textContent = String(count);
-        btn.appendChild(badge);
+      const badge = folderBadge(f.id, flags);
+      if (badge.count > 0) {
+        btn.appendChild(this.mailFolderCountEl(badge));
       }
       btn.onclick = () => this.openFolder(f.id);
       list.appendChild(btn);
     }
     col.appendChild(list);
     return col;
+  }
+
+  /** A folder's count badge. Drawn by the column's first paint and by the patch
+   *  a mail reload runs, so the two cannot disagree about its look. */
+  private mailFolderCountEl(badge: FolderBadge): HTMLElement {
+    const el = document.createElement("span");
+    el.className = badge.unread ? "mail-folder-count unread" : "mail-folder-count";
+    el.textContent = String(badge.count);
+    return el;
+  }
+
+  /**
+   * The folder column's counts, in place.
+   *
+   * Nothing else in the column moves — the labels and the active folder are set
+   * by the rebuild that follows a folder switch — so this is what a mail reload
+   * owes the rail's left column, and it is the last thing that used to force a
+   * whole-shell render on an arriving message.
+   */
+  private patchMailFolderCounts(): void {
+    const flags = this.mailPrefs();
+    for (const btn of this.root.querySelectorAll<HTMLElement>(".mail-folder[data-folder]")) {
+      const folder = btn.dataset.folder as MailFolder | undefined;
+      if (!folder) continue;
+      const want = folderBadge(folder, flags);
+      const live = btn.querySelector<HTMLElement>(".mail-folder-count");
+      if (want.count === 0) {
+        live?.remove();
+        continue;
+      }
+      if (live) {
+        live.className = want.unread ? "mail-folder-count unread" : "mail-folder-count";
+        live.textContent = String(want.count);
+        continue;
+      }
+      btn.appendChild(this.mailFolderCountEl(want));
+    }
+  }
+
+  /**
+   * The Mail rail's folder column, kept: the counts and the active mark.
+   *
+   * Both are patched rather than keyed. The counts already had their writer
+   * (`patchMailFolderCounts`, shared with a mail reload); the active mark moves
+   * here so that switching folders repaints one class instead of rebuilding the
+   * column, which would drop the focus off the button the user just pressed. The
+   * address line is the only drawn fact left, and it is the region's key.
+   */
+  private syncMailFolders(el: HTMLElement): void {
+    this.patchMailFolderCounts();
+    for (const btn of el.querySelectorAll<HTMLElement>(".mail-folder[data-folder]")) {
+      btn.classList.toggle("active", btn.dataset.folder === this.mailFolder);
+    }
+  }
+
+  /**
+   * Paint a mail reload where it lands, or say that it cannot be.
+   *
+   * A reload reaches the rail's folder counts and, when the Mail rail is up, its
+   * list, its reader or the Drops folder's two bodies — and nothing else on
+   * screen. Those are the Mail rail's keyed regions, each with an update, so a
+   * reload is brought forward without touching the shell: the rows are redrawn,
+   * and the search field, the caret in it and the scroll box around them are the
+   * elements they already were. The rail's other bodies (compose, Drafts) are
+   * unkeyed, so a reload does move them and they return false, which is the
+   * poll's cue to rebuild. Off the Mail rail a reload owes nothing at all beyond
+   * the rail's own mail badge, which `patchRailBadges` already owns.
+   *
+   * The counts are patched first and unconditionally, because they are their own
+   * region: a rebuild paints over them, and when the editing gate holds that
+   * rebuild back they are the difference between a correct badge and a stale
+   * one. A false return therefore means "a rebuild is still needed", never "the
+   * pane is up to date".
+   */
+  private patchMailReload(): boolean {
+    if (this.rail !== "mail") return true;
+    this.patchMailFolderCounts();
+    // The regions are the shell's children, not the root's: the root holds the
+    // shell, the banner and the dialogs above it. Reading the pane out of the
+    // wrong parent finds nothing every time, and "nothing found" means a rebuild
+    // — which is what a mail reload used to cost on this rail.
+    const shell = this.shellEl;
+    if (!shell) return false;
+    return updateRegionInPlace(shell, this.mailMainRegion());
   }
 
   private openFolder(folder: MailFolder): void {
@@ -10400,17 +12535,160 @@ export class App {
 
   // ----------------------------------------------------------- main pane
 
-  private renderMailMain(): HTMLElement {
-    if (this.mailComposeOpen) return this.renderMailCompose();
-    if (this.mailFolder === "drops") {
-      return this.dropInboxOpenId
-        ? this.renderDropView(this.dropInboxOpenId)
-        : this.renderDropList();
+  /**
+   * The Mail rail's right-hand region.
+   *
+   * The folder's message list, the reader, and the Drops folder's two bodies are
+   * keyed, and the folder is part of the list's key. Each of them holds something
+   * a rebuild would cost: a search field with a caret in it, a scroll box the
+   * reader has scrolled — the list's, the open thread's, or the drop reader's —
+   * and, in the Drops folder, the note that may hold a key being generated. The
+   * folder belongs in the list's key because it is what makes the pane *that*
+   * list — the folder name is drawn into the toolbar, which `updateMailList`
+   * deliberately leaves alone, so a folder switch has to be a rebuild.
+   *
+   * Every other body is rebuilt, which is the honest default: none holds a scroll
+   * box worth keeping, and compose's fields are already held back by the poll's
+   * editing gate. `mailBody` is what decides, so this cannot disagree with
+   * `renderMailMain` about which body is up.
+   */
+  private mailMainRegion(): RegionSpec {
+    const body = this.mailBody();
+    if (body.kind === "list") {
+      return {
+        key: `mailList:${this.mailFolder}`,
+        build: () => this.renderMailList(),
+        update: (el) => this.updateMailList(el),
+      };
     }
-    if (this.mailThreadId) return this.renderMailThread(this.mailThreadId);
-    return this.renderMailList();
+    if (body.kind === "thread") return this.mailThreadRegion(body.id);
+    if (body.kind === "dropList") {
+      // The folder has no identity of its own to switch — there is exactly one
+      // Drops folder, and the body decides which list this is — so the key is a
+      // constant, and the update redraws the rows and the note under it. What it
+      // must not touch is the search field, which is the caret's home, and the
+      // scroll box the rows live in.
+      return {
+        key: "mailDropList",
+        build: () => this.renderDropList(),
+        update: (el) => this.updateDropList(el),
+      };
+    }
+    if (body.kind === "dropView") {
+      // Keyed by the drop, for the reason the reader is keyed by its thread: a
+      // different drop means the pane on screen belongs to the wrong one. The
+      // pane is its own scroll box, so the update redraws everything inside it
+      // and the reader keeps their place in a long submission.
+      return {
+        key: `mailDropView:${body.id}`,
+        build: () => this.renderDropView(body.id),
+        update: (el) => this.updateDropView(el, body.id),
+      };
+    }
+    return { key: null, build: () => this.renderMailMain() };
   }
 
+  /**
+   * The reader pane, keyed by the thread it is reading.
+   *
+   * `.mail-messages` is a scroll box, and a reload used to reset it to the top
+   * mid-read — the same cost the list had, in the same rail. The thread id is the
+   * whole key: the chrome around the box is rebuilt on every update, so nothing
+   * about it has to be constant under the key, and a different thread means the
+   * box on screen is the wrong thread's. The box's *contents* are the update's
+   * business rather than the key's — `updateMailThread` draws what arrived into
+   * the box it already has.
+   */
+  private mailThreadRegion(threadId: string): RegionSpec {
+    return {
+      key: `mailThread:${threadId}`,
+      build: () => this.renderMailThread(threadId),
+      update: (el) => this.updateMailThread(el, threadId),
+    };
+  }
+
+  /**
+   * Redraw the folder's rows under the search field, leaving the pane around
+   * them where it is.
+   *
+   * This is what a mail reload costs now: the rows are new, and the field the
+   * user may be typing into and the scroll box around them are the elements
+   * they already were.
+   */
+  private updateMailList(el: HTMLElement): void {
+    const list = el.querySelector<HTMLElement>(".mail-list");
+    if (list) {
+      this.fillMailList(list);
+      return;
+    }
+    // Not the shape the key promises — the draft and drops lists carry the same
+    // class, and each is reached by its own update through its own key, never
+    // through this one. The key and this builder read the same state, so this
+    // should be unreachable; if it is reached the pane is wrong either way, and a
+    // fresh one is the honest answer rather than a stale list.
+    el.replaceChildren(...Array.from(this.renderMailList().childNodes));
+  }
+
+  /**
+   * Which of the Mail rail's bodies is up, as one value.
+   *
+   * Read by both the dispatch below and the region key, so the two cannot
+   * disagree about which body is showing — and in particular about whether it is
+   * one of the ones that must not be rebuilt. An id travels with the body rather
+   * than being re-read at the far end, which is what keeps `renderMailMain`
+   * cast-free.
+   *
+   * The Drops folder's reader is the one body whose existence depends on a
+   * store: a drop the vault no longer holds — filed away, deleted, or reloaded
+   * out from under the reader — is not a body, so the folder falls back to its
+   * list. Deciding it here rather than inside the reader's builder is what makes
+   * the region key honest: a key promising `mailDropView:x` would otherwise be
+   * kept while the update drew a list under it.
+   */
+  private mailBody(): MailBody {
+    if (this.mailComposeOpen) return { kind: "compose" };
+    if (this.mailFolder === "drops") {
+      const id = this.dropInboxOpenId;
+      return id && getDropById(id)
+        ? { kind: "dropView", id }
+        : { kind: "dropList" };
+    }
+    if (this.mailThreadId) return { kind: "thread", id: this.mailThreadId };
+    if (this.mailFolder === "drafts") return { kind: "drafts" };
+    return { kind: "list" };
+  }
+
+  private renderMailMain(): HTMLElement {
+    // Exhaustive on purpose, with no `default`: a new body has to be given a
+    // case here and a kind in `mailBody`, and `mailMainRegion` will treat it as
+    // unkeyed until someone decides otherwise.
+    const body = this.mailBody();
+    switch (body.kind) {
+      case "compose":
+        return this.renderMailCompose();
+      case "dropView":
+        return this.renderDropView(body.id);
+      case "dropList":
+        return this.renderDropList();
+      case "thread":
+        return this.renderMailThread(body.id);
+      case "drafts":
+      case "list":
+        return this.renderMailList();
+    }
+  }
+
+  /**
+   * The folder's message list: a toolbar (folder name, search) over one scroll
+   * area of rows.
+   *
+   * The two halves are built apart because they have different lifetimes. The
+   * rows are redrawn whenever the store moves — `fillMailList` — while the
+   * toolbar and the scroll box around them are the same elements for as long as
+   * the folder is open, which is what the region key promises (`mailMainRegion`).
+   * That is also why the search field finds its list by looking rather than by
+   * capturing one at build time: the list it narrows is the one that survives.
+   */
   private renderMailList(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane";
@@ -10426,10 +12704,13 @@ export class App {
     const inp = document.createElement("input");
     inp.placeholder = "Search mail";
     inp.value = this.mailSearch;
+    // Drafts are their own records and this search has never narrowed them, so a
+    // keystroke in that folder only records the query for the next one — there
+    // is no list to find, and the keystroke is still recorded.
     inp.oninput = () => {
       this.mailSearch = inp.value;
-      // Synchronous, as before — same reason as the conv-list search.
-      this.render();
+      const list = pane.querySelector<HTMLElement>(".mail-list");
+      if (list) this.applyMailSearch(list);
     };
     search.appendChild(inp);
     bar.append(title, search);
@@ -10440,43 +12721,65 @@ export class App {
       return pane;
     }
 
+    const list = document.createElement("div");
+    list.className = "mail-list";
+    this.fillMailList(list);
+    pane.appendChild(list);
+    return pane;
+  }
+
+  /**
+   * Draw the open folder's rows into `list`, replacing what it held.
+   *
+   * The list element itself is not replaced: it is the pane's one scroll area,
+   * so a reload arrives here with the reader's place in it and the rows change
+   * around them. The one class this shares with the draft and drops lists is
+   * `.mail-list`, which is why `updateMailList` — the caller that finds its list
+   * by that class — is only ever reached for this folder's message list.
+   */
+  private fillMailList(list: HTMLElement): void {
     const flags = this.mailPrefs();
-    const rows = searchMessages(
-      listFolder(this.mailFolder, flags),
-      this.mailSearch,
-    );
+    // Every message in the folder is drawn and the search hides the ones that
+    // do not match, so a keystroke never rebuilds the list — which is what used
+    // to replace this very field and drop the caret after one character.
+    const mail = listFolder(this.mailFolder, flags);
     // The shared folders file drops too — Trash, Archive, and Starred list
     // them beside mail, newest first across both kinds.
-    const needle = this.mailSearch.trim().toLowerCase();
-    const dropRows = listDropsInFolder(this.mailFolder, flags).filter(
-      (d) =>
-        !needle ||
-        (d.subject ?? "").toLowerCase().includes(needle) ||
-        d.body.toLowerCase().includes(needle),
-    );
-    if (!rows.length && !dropRows.length) {
-      pane.appendChild(
-        this.mailEmpty(
-          this.mailSearch
-            ? "No mail matches that search."
-            : MAIL_EMPTY[this.mailFolder],
-        ),
-      );
-      return pane;
-    }
-
+    const drops = listDropsInFolder(this.mailFolder, flags);
     // One list, one chronology: mail and drops interleaved by when each
     // arrived, so a folder reads as a single history.
     const items: { ts: number; el: HTMLElement }[] = [
-      ...rows.map((m) => ({ ts: m.createdAt, el: this.mailRow(m, flags) })),
-      ...dropRows.map((d) => ({ ts: d.receivedAt, el: this.dropRow(d, flags) })),
+      ...mail.map((m) => ({ ts: m.createdAt, el: this.mailRow(m, flags) })),
+      ...drops.map((d) => ({ ts: d.receivedAt, el: this.dropRow(d, flags) })),
     ].sort((a, b) => b.ts - a.ts);
 
-    const list = document.createElement("div");
-    list.className = "mail-list";
-    for (const it of items) list.appendChild(it.el);
-    pane.appendChild(list);
-    return pane;
+    // Two different nothings, and the query decides which one is true: a folder
+    // with no mail at all, or mail the search is hiding. The note lives inside
+    // the list so the list can stay the pane's one scroll area either way.
+    const noMatch = this.mailEmpty(MAIL_EMPTY[this.mailFolder]);
+    list.replaceChildren(...items.map((it) => it.el), noMatch);
+    this.applyMailSearch(list);
+  }
+
+  /**
+   * Apply the folder's search to the list in place, and say which nothing the
+   * folder is showing.
+   *
+   * Cheap enough to run on every keystroke and after every redraw, which is why
+   * it is the one step both paths share: a keystroke narrows what is already
+   * drawn, a redraw draws the whole folder and then narrows it again.
+   */
+  private applyMailSearch(list: HTMLElement): void {
+    const shown = applyRowFilter(list, this.mailSearch);
+    const note = list.querySelector<HTMLElement>(".mail-empty");
+    // The filter above is the part that matters and has already run; the note is
+    // drawn by `fillMailList`, so a list without one is a list this did not
+    // build, and there is nothing to say about it.
+    if (!note) return;
+    note.textContent = this.mailSearch.trim()
+      ? "No mail matches that search."
+      : MAIL_EMPTY[this.mailFolder];
+    note.hidden = shown > 0;
   }
 
   /** One row in the message list: who, subject, snippet, when. */
@@ -10484,6 +12787,10 @@ export class App {
     const row = document.createElement("button");
     row.type = "button";
     row.className = `mail-row pressable${isUnread(m, flags) ? " unread" : ""}`;
+    // What the folder's search matches on. Not the row's visible text: the body
+    // is drawn as a truncated preview, so a word past the ellipsis would be
+    // findable in the search but not in the row.
+    row.dataset.filterText = mailSearchText(m);
 
     const dot = document.createElement("span");
     dot.className = "mail-row-dot";
@@ -10590,9 +12897,149 @@ export class App {
     await patchUiPrefs({ mail_read: [...read] });
   }
 
-  private renderMailThread(threadId: string): HTMLElement {
+  /**
+   * The reader's chrome — its head and its message list — with the list empty.
+   *
+   * Split from the fill because the two have different lifetimes, the same way
+   * the folder list's toolbar and rows do: a reload redraws the head (the unread
+   * count and the action buttons read state) around the live list, and the list's
+   * contents are brought forward by `appendMailThread`. Building the chrome by
+   * calling the full reader used to mean every body in the thread was parsed
+   * twice per reload — once into a pane that was immediately discarded, once into
+   * the list that stayed.
+   */
+  private mailThreadChrome(threadId: string): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane";
+    pane.appendChild(this.mailThreadHead(threadId));
+    const list = document.createElement("div");
+    list.className = "mail-messages";
+    pane.appendChild(list);
+    return pane;
+  }
+
+  /** A whole reader, for a first paint or a rebuild: chrome, then the messages. */
+  private renderMailThread(threadId: string): HTMLElement {
+    const pane = this.mailThreadChrome(threadId);
+    const list = pane.querySelector<HTMLElement>(".mail-messages");
+    // The chrome above is this method's own, so the list is there by
+    // construction; the guard is for the type, not for a case that can happen.
+    if (list) this.fillMailThread(list, threadId);
+    return pane;
+  }
+
+  /**
+   * Redraw the reader's head around the live message list, then bring the list
+   * up to date with what arrived.
+   *
+   * The box keeps the reader's place because the box is the element it already
+   * was: the head is transplanted in front of it and behind it, and the messages
+   * are appended to it. What the reader is looking at is held by an anchor rather
+   * than by the pixel offset `scrollTop` happens to hold — a thread is newest
+   * first, so an arrival is inserted *above* the viewport, and every card the
+   * reader was looking at moves down by the new card's height. Carrying the
+   * number across would scroll them backwards by exactly that much.
+   */
+  private updateMailThread(el: HTMLElement, threadId: string): void {
+    const list = el.querySelector<HTMLElement>(".mail-messages");
+    const usable = list !== null && list.parentElement === el;
+    const fresh = this.mailThreadChrome(threadId);
+    if (!list || !usable || !transplantAround(el, list, fresh, ".mail-messages")) {
+      el.replaceChildren(...Array.from(this.renderMailThread(threadId).childNodes));
+      return;
+    }
+    this.appendMailThread(list, threadId);
+  }
+
+  /**
+   * Bring the reader's message list up to date in place: draw what arrived, keep
+   * what is there, and hold the reader's place across it.
+   *
+   * The plan is `planPrepend`, so anything other than "what is drawn is the older
+   * end of the thread" is a rebuild — a message pruned or trashed, a contact
+   * removed so their mail left the thread, or a reply that landed in the middle
+   * because its clock is older than the newest. That last one is why this is not
+   * a plain "is the store longer than the pane" check: the store's order is by
+   * timestamp, and an arrival is only at the head when its timestamp says so.
+   */
+  private appendMailThread(list: HTMLElement, threadId: string): void {
+    const rendered = Array.from(
+      list.querySelectorAll<HTMLElement>("[data-mail-id]"),
+    ).map((card) => card.dataset.mailId ?? "");
+    const messages = getMailThread(threadId);
+    const fresh = planPrepend(rendered, messages);
+    if (!fresh) {
+      this.fillMailThread(list, threadId);
+      return;
+    }
+    // The open mark is drawn, and it is not part of the pane's key: clicking
+    // another message in the same conversation keeps `mailThread:<id>` and only
+    // moves this class, so it is repainted here rather than left stale.
+    this.markOpenMailMessage(list);
+    if (!fresh.length) return;
+    const atNewest = isAtTop(list);
+    const anchor = atNewest ? null : this.mailAnchor(list);
+    const subject = threadSubject(threadId);
+    // Newest first, so the batch goes in front of the list — built in reverse so
+    // that one insertion puts the newest of them at the top.
+    const batch = document.createDocumentFragment();
+    for (let i = fresh.length - 1; i >= 0; i -= 1) {
+      batch.appendChild(this.mailMessageCard(fresh[i], subject));
+    }
+    list.insertBefore(batch, list.firstChild);
+    if (atNewest) {
+      // The reader was on the newest message, so they stay on it: the top is the
+      // one position that needs no correction, since nothing sits above it.
+      list.scrollTop = 0;
+      return;
+    }
+    if (anchor) this.restoreMailAnchor(list, anchor);
+  }
+
+  /** Move the highlight to the message the reader opened, in place. */
+  private markOpenMailMessage(list: HTMLElement): void {
+    for (const card of list.querySelectorAll<HTMLElement>(".mail-message")) {
+      card.classList.toggle("open", card.dataset.mailId === this.mailOpenId);
+    }
+  }
+
+  /**
+   * The message the reader is looking at, and where it sits in the box.
+   *
+   * The topmost card still visible: the first one whose bottom is below the box's
+   * top edge, which is the card the reader's eye is on when the box is scrolled
+   * into history. Its offset is negative when the card is partly scrolled past,
+   * which is exactly what has to be restored.
+   */
+  private mailAnchor(list: HTMLElement): { id: string; offset: number } | null {
+    const boxTop = list.getBoundingClientRect().top;
+    for (const card of list.querySelectorAll<HTMLElement>("[data-mail-id]")) {
+      const rect = card.getBoundingClientRect();
+      if (rect.bottom > boxTop) {
+        return { id: card.dataset.mailId ?? "", offset: rect.top - boxTop };
+      }
+    }
+    return null;
+  }
+
+  /** Put the anchored message back where the reader had it, after an arrival. */
+  private restoreMailAnchor(list: HTMLElement, anchor: { id: string; offset: number }): void {
+    const card = Array.from(list.querySelectorAll<HTMLElement>("[data-mail-id]")).find(
+      (el) => el.dataset.mailId === anchor.id,
+    );
+    if (!card) return;
+    const offset = card.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    list.scrollTop += offset - anchor.offset;
+  }
+
+  /**
+   * The reader's chrome: back, the thread's subject and participants, and the
+   * actions, which apply to the message the user clicked rather than the thread.
+   *
+   * Rebuilt on every update — nothing in it is a scroll box or holds the caret,
+   * and the actions have to follow the open message and the folder flags.
+   */
+  private mailThreadHead(threadId: string): HTMLElement {
     const msgs = getMailThread(threadId);
     const contact =
       msgs.find((m) => !m.outgoing)?.contactNick ?? msgs[0]?.contactNick ?? "";
@@ -10668,75 +13115,96 @@ export class App {
       );
     }
     head.append(back, titles, actions);
-    pane.appendChild(head);
+    return head;
+  }
 
-    const list = document.createElement("div");
-    list.className = "mail-messages";
-    for (const m of msgs) {
-      const card = document.createElement("article");
-      card.className = `mail-message${m.outgoing ? " outgoing" : ""}${m.id === this.mailOpenId ? " open" : ""}`;
+  /**
+   * Draw a thread's messages into `list`, replacing what it held.
+   *
+   * The list element itself is not replaced — it is the reader's scroll box, so
+   * a reload arrives here with the reader's place in it. Every message is drawn
+   * again rather than appended to, because a reload can file, delete, or re-flag
+   * one in the middle of the thread and an append cannot see that. That is why
+   * this is the fallback rather than the reload path: `appendMailThread` appends
+   * when the store's thread still ends with what is drawn, and comes here when it
+   * does not.
+   */
+  private fillMailThread(list: HTMLElement, threadId: string): void {
+    const msgs = getMailThread(threadId);
+    const subject = threadSubject(threadId);
+    list.replaceChildren(...msgs.map((m) => this.mailMessageCard(m, subject)));
+  }
 
-      // Classic mail layout: a fixed avatar column, then everything else. The
-      // message is not a card — messages are separated by a rule, and the avatar
-      // is what tells you who wrote it without reading the header.
-      // The avatar is the author: the contact for mail that arrived, you for
-      // mail you sent (the same key `avatarKeyFor` already picks).
-      const author = m.outgoing
-        ? (this.mailHandle ?? this.vaultName)
-        : displayNick(m.contactNick);
-      card.appendChild(createAvatarEl(this.avatarKeyFor(m), "sm", false, author));
+  /**
+   * One message of a conversation, as the card the reader sees.
+   *
+   * `data-mail-id` is what makes the reader reconcilable at all: it is how
+   * `appendMailThread` reads back which messages are drawn, and how the anchor
+   * finds its card again after an arrival moved it.
+   */
+  private mailMessageCard(m: MailMessage, subject: string): HTMLElement {
+    const card = document.createElement("article");
+    card.dataset.mailId = m.id;
+    card.className = `mail-message${m.outgoing ? " outgoing" : ""}${m.id === this.mailOpenId ? " open" : ""}`;
 
-      const content = document.createElement("div");
-      content.className = "mail-message-content";
+    // Classic mail layout: a fixed avatar column, then everything else. The
+    // message is not a card — messages are separated by a rule, and the avatar
+    // is what tells you who wrote it without reading the header.
+    // The avatar is the author: the contact for mail that arrived, you for
+    // mail you sent (the same key `avatarKeyFor` already picks).
+    const author = m.outgoing
+      ? (this.mailHandle ?? this.vaultName)
+      : displayNick(m.contactNick);
+    card.appendChild(createAvatarEl(this.avatarKeyFor(m), "sm", false, author));
 
-      // A genuine mail header: the fields a client shows, one per line, with
-      // the labels forming a left column so the values line up. The subject
-      // belongs to the thread, not this message, so it repeats down the stack.
-      const msgHead = document.createElement("dl");
-      msgHead.className = "mail-message-head";
-      msgHead.append(
-        ...this.mailHeaderField(
-          "From",
-          m.outgoing ? (this.mailAddress() ?? "You") : displayNick(m.contactNick),
-          "mail-message-from",
-        ),
-        ...this.mailHeaderField(
-          "To",
-          m.outgoing
-            ? (this.contactByNick(m.contactNick)
-                ? this.contactAddress(this.contactByNick(m.contactNick)!)
-                : displayNick(m.contactNick))
-            : (this.mailAddress() ?? "you"),
-        ),
-        ...this.mailHeaderField("Date", this.mailDateEl(m.createdAt)),
-        ...this.mailHeaderField("Subject", subject || "(no subject)"),
-      );
+    const content = document.createElement("div");
+    content.className = "mail-message-content";
 
-      // A rule under the header is what separates the envelope from the letter.
-      const rule = document.createElement("hr");
-      rule.className = "mail-message-rule";
+    // A genuine mail header: the fields a client shows, one per line, with
+    // the labels forming a left column so the values line up. The subject
+    // belongs to the thread, not this message, so it repeats down the stack.
+    const msgHead = document.createElement("dl");
+    msgHead.className = "mail-message-head";
+    msgHead.append(
+      ...this.mailHeaderField(
+        "From",
+        m.outgoing ? (this.mailAddress() ?? "You") : displayNick(m.contactNick),
+        "mail-message-from",
+      ),
+      ...this.mailHeaderField(
+        "To",
+        m.outgoing
+          ? (this.contactByNick(m.contactNick)
+              ? this.contactAddress(this.contactByNick(m.contactNick)!)
+              : displayNick(m.contactNick))
+          : (this.mailAddress() ?? "you"),
+      ),
+      ...this.mailHeaderField("Date", this.mailDateEl(m.createdAt)),
+      ...this.mailHeaderField("Subject", subject || "(no subject)"),
+    );
 
-      const body = document.createElement("div");
-      body.className = "text-15 mail-message-body";
-      // The body may be rich HTML from the composer, or plain text from an
-      // older record. `bodyToDisplayHtml` sanitizes either way.
-      body.innerHTML = bodyToDisplayHtml(m.body);
-      this.guardLinks(body);
+    // A rule under the header is what separates the envelope from the letter.
+    const rule = document.createElement("hr");
+    rule.className = "mail-message-rule";
 
-      content.append(msgHead, rule, body);
-      if (m.attachments.length) {
-        // Attachments are their own section, not text that happens to sit under
-        // the message, so a second rule introduces them.
-        const attachRule = document.createElement("hr");
-        attachRule.className = "mail-message-rule";
-        content.appendChild(attachRule);
-        for (const a of m.attachments) content.appendChild(this.mailAttachmentChip(a));
-      }
-      card.appendChild(content);
-      list.appendChild(card);
+    const body = document.createElement("div");
+    body.className = "text-15 mail-message-body";
+    // The body may be rich HTML from the composer, or plain text from an
+    // older record. `bodyToDisplayHtml` sanitizes either way.
+    body.innerHTML = bodyToDisplayHtml(m.body);
+    this.guardLinks(body);
+
+    content.append(msgHead, rule, body);
+    if (m.attachments.length) {
+      // Attachments are their own section, not text that happens to sit under
+      // the message, so a second rule introduces them.
+      const attachRule = document.createElement("hr");
+      attachRule.className = "mail-message-rule";
+      content.appendChild(attachRule);
+      for (const a of m.attachments) content.appendChild(this.mailAttachmentChip(a));
     }
-    pane.appendChild(list);
-    return pane;
+    card.appendChild(content);
+    return card;
   }
 
   /**
@@ -10894,7 +13362,14 @@ export class App {
     });
   }
 
-  /** The Drops folder's list: one row per filed drop, newest first. */
+  /**
+   * The Drops folder's list: one row per filed drop, newest first.
+   *
+   * The rows and the note below them are `fillDropList`'s, so the first paint
+   * and a mail reload that lands here draw them the same way. What this builder
+   * owns is the chrome the field lives in: the toolbar, the search field with its
+   * query in it, and the scroll box the rows are drawn into.
+   */
   private renderDropList(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane";
@@ -10910,67 +13385,140 @@ export class App {
     const inp = document.createElement("input");
     inp.placeholder = "Search drops";
     inp.value = this.dropInboxSearch;
-    inp.oninput = () => {
-      this.dropInboxSearch = inp.value;
-      // Synchronous, as before — same reason as the conv-list search.
-      this.render();
-    };
     search.appendChild(inp);
     bar.append(title, search);
     pane.appendChild(bar);
 
-    const flags = this.mailPrefs();
-    const needle = this.dropInboxSearch.trim().toLowerCase();
-    const rows = listDropInbox(flags).filter(
-      (d) =>
-        !needle ||
-        (d.subject ?? "").toLowerCase().includes(needle) ||
-        d.body.toLowerCase().includes(needle),
-    );
-
-    if (!rows.length) {
-      const empty = document.createElement("div");
-      empty.className = "mail-empty";
-      if (!needle && this.dropInboxKey && !this.dropInboxKey.exists) {
-        // The one thing a fresh vault needs is the key — offer it here rather
-        // than sending the user hunting through Settings first.
-        empty.textContent =
-          "No drop key yet — generate one, publish it anywhere, and drops sealed to it land here.";
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "btn-primary pressable";
-        btn.textContent = "Generate drop key";
-        btn.onclick = () => {
-          btn.disabled = true;
-          void api
-            .dropsKeyCreate()
-            .then((k) => {
-              this.dropInboxKey = k;
-              this.scheduleRender();
-            })
-            .catch((e) => {
-              showToast(
-                e instanceof AppError ? e.message : "Could not generate the drop key.",
-                { kind: "error" },
-              );
-              this.scheduleRender();
-            });
-        };
-        empty.appendChild(btn);
-      } else {
-        empty.textContent = MAIL_EMPTY.drops;
-      }
-      pane.appendChild(empty);
-      return pane;
-    }
-
     const list = document.createElement("div");
     list.className = "mail-list";
-    for (const d of rows) {
-      list.appendChild(this.dropRow(d, flags, this.dropInboxOpenId === d.id));
-    }
+    this.fillDropList(list);
+    inp.oninput = () => {
+      this.dropInboxSearch = inp.value;
+      this.narrowDropList(list);
+    };
     pane.appendChild(list);
     return pane;
+  }
+
+  /**
+   * Draw the filed drops, and the note under them, into `list`.
+   *
+   * Every drop is drawn and the search hides the ones that do not match, so a
+   * keystroke never rebuilds the list — which is what used to replace the field
+   * above it and drop the caret after one character. The same holds for a mail
+   * reload: it arrives here with the field and the scroll box already in place,
+   * and the rows change around them.
+   */
+  private fillDropList(list: HTMLElement): void {
+    const flags = this.mailPrefs();
+    const rows = listDropInbox(flags).map((d) =>
+      this.dropRow(d, flags, this.dropInboxOpenId === d.id),
+    );
+
+    // The empty state has two forms, and which one is true is structural rather
+    // than a search result: a vault with no drop key has nothing to search for
+    // and one thing to offer. Deciding it from the key rather than from the
+    // query is also what keeps the button from being rebuilt mid-request — a
+    // second click would otherwise start a second key. The note is therefore
+    // kept while its kind holds, rather than replaced by a fresh button.
+    const kind = this.dropEmptyKind();
+    const live = list.querySelector<HTMLElement>(".mail-empty");
+    const empty = live && live.dataset.emptyKind === kind ? live : this.dropEmpty(kind);
+
+    list.replaceChildren(...rows, empty);
+    this.narrowDropList(list);
+  }
+
+  /**
+   * The folder's rows redrawn under the field and the scroll box, which stay
+   * where they are. What a mail reload costs the Drops folder, and the same
+   * shape `updateMailList` has for the other folders.
+   */
+  private updateDropList(el: HTMLElement): void {
+    const list = el.querySelector<HTMLElement>(".mail-list");
+    if (list) {
+      this.fillDropList(list);
+      return;
+    }
+    // Not the shape the key promises. The key and the builder read the same
+    // state, so this should be unreachable; if it is reached the pane is wrong
+    // either way, and a fresh one is the honest answer rather than a stale list.
+    el.replaceChildren(...Array.from(this.renderDropList().childNodes));
+  }
+
+  /**
+   * The quarantined reader, redrawn under its own element.
+   *
+   * The pane is its own scroll box — `.main-pane` scrolls — so redrawing what is
+   * inside it keeps the reader's place in a long submission, the way the Reads
+   * and Zines readers keep theirs. The whole body is redrawn rather than patched
+   * because there is nothing here to preserve but the offset: the card's fields,
+   * its attachment chips and the two dates are cheap to draw, and the body is
+   * drawn as `textContent`, so no sanitizer runs.
+   */
+  private updateDropView(el: HTMLElement, id: string): void {
+    el.replaceChildren(...Array.from(this.renderDropView(id).childNodes));
+  }
+
+  /** Which of the note's two forms the folder is in. */
+  private dropEmptyKind(): "no-key" | "plain" {
+    return !!this.dropInboxKey && !this.dropInboxKey.exists ? "no-key" : "plain";
+  }
+
+  /** The note under the rows: the offer of a key, or the two kinds of nothing. */
+  private dropEmpty(kind: "no-key" | "plain"): HTMLElement {
+    const empty = document.createElement("div");
+    empty.className = "mail-empty";
+    empty.dataset.emptyKind = kind;
+    if (kind === "no-key") {
+      // The one thing a fresh vault needs is the key — offer it here rather
+      // than sending the user hunting through Settings first.
+      empty.textContent =
+        "No drop key yet — generate one, publish it anywhere, and drops sealed to it land here.";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn-primary pressable";
+      btn.textContent = "Generate drop key";
+      btn.onclick = () => {
+        btn.disabled = true;
+        void api
+          .dropsKeyCreate()
+          .then((k) => {
+            this.dropInboxKey = k;
+            this.scheduleRender();
+          })
+          .catch((e) => {
+            showToast(
+              e instanceof AppError ? e.message : "Could not generate the drop key.",
+              { kind: "error" },
+            );
+            this.scheduleRender();
+          });
+      };
+      empty.appendChild(btn);
+      return empty;
+    }
+    empty.textContent = MAIL_EMPTY.drops;
+    return empty;
+  }
+
+  /**
+   * Hide the rows the query does not match, and say so in the note.
+   *
+   * The note is looked up rather than carried, because `fillDropList` is free to
+   * have replaced it since the field's listener was wired.
+   */
+  private narrowDropList(list: HTMLElement): void {
+    const shown = applyRowFilter(list, this.dropInboxSearch);
+    const empty = list.querySelector<HTMLElement>(".mail-empty");
+    if (!empty) return;
+    empty.hidden = shown > 0;
+    // A drop with no key to open it is the state, not a search result, so the
+    // offer stands whatever is typed.
+    if (empty.dataset.emptyKind === "no-key") return;
+    empty.textContent = this.dropInboxSearch.trim()
+      ? "No drops match that search."
+      : MAIL_EMPTY.drops;
   }
 
   /**
@@ -10983,6 +13531,7 @@ export class App {
     const row = document.createElement("button");
     row.type = "button";
     row.className = `mail-row pressable${active ? " active" : ""}`;
+    row.dataset.filterText = dropSearchText(d);
     if (isDropUnread(d, flags)) row.classList.add("unread");
 
     const dot = document.createElement("span");
@@ -11030,7 +13579,11 @@ export class App {
     pane.className = "main-pane";
     const drop = getDropById(id);
     if (!drop) {
-      // Filed away by a refresh? Back to the list rather than a dead pane.
+      // A backstop, not the decision: `mailBody` reads the store too, so the
+      // folder is already showing its list by the time this could be reached.
+      // Reaching it anyway means the pane on screen is the wrong one either way,
+      // and the list is the honest answer rather than a reader for a drop that is
+      // no longer there.
       this.dropInboxOpenId = null;
       return this.renderDropList();
     }
@@ -11809,6 +14362,59 @@ export class App {
    * phrase backs both, so there is no separate "create" per chain: the tabs
    * are a view, not two wallets.
    */
+  /**
+   * Everything the Wallet pane draws, card by card.
+   *
+   * The pane is redrawn whole rather than patched piecewise, so this is what
+   * decides whether any of it is redrawn at all — and the fields the reader is
+   * typing in are the reason the line is drawn where it is. `walletRestoreInput`,
+   * `walletSendTo`, `walletSendAmount`, `walletSendFee`, `walletTokenInput` and
+   * `walletWipeConfirm` are absent: they live in state, the redraw writes them
+   * back, and each is the field's own business. Two of them patch the DOM they
+   * own instead — the token field's Add button and the wipe field's Remove
+   * button — because nothing else on the pane moves when a character is typed.
+   *
+   * What is here is what the cards *draw*: the head's two states, whether the
+   * daemon has answered and why not, the error line, both chains' availability
+   * and the current chain's address, unit and two balances, the tokens (which
+   * are the picker's options, the send card's unit and the tokens card's rows),
+   * the chosen token, the last transaction, the network mode and its lock, the
+   * one-time phrase, and the busy flag that labels six buttons.
+   */
+  private walletBodyFacts(): string {
+    const state = getWalletState();
+    const view = chainState(state, this.walletChain);
+    return [
+      isWalletLoaded() ? "loaded" : "loading",
+      getWalletLoadError() ?? "",
+      state.exists ? "exists" : "none",
+      state.mode,
+      state.mode_locked ? "locked" : "unlocked",
+      this.walletChain,
+      this.walletBusy ? "busy" : "idle",
+      this.walletError ?? "",
+      this.walletPhrase ?? "",
+      this.walletSendToken ?? "",
+      CHAINS.map((c) => `${c}:${chainState(state, c).available ? "yes" : "no"}`).join(
+        "\n",
+      ),
+      view.address ?? "",
+      view.unit,
+      view.confirmed,
+      view.pending,
+      state.tokens
+        .map((t) => [t.address, t.symbol, String(t.decimals), t.balance].join("\n"))
+        .join("\n\n"),
+      this.walletLastTx
+        ? [
+            this.walletLastTx.chain,
+            this.walletLastTx.txid,
+            this.walletLastTx.fee_sat ?? "",
+          ].join("\n")
+        : "",
+    ].join("\n\n");
+  }
+
   private renderWallet(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane wallet-pane";
@@ -12449,14 +15055,21 @@ export class App {
     input.className = "input-field";
     input.placeholder = "remove";
     input.value = this.walletWipeConfirm;
-    input.oninput = () => {
-      this.walletWipeConfirm = input.value;
-    };
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "btn-danger pressable";
     btn.textContent = "Remove wallet";
-    btn.disabled = this.walletBusy || this.walletWipeConfirm.trim() !== "remove";
+    const armed = (): boolean => this.walletWipeConfirm.trim() === "remove";
+    btn.disabled = this.walletBusy || !armed();
+    input.oninput = () => {
+      this.walletWipeConfirm = input.value;
+      // The button is enabled by the word, so its state has to follow the field
+      // — and the field is not a reason to render. Patched in place, the way the
+      // token field's Add button is: a redraw would drop the caret out of the
+      // field mid-word, and a render for this alone would redraw the pane under
+      // the reader for nothing.
+      btn.disabled = this.walletBusy || !armed();
+    };
     btn.onclick = () => void this.walletWipeNow();
     card.append(h, p, input, btn);
     return card;
@@ -12716,9 +15329,20 @@ export class App {
     return host;
   }
 
-  /** Patch the IRC rail badge in place while the rail is already up. */
-  private updateIrcRailBadge(total: number, mentions: number): void {
-    const btn = this.root.querySelector<HTMLElement>('.rail-btn[data-rail="irc"]');
+  /**
+   * The IRC rail badge, which is the one badge with two parts: the unread count
+   * and a mention dot. One writer, because the store subscription patches it in
+   * place while the rail is up and the rail's first paint draws it from the same
+   * place — a render used to drop a mention dot that was already on screen,
+   * because the subscription only fires when the count changes.
+   */
+  private updateIrcRailBadge(
+    total: number,
+    mentions: number,
+    btn: HTMLElement | null = this.root.querySelector<HTMLElement>(
+      '.rail-btn[data-rail="irc"]',
+    ),
+  ): void {
     if (!btn) return;
     btn.querySelector(".rail-count")?.remove();
     btn.querySelector(".rail-badge")?.remove();
@@ -12726,6 +15350,7 @@ export class App {
       const pill = document.createElement("span");
       pill.className = "rail-count";
       pill.textContent = total > 99 ? "99+" : String(total);
+      pill.setAttribute("aria-label", `${total} unread`);
       btn.appendChild(pill);
     }
     if (mentions > 0) {
@@ -12740,6 +15365,7 @@ export class App {
     const pane = document.createElement("div");
     pane.className = "main-pane torrents-pane";
     const state = getTorrentsState();
+    const body = this.torrentsPaneBody();
 
     const head = document.createElement("div");
     head.className = "torrents-head";
@@ -12758,24 +15384,154 @@ export class App {
     head.append(title, settingsBtn);
     pane.appendChild(head);
 
-    if (!state.has_key) {
+    if (body.kind === "no-key") {
       pane.appendChild(this.renderTorrentsNoKey());
       return pane;
     }
 
     pane.appendChild(this.renderTorrentsAddBar());
+    pane.appendChild(this.renderTorrentsTabs(state));
 
+    pane.appendChild(
+      body.kind === "active"
+        ? this.renderTorrentsActive(state)
+        : this.renderTorrentsLibrary(state),
+    );
+    return pane;
+  }
+
+  /**
+   * Which of the pane's three bodies is up, from the same state its key is.
+   *
+   * One definition with three readers — this, `torrentsPaneKey` and the update
+   * that dispatches on it — so the pane on screen and the pane the key says is
+   * on screen cannot disagree.
+   */
+  private torrentsPaneBody(): TorrentsPaneBody {
+    const state = getTorrentsState();
+    if (!state.has_key) return { kind: "no-key" };
+    if (this.torrentsView === "active") return { kind: "active" };
+    const path = this.torrentsLibraryPath;
+    return {
+      kind: "library",
+      path,
+      missing: path.length > 0 && !state.library.some((e) => e.id === path[0]),
+      sort: this.torrentsLibrarySort,
+      view: this.torrentsLibraryView,
+    };
+  }
+
+  /** The pane: the rail's scroll box, redrawn in place by its update. */
+  private torrentsPaneRegion(): RegionSpec {
+    return {
+      key: torrentsPaneKey(this.torrentsPaneBody()),
+      shape: () => torrentsPaneShape(this.torrentsPaneFacts()),
+      build: () => this.renderTorrents(),
+      update: (el) => this.fillTorrentsPane(el),
+    };
+  }
+
+  /**
+   * Everything the pane's update redraws, in the terms its shape compares.
+   *
+   * The cards and the rows are the two row sets, and only one of them is ever
+   * drawn: the body decides which, and `torrentsPaneFacts` asks for the one the
+   * update will write.
+   */
+  private torrentsPaneFacts(): TorrentsPaneFacts {
+    const state = getTorrentsState();
+    const body = this.torrentsPaneBody();
+    const labels = this.torrentsTabLabels(state);
+    return {
+      activeTab: labels.active,
+      libraryTab: labels.library,
+      addBusy: this.torrentsAddBusy,
+      addError: this.torrentsAddError,
+      addValue: this.torrentsAddInput,
+      cards:
+        body.kind === "active"
+          ? state.items.map((item) => this.torrentCardFacts(item))
+          : [],
+      rows:
+        body.kind === "library"
+          ? this.torrentsLibraryRows(state, body).map((r) => r.facts)
+          : [],
+    };
+  }
+
+  /**
+   * Redraw the pane under its own element.
+   *
+   * The pane is the rail's scroll box and it holds the only two fields in this
+   * rail, so nothing here is rebuilt: the chrome is rewritten where its own text
+   * moved (the tab labels, the Add button, the inline error, and the Add field's
+   * text when a submit cleared it behind the field's back), and the rows are
+   * reconciled in place — the queue's cards by id and status, the Library's rows
+   * as a set. That is what lets a running download tick every three seconds
+   * without taking the caret out of the filter the reader is typing in.
+   */
+  private fillTorrentsPane(el: HTMLElement): void {
+    const body = this.torrentsPaneBody();
+    // The no-key body draws nothing that moves: whether there is a key at all is
+    // the body, and the body is the key.
+    if (body.kind === "no-key") return;
+    const state = getTorrentsState();
+    this.patchTorrentsChrome(el, state);
+    if (body.kind === "active") {
+      const list = el.querySelector<HTMLElement>(".torrents-list");
+      if (list) this.fillTorrentsActive(list, state);
+      return;
+    }
+    const items = el.querySelector<HTMLElement>(".torrents-items");
+    if (!items) return;
+    this.fillTorrentsLibraryRows(items, state, body);
+    // The rows that were just drawn are not narrowed: the query hides rows
+    // rather than changing which are drawn, so the redraw has to re-run it.
+    this.applyTorrentsNarrow(el);
+  }
+
+  /**
+   * Paint a Torrents-rail delta where it lands, or say that it cannot be.
+   *
+   * The store polls every three seconds while anything is in flight, and each
+   * poll reaches this pane's own state — a card's progress, the tab counts, a
+   * library that just gained an entry. All of it is drawn in the pane, so the
+   * region's update is the whole patch and the tick costs one pane instead of a
+   * rebuild of the shell. Returns false when the pane is not on screen to paint,
+   * which is the caller's cue to rebuild.
+   */
+  private patchTorrentsPane(): boolean {
+    // A rebuild is already queued: it paints this delta too, and patching first
+    // would only be undone by it.
+    if (this.renderRaf !== null || this.renderDelayTimer !== null) return true;
+    const shell = this.shellEl;
+    if (!shell) return false;
+    return updateRegionInPlace(shell, this.torrentsPaneRegion());
+  }
+
+  /** The two tab labels, in one definition: the builder and the patch agree. */
+  private torrentsTabLabels(state: TorrentsStateDto): { active: string; library: string } {
     const active = activeTorrentCount(state);
+    return {
+      active: active > 0 ? `Active & Queue (${active})` : "Active & Queue",
+      library: `Library${state.library.length ? ` (${state.library.length})` : ""}`,
+    };
+  }
+
+  private renderTorrentsTabs(state: TorrentsStateDto): HTMLElement {
+    const labels = this.torrentsTabLabels(state);
     const tabs = document.createElement("div");
     tabs.className = "torrents-tabs";
-    const tabDefs: { id: "active" | "library"; label: string }[] = [
-      { id: "active", label: active > 0 ? `Active & Queue (${active})` : "Active & Queue" },
-      { id: "library", label: `Library${state.library.length ? ` (${state.library.length})` : ""}` },
-    ];
-    for (const t of tabDefs) {
+    for (const t of [
+      { id: "active" as const, label: labels.active },
+      { id: "library" as const, label: labels.library },
+    ]) {
       const b = document.createElement("button");
       b.type = "button";
       b.className = `torrents-tab pressable${this.torrentsView === t.id ? " active" : ""}`;
+      // The patch rewrites these two labels in place, so each carries which tab
+      // it is: an index would be a second description of this list.
+      b.dataset.view = t.id;
       b.textContent = t.label;
       b.onclick = () => {
         this.torrentsView = t.id;
@@ -12784,15 +15540,51 @@ export class App {
       };
       tabs.appendChild(b);
     }
-    pane.appendChild(tabs);
-
-    pane.appendChild(
-      this.torrentsView === "active"
-        ? this.renderTorrentsActive(state)
-        : this.renderTorrentsLibrary(state),
-    );
-    return pane;
+    return tabs;
   }
+
+  /**
+   * Rewrite the pane's chrome where its own text moved.
+   *
+   * The Add button and the inline error are drawn from state a submit moves, and
+   * the two tab labels carry counts the queue moves — all of it inside elements
+   * that must not be replaced, because the Add bar holds the field the reader
+   * pastes a magnet into.
+   */
+  private patchTorrentsChrome(pane: HTMLElement, state: TorrentsStateDto): void {
+    const labels = this.torrentsTabLabels(state);
+    for (const tab of pane.querySelectorAll<HTMLElement>(".torrents-tab[data-view]")) {
+      const label = tab.dataset.view === "active" ? labels.active : labels.library;
+      if (tab.textContent !== label) tab.textContent = label;
+    }
+    const bar = pane.querySelector<HTMLElement>(".torrents-add");
+    if (!bar) return;
+    const add = bar.querySelector<HTMLButtonElement>(".torrents-add-go");
+    if (add) {
+      const label = this.torrentsAddBusy ? "Adding…" : "Add";
+      if (add.textContent !== label) add.textContent = label;
+      add.disabled = this.torrentsAddBusy;
+    }
+    // Only ever a no-op or a clear: the field's own handler keeps the state and
+    // the field in step, so a submit that emptied the state is the one thing
+    // this writes.
+    const input = bar.querySelector<HTMLInputElement>(".torrents-add-input");
+    if (input && input.value !== this.torrentsAddInput) input.value = this.torrentsAddInput;
+    const live = bar.querySelector<HTMLElement>(".torrents-add-error");
+    if (!this.torrentsAddError) {
+      live?.remove();
+      return;
+    }
+    if (live) {
+      if (live.textContent !== this.torrentsAddError) live.textContent = this.torrentsAddError;
+      return;
+    }
+    const err = document.createElement("p");
+    err.className = "text-13 torrents-add-error";
+    err.textContent = this.torrentsAddError;
+    bar.appendChild(err);
+  }
+
 
   private renderTorrentsNoKey(): HTMLElement {
     const wrap = document.createElement("div");
@@ -12851,7 +15643,7 @@ export class App {
 
     const add = document.createElement("button");
     add.type = "button";
-    add.className = "btn-primary pressable";
+    add.className = "btn-primary pressable torrents-add-go";
     add.textContent = this.torrentsAddBusy ? "Adding…" : "Add";
     add.disabled = this.torrentsAddBusy;
     add.onclick = () => void this.torrentsSubmit();
@@ -12962,14 +15754,140 @@ export class App {
     const wrap = document.createElement("div");
     wrap.className = "torrents-list";
     if (!state.items.length) {
-      const p = document.createElement("p");
-      p.className = "muted torrents-list-empty";
-      p.textContent = "Nothing in the queue. Add a magnet above to get started.";
-      wrap.appendChild(p);
+      wrap.appendChild(this.torrentsQueueEmptyNote());
       return wrap;
     }
     for (const item of state.items) wrap.appendChild(this.renderTorrentCard(item));
     return wrap;
+  }
+
+  /** The one sentence that stands in place of the queue's rows. */
+  private torrentsQueueEmptyNote(): HTMLElement {
+    const p = document.createElement("p");
+    p.className = "muted torrents-list-empty";
+    p.textContent = "Nothing in the queue. Add a magnet above to get started.";
+    return p;
+  }
+
+  /**
+   * The queue's rows, kept: one card per item, replaced only when its own key
+   * moves.
+   *
+   * A card is reconciled by id and status, so a progress tick rewrites the three
+   * things that moved inside the card it belongs to — the badge's wording, the
+   * bar's width, the muted line under it — instead of rebuilding the list. The
+   * status is in the key because the actions are drawn from it and nothing
+   * rewrites them: a card that started downloading is a card with a Pause button
+   * where a Retry was.
+   */
+  private fillTorrentsActive(list: HTMLElement, state: TorrentsStateDto): void {
+    if (state.items.length) {
+      syncRegions(
+        list,
+        state.items.map((item) => this.torrentCardRegion(item)),
+      );
+      return;
+    }
+    // The empty note is not a row, and the queue can empty between two polls:
+    // this is the one case the list is redrawn rather than reconciled.
+    list.replaceChildren(this.torrentsQueueEmptyNote());
+  }
+
+  private torrentCardRegion(item: TorrentItemDto): RegionSpec {
+    const facts = this.torrentCardFacts(item);
+    return {
+      key: `torrentCard:${item.id}\n${item.status}`,
+      shape: () => torrentCardShape(facts),
+      build: () => this.renderTorrentCard(item),
+      update: (el) => this.updateTorrentCard(el, facts),
+    };
+  }
+
+  /** Everything one card draws that can move while its key stands. */
+  private torrentCardFacts(item: TorrentItemDto): TorrentCardFacts {
+    return {
+      id: item.id,
+      status: item.status,
+      label: torrentStatusLabel(item),
+      meta: this.torrentCardMeta(item),
+      bar: this.torrentCardBar(item),
+      error: item.status === "error" ? item.message ?? null : null,
+    };
+  }
+
+  /**
+   * The bar's fill width, as the percentage both the card and its shape use.
+   *
+   * Two different measures, deliberately: a transfer is a fraction of the bytes
+   * it has to fetch, while a torrent still being cached on TorBox has only its
+   * own progress to show. Rounded to whole percent, because that is what the
+   * card shows and what its shape compares — an unrounded width would move the
+   * shape on every poll without moving anything a reader can see.
+   */
+  private torrentCardBar(item: TorrentItemDto): string {
+    const frac =
+      item.status === "downloading" || item.status === "completed"
+        ? item.dl_total
+          ? item.dl_done / item.dl_total
+          : 0
+        : item.progress;
+    return `${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%`;
+  }
+
+  /**
+   * The muted line under a card's bar.
+   *
+   * One definition with two readers — the card and its shape — because the line
+   * ends in `readsTimeAgo`: the age moves on its own, so a shape built from
+   * `added_at` would be the same string while the row on screen says "2 min ago"
+   * and then should say "3 min ago".
+   */
+  private torrentCardMeta(item: TorrentItemDto): string {
+    const bits: string[] = [];
+    if (item.size) bits.push(formatBytes(item.size));
+    if (item.status === "caching") {
+      const speed = formatSpeed(item.speed);
+      if (speed) bits.push(speed);
+      if (item.seeds) bits.push(`${item.seeds} seed${item.seeds === 1 ? "" : "s"}`);
+    }
+    if (item.status === "downloading" && item.dl_total) {
+      bits.push(`${formatBytes(item.dl_done)} / ${formatBytes(item.dl_total)}`);
+      const speed = formatSpeed(item.dl_speed);
+      if (speed) bits.push(speed);
+    }
+    bits.push(readsTimeAgo(item.added_at));
+    return bits.join(" · ");
+  }
+
+  /**
+   * Rewrite the three things inside a card that moved.
+   *
+   * Nothing here replaces an element: the card's name, its bar and its actions
+   * are the ones it was built with, which is what keeps the hover under a
+   * pointer resting on Pause while the download ticks.
+   */
+  private updateTorrentCard(el: HTMLElement, facts: TorrentCardFacts): void {
+    const badge = el.querySelector<HTMLElement>(".torrent-badge");
+    if (badge && badge.textContent !== facts.label) badge.textContent = facts.label;
+    const fill = el.querySelector<HTMLElement>(".torrent-bar-fill");
+    if (fill) fill.style.width = facts.bar;
+    const meta = el.querySelector<HTMLElement>(".torrent-meta");
+    if (meta && meta.textContent !== facts.meta) meta.textContent = facts.meta;
+    const live = el.querySelector<HTMLElement>(".torrent-error");
+    if (!facts.error) {
+      live?.remove();
+      return;
+    }
+    if (live) {
+      if (live.textContent !== facts.error) live.textContent = facts.error;
+      return;
+    }
+    const err = document.createElement("p");
+    err.className = "torrent-error text-13";
+    err.textContent = facts.error;
+    // After the meta line and before the actions, which is where the builder
+    // puts it: a card's error sits under its numbers, not under its buttons.
+    el.insertBefore(err, el.querySelector(".torrent-actions"));
   }
 
   private renderTorrentCard(item: TorrentItemDto): HTMLElement {
@@ -12988,36 +15906,17 @@ export class App {
     top.append(name, badge);
     card.appendChild(top);
 
-    const frac =
-      item.status === "downloading" || item.status === "completed"
-        ? item.dl_total
-          ? item.dl_done / item.dl_total
-          : 0
-        : item.progress;
     const bar = document.createElement("div");
     bar.className = "torrent-bar";
     const fill = document.createElement("div");
     fill.className = "torrent-bar-fill";
-    fill.style.width = `${Math.max(0, Math.min(1, frac)) * 100}%`;
+    fill.style.width = this.torrentCardBar(item);
     bar.appendChild(fill);
     card.appendChild(bar);
 
-    const bits: string[] = [];
-    if (item.size) bits.push(formatBytes(item.size));
-    if (item.status === "caching") {
-      const speed = formatSpeed(item.speed);
-      if (speed) bits.push(speed);
-      if (item.seeds) bits.push(`${item.seeds} seed${item.seeds === 1 ? "" : "s"}`);
-    }
-    if (item.status === "downloading" && item.dl_total) {
-      bits.push(`${formatBytes(item.dl_done)} / ${formatBytes(item.dl_total)}`);
-      const speed = formatSpeed(item.dl_speed);
-      if (speed) bits.push(speed);
-    }
-    bits.push(readsTimeAgo(item.added_at));
     const meta = document.createElement("div");
     meta.className = "torrent-meta muted text-13";
-    meta.textContent = bits.join(" · ");
+    meta.textContent = this.torrentCardMeta(item);
     card.appendChild(meta);
 
     if (item.status === "error" && item.message) {
@@ -13130,10 +16029,15 @@ export class App {
     const si = document.createElement("input");
     si.placeholder = "Search";
     si.value = this.torrentsLibrarySearch;
+    // Every list below draws all of its rows and lets the search hide some of
+    // them, so a keystroke never rebuilds the pane — which is what used to
+    // replace this very field and drop the caret after one character. The rows
+    // are redrawn by the pane's update, so the narrowing is looked up in the
+    // element as it is now rather than closed over: a query typed before a
+    // redraw must still hide the rows that redraw brought back.
     si.oninput = () => {
       this.torrentsLibrarySearch = si.value;
-      // Synchronous, as before — same reason as the conv-list search.
-      this.render();
+      this.applyTorrentsNarrow(wrap);
     };
     search.appendChild(si);
     const sortSel = document.createElement("select");
@@ -13170,30 +16074,18 @@ export class App {
     tools.append(search, sortSel, viewToggle);
     wrap.appendChild(tools);
 
-    const q = this.torrentsLibrarySearch.trim().toLowerCase();
-
     if (this.torrentsLibraryPath.length === 0) {
-      // Top level: one folder per downloaded torrent.
-      let entries = [...state.library];
-      if (q) entries = entries.filter((e) => e.name.toLowerCase().includes(q));
-      entries.sort((a, b) => {
-        if (this.torrentsLibrarySort === "name") return a.name.localeCompare(b.name);
-        if (this.torrentsLibrarySort === "size") return b.size - a.size;
-        return b.added_at - a.added_at;
-      });
-      if (!entries.length) {
-        const p = document.createElement("p");
-        p.className = "muted torrents-list-empty";
-        p.textContent = state.library.length
-          ? "No torrents match that search."
-          : "Nothing in the library yet. Finished torrents land here.";
-        wrap.appendChild(p);
-        return wrap;
-      }
       const container = document.createElement("div");
       container.className = `torrents-items ${this.torrentsLibraryView}`;
-      for (const e of entries) container.appendChild(this.renderLibraryTorrent(e));
-      wrap.appendChild(container);
+      for (const row of this.torrentsLibraryRows(state, this.torrentsPaneBody())) {
+        container.appendChild(row.build());
+      }
+      // Two different nothings, and the query decides which is true: a library
+      // with nothing in it, and a search that is hiding all of it.
+      const noMatch = document.createElement("p");
+      noMatch.className = "muted torrents-list-empty";
+      wrap.append(container, noMatch);
+      this.applyTorrentsNarrow(wrap);
       return wrap;
     }
 
@@ -13206,8 +16098,71 @@ export class App {
       wrap.appendChild(p);
       return wrap;
     }
-    const sub = this.torrentsLibraryPath.slice(1);
-    const nodes = new Map<string, { name: string; folder: boolean; size: number; file?: TorrentFileDto }>();
+
+    const deleteRow = document.createElement("div");
+    deleteRow.className = "torrents-library-actions";
+    deleteRow.appendChild(
+      this.torrentActionBtn("Delete torrent", "trash", async () => {
+        this.torrentsDeleteId = entry.id;
+        this.scheduleRender();
+      }),
+    );
+    wrap.appendChild(deleteRow);
+
+    const container = document.createElement("div");
+    container.className = `torrents-items ${this.torrentsLibraryView}`;
+    for (const row of this.torrentsLibraryRows(state, this.torrentsPaneBody())) {
+      container.appendChild(row.build());
+    }
+    // Two different nothings: a folder with nothing in it, and a search that is
+    // hiding all of it.
+    const noMatch = document.createElement("p");
+    noMatch.className = "muted torrents-list-empty";
+    wrap.append(container, noMatch);
+    this.applyTorrentsNarrow(wrap);
+    return wrap;
+  }
+
+  /**
+   * The Library's rows, in order, as facts and builders.
+   *
+   * One definition with two readers: the builder above draws each row, and the
+   * pane's update reconciles the same list against the rows already there. Both
+   * bodies go through here — the top level's one folder per torrent, and the
+   * inside of a torrent, where immediate children of the current subfolder are
+   * shown — because the two differ only in which nodes they list.
+   */
+  private torrentsLibraryRows(
+    state: TorrentsStateDto,
+    body: TorrentsPaneBody,
+  ): TorrentLibraryRow[] {
+    if (body.kind !== "library" || body.missing) return [];
+    if (body.path.length === 0) {
+      const entries = [...state.library].sort((a, b) => {
+        if (this.torrentsLibrarySort === "name") return a.name.localeCompare(b.name);
+        if (this.torrentsLibrarySort === "size") return b.size - a.size;
+        return b.added_at - a.added_at;
+      });
+      return entries.map((e) => ({
+        facts: {
+          id: e.id,
+          kind: "torrent" as const,
+          size: formatBytes(e.size),
+          sub: `${e.files.length} file${e.files.length === 1 ? "" : "s"} · ${readsTimeAgo(e.added_at)}`,
+          mime: "",
+          busy: false,
+        },
+        build: () => this.renderLibraryTorrent(e),
+      }));
+    }
+
+    const entry = state.library.find((e) => e.id === body.path[0]);
+    if (!entry) return [];
+    const sub = body.path.slice(1);
+    const nodes = new Map<
+      string,
+      { name: string; folder: boolean; size: number; file?: TorrentFileDto }
+    >();
     for (const f of entry.files) {
       const parts = f.path.split("/").filter(Boolean);
       if (parts.slice(0, sub.length).join("/") !== sub.join("/")) continue;
@@ -13220,46 +16175,94 @@ export class App {
         nodes.set(head, { name: head, folder: true, size: 0 });
       }
     }
-    let list = [...nodes.values()];
-    if (q) list = list.filter((n) => n.name.toLowerCase().includes(q));
-    list.sort((a, b) => {
+    const list = [...nodes.values()].sort((a, b) => {
       if (a.folder !== b.folder) return a.folder ? -1 : 1;
       if (this.torrentsLibrarySort === "name") return a.name.localeCompare(b.name);
       if (this.torrentsLibrarySort === "size") return b.size - a.size;
       return a.name.localeCompare(b.name);
     });
-
-    const deleteRow = document.createElement("div");
-    deleteRow.className = "torrents-library-actions";
-    deleteRow.appendChild(
-      this.torrentActionBtn("Delete torrent", "trash", async () => {
-        this.torrentsDeleteId = entry.id;
-        this.scheduleRender();
-      }),
-    );
-    wrap.appendChild(deleteRow);
-
-    if (!list.length) {
-      const p = document.createElement("p");
-      p.className = "muted torrents-list-empty";
-      p.textContent = "This folder is empty.";
-      wrap.appendChild(p);
-      return wrap;
-    }
-    const container = document.createElement("div");
-    container.className = `torrents-items ${this.torrentsLibraryView}`;
-    for (const n of list) {
-      container.appendChild(
-        n.folder
-          ? this.renderLibraryFolder(n.name, () => {
+    return list.map((n) => {
+      if (n.folder) {
+        return {
+          facts: {
+            id: n.name,
+            kind: "folder" as const,
+            size: "",
+            sub: "",
+            mime: "",
+            busy: false,
+          },
+          build: () =>
+            this.renderLibraryFolder(n.name, () => {
               this.torrentsLibraryPath = [...this.torrentsLibraryPath, n.name];
               this.scheduleRender();
-            })
-          : this.renderLibraryFile(n.file!),
-      );
+            }),
+        };
+      }
+      const f = n.file!;
+      return {
+        facts: {
+          id: f.name,
+          kind: "file" as const,
+          size: formatBytes(f.size),
+          sub: "",
+          mime: f.mimetype ?? "",
+          busy: f.blob_id != null && f.blob_id === this.torrentsBusyBlob,
+        },
+        build: () => this.renderLibraryFile(f),
+      };
+    });
+  }
+
+  /**
+   * The Library's rows, kept: reconciled as a set, replaced one by one.
+   *
+   * A row's key is its facts, because nothing patches a row: a size that moved
+   * or an age that ticked over is a row that has to be drawn again, and drawing
+   * it again is what the key asks for. The rows that did not move are left where
+   * they are, which is what keeps the hover under a pointer resting on "Open
+   * inside vault" when a download finishes somewhere else in the list.
+   */
+  private fillTorrentsLibraryRows(
+    items: HTMLElement,
+    state: TorrentsStateDto,
+    body: TorrentsPaneBody,
+  ): void {
+    syncRegions(
+      items,
+      this.torrentsLibraryRows(state, body).map((row) => ({
+        key: `torrentRow:${torrentLibraryShape([row.facts])}`,
+        build: row.build,
+      })),
+    );
+  }
+
+  /**
+   * Re-apply the Library's search to the rows inside `wrap` as they are now.
+   *
+   * The query is the field's own state and never a reason to redraw, so a redraw
+   * has to re-run the narrowing those rows were hiding under — otherwise a poll
+   * tick would put the rows the reader filtered out back on screen. One
+   * definition with two callers, the field's own handler and the pane's update.
+   */
+  private applyTorrentsNarrow(wrap: HTMLElement): void {
+    const container = wrap.querySelector<HTMLElement>(".torrents-items");
+    const note = wrap.querySelector<HTMLElement>(".torrents-list-empty");
+    if (!container || !note) return;
+    const shown = applyRowFilter(container, this.torrentsLibrarySearch);
+    note.textContent = this.torrentsLibraryNote();
+    note.hidden = shown > 0;
+  }
+
+  /** What the Library's note says: two nothings, and the query picks one. */
+  private torrentsLibraryNote(): string {
+    const inside = this.torrentsLibraryPath.length > 0;
+    if (this.torrentsLibrarySearch.trim()) {
+      return inside ? "No files match that search." : "No torrents match that search.";
     }
-    wrap.appendChild(container);
-    return wrap;
+    return inside
+      ? "This folder is empty."
+      : "Nothing in the library yet. Finished torrents land here.";
   }
 
   private renderLibraryTorrent(e: TorrentLibraryEntryDto): HTMLElement {
@@ -13351,6 +16354,10 @@ export class App {
    * stops working. Rows that open something pass `onOpen` and get a button
    * around the name area only; file rows pass nothing and stay inert, so the
    * only controls on them are the explicit action buttons.
+   *
+   * The row is also its own search haystack: the Library's search hides rows
+   * rather than drawing a different set of them, and the name is all it matches
+   * on.
    */
   private libraryItemShell(
     ic: IconName | HTMLElement,
@@ -13360,6 +16367,7 @@ export class App {
   ): HTMLElement {
     const el = document.createElement("div");
     el.className = "library-item";
+    el.dataset.filterText = filterText(name);
     let main: HTMLElement;
     if (onOpen) {
       const btn = document.createElement("button");
@@ -13711,7 +16719,80 @@ export class App {
     return body;
   }
 
-  private renderVault(): HTMLElement {    const pane = document.createElement("div");
+  /**
+   * The Auto-lock tile's two lines: the window, and what is left of it.
+   *
+   * One definition with two readers — the tile and its shape. The countdown is
+   * the reason it exists: it is a clock, so the shape compares the *printed*
+   * minute rather than the window behind it, which is what lets a redraw arrive
+   * with the minute it names.
+   */
+  private autoLockLines(): { idle: string; countdown: string } {
+    const mins = getAutoLockMinutes();
+    const idle = mins <= 0 ? "Idle lock off" : `${mins} minute${mins === 1 ? "" : "s"}`;
+    const remain = Math.max(0, getAutoLockMs() - (Date.now() - this.unlockedAt));
+    return {
+      idle,
+      countdown:
+        mins <= 0
+          ? "Only manual lock or suspend"
+          : `${Math.ceil(remain / 60000)}m until lock`,
+    };
+  }
+
+  /** The Backup tile's line: how long ago, or the reason to make one. */
+  private backupTileHint(lastBackup: number): string {
+    return lastBackup > 0
+      ? `Last backup ${formatRelative(lastBackup * 1000)}`
+      : "Back up your vault so you never lose your chats";
+  }
+
+  /**
+   * Everything the bento tile draws.
+   *
+   * The two clock readings are in the form they are printed — the auto-lock
+   * countdown and the "last backup 3 days ago" line move on their own, and a
+   * shape built from the fields behind them would be identical while the tile
+   * said the wrong thing. Everything else is the state the tile's own text is a
+   * pure function of: the vault's size, the file count, TorBox's three facts,
+   * the note count, and the wallet's.
+   *
+   * This is the one body in the rail that moves in the background — a file
+   * exchanged over mail, a torrent finishing into the library, a note saved, a
+   * balance synced — so its facts are read from the same stores the tile reads,
+   * and `mailAttachmentCounts` is one pass over the mail store for every contact
+   * rather than one per contact (see item 8 in the smoothness notes).
+   */
+  private vaultTileFacts(): string {
+    const s = this.status;
+    const torrents = getTorrentsState();
+    const wallet = getWalletState();
+    const btc = chainState(wallet, "bitcoin");
+    const mailAttachments = mailAttachmentCounts(this.mailPrefs());
+    const fileCount =
+      allFileMessages().length +
+      this.contacts.reduce((n, c) => n + (mailAttachments.get(c.nickname) ?? 0), 0);
+    const lock = this.autoLockLines();
+    const lastBackup = s?.last_backup_unix ?? 0;
+    return [
+      s?.vault_bytes ?? 0,
+      lock.idle,
+      lock.countdown,
+      lastBackup,
+      this.backupTileHint(lastBackup),
+      fileCount,
+      torrents.has_key ? "key" : "no-key",
+      torrents.library.length,
+      torrents.library.reduce((sum, e) => sum + e.size, 0),
+      peekNotesState().notes.length,
+      isWalletLoaded() ? "loaded" : "loading",
+      wallet.exists ? "exists" : "none",
+      formatBtc(btc.confirmed),
+    ].join("\n");
+  }
+
+  private renderVault(): HTMLElement {
+    const pane = document.createElement("div");
     pane.className = "main-pane";
     const h = document.createElement("h1");
     h.className = "text-22";
@@ -13725,24 +16806,14 @@ export class App {
     storage.innerHTML = `<div class="text-15">Storage</div><div class="text-28">${formatBytes(s.vault_bytes)}</div><button class="btn-secondary pressable" style="margin-top:12px">Manage</button>`;
     const lock = document.createElement("div");
     lock.className = "tile";
-    const mins = getAutoLockMinutes();
-    const idleLabel =
-      mins <= 0 ? "Idle lock off" : `${mins} minute${mins === 1 ? "" : "s"}`;
-    const remain = Math.max(0, getAutoLockMs() - (Date.now() - this.unlockedAt));
-    const countdown =
-      mins <= 0
-        ? "Only manual lock or suspend"
-        : `${Math.ceil(remain / 60000)}m until lock`;
+    const { idle: idleLabel, countdown } = this.autoLockLines();
     lock.innerHTML = `<div class="text-15">Auto-lock</div><div class="muted text-13">${idleLabel}</div><div class="text-13">${countdown}</div><button class="btn-secondary pressable lock-now" style="margin-top:12px" title="Ctrl+L / Cmd+L">Lock now</button>`;
     lock.querySelector(".lock-now")!.addEventListener("click", () => void this.lock());
     const backup = document.createElement("div");
     backup.className = "tile";
     const lastBackup = s.last_backup_unix ?? 0;
     if (!lastBackup) backup.style.background = "var(--warning-soft)";
-    const backupHint =
-      lastBackup > 0
-        ? `Last backup ${formatRelative(lastBackup * 1000)}`
-        : "Back up your vault so you never lose your chats";
+    const backupHint = this.backupTileHint(lastBackup);
     backup.innerHTML = `<div class="text-15">Backup</div><div class="muted text-13">${backupHint}</div><button type="button" class="btn-secondary pressable backup-btn" style="margin-top:12px">Back up now</button>`;
     backup.querySelector(".backup-btn")!.addEventListener("click", async () => {
       try {
@@ -13757,9 +16828,12 @@ export class App {
     });
     const filesTile = document.createElement("div");
     filesTile.className = "tile";
+    // One pass for every contact's attachment count: asking per contact would
+    // re-read the whole store each time. See `mailAttachmentCounts`.
+    const mailAttachments = mailAttachmentCounts(this.mailPrefs());
     const fileCount =
       allFileMessages().length +
-      this.contacts.reduce((n, c) => n + this.mailAttachmentCount(c.nickname), 0);
+      this.contacts.reduce((n, c) => n + (mailAttachments.get(c.nickname) ?? 0), 0);
     filesTile.innerHTML = `<div class="text-15">Exchanged files</div><div class="muted text-13">${fileCount} in your sealed vault (encrypted blobs)</div><button type="button" class="btn-secondary pressable files-open-btn" style="margin-top:12px">Open Files</button>`;
     filesTile.querySelector(".files-open-btn")!.addEventListener("click", () => {
       this.filesOpenFiles();
@@ -13964,15 +17038,16 @@ export class App {
       const row = document.createElement("button");
       row.type = "button";
       row.className = `note-row pressable paper-${note.color}`;
+      const rowText = this.noteRowText(note);
       const t = document.createElement("div");
       t.className = "note-row-title text-15";
-      t.textContent = note.title.trim() || "Untitled";
+      t.textContent = rowText.title;
       const p = document.createElement("div");
       p.className = "note-row-preview muted text-13";
-      p.textContent = notePreview(note) || "Empty note";
+      p.textContent = rowText.preview;
       const meta = document.createElement("div");
       meta.className = "note-row-meta muted text-12";
-      meta.textContent = formatRelative(note.updated_at * 1000);
+      meta.textContent = rowText.age;
       row.append(t, p, meta);
       row.addEventListener("click", () => {
         this.attachNoteToCompose(note);
@@ -14326,6 +17401,86 @@ export class App {
       });
   }
 
+  /**
+   * Everything the Notes board draws, list or editor.
+   *
+   * The drafts are absent on purpose — the editor's title and body, and the
+   * search field's query. They live in state and the redraw writes them back, so
+   * leaving them out loses nothing; putting them in would make the reader's own
+   * typing a reason to rebuild the field they are typing in, on the next tick
+   * from anywhere. The list's rows are compared as the whole board rather than
+   * the filtered rows, for the same reason: the query is the field's own state,
+   * and `notesRenderRows` redraws the rows under it without a render.
+   *
+   * The rows are in the order the list draws them — newest first — and carry the
+   * "3 hours ago" line as printed, because that moves on its own.
+   */
+  private notesBodyFacts(): string {
+    if (this.notesEditorOpen) {
+      return [
+        "editor",
+        this.notesEditingId ?? "new",
+        this.notesSaving ? "saving" : "idle",
+        this.notesDeleteId === this.notesEditingId ? "confirming" : "idle",
+        this.notesError ?? "",
+      ].join("\n");
+    }
+    const state = this.notesState ?? peekNotesState();
+    return [
+      "list",
+      this.notesLoading ? "loading" : "idle",
+      this.notesState ? "loaded" : "peeked",
+      this.notesError ?? "",
+      this.notesListFacts(),
+    ].join("\n\n");
+  }
+
+  /**
+   * The notes list as the board and the Mail note picker draw it: the title, the
+   * preview, the paper colour and the age, per note, newest first.
+   *
+   * One definition with four readers — the board's rows, the picker's rows, the
+   * board's shape and the picker dialog's shape. The age is why they have to
+   * agree: it moves without the store moving, so a shape that could not see the
+   * rendered text would leave "2 min ago" on screen all afternoon.
+   */
+  private notesListFacts(): string {
+    const state = this.notesState ?? peekNotesState();
+    return newestNotesFirst(state)
+      .map((n) => {
+        const row = this.noteRowText(n);
+        return [n.id, row.title, row.preview, n.color, row.age].join("\n");
+      })
+      .join("\n\n");
+  }
+
+  /**
+   * A note's title as Hush prints it: the note's own, or the word it shows for
+   * a note that has none.
+   *
+   * One definition with four readers — the board's rows, the Mail composer's
+   * note picker, the note popup's heading, and the board's shape. It is the same
+   * rule in all four places, and it has to stay the same rule for the shape to
+   * mean anything: the shape compares what the row prints.
+   */
+  private noteRowTitle(note: NoteDto): string {
+    return note.title.trim() || "Untitled";
+  }
+
+  /**
+   * What a note row prints under its colour: the title, the preview line, and
+   * the age. One definition with three readers — the board's rows, the picker's
+   * rows, and the shapes both are compared against — so a row cannot print one
+   * thing while its shape compares another.
+   */
+  private noteRowText(note: NoteDto): { title: string; preview: string; age: string } {
+    return {
+      title: this.noteRowTitle(note),
+      preview: notePreview(note) || "Empty note",
+      age: formatRelative(note.updated_at * 1000),
+    };
+  }
+
   private renderNotes(): HTMLElement {
     const pane = document.createElement("div");
     pane.className = "main-pane notes-pane";
@@ -14427,15 +17582,16 @@ export class App {
       const row = document.createElement("button");
       row.type = "button";
       row.className = `note-row pressable paper-${note.color}`;
+      const rowText = this.noteRowText(note);
       const t = document.createElement("div");
       t.className = "note-row-title text-15";
-      t.textContent = note.title.trim() || "Untitled";
+      t.textContent = rowText.title;
       const p = document.createElement("div");
       p.className = "note-row-preview muted text-13";
-      p.textContent = notePreview(note) || "Empty note";
+      p.textContent = rowText.preview;
       const meta = document.createElement("div");
       meta.className = "note-row-meta muted text-12";
-      meta.textContent = formatRelative(note.updated_at * 1000);
+      meta.textContent = rowText.age;
       row.append(t, p, meta);
       row.addEventListener("click", () => this.notesViewNote(note.id));
       container.appendChild(row);
@@ -14488,7 +17644,7 @@ export class App {
     head.className = "note-view-head";
     const title = document.createElement("h2");
     title.className = "text-22 note-view-title";
-    title.textContent = note.title.trim() || "Untitled";
+    title.textContent = this.noteRowTitle(note);
     const forward = document.createElement("button");
     forward.type = "button";
     forward.className = "btn-icon-round pressable note-view-forward";
@@ -14504,7 +17660,7 @@ export class App {
 
     const meta = document.createElement("div");
     meta.className = "muted text-12 note-view-meta";
-    meta.textContent = `Edited ${formatRelative(note.updated_at * 1000)}`;
+    meta.textContent = `Edited ${this.noteRowText(note).age}`;
 
     const body = document.createElement("div");
     body.className = "note-view-body text-15";
@@ -15005,10 +18161,7 @@ export class App {
             : "No input device is open — the meter cannot move.";
         })
         .catch(() => {
-          if (this.voiceMeterTimer !== null) {
-            clearInterval(this.voiceMeterTimer);
-            this.voiceMeterTimer = null;
-          }
+          this.stopVoiceMeter();
           meterNote.textContent =
             "The daemon did not answer; reopen this section to retry.";
         });
@@ -15046,19 +18199,160 @@ export class App {
   }
 
   private renderSettings(): HTMLElement {
-    // The meter poll belongs to this render's Voice section: any repaint
-    // (of this section or any other) tears it down, and the Voice branch
-    // re-arms it. Never stack two.
-    if (this.voiceMeterTimer !== null) {
-      clearInterval(this.voiceMeterTimer);
-      this.voiceMeterTimer = null;
-    }
     const pane = document.createElement("div");
     pane.className = "main-pane settings-layout";
-    // Which section this pane is showing. `render` reads it back before the
-    // next wipe: a repaint of the same section restores the reader's scroll
-    // position, while switching sections leaves the new pane at the top.
+    // Which section this pane drew. The update reads it back to decide whether
+    // the reader is looking at the same section (keep the scroll) or a new one
+    // (start at the top).
     pane.dataset.settingsSection = this.settingsSection;
+    pane.append(this.settingsNav(), this.settingsBody());
+    return pane;
+  }
+
+  /**
+   * The Settings page: a constant key and a shape over the section and its body.
+   *
+   * The nav's eleven sections are written out in the builder, so they cannot
+   * move and the nav is never rebuilt — which is what keeps the focus on the
+   * button the user just pressed when they switch sections. The section is a
+   * drawn fact rather than part of the key for that reason, and it is why the
+   * update has to reset the pane's scroll itself when the section moved.
+   */
+  private settingsPaneRegion(): RegionSpec {
+    return {
+      key: "settingsPane",
+      shape: () => settingsShape(this.settingsPaneFacts()),
+      build: () => this.renderSettings(),
+      update: (el) => this.fillSettingsPane(el),
+    };
+  }
+
+  private settingsPaneFacts(): SettingsFacts {
+    return {
+      section: this.settingsSection,
+      body: this.settingsBodyFacts(),
+    };
+  }
+
+  /**
+   * Everything the section on screen draws, in one string.
+   *
+   * The body's own state, section by section, and nothing else — the pane is a
+   * scroll box, so a shape that moved for a reason the body does not draw would
+   * redraw it and take the caret out of whatever field it holds. What is
+   * deliberately *not* here is as much of the decision as what is:
+   *
+   * - a field's own text: the TorBox key draft, the profile handle, the
+   *   passphrase form, the concurrency and auto-lock selects' pending value. A
+   *   body redraw recreates its fields, so a draft in the shape would turn the
+   *   reader's own typing into a reason to rebuild the field they are typing in.
+   *   Nothing is lost by leaving them out: the two flows that clear a draft in
+   *   state (`saveTorboxKey`) move the busy flag in the same breath, so the
+   *   redraw that follows writes the field back, and the rest are read from the
+   *   DOM by the handler that acts on them.
+   * - Voice's device list, the meter and the two pickers. That section fills
+   *   itself in place and re-arms its own 250 ms poll; a body redraw would
+   *   restart both, which is what its own comments forbid.
+   * - the theme, the auto-lock minutes and the notification switch: all three
+   *   are drawn from state, so they *are* here — the control the user just
+   *   pressed is redrawn, which is the cost of a section whose body is one
+   *   builder. Nothing in this page is patched piecewise.
+   */
+  private settingsBodyFacts(): string {
+    const state = getTorrentsState();
+    switch (this.settingsSection) {
+      case "appearance":
+        return getThemeMode();
+      case "profile":
+        return [this.mailAddress() ?? "", this.mailHandle ?? "", this.vaultName].join("\n");
+      case "relay":
+        return [
+          this.torMode ? "tor" : "clearnet",
+          this.torApplied ? "applied" : "pending",
+          this.torOnionUrl ?? "",
+          this.torActionError ?? "",
+        ].join("\n");
+      case "drops":
+        return [
+          this.dropInboxKey ? "key" : "loading",
+          this.dropInboxKey?.exists ? "exists" : "none",
+          this.dropInboxKey?.public_key ?? "",
+          this.dropRotateArmed ? "armed" : "idle",
+          this.dropDrainNote ?? "",
+        ].join("\n");
+      case "torbox":
+        return [
+          state.has_key ? "key" : "no-key",
+          state.plan_label ?? "",
+          state.email ?? "",
+          String(state.max_concurrent),
+          this.torboxKeyVisible ? "shown" : "hidden",
+          this.torboxBusy ? "busy" : "idle",
+          this.torboxTestOk ?? "",
+          this.torboxTestError ?? "",
+        ].join("\n");
+      case "voice":
+        // The section owns everything below its heading. See above.
+        return "";
+      case "notifications":
+        return chatSoundEnabled() ? "sound" : "silent";
+      case "security":
+        return [
+          String(getAutoLockMinutes()),
+          this.status?.locked ? "locked" : "unlocked",
+        ].join("\n");
+      case "recovery":
+        return this.status?.recovery_acknowledged ? "acknowledged" : "outstanding";
+      case "backup":
+        // Two buttons and a hidden file input: nothing here can move.
+        return "";
+      case "about":
+        // The update *prompt* is a dialog, mounted above the shell, not part of
+        // this body; `pendingUpdate` is deliberately not here for that reason.
+        // What the body draws is the version, the status lines and the update
+        // controls' own state.
+        return [
+          this.appVersion ?? "",
+          this.status?.relay ?? "",
+          this.status?.relay_source ?? "",
+          this.status?.vault_dir ?? "",
+          this.status?.tcp_addr ?? "",
+          getApiBase(),
+          this.updateNote?.text ?? "",
+          this.updateNote?.error ? "error" : "note",
+          this.updateCheckBusy ? "checking" : "idle",
+          this.updateProgress ? "installing" : "idle",
+        ].join("\n");
+      default:
+        return "";
+    }
+  }
+
+  /**
+   * Redraw the section's body under the nav, and nothing else.
+   *
+   * A section switch is a body change, not a pane change: the nav stays where it
+   * is, with the focus on the button the user just pressed, and the pane's
+   * scroll is reset by hand because a new section should open at its top. A
+   * repaint of the section already on screen leaves the reader exactly where
+   * they were, which is what the scroll carry in `render()` used to do for this
+   * pane — and the carry is gone, because the pane is no longer rebuilt.
+   */
+  private fillSettingsPane(el: HTMLElement): void {
+    const switched = el.dataset.settingsSection !== this.settingsSection;
+    for (const b of el.querySelectorAll<HTMLElement>(".settings-nav > button[data-section]")) {
+      b.classList.toggle("active", b.dataset.section === this.settingsSection);
+    }
+    const live = el.querySelector<HTMLElement>(".settings-body");
+    if (live) {
+      const fresh = this.settingsBody();
+      live.replaceChildren(...Array.from(fresh.childNodes));
+    }
+    el.dataset.settingsSection = this.settingsSection;
+    if (switched) el.scrollTop = 0;
+  }
+
+  private settingsNav(): HTMLElement {
     const nav = document.createElement("nav");
     nav.className = "settings-nav";
     const sections: { id: SettingsSection; label: string }[] = [
@@ -15077,6 +18371,9 @@ export class App {
     for (const s of sections) {
       const b = document.createElement("button");
       b.className = this.settingsSection === s.id ? "active" : "";
+      // Which section this button is: the update patches the marks in place
+      // rather than rebuilding the column the user just clicked in.
+      b.dataset.section = s.id;
       b.textContent = s.label;
       b.onclick = () => {
         this.settingsSection = s.id;
@@ -15084,6 +18381,14 @@ export class App {
       };
       nav.appendChild(b);
     }
+    return nav;
+  }
+
+  private settingsBody(): HTMLElement {
+    // The meter poll belongs to this render's Voice section: any repaint
+    // (of this section or any other) tears it down, and the Voice branch
+    // re-arms it. Never stack two.
+    this.stopVoiceMeter();
     const body = document.createElement("div");
     body.className = "settings-body";
     if (this.settingsSection === "appearance") {
@@ -15162,7 +18467,7 @@ export class App {
       };
       body.append(current, label, row, err, save);
     } else if (this.settingsSection === "notifications") {
-      body.innerHTML = `<h2 class="text-22">Notifications</h2><p class="muted text-13">The arrival sound plays for chats only, and only while that conversation is not on screen. Mail is silent — its unread count on the rail is the notice.</p>`;
+      body.innerHTML = `<h2 class="text-22">Notifications</h2><p class="muted text-13">The arrival sound plays for chats only, and only while that conversation is not on screen. Mail is silent — its unread count on the rail is the notice. Voice calls ring whether or not the window is in front, and a room you opened plays a ringback while you are still alone in it; both stop when you turn this off.</p>`;
       const soundRow = document.createElement("label");
       soundRow.className = "text-15";
       soundRow.style.display = "flex";
@@ -15174,10 +18479,12 @@ export class App {
       soundCb.checked = chatSoundEnabled();
       soundCb.onchange = () => {
         void setChatSoundEnabled(soundCb.checked);
+        // A call in progress follows the switch, not the next room poll.
+        this.updateVoiceCue();
       };
       soundRow.append(
         soundCb,
-        document.createTextNode("Play a sound when a chat message arrives"),
+        document.createTextNode("Play sounds"),
       );
       body.appendChild(soundRow);
       // Play the clip on demand: the arrival path depends on which pane is
@@ -15315,8 +18622,7 @@ export class App {
     } else {
       body.innerHTML = `<h2 class="text-22">${this.settingsSection}</h2><p class="muted">More options coming soon.</p>`;
     }
-    pane.append(nav, body);
-    return pane;
+    return body;
   }
 
   /** Two-state rotate button: the confirm states what rotation preserves. */

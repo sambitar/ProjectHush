@@ -7,6 +7,1876 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-18 — The daemon's allocator (plan item 14)
+
+### The daemon's own hardening is what made the measurement unreadable [WORKED AROUND]
+
+- Attempted: measure the arena cap by counting glibc's arena mappings in `/proc/<pid>/maps` —
+  each non-main arena is a 64 MiB anonymous `PROT_NONE` region, so the count is directly
+  observable and the claim would have been measured rather than asserted.
+- Symptom: `PermissionError: [Errno 13] Permission denied: '/proc/957220/maps'` — on the
+  daemon's *own* process, as the same user that started it. The cause is the daemon's own
+  hardening: `security::harden_process` calls `prctl(PR_SET_DUMPABLE, 0)`, which makes
+  `/proc/<pid>/maps` and `smaps` root-only. No sudo on this host, so the mappings were not
+  readable. `/proc/<pid>/status` still is, and `ps` still reports RSS.
+- Resolution: measured the *derived* quantity instead. An arena reservation adds 64 MiB to the
+  address space whether or not any of it is resident, so `VmSize` from `/proc/<pid>/status`
+  answers the question the mapping count would have: capped 162,860 kB against uncapped
+  752,716 kB, a difference of 589,856 kB, which is 9.0 × 65,536 kB. Both runs 11 threads, same
+  binary, same load, reproduced twice.
+- Lesson: a security hardening can remove the observability a performance measurement needs,
+  and the two teams' requirements collide in the same file. The workaround is to find a
+  derived quantity that is still readable, and to say in the write-up that it is derived.
+
+### The measurement the item is actually for still has not been made [OPEN]
+
+- Attempted: measure the audio latency spikes the arena cap is for.
+- Symptom: the prerequisite is a live audio path — an unlocked vault, a conclave with a peer
+  on the other end, and a working capture/playout device — and this environment has none of
+  them. The daemon starts and answers `/api/status`, which is as far as it goes.
+- Resolution: not resolved. What is verified is that glibc accepts the parameter
+  (`glibc_accepts_the_arena_cap` calls the real `mallopt`), that it is applied before the
+  runtime's workers exist, and that it removes nine arena reservations from a running daemon.
+  The spikes themselves are unmeasured, and `docs/tasks/app-smoothness.md` item 6 says so
+  rather than implying the address-space number covers it.
+- Lesson: an address-space measurement is a proxy for the mechanism, not for the symptom. The
+  two are easy to conflate when the symptom is "jitter", because the proxy is the only one that
+  a headless environment can produce.
+
+### `MALLOC_ARENA_MAX` in a launcher would have covered three of sixteen start paths [FIXED]
+
+- Attempted: take the item at its word — "`MALLOC_ARENA_MAX` in the launcher".
+- Symptom: found by grepping for the launch sites before writing anything. The daemon is
+  started from `scripts/run-one-ui.sh`, `scripts/run-two-ui.sh`, the bundled sidecar in
+  `daemon_supervisor.rs`, `packaging/systemd/user/hush-daemon.service`, and eight smoke and
+  dogfood scripts, plus the README's by-hand `cargo run -p hush-daemon` instructions. Setting
+  the variable in the launchers means setting it in every one of them, and a launcher added
+  later that forgets it regresses silently — with no symptom until someone measures audio
+  latency again, which is the measurement this repo cannot make.
+- Resolution: the cap is applied by the daemon itself (`crates/hush-daemon/src/alloc.rs`,
+  `mallopt(M_ARENA_MAX, 2)`), so no launcher can forget it. `main` builds the tokio runtime by
+  hand instead of with `#[tokio::main]`, because the attribute runs the body with the workers
+  already spawned and the call has to happen while the process still has one thread. A
+  `MALLOC_ARENA_MAX` set in the environment is honoured rather than overridden, and the daemon
+  logs which of the two applied.
+- Lesson: "in the launcher" is a statement about a process's environment that has to be
+  audited against every way the process can be started. When the process can be started by
+  other people's scripts, the binary is the only place the setting cannot be lost.
+
+## 2026-10-18 — The Mail reader (plan item 13)
+
+### The plan said `planAppend`, but a mail thread is newest first [FIXED]
+
+- Attempted: follow the doc's own instruction — "`planAppend` is the shape of the fix" — and
+  reconcile `.mail-messages` by appending what the store has past what is drawn.
+- Symptom: caught before writing the caller, by reading `getThread`: it sorts
+  `(a, b) => b.createdAt - a.createdAt` and says so in its own comment ("newest first —
+  classic email style, where a reply shows at the top"). `planAppend` tests whether the drawn
+  ids are a *prefix* of the store's list; a newest-first pane's drawn ids are a *suffix*, so
+  every arrival would have failed the check and taken the rebuild path. The feature would have
+  shipped doing nothing, and the tests for it would have passed — they test `planAppend`.
+- Resolution: `planPrepend` in `messageAppend.ts`, same contract with the end swapped, sharing
+  one `matchesAt` check with `planAppend`. The item's wording is the thing that was wrong, and
+  the doc now records the direction rather than repeating the guess.
+- Lesson: a plan that names an existing function as "the shape of the fix" is a hypothesis
+  about that function's contract, not a fact about it. Reading the contract is one grep; the
+  cost of trusting the name is a slice that does nothing and looks finished.
+
+### The reader's place was not lost, it was wrong — and the fix is an anchor, not a carry [FIXED]
+
+- Attempted: take item 13 at its word — "keeps the reader's place by pixel offset" — and look
+  for the carry that had to be replaced with an anchor.
+- Symptom: there is no carry to replace. `.mail-messages` is a kept region since item 5, so
+  its `scrollTop` was never reset; the number survived and was *incorrect*. Prepending a card
+  above the viewport moves every visible card down by that card's height, while `scrollTop`
+  stays the same number, so the reader is silently scrolled backwards by exactly the height of
+  the arrival. A carry would have made this worse, not better.
+- Resolution: the place is held by an anchor — the topmost visible card and its offset from the
+  box's top edge, measured after the transplant and applied as a delta to `scrollTop`. The
+  reader on the newest message needs no anchor at all, because nothing can be inserted above the
+  top; that case snaps to the top instead, which is what makes the arrival visible.
+- Lesson: "the scroll position is preserved" and "the reader's place is preserved" are different
+  claims, and only the first is about a number. Which one a pane needs depends on which end it
+  grows from.
+
+### A reload parsed every body in the thread twice, into a pane that was thrown away [FIXED]
+
+- Attempted: change the mail reader's update path and measure what it cost before.
+- Symptom: `updateMailThread` called `renderMailThread` to build a whole fresh reader — which
+  calls `fillMailThread`, parsing and sanitizing every body in the thread — and then handed it
+  to `transplantAround`, which kept only the chrome around the live list and discarded every one
+  of those parsed bodies. The list that stayed was then filled by a *second* full parse. So the
+  cost was two full parses per reload, one of them for nothing.
+- Resolution: `mailThreadChrome` builds the head and an empty list; the update transplants that
+  and hands the live list to `appendMailThread`. `renderMailThread` is now chrome plus fill, for
+  a first paint and for the rebuild fallback.
+- Lesson: a builder that draws more than the caller keeps is invisible from the call site — the
+  `transplantAround` call reads as "rebuild the chrome", and the bodies it also parsed are one
+  function call further down.
+
+## 2026-10-18 — The caret carry (plan item 12)
+
+### `npx vitest run` is not this repo's runner, and it fails in a way that reads like a repo problem [FIXED]
+
+- Attempted: verify the slice after the deletions in `app.ts` with `npx vitest run`, on the
+  assumption that a Vite project tests with Vitest.
+- Symptom: all 16 test files failed with `Error: No test suite found in file
+  .../src/lib/regions.test.ts`, and `Test Files 16 failed (16) / Tests no tests`. The wording
+  points at the test files, so the first read is that the tests were broken — they were not;
+  this repo tests with `node --test src/lib/*.test.ts` (the `test` script in `package.json`)
+  and Vitest does not collect `node:test` suites. The failure is also silent in the way that
+  matters: piping through `tail` returns `tail`'s exit code, so the run reported success
+  (exit 0) while printing 16 failures.
+- Resolution: `npm test` — 269 passing. The lesson is to read `package.json`'s `test` script
+  before choosing a runner, and not to pipe a test command through `tail` when the exit code is
+  what decides whether the slice is done.
+
+### The caret carry's deletion was gated on keys that were already there, so it is a deletion only [FIXED]
+
+- Attempted: delete the composer capture/restore in `render()` and be able to say why nothing
+  needed it.
+- Symptom: no new work was required — the chat composer's pane key
+  (`chatComposer:${nick}:${reach}`, with `updateComposer` patching the presence half) and the
+  conclave detail key (meeting, Chat/Paper tab, ended) already cover every repaint the app still
+  performs. So the honest framing is that the carry was dead weight left over from the wipe, not
+  that its removal was earned by this slice. The risk in the deletion is the opposite of the
+  usual one: it cannot break anything *now*, but it silently widens the contract on those two
+  keys — a field added to either key later (a presence flag, a display name) re-introduces the
+  lost caret with nothing to catch it, because the carry that used to paper over it is gone.
+- Resolution: the contract is written at the keys and in the doc, and the manual check that
+  stands in for it ("The composer is never detached") is listed in "How we will know it worked".
+  One unkeyed draft remains and is named rather than implied: the Mail rail's compose body, whose
+  text survives a reload (state) and whose caret does not.
+- Lesson: deleting compensation machinery is safe only while the invariant it compensated for is
+  written down somewhere a later change will read. Otherwise the deletion converts a visible bug
+  into a silent one.
+
+## 2026-10-18 — The modal layer (plan item 11)
+
+### The dialog pairing could not be positional, and the first version of it was [FIXED]
+
+- Attempted: write `planModalSync` the way `planRegionSync` is written — pair the wanted slots
+  against the live ones by position, since the shell's region order is fixed per rail.
+- Symptom: caught while writing the tests, before it shipped. The dialog list is sparse, so it
+  shifts: with the palette and a contact card up, closing the palette leaves the card at
+  position 1 while the wanted list has it at position 0. Positional pairing reads that as a
+  different dialog at that slot and *rebuilds* the card — a visible flash, the caret gone from
+  whatever field was focused, and the whole item's purpose defeated by the most ordinary action
+  there is (closing one dialog while another is open).
+- Resolution: the pairing is keyed, with a second condition that a kept dialog must still sit
+  after the previous kept one; a want that would reorder the stack rebuilds rather than moving
+  an element, because moving is what detaches it. Ten tests in `regions.test.ts`, including the
+  close-behind case above and the reorder that must not happen.
+- Lesson: a positional plan is only safe when the list's order and length are fixed by
+  construction. Copying the shape of an existing planner without checking that assumption is how
+  the bug would have shipped.
+
+### A fresh dialog inserted after the previous slot landed *below* a kept one [FIXED]
+
+- Attempted: insert a rebuilt or new dialog after the previous slot's element, so the stack keeps
+  the list's order without moving anything that was kept.
+- Symptom: also caught while writing the executor. When the first wanted slot is fresh and a
+  later one is kept — the palette opening while a contact card is already up — the "previous
+  slot" is nothing, so the new dialog was appended to the root, *after* the kept card. The DOM
+  order then disagreed with the list's order, which for overlays is the stacking order: the
+  palette would have opened underneath the dialog it should sit over.
+- Resolution: a fresh dialog goes after the previous slot's element when there is one, and
+  otherwise before the next slot that is being kept (computed with one right-to-left pass). Both
+  cases keep the stack in the list's order without moving a kept element.
+- Lesson: "append in list order" is only equivalent to "insert at the right place" while every
+  element is rebuilt. Once some are kept, the insertion point has to be derived from where the
+  kept ones actually are.
+
+### The atproto Explore filter rendered the whole app per keystroke, and said so [FIXED]
+
+- Attempted: give every dialog a shape, and find out which ones were being rebuilt for no reason.
+- Symptom: the Explore dialog's filter called `this.render()` on every `input` and then re-queried
+  `.atproto-explore-search` to put the caret back, with a comment that read "(Deferred until the
+  render itself stops rebuilding the modal — pane-scoped renders.)". So the workaround was
+  written knowing it was one, and the item that was supposed to end it was this one.
+- Resolution: the filter is out of the shape and the list is rebuilt under the field by a
+  `fillList` closure, like every other search in the app. The render, the re-query and the
+  comment are gone.
+- Lesson: a workaround comment that names the fix is a to-do list entry. Searching for "until"
+  and "deferred" in comments finds them.
+
+### `pendingIntroConsent()` is read twice per render pass [WORKED AROUND]
+
+- Attempted: have `openModals` decide whether the consent dialog is wanted, and `modalShape`
+  say what it draws.
+- Symptom: both call `this.pendingIntroConsent()`, which walks a module-level store. It is a
+  pure read of a short list, so the two cannot disagree and the cost is nothing — but it is a
+  state read duplicated across two functions that must stay in agreement about *which* request
+  is being drawn.
+- Resolution: left as is, deliberately, with this entry as the note. A single read would need the
+  spec and the shape computed in one place, which is a different shape for `ModalSlot` than the
+  one every other dialog uses — more machinery than a duplicate pure read is worth.
+- Lesson: the shape idiom assumes the shape and the builder read the same state independently.
+  Where the state read is a search rather than a field, that is a second walk; it is fine at
+  this size and would not be at a larger one.
+
+### The dialog layer's insertion order has no test, only the plan does [OPEN]
+
+- Attempted: keep `syncModals` thin and put the decision in a pure function, so it can be
+  tested without a DOM.
+- Symptom: the *decision* is tested (ten cases), but the *executor* is not: which element a
+  rebuilt or new dialog is inserted before, whether a kept one is left where it is, and the
+  carry of the launch point across a rebuild are all DOM work in `app.ts`, and this repo has no
+  DOM test runner. The two bugs above were both in that code, and both were found by reasoning,
+  not by a test — which means the third one, if there is one, is also not covered.
+- Resolution: not resolved. The manual pass in "How we will know it worked" now names the two
+  orderings that matter (a dialog opening over an open one, and closing the one underneath), and
+  that is the check that stands in for the test.
+- Lesson: extracting the decision buys testability for the decision only. The executor around it
+  stays unverified in an environment with no DOM, and the honest move is to say so in the doc
+  and name the manual checks, rather than to imply the tests cover the feature.
+
+## 2026-10-18 — The Vault rail and Settings (plan item 10)
+
+### The wallet's "Type remove to confirm" button could never be enabled by typing [FIXED]
+
+- Attempted: audit the Wallet pane card by card to build a shape for it, which means asking of
+  every drawn fact who owns it.
+- Symptom: the danger card's Remove button is drawn `disabled` unless the field's text is
+  `remove`, and its `oninput` handler only wrote the draft into state. Nothing re-read it until
+  some unrelated render happened to run, so typing the word left the button disabled and the
+  wipe flow unreachable — unless a background tick (a message, a presence flip) happened to
+  paint in between. Found by the audit, not by a user report; nothing tests this pane.
+- Resolution: the handler patches the button it arms, the way the token field's Add button
+  already does, and the draft stays out of the pane's shape. The same reasoning is written on
+  both sites now.
+- Lesson: "a field's draft is state, so a render will write it back" is only true if something
+  renders. A draft that also *gates* a control has to patch that control itself, because the
+  field's own typing is deliberately not a render.
+
+### A guard on the wallet subscription survived the keying, and had to be explained rather than deleted [WORKED AROUND]
+
+- Attempted: key the Vault rail's bodies and let the shape decide what is redrawn, the way item 9
+  deleted the torrents focus guard.
+- Symptom: the wallet body is redrawn *whole* — nothing in that pane is patched piecewise — so a
+  background store change landing while a field has focus still takes the caret out of the field.
+  Deleting the guard would have made that a live regression; the shape cannot decide it, because
+  the shape is right that what the pane draws has moved.
+- Resolution: the guard stays, narrowed to what it protects (a focused input or textarea in
+  `.wallet-pane`), with the reason written at the site; the phrase-card clause is gone, because
+  the phrase lives in state and the redraw reproduces it. The real fix is a per-card patch path
+  for the Wallet, which no item asks for and which is a slice of its own.
+- Lesson: the shape answers "did what is drawn move", not "is redrawing safe". A pane that is
+  redrawn whole has to answer the second question separately, and honestly, rather than by
+  deleting the guard and hoping.
+
+
+
+### The "done when" was already true, because the caret was protected by freezing the pane [FIXED]
+
+- Attempted: follow item 9 as written — "The same row patch first, with one honest question
+  before it: its rows tick on every progress update, so the patch has to be cheap per row or the
+  rebuild it replaces was the better deal. Done when a running download no longer interrupts
+  typing in the filter."
+- Symptom: the store's subscription already refused to render while an `input` inside
+  `.torrents-pane` had focus, so a running download did not interrupt typing in the filter. It
+  did something worse: it stopped the pane. Progress froze mid-download, a torrent that finished
+  never appeared in the list, and the queue stayed as it was until the caret left the field —
+  silently, with no indicator that anything was being held back. The "done when" as written was
+  satisfiable by deleting nothing and shipping nothing.
+- Resolution: the guard is gone and the pane is patched instead, which is what makes the sentence
+  true in the useful direction: the rows tick while the field keeps its caret, because the field
+  is never replaced. The remaining cost per tick is one pane, not the shell.
+- Lesson: a "done when" phrased as an absence ("no longer interrupts") is satisfied by any
+  mechanism that prevents the symptom, including a bad one. The check that catches this is
+  asking what the workaround does to everything else, which the plan's phrasing does not ask.
+
+### The card's bar was drawn at a precision its shape could not compare [FIXED]
+
+- Attempted: put the bar's fill width in a card's shape so an unchanged card is skipped, and have
+  the update write the same value back.
+- Symptom: the builder wrote `${frac * 100}%` (39.7341…%) while the shape carried a rounded
+  percentage. The first update after a build would have moved the bar by a fraction of a percent
+  — invisible, but a real disagreement between what the key promised was drawn and what the
+  update draws, and the exact class of drift the shape doctrine exists to prevent. Not caught by
+  a test: nothing compares a builder's style string with its shape.
+- Resolution: `torrentCardBar` is now one definition with two readers — the card and its facts —
+  and it rounds, with the reason written down (an unrounded width would move the shape on every
+  poll without moving anything a reader can see).
+- Lesson: a shape and its builder agreeing is not checkable by a unit test over pure functions,
+  so the values they share have to come from one function rather than two expressions that look
+  alike.
+
+### Unverified: no poll has been watched against a live download [OPEN]
+
+- Attempted: verify item 9 at runtime — a download ticking every three seconds while the caret
+  sits in the Library's filter and in the Add field.
+- Symptom: this environment has no display, no Tauri shell and no daemon, so the app cannot run.
+  `tsc`, the production build and 255 unit tests cover the pure parts (the key's bodies, the pane
+  shape's facts, a card's shape); the patch path, the row reconcile and the field writes are DOM
+  code with no harness. Specifically unverified: that the pane's shape is complete (a drawn fact
+  missing from it is a pane that silently stops updating), that `syncRegions` over the queue
+  never moves a card when the daemon reorders `items`, and that the Add field's value write never
+  lands mid-composition (an IME).
+- Resolution: none available here. The checks are written into the doc's manual pass. Needs a
+  machine that can run the app.
+- Lesson: same as item 8's — the environment can only verify decisions, not DOM. Every item in
+  this session inherits this, and each one says so in its own entry rather than once at the top.
+
+## 2026-10-18 — The Drops panes (plan item 8)
+
+### The mail reload patch has been finding nothing since it was written [FIXED]
+
+- Attempted: key the Drops folder's list and reader so a drop arriving leaves the search field,
+  the caret in it and the reader's place alone. That depends on `patchMailReload`, which is the
+  path a drop arriving takes.
+- Symptom: reading that path before trusting it showed it could never have worked.
+  `patchMailReload` did `findRegion(this.root, spec.key)`, and the regions are the *shell's*
+  children — `ensureShell` puts the shell in the root, and `syncShell` hands the regions to
+  `syncRegions(shell, ...)`. `findRegion` walks `parent.children`, so it looked at the shell, the
+  ring banner and the dialogs, found no key, and returned null. Every call therefore returned
+  "cannot patch, rebuild instead" — which is what a mail reload has cost since item 3 claimed
+  otherwise, and that claim is in `docs/tasks/app-smoothness.md` in three places.
+  What hid it: the regions are keyed, so the render that happened *kept* the mail list, the mail
+  reader and the folder column anyway. The caret and the scroll survived, and only the work was
+  wasted, so no manual check and no test could see it from the outside. There is no test over
+  this path at all — it is DOM code and this environment has no DOM.
+- Resolution: the lookup moved into `lib/regions.ts` as `updateRegionInPlace(parent, spec)`, which
+  is the same three decisions `syncRegions` makes for a kept region (key present, region has an
+  update, shape moved) with the parent passed in, and `patchMailReload` now passes `this.shellEl`.
+  Six unit tests over it with fake children, including the failure mode itself: a parent one
+  level above the regions finds none and returns false. The doc's three claims were corrected
+  rather than left standing, and the render-counter check that would have caught it is now named
+  as such in the manual pass.
+- Lesson: a patch that returns "I could not" is indistinguishable from a patch that returns "I
+  did" unless something counts renders. The failure was silent for a day because the expensive
+  path and the cheap path produce the same DOM when the regions are keyed — the only difference
+  is the work, and nothing was measuring the work.
+
+### The plan's "Drops pane" is two panes in two rails, and only one of them holds a caret [WORKED AROUND]
+
+- Attempted: follow item 8 as written — "The Drops pane. Its search field is one of the two that
+  still lose the caret, and `patchBackground` has no drops branch, so the row patch comes first."
+- Symptom: the three clauses point at three different places. "Its search field" is in the *Mail*
+  rail's Drops folder (`renderDropList`); "`patchBackground` has no drops branch" is about the
+  *Drops rail's* pane (`renderDrops`), whose deltas are Tor status and the open window; and the
+  Drops rail has no search field at all. Taken as one item it is unsatisfiable: keying the rail's
+  pane does nothing for a drop arriving (`refreshDrops` reads neither the mailbox nor the drop
+  store), and patching `patchBackground` for a drops rail has no work to do, because the pane
+  draws nothing that a `pollRecv` delta changes.
+- Resolution: both halves done, as two changes with two reasons. The Mail rail's Drops folder got
+  the row patch and the keys (this is what the item's "done when" describes); the Drops rail got
+  a key, a shape and a patch path of its own — `patchDropsPane`, called from `refreshDrops`,
+  `connectTor`, `openDropCard` and `closeOpenDrop`, which used to schedule a full shell render for
+  a Tor phase change. `patchBackground` was deliberately *not* given a drops branch: there is no
+  delta on that path that reaches the pane, so a branch would be a claim with nothing behind it.
+- Lesson: the plan's per-item prose was written from symptoms rather than from the DOM, and an
+  item that names three symptoms can be one item, three items, or one item plus two. Reading the
+  builders before writing anything is what separated them — the same check item 5 and item 6
+  needed.
+
+### The drop list's note is stateful, so it cannot be rebuilt per fill [FIXED]
+
+- Attempted: extract the rows and the note into `fillDropList` and call it from both the builder
+  and the region's update — the shape `fillMailList` already has.
+- Symptom: the note is not always a note. In the "no drop key yet" form it holds a *disabled*
+  button mid-request (`api.dropsKeyCreate`), and the builder's comment says as much: deciding the
+  note from the key rather than from the query "is what keeps the button from being rebuilt
+  mid-request — a second click would otherwise start a second key". A fill that rebuilt the note
+  unconditionally would have replaced that disabled button with a fresh enabled one on any mail
+  reload that landed while the key was being generated, and re-introduced the double-key bug the
+  comment was written about. `fillMailList` has no equivalent: its note is a `<p>`.
+- Resolution: the note carries `data-empty-kind` (`no-key` | `plain`) and `fillDropList` keeps it
+  while the kind holds, replacing it only when the folder changes form — which is the one case
+  where the text and the button both have to change. `dropEmpty` builds either form.
+- Lesson: extracting a builder into a fill assumes its parts are stateless. A button that disables
+  itself while a request is in flight is state the DOM owns, and the audit has to look for it
+  before the extraction, not after.
+
+### Unverified: no drop arriving, no Tor connect and no toggle has been run [OPEN]
+
+- Attempted: verify item 8 the way the plan asks — a drop arriving leaving the field, the caret
+  and the reader's place alone.
+- Symptom: this environment has no display, no Tauri shell and no daemon, so the app cannot be
+  run at all. Everything claimed here is from `tsc`, the production build and 250 unit tests over
+  pure functions; the fill, the patch and the key lookup are DOM code with no test harness.
+  Specifically unverified: that `replaceChildren` on a scroll box preserves its offset in WebKit
+  (the assumption the mail, reads, zines and now drops updates all rest on — inherited, not
+  measured here), that the drops pane's shape is complete, and that `patchDropsPane`'s render
+  fallback covers every path that used to schedule a render.
+- Resolution: none available here. The checks are written into the doc's manual pass, including
+  the one that would have caught the parent bug. Needs a machine that can run the app.
+- Lesson: item 8 fixed a bug that had been invisible for a day precisely because the checks it
+  needed cannot run in this environment. Where a change's correctness rests on the DOM, say so in
+  the same breath as the change.
+
+## 2026-10-18 — The zines panes (plan item 7)
+
+### A key cannot carry a scroll across a body change, so the carry it was meant to delete stays [FIXED]
+
+- Attempted: key the zines panes as the plan specified — "a keyed front page is what makes
+  `pendingZinesScroll` unnecessary", and it is "the last scroll carry in the file".
+- Symptom: the first half cannot be true, and the second half is wrong twice.
+  1. The front page and the reader are the *same* region: both are built by `renderZinesPage` into
+     a `.zines-page`, which is also the scroll box. Opening a story is therefore a key change, so
+     the element holding the front page's scroll is replaced, and coming back builds a fresh page
+     at the masthead. There is nowhere for that scroll to live, which is exactly why the carry
+     exists. Deleting it would have replaced "comes back where you were" with "comes back at the
+     top" — a regression dressed as a cleanup.
+  2. It is not the last carry. The Settings pane has one (`settingsScroll`, item 10), and the
+     comment on this one referred to "the thread pane above", a carry that no longer exists: that
+     pane was keyed in earlier work. A stale comment is how a dead carry gets copied.
+- Resolution: both regions keyed, and the carry kept with a comment that says why it survives —
+  the reader's scroll needs none (its key is the story, so the box is kept) and the column's needs
+  none (it is keyed outright), which leaves the front page's round trip as the only thing the carry
+  is for. The stale reference to the thread pane is gone.
+- Lesson: "keying makes a carry unnecessary" only holds when the element survives the change the
+  carry covers. A key is an identity, so a carry for a transition *between* identities cannot be
+  replaced by one — the two are not the same mechanism, and the plan conflated them.
+
+### The zines page's shape had to be body-aware, and the draft's had to be almost empty [FIXED]
+
+- Attempted: one shape function for the page, filled from all the state the page can draw from.
+- Symptom: two problems, both found by reading the three builders against the update that redraws
+  them. A shape covering every body's facts would move when the *corpus* changed while the reader
+  was open — redrawing the article and re-parsing its body for a change behind it — and again the
+  other way round. And a shape for the draft that included its title and sections would move on the
+  keystroke that changed them, redrawing the form and taking the caret out of the field being typed
+  in, which is the one thing keying the draft was for.
+- Resolution: `zinesPageFacts` fills only the body that is up and leaves the other two empty, and
+  the draft's facts are its post id and nothing else. Checked that nothing else on the draft page
+  moves without the DOM: its title error is written in place (`zinesDraftTitleError` adds `.invalid`
+  and focuses), its Publish button is written in place (`zinesDraftChanged` flips `disabled`), and
+  its "Publishing…" state is the button's own text.
+- Lesson: for a pane with several bodies, the shape is per body, not per pane. Filling it from all
+  the state is not "safer" — it is a redraw of a body that has nothing to do with the change, and
+  where that body holds a caret it is a bug.
+
+## 2026-10-18 — The Reads rail's three regions (plan item 6)
+
+### The plan pointed at the wrong rail, and the item needed a mechanism that did not exist [FIXED]
+
+- Attempted: key the Reads rail's three regions, taking the plan's line at face value — "the notes
+  search is the field here, and `notesRenderRows` is already the in-place redraw its update needs".
+- Symptom: two problems, one before any code was written.
+  1. The Reads rail has no search field and no notes. `renderNotes` / `notesRenderRows` are the
+     Vault's notes pane, which the plan lists separately as item 10. Read literally, item 6 asks
+     for an update function that belongs to a different rail, and the "done when" line would be
+     satisfied by doing nothing here at all. What the three regions actually hold is a scroll box
+     each (`.reads-surface-list`, `.reads-list`, `.reads-main`), and the poll was resetting all
+     three every tick — the article you are reading jumps to its top every few seconds.
+  2. Every region so far could take a coarse key and a cheap update, on the mail list's rule: the
+     key keeps the scroll box, the update redraws what is inside it. The Reads updates are not
+     cheap — the list redraws every row, and the reader re-sanitizes a whole article and rebuilds
+     the comment tree — and `syncRegions` runs an update on every render while the key matches.
+     So a coarse key plus a faithful update would have replaced "rebuild the pane every tick" with
+     "re-sanitize the article every tick": the scroll saved, the jank kept.
+- Resolution: `RegionSpec` grew an optional `shape`, compared against the shape the element was
+  last drawn from (`shapeMoved`, in `regions.ts`, with tests), and the executor skips the update
+  when it has not moved. The three keys are identities; the shapes carry the drawn facts, including
+  the *rendered* "2 min ago" text rather than `created_at` — a shape built from the field would be
+  the same string while the row said the wrong thing, which is the trap the mail folder column hit
+  from the other side.
+- Lesson: the plan's per-item notes were written from a skim of the file list, not from the
+  builders. Three of six items have now had a wrong key or a wrong rail in them (3, 5, 6) and one
+  was incomplete (4). Reading the builder before writing the key is the only step that has ever
+  caught these, and it should be the first step of every item, not a check on the plan's wording.
+
+### The Saved count was never cleared, and keying the column would have frozen it [FIXED]
+
+- Attempted: reuse the feeds column's build-time read of `getReadsState()` as the only writer of
+  the Saved count.
+- Symptom: the promise that fills the count runs once per build and only writes when the count is
+  non-zero (`if (n > 0 && this.rail === "reads")`). Today a rebuild hides that — the column is
+  thrown away and the span starts empty — but a keyed column is never rebuilt, so unstarring the
+  last story would leave "7" beside Saved indefinitely. The same build-time read would also go
+  stale the other way: a story saved from the reader would not move the number until something
+  else rebuilt the column.
+- Resolution: `syncReadsSavedCount`, called by the column's build and by its update, writing the
+  empty string for zero. `getReadsState()` resolves from the module's cache after its first read,
+  so calling it per render is a promise over cached state, not a request.
+- Lesson: a build-time async write is invisible to a rebuild, so every one of them is a latent
+  staleness bug the moment its region earns a key. This one had been sitting in the Reads column
+  since before the work started.
+
+## 2026-10-18 — The Mail rail's folder column (plan item 5)
+
+### The plan's key named a fact that cannot move, and one that must not be in a key [FIXED]
+
+- Attempted: key `renderMailFolders` as the plan specified — "the key is the folder set and the
+  open folder" — reusing `patchMailFolderCounts` as the update.
+- Symptom: reading the builder against the patch, both halves of the plan's key are wrong, in
+  opposite ways.
+  1. "the folder set" is a literal array of eight folders written out inside the builder
+     (`inbox`, `drops`, `sent`, `outbox`, `drafts`, `starred`, `archive`, `trash`), with labels
+     from a constant. It cannot move, so a key entry for it would only ever be dead weight.
+  2. The open folder *does* move, but putting it in the key rebuilds the column on every folder
+     switch. The buttons are `pressable` and reachable by keyboard, so the rebuild takes the focus
+     off the button the user just pressed with Enter — the same defect item 3 fixed on the ring
+     prompt, arrived at from the other direction.
+  3. What was actually drawn with no owner was the address line
+     (`this.mailAddress() ?? "No address yet — set one in Settings → Profile."`), which nothing
+     patches.
+- Resolution: `mailFoldersKey(address)` keys the column on the address line alone, pinned by
+  tests; `syncMailFolders` toggles the `.active` mark beside `patchMailFolderCounts`. Checked all
+  three sites that assign `this.mailFolder` (`openFolder`, draft save, send) and each one ends in
+  a render, so the mark cannot go stale.
+- Lesson: "key by the folder set and the open folder" reads like an audit and is not one — the
+  first half named something immutable, the second half named a selection, which by the Chats
+  rule belongs to the patch. The audit has to be run against the builder and the patch, not
+  transcribed from the plan. That is now three of five items where the plan's stated key was
+  wrong (3 and 5) or incomplete (4).
+
+## 2026-10-18 — The Conclaves column (plan item 4)
+
+### The same four-fact audit, a third time, and two of the four were new [FIXED]
+
+- Attempted: key the Conclaves list column, reusing `patchConclaveCards` and
+  `patchConclaveInvites` as the region's update, as the Chats and Trusts columns do.
+- Symptom (found by reading `renderConclavesList` and `conclaveCard` against the two patches,
+  before writing the key): four drawn facts had no owner, and only one of them was the kind the
+  earlier audits had found.
+  1. the head's "New conclave" button — `disabled` and `title` both follow
+     `this.contacts.length === 0`, and nothing rewrites either. A column keyed on its cards
+     alone would have kept a live button pointing at a dialog with nobody to invite;
+  2. the empty state's paragraph and button — the same flag, a different place. It is also why
+     the *body* has to be in the key, not just the cards: the empty state stands where the
+     filter, the invitation box and the cards would be, and `patchConclaveInvites` already says
+     so by returning false when it finds that shape;
+  3. the card's sub-line — "Ended" or "N trustees", from `m.ended` and `joinedTrustees(m).length`.
+     The member count reads the *trust list*, so a trust deleted anywhere moves it, and a reach
+     move now forces a render that would have found it unchanged;
+  4. the live-voice chip — drawn from `this.voiceRooms`, so a session starting or ending in a
+     meeting changes the card. `voiceChanged` forces the render that would have shown it stale.
+- Resolution: `conclaveCardShape` (in `lib/regionKeys.ts`, with tests) covers the ended flag, the
+  member count and the voice chip; `conclavesKey` adds the body and the has-contacts flag. The
+  selected mark went the other way, into `patchConclaveCards`, which is the Chats precedent: a
+  click on a card repaints the mark instead of rebuilding the column and taking the caret out of
+  the filter field.
+- Lesson: the audit is not "which parts look static" but "which parts does the patch not write".
+  It has now been run three times and found something each time — the third pass found a button's
+  disabled state and a chip driven by a *different* store (voice), neither of which the earlier
+  passes had taught me to look for.
+
+### The region update contract needed a fallback, and it is the same one the Chats column uses [FIXED]
+
+- Attempted: make the column's update the two patches.
+- Symptom: a patch can *decline* — `patchConclaveInvites` returns false when the column's shape is
+  not the one it patches — and `syncRegions` has no way to hear that. A declined update would
+  leave a kept region stale with no rebuild.
+- Resolution: `syncConclavesList` falls back to rebuilding the column's children in place when
+  either patch declines, which is exactly what `syncConvList` and `syncTrustsPane` do. The
+  fallback is meant to be unreachable — the key is made of the same things the patches check — and
+  it costs the filter field's caret if it is ever reached, so it is a correctness net rather than
+  a path.
+- Lesson: when a region's update can decline, the region needs a fallback, and the fallback is a
+  rebuild. Worth stating because it is the one place where this pattern is *not* free.
+
+### The Conclaves column's DOM path is not exercised [OPEN]
+
+- Attempted: key the column and move the selected mark into the patch.
+- Symptom: the usual. `conclavesListKey`, `syncConclavesList` and the new line in
+  `patchConclaveCards` read `this` and touch DOM; the runner has no jsdom and the app could not be
+  run here. Static verification only: `tsc --noEmit` clean, 220 tests pass (up from 215, the 5 new
+  ones over `conclaveCardShape` and `conclavesKey`), `vite build` clean.
+- Needed: with the filter focused, let an invitation arrive, then let a voice session start in a
+  meeting and end again, and confirm the filter keeps its caret, the chip appears and disappears,
+  and a click on a card moves the mark without the field losing focus. Then delete a trust and
+  confirm the member counts redraw.
+- Lesson: unchanged. The keys are tested; nothing exercises what reads them.
+
+## 2026-10-18 — The ring prompt (plan item 3)
+
+### The plan's premise for this item was wrong, and the real defect was next to it [FIXED]
+
+- Attempted: plan item 3 — "key the ring banner by the ringing session, patch the elapsed state;
+  a 30 s ring should render once at each end".
+- Symptom (found by reading `renderVoiceRingBanner`, `ringSignature` and the poll before writing
+  anything): there is no elapsed state. The prompt draws the opener, the conclave name and two
+  buttons, and nothing ticks. The "once at each end" half was also already true, because
+  `refreshVoiceRooms` returns whether anything the UI renders changed and `ringSignature` only
+  flips when a room appears or leaves, a ring starts or expires, or the joined count moves — so
+  the poll never renders for a ring that has not changed. A ring is not the frequent renderer the
+  item claimed.
+- Resolution, such as it is: the item's stated work was dropped as unnecessary, and the defect
+  that *was* there was fixed instead. `render()` rebuilt the prompt on every render regardless of
+  cause, and during a ring the poll renders for other reasons — someone else joining the room, a
+  message arriving, a click on another rail — so each of those replaced the prompt and took the
+  focus off "Answer" mid-tab, and re-announced an `alertdialog` whose text had not changed. It is
+  now synced by key (`syncRingBanner`), with the key being the ring plus the two names it shows
+  (`ringPromptKey`, 3 tests, pinned exactly so the joined count cannot be added silently).
+- Lesson: a plan item is a claim about the code, and this one had not been read closely enough
+  before it was written down. The reading took ten minutes and produced a different fix. When an
+  item says "patch X", check that X exists.
+
+### Two names for one thing, and an anchor that matched twice [FIXED]
+
+- Attempted: add `ringPromptKey` to `lib/regionKeys.ts` while `app.ts` had a method of its own
+  building the same string.
+- Symptom: the method would have been shadowed by the import in the same class, which is the
+  hazard logged one slice ago with `composerState`. The edit that was supposed to delete the
+  method failed first — `The string to replace was found multiple times in the file` — because the
+  anchor was a bare `/**`, which is everywhere in `app.ts`.
+- Resolution: the method is gone and the inline call to `ringPromptKey` is the only definition;
+  the dead method was removed with an anchor that named it. The string-building decision now lives
+  in the lib with the other keys.
+- Lesson: same as the last one — a new import is a namespace change, and a name that exists in two
+  places is a name that will be wrong in one of them. Also: pick an anchor that names the thing
+  being changed, not the comment above it.
+
+### The ring prompt's DOM path is not exercised [OPEN]
+
+- Attempted: keep the ring prompt across renders that are not about the ring.
+- Symptom: the usual one. `syncRingBanner` and `ringBannerFacts` read `this` and build DOM; the
+  runner has no jsdom and the app could not be run here. Static verification only: `tsc --noEmit`
+  clean, 215 tests pass (up from 212, the 3 new ones over `ringPromptKey`), `vite build` clean.
+- Needed: with a ring showing, tab to "Answer", then force a render (a click on another rail, or
+  a message arriving) and confirm the button keeps focus and the prompt is the same element. Then
+  have the opener renamed — or the conclave renamed — and confirm the prompt *does* redraw.
+- Lesson: unchanged from the composer entry. The keys are tested; the wiring that reads them is
+  not.
+
+## 2026-10-18 — The composer's presence half (plan item 2)
+
+### "Key it by the conversation alone" was wrong: presence is part of the composer's structure [FIXED]
+
+- Attempted: plan item 2 — key the 1:1 composer by the conversation instead of by presence, and
+  patch its enabled state in place, so a peer going offline stops detaching a box the user is
+  typing in.
+- Symptom (found by reading `renderComposer` before writing the key): presence is not only flags.
+  An offline contact gets a `<p class="composer-offline-hint">` above the box, and that element is
+  added and removed with presence — so keying by the conversation alone would have left a stale
+  "is offline" line on screen for a peer who came back, or none for one who went away. The
+  obvious alternative, keying by presence, is exactly the detach this item exists to remove.
+- Resolution: the hint is now always rendered and `hidden` when it has nothing to say
+  (`writeComposerHint`), which makes presence entirely non-structural, and the key became the
+  conversation plus the **reach** — the one presence-adjacent fact that *is* structural, because
+  a mail-only trust has the reason and the way out instead of a box at all.
+  `.composer-offline-hint` has no `display` rule in the CSS, so `hidden` is enough; there is a
+  precedent for that being untrue elsewhere (`.voice-led-btn[hidden]` restates it because the
+  button's own `display` would win), and the selectors around the composer are all class-based,
+  so an always-present hint changes no layout.
+- Lesson: "patch it in place instead of keying it" only works if nothing about the element's
+  *shape* depends on the fact being patched. The audit is the same one the keying work needed —
+  every part the builder draws — but it has to be run for the *patch* side too, and this time it
+  found a child element, not a string.
+
+### The patch and the builder would have drifted; one module now decides both [FIXED]
+
+- Attempted: patch the composer's presence half in place, next to a builder that draws the same
+  values.
+- Symptom: two writers of the same copy and the same flags — the hint text, the placeholder and
+  three disabled flags — with nothing to keep them equal. This doc names that hazard repeatedly
+  (`convListBody` exists for it, and `renderComposer`'s own comment used to say the rebuild was
+  what kept the two from disagreeing).
+- Resolution: `lib/composer.ts` holds the decisions — `composerState`, `composerHint`,
+  `composerPlaceholder`, `composerEnabled` — with 5 tests pinning the copy exactly, and both the
+  builder and `updateComposer` read them. `patchComposer` (rebuild + carry draft and caret) is
+  gone: `patchOpenChat` and the region's own `update` both call `updateComposer`.
+- Lesson: when a value has to be written twice — once on build, once on patch — the second writer
+  is a second definition until it is moved into a shared pure function. The tests are what make
+  that function trustworthy.
+
+### A new import shadowed by a local of the same name [FIXED]
+
+- Attempted: import `composerState` into `app.ts` while `render()` already declared
+  `const composerState` for the caret carry.
+- Symptom: TypeScript allows it, so nothing failed; inside `render()` the local would win, and the
+  next person to call the imported function there would get a type error at best. The caret carry
+  is the last piece of wipe compensation and is due to be deleted, which makes it the worst place
+  for a name to be load-bearing.
+- Resolution: the local is now `carriedDraft`. Found by reading the shadowed name before running
+  `tsc`, which would not have caught it.
+- Lesson: a new import is a name-space change. `tsc` is happy to let a local hide it.
+
+### The composer's DOM path is not exercised either [OPEN]
+
+- Attempted: make a presence flip patch the composer instead of replacing it.
+- Symptom: the same gap as every other DOM path in this doc. `updateComposer`,
+  `writeComposerHint` and `renderComposer` read `this` and build or patch DOM; the runner has no
+  jsdom, so nothing exercises them, and the app could not be run here. What is verified is static:
+  `tsc --noEmit` clean, 212 tests pass (up from 207, the 5 new ones over `lib/composer`),
+  `vite build` clean.
+- Needed: with a draft typed into a chat, take the peer offline (or force `contacts()` to report
+  them offline) and confirm the textarea is the *same element* afterwards — the draft, caret and
+  grown height intact, the hint shown, and the send and attach buttons disabled. Then bring them
+  back and confirm the hint hides and the box enables, still without a detach.
+- Lesson: the tests cover the decisions, not the wiring. The wiring is where every bug in this
+  doc's history has been.
+
+## 2026-10-18 — The reach delta (item 3's gap), and the remaining-work plan
+
+### A lib under test cannot import `mock.ts`, and the first draft of the reach fix did [WORKED AROUND]
+
+- Attempted: move the two row-shape decisions out of `app.ts` into `lib/regionKeys.ts` so tests
+  could pin them, which meant importing `displayNick` from `./api/mock` — the module that owns
+  the local rename — so the helper could build a row's shown name itself.
+- Symptom: `node --test` could not load the module at all:
+  `code: 'ERR_MODULE_NOT_FOUND', url: 'file:///home/sam/ProjectHush/apps/hush-tauri/src/lib/api/mock'`.
+  `mock.ts` imports `./uiPrefs` with no extension, and Node's ESM resolver requires one; the app
+  only ever sees these modules through Vite, which resolves them either way. Fixing that import
+  by hand was rejected as scope creep into a shared module whose own imports would likely need
+  the same treatment on the next hop.
+- Resolution: `regionKeys.ts` stays a leaf module with no imports. The caller hands the shown name
+  over as data — `{ shownName: displayNick(c.nickname), protocol, reach }` — and the helper picks
+  the shape. A `trustRowShapes` that would have called `displayNick` was dropped for the same
+  reason: `app.ts` maps the names for the Trusts pane, and only the shape function lives in the
+  lib.
+- Lesson: tooling constraint rather than a repo defect, but it decides module boundaries. A lib
+  that wants tests has to be loadable by Node, so either it imports nothing or its whole
+  transitive closure uses explicit extensions. Worth knowing before designing a helper that
+  "obviously" should read the display name.
+
+### A parameter that exists only so a test can vary it [WORKED AROUND]
+
+- Attempted: pin the decision "a chat row's key is the protocol, not the reach" with a test.
+- Symptom: the decision is made in `app.ts` — which field is passed as the row's shape — and
+  nothing in the runner can execute `app.ts`. A helper taking only `{ shownName, protocol }`
+  would make the reach unrepresentable, which is a stronger guarantee than a test, but then the
+  test would be vacuous and the caller's mapping — the decision itself — would still be unpinned.
+- Resolution: `chatRowShapes` takes `{ shownName, protocol, reach }` and deliberately does not read
+  `reach`; the test varies it and asserts the shapes do not move. The parameter is documentation
+  that a test can execute.
+- Lesson: when the thing under test is a *choice* rather than a computation, the choice has to be
+  visible in the function's input for a test to see it. An unused field is the price; a comment
+  would have been checked by nothing.
+
+### The fix this slice proposed for the reach delta was more machinery than the problem needed [FIXED]
+
+- Attempted: item 1 of the plan — make `presenceChanged` compare `reach`, and then have each
+  rail's patch (`patchConvRows`, `patchOpenChat`, the conclave chips) refuse a row whose reach
+  moved, so the render that fixes the menus is the render that happens.
+- Symptom: the first half is right and the second half is unnecessary. With the region keys in
+  place, a reach move only has to *reach* a render; what that render costs is already decided by
+  the keys. Adding per-patch refusals would have been three more comparisons guarding a render
+  that the keys make cheap, and one of them (`patchConvRows`) would have rebuilt a column whose
+  only reach-dependent drawing is a dot the patch already rewrites.
+- Resolution: `pollRecv` computes `reachChanged` beside `presenceChanged` and sends a reach move
+  straight to `scheduleBackgroundRender` without asking the patch. The Chats key was changed from
+  the reach to the protocol so that render does not cost that column its search field.
+- Lesson: when change detection and region keys both exist, the question for a new delta is not
+  "which patch should handle it" but "does it need a render, and what does that render cost". The
+  second question is already answered by the keys.
+
+## 2026-10-18 — Item 5: the rail, the Chats list and the Trusts pane
+
+### Keying a region means auditing every part it draws [FIXED]
+
+- Attempted: give the rail, the Chats list and the Trusts pane region keys, reusing the
+  patches the poll already runs (`patchConvRows`, `patchTrustRows`) to bring a kept region
+  forward. The badges are patched in place by `patchRailBadges`, so the rail's structure
+  looked static; the Chats rows and Trusts rows looked covered by their patches.
+- Symptom (found by reading the three builders before writing the keys, not by running
+  anything): four drawn parts were covered by neither the keys as first drafted nor the
+  patches, and each would have been a pane showing something no longer true —
+  1. the torrents badge: `patchRailBadges` rewrites chats, mail and conclaves, and IRC has a
+     writer of its own, but nothing writes the torrents count. A rail keyed by the active rail
+     alone would have kept a stale number on the nav for as long as the rail survived;
+  2. the Chats row's selected mark: `convRow` draws it from `this.selectedNick`, and neither
+     the patch nor a key made of the rows would have noticed a row being clicked;
+  3. the Chats row's name: the row shows `displayNick(c.nickname)`, and a key made of raw
+     nicknames would have survived a local rename with the old name on screen — and with the
+     old search haystack, since the row's `data-filter-text` is that name too;
+  4. the Trusts row's shape: its badge's text is drawn from `my_reach`, its mail line from
+     `mail_handle`/`mail_vault`, and its menu's reach toggle from `my_reach` again — a shape
+     of `reach` alone, which is what `patchTrustRows` had been checking, left all three out.
+- Resolution: the torrents count is in `railKey`; the selected mark is now the patch's to
+  toggle, which is the better answer anyway — a click on a row must not rebuild the field the
+  user may be typing in; the Chats key uses the shown name; and the Trusts shape became one
+  read, `trustShape(c)`, used by the row, the key and the patch, replacing the narrower
+  `data-trust-reach` the patch had been checking. A test pins each key's exact string, so a
+  part cannot be added or dropped silently.
+- Lesson: a key is a claim that the parts it does not name are covered by something else, so
+  writing one means auditing every part the builder draws — not the parts that look static.
+  The patch's own identity check is part of that audit and can be too narrow: `patchTrustRows`
+  looked like the guard for reach and was checking one of the four fields the row draws from.
+
+### The new keys' DOM paths are not exercised, and only their shape is pinned [OPEN]
+
+- Attempted: key the rail, the Chats list and the Trusts pane, and bring a kept region forward
+  by reusing the patch the poll already runs (`patchConvRows`, `patchTrustRows`).
+- Symptom: the same gap as the two entries above it, one step further along. The keys are pure
+  functions with 11 tests, and those tests pin their *shape* — that the Chats key is the body,
+  the appear-offline flag and the rows, and neither the query nor anything `patchConvRows`
+  rewrites — but nothing asserts that `app.ts` hands those functions what they mean.
+  `convListBody`, `convListKey`, `trustsKey`, `syncConvList` and `syncTrustsPane` read `this`
+  and build or patch DOM, and the runner has no DOM (no jsdom in the project), so nothing
+  exercises them. The app could not be run here either. What was verified is static:
+  `tsc --noEmit` clean, 202 tests pass (up from 191), `vite build` clean.
+- Needed: the doc's check — with the Chats and Trusts search fields focused, force a render
+  (a voice ring, or a click on another rail and back) and confirm the caret stays; then read
+  `window.__HUSH_RENDER_COUNT__` across a background arrival and confirm it does not tick.
+- Update, same day, from the reach slice: the two row-shape *decisions* now live in
+  `lib/regionKeys.ts` (`chatRowShapes`, `trustRowShape`) with tests over the reach, the protocol
+  and the mail address, so what a key means is pinned for the shapes. `convListBody`,
+  `syncConvList` and `syncTrustsPane` are still unexercised, and the checks above are still the
+  only way to see a render.
+- Lesson: a key that is too *small* is a stale pane, and the manual checks are the only thing
+  that catches it. A key that is too *large* is a region that rebuilds on a change it could
+  have patched — the render counter is the only thing that shows it, and reading the tests
+  cannot, because a field that should not be in the key is not a field the tests can see.
+
+## 2026-10-18 — Item 3: the invitation cards, and the conclave chrome
+
+### A contact's reach moving is a delta the poll cannot see [FIXED in code, unverified at runtime]
+
+- Attempted: finish item 3 — the last background deltas that cost a rebuild — and in particular
+  the conclave members row and header.
+- Symptom (found by reading, not by running): `presenceChanged` in `pollRecv` compares
+  `online` and the contact count only —
+  `fresh.some((c) => prevOnline.get(c.nickname) !== c.online)`. A trust that moves from full
+  reach to mail-only changes neither, so `changed` is false, `patchBackground` is never asked,
+  and nothing repaints. The menus built from `this.contacts` at render time — a trust row's, a
+  chat row's, a conclave member chip's — keep offering actions the boundary would now refuse
+  (the chip's "Chat directly" on a mail-only trust is the one this doc already names as a
+  dead-end). `patchTrustRows` is the one place that guards it, via `data-trust-shape`, and that
+  guard is unreachable while the poll does not notice the move.
+- Resolved 2026-10-18, and not the way this entry first proposed. It proposed comparing reach in
+  `presenceChanged` and then having every rail's patch refuse a moved reach. Instead `pollRecv`
+  computes `reachChanged` beside `presenceChanged` (both over the contact set, so an arrival or
+  a departure counts as both) and a reach move goes straight to `scheduleBackgroundRender`
+  *without* asking the patch at all — because a reach move rewrites menus, and menus are drawn
+  once and never patched. The per-patch refusals turned out to be unnecessary: the region keys
+  already decide the cost, and the keying work had made them decide it correctly. The Trusts
+  pane rebuilds (`trustRowShape` carries both reaches), the Chats list does not (a reach that
+  leaves `full` takes the row off `chatContacts`, so the row set already carries it, and the dot
+  is patched), the open chat rebuilds its header and composer (`syncChatPane` keys both by the
+  facts they draw), and a conclave's member row is redrawn by `updateConclaveDetail` on every
+  update. Both row-shape decisions were moved out of `app.ts` into `lib/regionKeys.ts`
+  (`chatRowShapes`, `trustRowShape`) so tests can pin them: 207 tests pass, `tsc` clean, `vite
+  build` clean.
+- Still open: no runtime check. The render counter needs a manual pass, and this is one of the
+  deltas that pass has to exercise — flip a trust to mail-only with the Chats rail up and confirm
+  the render ticks, the column's search field keeps its caret, and the menus stop offering chat.
+- Lesson: "the patch covers the deltas the item names" is not the same as "the patch covers every
+  delta". A patch contract is only as good as the change detection above it, and the reach case
+  showed the detection was narrower than the contract. It also showed the first fix proposed
+  (refuse in every patch) was more machinery than the problem needed once the keys existed: the
+  right question was not "which patch should refuse" but "what does this render cost", which the
+  keys already answer.
+
+### The invitation patch's DOM path is not exercised, and its empty-state branch was wrong twice [OPEN]
+
+- Attempted: stop an invitation arriving from forcing a shell render, by painting the invitation
+  box in place (`patchConclaveInvites`) instead of bailing out in `patchConclaveCards`.
+- Symptom: two gaps, both in the same place. First, the same one as the mail reload entry above:
+  the runner has no DOM, so the patch itself — the insert, the replace, the remove — is verified
+  by nothing, and `tsc`, 191 tests and `vite build` are all that stand behind it. Second, and
+  worse: the empty-state branch was wrong twice, and nothing but re-reading caught either.
+  Version one returned true after removing the box when the last invitation was answered, which
+  would have left the column showing an empty cards container where the empty state ("No
+  conclaves yet") belongs. Version two returned false whenever the cards container was missing —
+  which is how the empty state looks — so a presence flip with that state on screen would have
+  scheduled a render for nothing, the opposite of what this slice is for.
+- Resolution: the shape question was extracted to `conclaveListShape` in `lib/conclaveStore.ts`,
+  asked by the column's first paint and by the patch, and covered by three tests. The patch now
+  answers "the empty state is current while it is still the right shape" and "the list on screen
+  has to give way to it" from that one read.
+- Needed: the doc's check — invite this vault to a conclave with the rail open, watch the counter,
+  and decline the last invitation with no conclaves in the list to see the empty state.
+- Lesson: the decisions that were extracted and tested (`invitesAreCurrent`, and then
+  `conclaveListShape`) are the ones that turned out to be wrong; the ones that stayed inline in
+  `app.ts` are the ones nothing exercises. Extracting one half of a patch and testing it reads
+  like the whole thing is covered, and it is not — the second near-miss was introduced by the fix
+  for the first.
+
+## 2026-10-18 — Item 3: the mail reload paints in place
+
+### The mail reload's new path is not exercised anywhere [OPEN]
+
+- Attempted: take a mail reload off the shell-render path — patch the Mail rail's folder
+  counts and bring the rail's list or reader forward through its own region `update`, so an
+  arriving message no longer repaints the shell.
+- Symptom: the decision is covered and the DOM work is not. `folderBadge` has 5 tests and
+  `canUpdateInPlace` has 3, so the reads the first paint and the patch share are pinned —
+  but `patchMailReload`, `patchMailFolderCounts`, `findRegion`, and `updateMailList` /
+  `updateMailThread` build and walk real elements, and the runner has no DOM: `npm test`
+  covers `src/lib/*.test.ts` only, and there is no jsdom in the project. The app could not
+  be run here either (no display, and this is the same environment the earlier entries
+  describe). What was verified is static: `tsc --noEmit` clean, 183 tests pass (up from
+  175), `vite build` clean.
+- Needed: the check now written into the doc — with the Mail rail open, watch
+  `window.__HUSH_RENDER_COUNT__` across a reload. It must not tick, the counts must still be
+  right, and the list or reader must be current; it must still tick when the rail is showing
+  compose, Drafts, or the drop bodies.
+- Lesson: the same shape as the visibility entry below. Extracting the decision made the
+  *read* testable, and it is easy to let that stand in for the patch itself, which is the
+  part that can silently leave a pane stale.
+
+### A draft is not a mail: two wrong fixtures, both caught by the assertion [FIXED]
+
+- Attempted: seed the store for `folderBadge("drafts", …)` the way the neighbouring tests
+  seed it, with the file's existing `record(...)` helper.
+- Symptom: `folderBadge("drafts", noFlags())` returned `{ count: 0 }` twice. First because
+  `record` builds a `t: "mail"` payload and `loadMailbox` reads drafts from a `t: "draft"`
+  one — `if (r.payload.t !== "draft") continue`, so the record was skipped rather than
+  counted, and the assertion said 0 rather than throwing. Then, once the payload kind was
+  right, because `listDrafts()` filters through `draftToKnownContact`, and the test had
+  called `setKnownContacts([])`.
+- Resolution: added `draftRecord` and `dropRecord` helpers beside the existing fixtures, and
+  set the draft's addressee as a known contact. Both fixes are comments in the test, so the
+  next person does not repeat either.
+- Lesson: a loader that skips what it does not recognise turns a malformed fixture into a
+  zero instead of an error, and a zero is a plausible answer for a count. Worth seeding from
+  a fixture that mirrors the wire shape, not from a neighbour that happens to compile.
+
+### The folder column's only caller of `folderCount` was deleted, and nothing would have said so [WORKED AROUND]
+
+- Attempted: replace the folder column's inline count expression with `folderBadge`, which
+  composes `folderCount`, `unreadCount`, `listDropInbox` and `isDropUnread`.
+- Symptom: `folderCount` then had no remaining caller in `app.ts` and its import was dead.
+  `tsc --noEmit` passed either way: `noUnusedLocals` is not set in this project's
+  `tsconfig.json`, so an unused import is not an error, and nothing else in the toolchain
+  reports it.
+- Resolution: dropped the import by hand, after grepping every affected helper for remaining
+  callers. Not a repo bug, and not worth enabling `noUnusedLocals` for — the observation is
+  that "tsc is clean" cannot be read as "nothing was left dangling" here.
+- Lesson: when a refactor moves the only caller of a helper, check the import by hand; the
+  compiler in this project will not.
+
+## 2026-10-18 — Voice call cues (ringtone and ringback)
+
+### No one has heard either clip [OPEN]
+
+- Attempted: give the incoming call a real ringtone (`ring.mp3`) and the caller a ringback
+  (`tone.mp3`), both looping, and verify the slice.
+- Symptom: the path is verified up to the audio device and no further. `bundled_clips_decode`
+  proves both MP3s decode to real audio of the right length, the command is registered and
+  permitted end to end (the generated ACL was read back, not assumed), and the frontend
+  decision is covered by 16 tests. Nothing in this environment played a sound: the app was
+  not run, there is no speaker here, and `device_probe` needs a person at the machine.
+- Needed: run the shell, open a room in one vault and call it from another, and confirm by
+  ear — the ringtone loops for the whole 30 s stamp; the ringback stops the moment the other
+  side joins; a minimised window still rings but does not play the ringback; the sound
+  switch silences both.
+- Lesson: "the clip decodes" and "the user hears it" are different claims. Only the first
+  was tested, and this entry exists so the summary cannot imply the second.
+
+### The ringtone's loop outlived the banner's own deadline [FIXED]
+
+- Attempted: wire the cue into `refreshVoiceRooms`, which re-decides it on every poll.
+- Symptom (found by reading, not by a test — nothing in this repo covers `app.ts`): the
+  ring's expiry path is a `setTimeout` that re-renders when `ringing_until_ms` passes, so
+  the prompt does not outlive its deadline on screen. It did not touch the cue. The banner
+  would disappear at the deadline and the ringtone would keep looping until the next poll,
+  up to 4 s later.
+- Resolution: the expiry timeout re-decides the cue before it repaints.
+- Lesson: a timed callback that corrects the UI at a deadline is a place where anything else
+  keyed to that same deadline has to be corrected too.
+
+### `rg -rn` is not "recursive with line numbers", and it rewrote the output [FIXED]
+
+- Attempted: `rg -rn "opener" --glob '*.rs'` to find the daemon's voice `opener` field and
+  confirm whether it holds an account id or a nick.
+- Symptom: every match came back with `opener` replaced by `n` — `pub n: String`,
+  `/// Random id, generated by the n` — which read as a codebase that names the field `n`.
+  Nearly concluded that `VoiceViewDto.opener` is a nick, which would have made the
+  `opener === me` comparison in `voiceCueFor` never match and the ringback never play.
+- Resolution: `-r` is `--replace`, so `-rn` meant `--replace=n`: ripgrep was substituting `n`
+  for its own matches. Re-read the same lines with the Grep tool, which showed
+  `opener: sender.to_string()` at `crates/hush-core/src/voice.rs:133` — the account id, as
+  the comparison needs. The command was wrong, not the code.
+- Lesson: ripgrep is recursive by default and `-r` takes a value. A flag that changes the
+  output rather than the selection is dangerous precisely because the result still looks
+  like source.
+
+### The permission guard read only the first `commands.allow` in a file [FIXED]
+
+- Attempted: add `set_voice_cue` as a second `[[permission]]` block in
+  `permissions/hush-sound.toml`, beside `allow-chat-sound`.
+- Symptom: `every_registered_command_is_named_by_a_permission` failed with
+  `these commands are registered but no permission allows them ... ["set_voice_cue"]` —
+  although the permission existed and the capability granted it. `permitted_commands` did
+  `text.find("commands.allow")`, one occurrence per file, so a second block was invisible.
+- Resolution: the parser now walks every `commands.allow` in the file, and asserts per array
+  that it parsed at least one name. The old assert compared the running set's size instead,
+  which would also misreport a block that repeated a command another block already allowed.
+  The parser was fixed rather than the file split, because the assert's own message says
+  which side is out of date: "the parser is out of date with the file, not the file with the
+  parser".
+- Lesson: the guard that is the only thing catching a class of bug is itself unguarded. This
+  one failed loudly, which is the good case; a parser that silently matched nothing would
+  have passed.
+
+### The bundled chat WAV is 0.35 s, and two comments said ~1.4 s [FIXED]
+
+- Attempted: assert each bundled clip's length in a decode test.
+- Symptom: `chat wav decoded to 0.35 s, expected at least 1 s`. `ffprobe` agrees: 0.349 s,
+  44.1 kHz stereo (61680 bytes at 176400 bytes per second). The `CHAT_CLIP` doc comment and
+  `device_probe`'s own `println!` both claimed ~1.4 s.
+- Resolution: both corrected to 0.35 s, and the test's floor set to 0.3 s. The file was
+  right; the comments were wrong.
+- Lesson: a duration in a comment is a claim nothing checks. It took a test that measured
+  the clip to find one.
+
+### `total_duration()` is `None` for MP3, and the decoder yields `i16` [FIXED]
+
+- Attempted: assert clip lengths with `Decoder::total_duration()`.
+- Symptom: `ring mp3 reports no duration` — symphonia answers `None` for MP3, since it would
+  have to scan the whole stream. The sample-level rewrite then failed to compile with
+  `expected f32, found i16`, so the peak accumulator was wrong twice over: the samples are
+  `i16`, and `i16::MIN.abs()` would panic in debug.
+- Resolution: the test counts samples and takes a peak in `i32` (`i32::from(sample).abs()`),
+  asserting both a floor on the decoded length and `peak > 327` so a header-only decode
+  cannot pass.
+- Lesson: rodio's `Decoder` yields the stream's native sample type, not the `f32` the mixer
+  works in — and the length check and the "did audio come out" check are the same pass.
+
+## 2026-10-18 — App smoothness item 4 (timers while hidden)
+
+### The visibility pause stops the voice ring, and no doc said so [FIXED]
+
+- Attempted: before pausing the two remaining timers (the Paper sync loop and the Voice
+  settings meter), answer the user's question about whether stopping timers while the window
+  is hidden means incoming voice calls stop arriving.
+- Symptom: the two timers in question are both harmless to calls — `voiceMeterTimer` is the
+  Settings -> Voice input-level meter (`app.ts:15913`) and the Paper loop only syncs an open
+  collaborative document. But answering the question properly meant tracing the ring, and the
+  ring has no timer and no separate path: `refreshVoiceRooms()` has exactly one caller, inside
+  `pollRecv` (`app.ts:1621`), and `pollRecv` is precisely what the visibility handler stops.
+  So the pause that already landed in item 4 silently made incoming calls un-alertable while
+  the window is hidden: the daemon still takes the call and stamps a ring
+  (`crates/hush-daemon/src/main.rs:6915`, 30 s TTL at line 6160), the hidden UI never reads
+  `voiceState`, and nothing else surfaces it — no notification plugin in `Cargo.toml` or
+  `package.json`, no tray icon ever created, `request_user_attention` never called. The
+  daemon's comment blessing a missed ring ("degrades to the pill's Join voice affordance")
+  was written against a ~4 s poll and predates the pause, so it no longer covered this.
+- Resolution: FIXED on the user's decision that a hidden window must still ring. A
+  `voiceRingTimer` keeps a reduced voice-only read alive while hidden (one `voice_state` call
+  per `RECV_POLL_MS`, no recv/presence/stores), which restores the prompt and the chime; and
+  `lib/attention.ts` asks the OS for attention once per ring via `requestUserAttention`, with
+  `core:window:allow-request-user-attention` added to `capabilities/default.json` — it is not
+  in `core:default`. The resolved capability was read back from the build's
+  `out/capabilities.json`, not assumed. A desktop notification naming the caller was declined
+  as the larger surface (plugin in both manifests plus a permission prompt, versus no new
+  dependency).
+- Lesson: "stop the timers while hidden" reads as a pure win and is not one when a timer is
+  the only path by which something *arrives*. Before pausing a poll, ask what is discovered
+  only by polling. The cost of a poll and the cost of a missed ring are not the same kind of
+  thing, and this item's framing — requests per second — had no place to put the second one.
+
+### The audit said "all three timers"; there were seven [FIXED]
+
+- Attempted: implement item 4's remaining half — pause the Paper session's polls and the Voice
+  settings meter while the window is hidden.
+- Symptom: two separate traps in the same shape. (1) The plan's "all three timers" was wrong:
+  `paperStore.ts` ran `PAPER_POLL_MS` (1000) and `PAPER_PRESENCE_POLL_MS` (500) with no
+  visibility hook at all, so a hidden window with a Paper tab open made 3 daemon requests a
+  second indefinitely — a bigger hole than the three the plan named, which are 1-2 req/s
+  between them. (2) The Voice meter is torn down by `renderSettings` on any repaint, which
+  *looks* like it covers the hidden case and does not: a hidden window does not repaint, so
+  the 4 Hz probe ran until the section was closed.
+- Resolution: FIXED. `stopVoiceMeter` on the hidden branch reuses the teardown
+  `renderSettings` already did, and the visible branch's re-render re-arms it through the
+  surface's existing contract. The paper's loops go through new `pausePaperSync` /
+  `resumePaperSync`, with every `setInterval` in the module now inside one `startLoops`.
+  Verified by enumerating every `setInterval` in `src/` (seven) and checking each one against
+  the hidden path.
+- Lesson: "which timers run while hidden" is a question about the whole app, not about the
+  three a plan happened to list. Enumerate the primitive (`setInterval`) rather than trusting
+  the inventory.
+
+### A first draft of the paper pause used a sticky flag that could strand the paper [FIXED]
+
+- Attempted: implement `pausePaperSync` / `resumePaperSync` with a module-level `paused`
+  boolean, set by the two functions and read by the arming path.
+- Symptom: found while re-reading my own patch, before it was built. The App's visible branch
+  returns early when the vault is locked, so `resumePaperSync()` is not called in that case
+  and `paused` stays `true`. The next paper opened after an unlock would then arm no loops at
+  all — a silent, permanent sync failure with no error anywhere.
+- Resolution: FIXED by deleting the flag. `startLoops` reads `document.visibilityState`
+  directly, so the DOM is the single source of truth and there is no state to outlive the
+  pause.
+- Lesson: a flag that mirrors something the environment already knows is a second source of
+  truth, and its failure mode is "stuck in the wrong state forever" rather than "wrong for one
+  frame". Check whether the platform already answers the question before caching the answer.
+
+### `AUTO_LOCK_MS` was dead, and duplicated a policy the daemon owns [FIXED]
+
+- Attempted: record that no timer should be added to the auto-lock countdown, then check what
+  the countdown actually reads.
+- Symptom: `AUTO_LOCK_MS` in `lib/constants.ts` was declared and referenced nowhere. The pane
+  reads the daemon's own policy through `getAutoLockMinutes` / `getAutoLockMs`
+  (`lib/api/uiPrefs.ts`), and the daemon is what enforces it (`auto_lock_loop`,
+  `ui_prefs::auto_lock_duration`). So the constant was a stale UI copy of a
+  security-relevant setting — and the tempting move for a reader who finds it is to wire it
+  up, which would create exactly the permanent timer the note forbids.
+- Resolution: FIXED — removed (one line, provably unreferenced).
+- Lesson: a dead constant that duplicates live policy is worse than dead code. It reads as an
+  invitation to make it live.
+
+### None of the visibility behaviour is covered by a test, and it was not run [OPEN]
+
+- Attempted: verify the new hidden-window behaviour — the ring surviving the pause, the
+  attention request firing once per ring, the paper loops stopping and resuming.
+- Symptom: nothing to run it with. `npm test` covers `src/lib/*.test.ts` only, and every
+  piece of this change lives where that harness cannot reach: `app.ts` has no unit tests at
+  all, `paperStore.ts` imports ProseMirror, yjs, and the Tauri API layer, and the attention
+  request is a shell call. What was verified is static — `tsc --noEmit` clean, 159 tests
+  pass, `vite build` clean, `cargo check -p hush-tauri` clean with the new capability
+  resolved in `out/capabilities.json`, and every `setInterval` in `src/` enumerated and
+  checked against the hidden path. What was *not* verified is any of it actually happening
+  in a running app.
+- Resolution: needs a run with a real window (minimise it with a Paper tab open and a ring
+  in flight) to confirm the three behaviours. Not done in this session. Recorded so the
+  claim in the doc is not read as stronger than it is.
+- Lesson: for UI-lifecycle work in a repo whose test harness stops at pure modules, say
+  plainly which claims are static and which need a run. "tsc and the build pass" is not
+  evidence that a `visibilitychange` handler does what its comment says.
+
+### `lastRingChime` was write-only, and its comment described a gate that did not exist [FIXED]
+
+- Attempted: add a marker for "this ring has already asked for OS attention", so a 30 s ring
+  alerts once rather than at every poll.
+- Symptom: `lastRingChime` sat right there with a comment claiming exactly that job — "so a
+  ring repeats at the poll cadence instead of stacking on every state read" — but it was
+  assigned in three places and read in none. Grepping the field rather than trusting the
+  comment is what showed it: the chime plays unconditionally, so the field gated nothing.
+- Resolution: FIXED. Removed, replaced by `voiceAlerted`, which does what the old comment
+  claimed. Had it been left, it would have been a decoy beside the new field.
+- Lesson: a field whose comment describes behaviour the code does not implement is more
+  misleading than no field. When a comment and a grep disagree, the grep is right.
+
+## 2026-10-18 — App smoothness item 8 (the per-contact attachment count)
+
+### The audit named one call site; the helper had two [FIXED]
+
+- Attempted: fix the quadratic count in the Vault tile, which is where the doc's item 8
+  pointed (`renderVault`'s files tile, `app.ts:14656`).
+- Symptom: grepping the *helper* instead of the site — `rg mailAttachmentCount` — found a
+  second caller the audit had missed: `renderFilesContactList`'s row loop
+  (`app.ts:7042`) called `mailAttachmentCount(nick)` once per contact row, paying the same
+  whole-store cost the Vault tile was paying. Fixing only the reported site would have left
+  the Files pane quadratic, and the fix would have looked complete.
+- Resolution: both callers now read one `mailAttachmentCounts(flags)` map. Because the
+  defect was in the helper's contract — it answered for one contact by re-reading the store,
+  and both callers wanted every contact — the fix went into `lib/mailStore.ts` rather than
+  at either site.
+- Lesson: when a cost is "this call in a loop", grep the callee, not the call. The reported
+  site is where the symptom was noticed, not the boundary of the defect. This is the same
+  cascade the log has recorded before: fix the class, not the instance.
+
+### The chat half of the same count looks identical and is linear [FIXED]
+
+- Attempted: after finding the mail half quadratic, check the chat half of the same
+  expressions — `fileCountForContact`, `lastFileTimeForContact`, `contactsWithFiles`, all of
+  which are also called once per contact and all of which also filter and sort.
+- Symptom: nothing wrong, and that is the risk — they *look* like the same defect, so the
+  next reader (or the next audit) would either fix them for nothing or, worse, conclude the
+  mail fix was unnecessary because "the chat side does it too". They read `getThread(nick)`,
+  which is `threads.get(nick) ?? []` (`lib/chatStore.ts:48`): one contact's own thread, not
+  a scan of the store. Summed over contacts that is linear in the chat history, not
+  quadratic in contacts. They do re-sort one contact's thread several times, which is waste
+  bounded by that thread.
+- Resolution: no code changed. The finding is recorded in item 8's status and marked
+  "do not re-audit", so the asymmetry between the two halves is written down rather than
+  re-derived.
+- Lesson: "same shape" is a hypothesis until the callee is read. Two functions called once
+  per contact are only quadratic if each call scans the whole store, and that is a property
+  of `getThread` versus `listFolder`, not of the loop.
+
+### A dedup test against one folder would have passed either way [FIXED]
+
+- Attempted: test that `mailAttachmentCounts` does not count a message twice when it sits in
+  two folders at once — the reason the `seen` set exists.
+- Symptom: the obvious fixture (a message in the Inbox) never reaches the dedup, because
+  `inFolder` returns true for exactly one of inbox/sent/archive for most messages. A test
+  built from such fixtures passes with the guard deleted, which is a test that proves
+  nothing. The case that actually exercises it is a sent mail that is *also* archived: `sent`
+  is `outgoing && state === "sent"` with no archived check, so the message is legitimately
+  in both lists.
+- Resolution: the fixture is a sent-and-archived message with four attachments, and the
+  assertion is 4 where the un-deduplicated answer is 8. Confirmed by mutation: commenting
+  out `if (seen.has(m.id)) continue;` makes the test fail with `actual: 8, expected: 4`, and
+  the guard was restored.
+- Lesson: a test for a guard has to build the state the guard exists for. Where that state
+  is not the obvious one, prove the test discriminates — delete the guard, watch it fail,
+  put it back — rather than trusting that the assertion is doing work.
+
+### `mailStore.test.ts` now depends on module state, and nothing enforces the order [OPEN]
+
+- Attempted: unit-test `mailAttachmentCounts`, which reads the store's module-level
+  `messages` and `knownContacts` rather than taking them as arguments.
+- Symptom: these are the first tests in that file to touch the store at all; the existing
+  ones test free functions. `loadMailbox` replaces the store and `setKnownContacts` replaces
+  the contact list for everything after it in the file, and there is no way to put
+  `knownContacts` back to its "no filter" default — `setKnownContacts(nicks: string[])`
+  takes an array and `null` does not typecheck. Every test therefore sets both for itself,
+  which makes each one correct on its own, but the file's correctness now depends on nothing
+  being appended after the last of them that assumes the default. Nothing enforces that; a
+  comment in the file states it.
+- Resolution: documented, not fixed. Resolving it properly means either an explicit reset
+  (`setKnownContacts` accepting `null`, or a `resetMailStoreForTests`) or a store-shaped seam
+  so the tests can pass their own data instead of mutating shared state. Neither is worth
+  doing for one function; both are worth doing before a second one is tested this way.
+- Lesson: a test that mutates module state borrows correctness from the order of the file.
+  That is acceptable when it is stated in the file and the mutations are self-contained —
+  and it stops being acceptable the moment someone appends to the file, which is exactly
+  when the statement is least likely to be read.
+
+## 2026-10-18 — App smoothness item 7 (memoized body parsing)
+
+### The `.ts`-extension lesson was already in this log, and was hit again [FIXED]
+
+- Attempted: add `import { memoizeLru } from "./memo"` to `lib/richText.ts`, matching the
+  extensionless style used by `paperStore.ts`, `zineStore.ts` and the other app-only
+  modules.
+- Symptom: the full suite went from 153 passing to one failing *file* with no assertion
+  message — `ERR_MODULE_NOT_FOUND: Cannot find module '.../src/lib/memo' imported from
+  '.../src/lib/richText.ts'`. `node --test` runs the `.ts` sources directly and resolves
+  imports itself, so a module reachable from a test needs the explicit extension;
+  `tsc` (`moduleResolution: bundler`, `allowImportingTsExtensions`) and Vite accept both,
+  so nothing before the test run objected. `richText.ts` had no imports at all until this
+  change, which is why the convention had never applied to it.
+- Resolution: `"./memo.ts"`. The repo's rule is visible in the imports themselves —
+  `mailStore.ts` imports `"./richText.ts"` and `"./rowFilter.ts"`, `messageAppend.ts`
+  imports `"./messageGroups.ts"`, while `paperStore.ts` imports `"./conclaveStore"` — so
+  "does anything under `node --test` reach this file?" is the test, and `richText.ts`
+  answers yes through `mailStore.ts`.
+- Lesson: this exact lesson is already an entry in this log, under
+  "A `.ts`-extension import is required for modules loaded by `node --test`". Having
+  written it down did not help, because the entry was not read before the edit — the
+  search that would have found it (`rg 'node --test' DEEPSEEKPROBLEMS.MD`) is the same
+  search that would have found it *after*, and the test run found it instead. A log only
+  works if it is consulted on the way in; when adding an import to a module that has never
+  had one, the relevant question is not "what does this repo normally write" but "is this
+  file already on a test path".
+
+### The memo wraps a DOM function, so the test runner cannot reach the half that matters [FIXED]
+
+- Attempted: cover item 7 with `node --test`, the way every other slice here has been
+  covered.
+- Symptom: `parseBodyText` calls `document.createElement` and `sanitizeHtml`, which calls
+  `new DOMParser()`. The runner has no DOM and the project has no DOM library in
+  `devDependencies` (`node --test src/lib/*.test.ts` against Node's own type stripping),
+  and `mailStore.test.ts` already documents the workaround it uses: its fixtures are
+  tagless bodies, so `htmlToText` returns at its `hasHtmlTags` early exit and never touches
+  the DOM. That leaves the memoized path — the entire change — unreachable from the suite.
+- Resolution: split the testable half out. `memoizeLru` is a new module with no DOM
+  dependency, and its policy is pinned by 7 tests (one compute per key, LRU eviction,
+  recency refresh on a hit, the bound, a bound below one, a cached `undefined`, a
+  non-integer bound). The wiring was then verified in a browser instead, with `DOMParser`
+  replaced by a counting wrapper: one parser constructed on the first call and still one on
+  the second, output identical to the unmemoized parse, tagless bodies skipping the cache,
+  and a two-entry bound re-parsing exactly the evicted body.
+- Lesson: when the function that needs to change cannot be tested, the fix is usually to
+  find the part of it that is pure and move the seam there. Extracting the *policy* made it
+  testable; the remaining untested part is one line of wiring, which is a much smaller
+  claim to have to stand behind.
+
+## 2026-10-18 — App smoothness: audit for remaining work
+
+### Item 4 said "all three timers" and there were five [FIXED]
+
+- Attempted: answer "what else remains in smoothness" from the doc, then audit the code
+  against it.
+- Symptom: the plan's item 4 reads "Pause or back off all three timers when
+  `document.hidden`", and its status confirms "the recv, Tor-pill, and drops timers all
+  stop". Two more repeating timers reach the daemon and nothing stops them on
+  `visibilitychange`: the Paper session's `PAPER_POLL_MS` (1000) and
+  `PAPER_PRESENCE_POLL_MS` (500) in `lib/paperStore.ts:61,73`, and the Voice section's
+  250 ms `voiceDeviceMeter` poll (`app.ts:15913`). A hidden window with a Paper tab open
+  is 3 daemon requests a second, forever; with the Voice section open, 4. The "three
+  timers" framing came from the diagnosis, which counted the timers it had found rather
+  than searching for timers, and the status then repeated that count as fact.
+- Resolution: item 4's status now names both timers and says why the fix cannot live
+  entirely in the `App` visibility listener — `paperStore` owns its own timers and has no
+  visibility hook. Not fixed; recorded as the item's remaining work.
+- Lesson: "all N of X" is a search result, not a fact. Write the count with the query that
+  produced it, or re-run the query when the claim starts being relied on. `rg setInterval`
+  is one command.
+
+### The search-field work doubled the mail list's HTML parsing, and nothing could see it [FIXED]
+
+- Attempted: give each mail row a search haystack, stamped at row creation.
+- Symptom: `mailRow` already called `preview(m)`, which flattens the body with
+  `htmlToText`; the haystack added `mailSearchText(m)`, which flattens the same body again.
+  So every row now pays for two `htmlToText` calls, and each one is a full
+  `DOMParser().parseFromString` plus a node walk, a serialize, a second parse, and two
+  `querySelectorAll` sweeps (`lib/richText.ts:159,189`). A 200-message folder fill is ~400
+  document parses. The slice's own tests could not see it — `mailStore.test.ts` asserts the
+  haystack's *contents*, and the cost is not a content question — and the doc's item 2 is
+  about `content-visibility`, which reduces paint, not parse.
+- Resolution: FIXED as the doc's item 7. `htmlToText`'s parse is now `parseBodyText`,
+  wrapped by `memoizeLru` (`lib/memo.ts`) with a 512-entry bound, so the duplicate call and
+  every reload after the first are cache hits. The cost was measured before it was changed
+  — ~41 ms per 200-row fill of ordinary bodies, ~136 ms for long ones — and the measurement
+  is in item 7's status with its engine caveat.
+- Lesson: when adding a per-item computation to a render path, grep the builder for the
+  same computation already there. Two callers wanting the same derived value from the same
+  source is a memo waiting to happen, and the second caller is easy to add without noticing
+  the first.
+
+### `htmlToText` is two parses, and that is not visible from its name [FIXED]
+
+- Attempted: reason about the cost of stamping a haystack per row.
+- Symptom: `htmlToText` reads like a string operation. It is `sanitizeHtml` — a
+  `DOMParser` document parse, a recursive `sanitizeNode` walk, and an `innerHTML`
+  serialize — and then it parses that output *again* into a `div`, appends text to `br`,
+  `li`, and eight block tags, and runs two `querySelectorAll` sweeps
+  (`lib/richText.ts`). Any estimate made from the call site would be wrong by an order of
+  magnitude.
+- Resolution: FIXED — `htmlToText` now carries a doc comment that states what it costs and
+  where the measurement came from, and the doc's item 7 records the table. Nothing about the
+  parse itself changed; it is memoized, not made cheaper.
+- Lesson: the cost of a call is a property of the callee. Before calling a per-item
+  helper in a loop, read the helper — especially one named after its output rather than
+  its method.
+
+### The plan's "cheapest first" fix ordering was wrong, and the cheap fix was subsumed [FIXED]
+
+- Attempted: take item 7's first-listed fix — have `mailRow` flatten once and pass the text
+  to both consumers — as the smallest correct change, with the memo as a later step.
+- Symptom: once `htmlToText` is memoized, the duplicate call inside `mailRow` is already a
+  cache hit, so the call-site change buys nothing and adds an API (`mailSearchText` and
+  `preview` would each need a text-taking variant) that nothing else uses. The plan had
+  ordered three candidates as if they were independent increments; two of them are the same
+  change, and the third (lazy haystack) is a different optimisation for a case that no
+  longer costs anything.
+- Resolution: implemented the memo only, no call-site change. Item 7's status now says the
+  ordering was wrong and why, so the next reader does not implement the first candidate
+  because it is listed first.
+- Lesson: a list of fix candidates is a menu, not a sequence. Before taking the first one,
+  check whether a later one makes it unnecessary — the cheapest fix is often the one that
+  makes the others moot.
+
+### The item 7 measurement is Chromium, and the app is WebKitGTK [FIXED, QUALIFIED]
+
+- Attempted: replace item 7's operation-count reasoning with a real number, so the change
+  would be measured rather than guessed.
+- Symptom: the only browser available here is the one behind the browser tool —
+  Electron 42 / Chrome 148 — while the app renders in WebKitGTK. The 41 ms figure is
+  therefore not the app's number, and quoting it as one would be the same class of error
+  the doc keeps recording: a plausible figure standing in for the real thing.
+- Resolution: the number is reported with its engine named, and the doc's item 7 status
+  states plainly that what transfers is the shape (cost is linear in body size and paid
+  twice per row), not the absolute figure. The running-app profile is still listed as
+  pending in "How we will know it worked".
+- Lesson: a benchmark run somewhere other than the target is evidence about the shape, not
+  the size. Name the engine in the same sentence as the number, or the number will be
+  quoted later without it.
+
+### The Vault tile's exchanged-files count is quadratic, and reads as a one-liner [FIXED]
+
+- Attempted: audit the unkeyed panes for work proportional to the store.
+- Symptom: `renderVault`'s files tile is
+  `allFileMessages().length + this.contacts.reduce((n, c) => n + this.mailAttachmentCount(c.nickname), 0)`
+  (`app.ts:14657`), and `mailAttachmentCount` calls `exchangedMailMessages(nick)`
+  (`app.ts:6964`), which runs three `listFolder` calls — each a filter *and a sort* over
+  the whole message store — per contact. Fifty contacts against two thousand messages is
+  a hundred and fifty sorts of two thousand items per render of the pane. The line reads
+  like a count.
+- Resolution: FIXED as the doc's item 8. Both callers — this one and a second in
+  `renderFilesContactList` that this audit missed, see the item 8 section above — now read
+  one `mailAttachmentCounts(flags)` map built in a single pass, in `lib/mailStore.ts` so it
+  is testable. Measured at ~19.5 ms for the per-contact loop against ~0.8 ms for one pass.
+- Lesson: a `reduce` over contacts whose body scans the message store is O(contacts ×
+  messages), however short it looks. When a summary number is per-vault but the helper is
+  per-contact, the helper is being called N times too many.
+
+### Two things were checked and found clean, and are now written down [FIXED]
+
+- Attempted: audit CSS paint/compositing and the frame loop, the two usual causes of
+  scroll jank that no amount of JavaScript work fixes.
+- Symptom: nothing found, which is the problem — an audit that turns up nothing leaves no
+  trace, so the next reader re-does it. `app.css` has no `backdrop-filter`, no
+  `filter: blur`, no `will-change`, and no `transition: all`; its four `infinite`
+  animations are each gated on a transient state class; and the only
+  `requestAnimationFrame` in the app is the coalesced render's one-shot frame
+  (`app.ts:2335`), not a loop.
+- Resolution: both recorded under "Out of scope for this goal (checked, do not
+  re-litigate)" with the counts and the line numbers, so the audit is not repeated.
+- Lesson: a negative result is a result. Write down what was checked and how, or the check
+  has to be paid for again.
+
+## 2026-10-18 — App smoothness: the Mail list as a keyed region
+
+### The same defect was sitting in the reader, one state away [FIXED]
+
+- Attempted: key the Mail rail's right-hand region so a reload stops repainting it. The
+  first pass keyed the folder's list and treated the other bodies as cheap.
+- Symptom: the reader is not cheap. `renderMailThread` draws `.mail-messages`, which is
+  `overflow: auto` (`app.css:1244`), and the reload path reaches it: `mailboxChanged` forces
+  a shell render and the `editing` gate checks `mailComposeOpen`, not `mailThreadId`. So
+  reading a long thread when mail arrived reset it to the top — the exact symptom this slice
+  was removing from the list, in the pane next to it. Found by reading `renderMailThread`
+  after finishing the list, not by anything failing.
+- Resolution: the reader is keyed by thread and updates through a scaffold transplant, the
+  same shape as the conclave pane. The transplant itself was hand-written in
+  `updateConclaveDetail` and would have been copied verbatim a second time, so it is now
+  `transplantAround` in `lib/regions.ts` and both callers use it.
+- Lesson: "the pane a reload repaints" is a list of states, not a pane. The Mail rail has six
+  bodies and only one of them was on the doc's list, because the doc was written from what a
+  reload had been *observed* to disturb. When keying a region, enumerate the bodies first and
+  decide per body — the ones left out are exactly where the same bug hides.
+
+### The reader's split is the newest thing nothing exercises [OPEN]
+
+- Attempted: split `renderMailThread` into chrome (`mailThreadHead`) and messages
+  (`fillMailThread`) so the update can keep the scroll box and redraw around it.
+- Symptom: nothing in the test suite touches either half — they build DOM and read `this`.
+  The shape they must agree on (`.mail-messages` a direct child of the pane, exactly one of
+  it) is now load-bearing for `transplantAround`, which returns false and makes the caller
+  replace the pane wholesale if it does not hold. A wrong shape therefore degrades to the old
+  behaviour rather than breaking, which is the right default and also means a mistake here
+  would be invisible.
+- Resolution: none available in this environment. `transplantAround` needs a DOM to test and
+  `node --test` here has none, which is why `regions.test.ts` covers only `planRegionSync` —
+  the same reason `syncRegions` is uncovered. The runtime check in the doc's "How we will know
+  it worked" is what would settle it.
+- Lesson: the guard that turns a wrong assumption into a silent fallback is worth having, but
+  it is not evidence. Say which it is in the status, so the next reader does not read "it
+  degrades gracefully" as "it is covered".
+
+### An edit joined two lines of `regions.test.ts` without a newline [FIXED]
+
+- Attempted: add the Mail rail's key shape as a case in `regions.test.ts`. The first
+  `StrReplace` was a mistake of its own — I meant to insert a test *before* an existing one
+  and wrote an `old_string` with a trailing newline against a `new_string` without one.
+- Symptom: the file came back with the comment of the following test welded onto the
+  previous test's opening brace:
+  `test("a rail with more panes than the last one inserts the extras", () => {  // Chats -> Reads: ...`.
+  It still parsed and still ran, so nothing failed — the damage was only visible by reading
+  the file back. It would have shipped as a garbled comment.
+- Resolution: repaired in the next edit, and the real tests added. `npm test` was re-run
+  after, which would not have caught it either way.
+- Lesson: when an edit is meant to be an insertion, use the smallest possible anchor and do
+  not include a trailing newline in only one of the two strings. A whitespace-only difference
+  between `old_string` and `new_string` is a no-op at best and a join at worst. Read the
+  region back after any edit whose purpose was structural, not textual.
+
+### The comment explaining the mail reload's shell render went stale under it [FIXED]
+
+- Attempted: key the Mail list so a mail reload redraws rows in place.
+- Symptom: the gate at the end of `pollRecv` explained `shellNeeded` as "a mail reload, a
+  conclave whose structure moved, and a voice ring all reach past what the patch covers (the
+  mail list, ...)". Once the list was keyed, the parenthetical was wrong about its first item
+  — the mail list is exactly what the patch no longer has to cover — while `mailboxChanged`
+  still correctly forced the render, for a reason the comment did not name. A reader would
+  have concluded the reload was now unnecessary and tried to remove it.
+- Resolution: the comment now names the Mail rail's left column and its per-folder counts,
+  which nothing patches, as what `mailboxChanged` still buys. Item 3's status in the doc says
+  the same, and names patching that column as the change that would take the mail reload out
+  of the list.
+- Lesson: a comment that explains *why* a condition is still needed is a consumer of the
+  code it justifies. Changing the code without re-reading it leaves a comment that argues for
+  the opposite of the truth, which is worse than no comment.
+
+### The Mail list's scroll position survives a reload, but its rows do not [OPEN]
+
+- Attempted: preserve the reader's place in a long folder across a mail reload.
+- Symptom: the pane and its scroll box are kept, so `scrollTop` is kept with them — but
+  `fillMailList` redraws every row, so the reader's place is held by pixel offset rather than
+  by scroll anchoring (all the anchors are destroyed at once, so the browser's anchoring has
+  nothing to work with). The rows that were never rendered carry
+  `contain-intrinsic-size: auto 72px` placeholders, so their real heights are unknown at the
+  moment the position is restored. A deep scroll position can land on slightly different
+  content, or, if the folder shrank, be clamped to the new maximum.
+- Resolution: none. The honest fix is to redraw only the rows that actually arrived, which is
+  `planAppend` (item 3, already used by the two message panes) applied to mail — and mail rows
+  are harder, because filing, read flags, and the mail/drops interleave all change the order
+  rather than only appending. Not attempted here. The reader has the same shape of problem
+  from the other direction: `fillMailThread` re-parses every message body on every reload, so
+  the thread keeps its place and pays for it in work rather than in drift.
+- Lesson: keeping an element is not the same as keeping what is inside it. A keyed region
+  preserves the container's own state (`scrollTop`, focus, hover) and nothing about its
+  children, so "the pane survives" is a claim about the pane and has to be checked against
+  what the update then does to its contents.
+- Severity: minor, and strictly better than the alternative — before this change a reload
+  reset the list to the top and dropped the caret out of the search field.
+
+### `updateMailList`'s fallback branch cannot be reached, and is untested [OPEN]
+
+- Attempted: give the keyed region an `update` that is total — it should not be able to leave
+  a stale pane if the DOM is not the shape the key promises.
+- Symptom: the fallback (rebuild the pane's children when `.mail-list` is missing) is
+  unreachable by construction: `mailBody` returns `list` only for a non-drafts, non-drops
+  folder, and `renderMailList` always produces `.mail-list` for those. Nothing exercises it.
+  It is also not quite safe in one direction — `.mail-list` is the class the *draft* and
+  *drops* lists use too, so a future body that drew one of those under the `list` key would
+  have its rows redrawn by `fillMailList` rather than caught by the fallback.
+- Resolution: the class collision is documented in `fillMailList`, and the key/dispatch
+  agreement is enforced by type instead — `MailBody` is a union and `renderMailMain`'s switch
+  is exhaustive with no `default`, so a new body has to be added to both. The fallback stays
+  as the honest answer to a state that should not exist.
+- Lesson: an unreachable branch is not a bug, but claiming it is a safety net is. Say which
+  it is. Where the real guard is a type, say that instead.
+
+### The Mail list key's dependence on the folder is load-bearing, not an optimisation [FIXED]
+
+- Attempted: key the mail pane by the folder (`mailList:inbox`), on the reasoning that a
+  folder switch should show the top of the new list.
+- Symptom: while writing it, the folder in the key read as a refinement — `fillMailList`
+  reads `this.mailFolder`, so even a folder-agnostic key would redraw the right rows. It is
+  not a refinement: the folder *name* is drawn into the toolbar, and `updateMailList` leaves
+  the toolbar alone, so a folder-agnostic key would keep a stale title over the new folder's
+  rows. Caught by writing the `update` and noticing what it does not touch.
+- Resolution: the folder stays in the key, and both the doc comment and item 5's status say
+  why — it is what makes the pane *that* list.
+- Lesson: the boundary of an `update` is the specification of its key. Whatever the update
+  does not touch has to be either constant under the key or rebuilt; write the update first
+  and read the key off it, not the other way round.
+
+## 2026-10-18 — App smoothness: the four list search fields
+
+### A wrong claim about which repaints reach the search field [FIXED]
+
+- Attempted: write the verification step for the caret fix — what a tester should do to
+  confirm the field survives a repaint while typing.
+- Symptom: the first draft said "the same with a search active while a presence flip or a
+  mail reload lands", implying both rebuild the column the field sits in. Only the mail
+  reload does. `patchBackground` (`app.ts:2343`) patches a presence flip in place and
+  returns true, so the poll skips the render entirely and the field is never touched. The
+  claim was written from the item-3 summary ("presence flip isolation") rather than from
+  the gate, and it would have sent a tester looking for a caret loss that cannot happen —
+  and reading a pass as a failure, or the reverse.
+- Resolution: the verification bullet now names the renders that actually reach the column
+  (mail reload, conclave structure, voice ring, a user action) and says plainly that a
+  presence flip is patched. Found by reading `patchBackground` before answering "what
+  remains", not by any test — no test covers the doc.
+- Lesson: "the poll rebuilds the shell" is not one behaviour. The gate at the end of
+  `pollRecv` is the only authority on which deltas reach a render, and the item summaries
+  describe intent, not the gate. Read the gate before describing what a repaint costs.
+
+### The background patch's contract was "the drawn rows are the search's rows" [FIXED]
+
+- Attempted: make the Chats search hide rows instead of drawing a filtered set, the way
+  the Trusts filter works.
+- Symptom: `patchConvRows` — the poll's in-place patch for the Chats list — pairs the
+  rows on screen with `convListContacts()`, the *search-filtered* list, and bails to a
+  rebuild whenever the two lengths disagree. That contract only holds while the drawn rows
+  are exactly the filtered set. Switch to hiding and the patch would be comparing N drawn
+  rows against M matching contacts on every render where a search is active: it would
+  return false and rebuild, which is the churn the change was meant to remove. Worse, if
+  the numbers happened to agree it would pair row *i* with the wrong contact and patch a
+  preview onto someone else's row.
+- Resolution: the drawn set is now the whole list and the search only hides, so the patch
+  walks `chatContacts()` — the unfiltered list — and `convListContacts` is deleted rather
+  than kept as an alias. Found by reading the patch, not by a test; nothing about the
+  symptom would have surfaced until a search was active during a poll.
+- Lesson: before changing what a list *contains*, find everything that reads the list as
+  a key. A patch that pairs DOM rows positionally is a consumer of the list's identity,
+  and it is invisible from the search field's own code.
+
+### The Drops empty state would have been rebuilt on every keystroke, mid-request [FIXED]
+
+- Attempted: fold the Drops empty state into the same `narrow()` closure the other lists
+  use, so it is rewritten from the query on each keystroke.
+- Symptom: that empty state is not a sentence — when the vault has no drop key it is a
+  sentence plus a **Generate drop key** button whose click handler sets `btn.disabled =
+  true` and then awaits the daemon. Rewriting the state on a keystroke recreates the
+  button, un-disabling it while the first request is in flight, so a second click starts a
+  second key. Caught by reading the handler while moving the code, not by running it.
+- Resolution: which of the two forms is true is decided from the key, not from the query.
+  A vault with no key has no drops, so a query has nothing to narrow, and the offer stands
+  whatever is typed. This also removes a smaller oddity the old code had: typing into the
+  Drops search hid the only useful action on the screen.
+- Lesson: an empty state that contains a control is not interchangeable with an empty
+  state that contains a sentence. Rebuilding the first one is a state mutation.
+
+### `mailStore.ts` could not be loaded by the test runner [FIXED]
+
+- Attempted: add unit tests for the new haystack functions in `lib/mailStore.ts`, which is
+  where the definition of "what searching mail looks at" belongs.
+- Symptom: `node --test --experimental-strip-types src/lib/mailStore.test.ts` failed with
+  `ERR_MODULE_NOT_FOUND: .../src/lib/richText`. Node's ESM resolver does not guess
+  extensions, and `mailStore.ts` imported `./richText` the way the bundler allows.
+- Resolution: `./richText` → `./richText.ts`, matching what every already-tested module in
+  the directory does. `./api/types` is a type-only import and is erased, so it needed
+  nothing.
+- Lesson: a module is testable under `node --test` only if its whole runtime import chain
+  uses explicit extensions. The repo is mixed, so this is a per-module property to check
+  before writing the test rather than after.
+
+### The atproto explore search cannot use the in-place filter, and should not [WORKED AROUND]
+
+- Attempted: convert the last search field with the same symptom to the same fix, since it
+  is the one field still re-rendering on every keystroke.
+- Symptom: its filter is not a visibility filter. `groupDirectory(entries, filter)` drops
+  non-matching entries *and* recomputes each `via` group and its heading count (`via ada ·
+  3`). Hiding rows would leave a heading claiming three members above one visible row.
+  There is no row-level equivalent of what it does.
+- Resolution: left as it is — synchronous render, then re-query the fresh field and
+  restore the caret, which is a working fix for the caret and the only correct one for the
+  regrouping. It is now the only search field that renders on input; the other four do not
+  render at all.
+- Lesson: "the same bug" can be two different problems. Check that the fix's mechanism —
+  here, that the query only changes visibility — actually holds for each site.
+
+### Nothing exercises the filter against a real DOM, and the CSS is load-bearing [OPEN]
+
+- Attempted: verify the change beyond `tsc` and the unit tests.
+- Symptom: `applyRowFilter` has 11 unit tests, but against a fake container: it covers the
+  matching rule, not the wiring. Three things are unverified and this environment cannot
+  run the app to check them:
+  1. that each row builder stamps the haystack the search is supposed to match on — a
+     builder that forgets `data-filter-text` produces a row that can never be hidden and
+     never matches, silently;
+  2. that `[data-filter-text][hidden] { display: none }` in `app.css` is still the winning
+     rule for every row class it has to hide. A row's own `display` beats the `hidden`
+     attribute, which is why the rule exists, and it wins only while the row rules stay at
+     one class of specificity. `.torrents-items.grid .library-item` is already at three,
+     and only avoids the problem by not declaring `display`. Nothing enforces that.
+  3. that hiding rows instead of rebuilding the list does not leave a reader scrolled past
+     the results. The old code reset the scroll by recreating the list; the new code keeps
+     the position, which is the point, but it means a filter can leave the viewport below
+     the last match.
+- What is needed: the "Search fields keep the caret" check added to
+  `docs/tasks/app-smoothness.md`, run against the app.
+- Lesson: a filter that works by hiding rows has a CSS dependency that no test in this
+  repo can see. When the mechanism is "the DOM already there, plus one rule", say which
+  half is verified and which half is not.
+
+### The Drafts folder's search field would have been left silently inert [FIXED]
+
+- Attempted: move the Mail search field's `oninput` down past the `drafts` early return,
+  so it could close over the list it narrows.
+- Symptom: that early return is *above* where the handler landed, so the Drafts folder's
+  field would have had no handler at all — not a re-render, not a recorded query, nothing.
+  The old code assigned the handler before the branch, so typing in Drafts recorded the
+  query and it applied on the next folder opened. Nothing in the type checker or any test
+  can see a missing event handler, and the folder looks the same either way; found by
+  re-reading the function after the edit, not by running anything.
+- Resolution: the handler is installed where the field is created, closing over a `narrow`
+  that starts as a no-op and is replaced once there is a list to narrow — the same shape
+  the torrents-library renderer uses for its two levels and its own early return. Drafts
+  keeps its old behaviour exactly.
+- Lesson: an early return between "create the control" and "wire the control" is silent.
+  When a handler has to move to close over something built later, install it where the
+  control is created and let the closure be the part that changes.
+
+## 2026-10-18 — App smoothness item 5 (pane-scoped renders)
+
+### A detached element does not keep its scroll position — the carry could not be deleted by re-parenting [FIXED]
+
+- Attempted: the cheapest version of item 5 looked like "keep the `.chat-messages`
+  element across the wipe and put it back in the new pane". That would delete the
+  re-parse without restructuring the shell.
+- Symptom: tested the assumption in a real engine (Chromium 148 via CDP, `about:blank`)
+  before designing around it, rather than reasoning from the spec. Both cases reset to
+  zero and stayed there:
+
+  ```
+  {"aBefore":1234,"aAfter":0,          // remove() then appendChild, same task
+   "bBefore":777,"bDetached":0,"bAfter":0}   // parent.innerHTML = "" then re-append
+  ```
+
+  So re-parenting preserves nothing, and `content-visibility`'s remembered row heights
+  go with it. The only way to keep a scroll box's position is to never detach it, which
+  means its ancestors have to survive the render too — the whole shell.
+- Resolution: the shell (`.shell`) is created once and never wiped; regions are synced
+  inside it. The measurement is recorded in `lib/regions.ts` so the next session does not
+  re-derive it.
+- Lesson: this decided the entire shape of the change, and one browser probe settled it.
+  An hour of restructuring would have bought a pane that still jumped to the top.
+
+### The modal layer was load-bearing on the wipe, and removing the wipe silently stacked dialogs [FIXED]
+
+- Attempted: stop wiping the root, keep the existing modal mount logic as-is.
+- Symptom: `mountModal` appended the freshly built dialog to the root and relied on the
+  wipe having removed the previous pass's copy. With no wipe, every render that had a
+  dialog open would leave the old element in the DOM and add another — one more copy per
+  render, with the stale ones still listening to clicks. Nothing in the code said this,
+  and no type error catches it.
+- Resolution: `mountModal` now removes the same-key element it is replacing (before
+  appending), which is also what the zoom choreography already assumed — a rebuild must
+  not animate. Dialogs the render dropped are still handed to `leaveModal`, which moves
+  them over the fresh UI for the reverse zoom; that path got slightly better, since the
+  element is now still attached when the animation starts.
+- Lesson: `innerHTML = ""` was doing work that nothing declared. Every consumer of "the
+  tree is gone" has to be found before the wipe can be removed.
+
+### A fresh shell would have stranded the unlock screen under it [FIXED]
+
+- Attempted: `ensureShell()` inserts the shell as the root's first child.
+- Symptom: the lock path paints the unlock screen into a wiped root, so on the next
+  unlock there is no shell and the unlock screen is still in the root. Inserting the new
+  shell as first child leaves the unlock screen sitting *under* it, still in the DOM.
+- Resolution: `ensureShell` clears the root when it has to create the shell — no shell
+  means the last frame was not a shell (the unlock or vault-setup screen), and nothing
+  there is worth keeping.
+- Lesson: "create if missing" on a container that is no longer exclusively owned by one
+  writer needs the else-branch spelled out.
+
+### The Chats empty pane would have gone stale, because its key carried no reason [FIXED]
+
+- Attempted: key the chat pane `chat:<nick>` and treat a missing nick as `chat:`.
+- Symptom: the empty pane says one of three different things ("Invite someone to start
+  your first chat" / "Pick a conversation on the left" / "Everyone you know is mail
+  only"). All three share the same nick-less state, so all three would have keyed
+  identically — adding the first trust, or narrowing one to mail-only, would have left
+  the old sentence on screen with `updateMainChat` returning early because there is no
+  nick. Found by reading the builder's own comment, not by a test.
+- Resolution: `chatPaneKey()` encodes which of the three it is. The rule applied
+  afterwards: when a region has an `update`, its key must cover everything the region
+  *decides* on, not just the thing that must be preserved.
+- Lesson: a key that identifies "the same pane" is not the same as a key that identifies
+  "the same rendering". For keyed-and-updated regions the key has to be a signature of
+  the decisions, which is the risk the doc flagged about region scoping in general.
+
+### The doc's four-region split does not map onto the rails [WORKED AROUND]
+
+- Attempted: implement item 5 as written — "rail, list column, active pane, modal layer".
+- Symptom: the shell is not four regions. Reads has three columns (nav, list, main),
+  zines two, torrents one, vault four interchangeable bodies, and the conclaves rail is a
+  two-column pane whose right column is the one that matters. There is no assignment of
+  these to "list column" and "active pane" that holds across rails.
+- Resolution: the model is `rail + N columns`, each column a region, with the modal layer
+  handled separately (it mounts into the root, not the shell). For this slice only two
+  regions carry keys at all — the 1:1 thread and the conclaves pane — and everything else
+  is rebuilt, which is the honest default.
+- Lesson: when a plan doc names a structure ("four regions"), check it against the code
+  before adopting the names; the useful part was the principle (scope the churn), not the
+  inventory.
+
+### Comments across three modules asserted the wipe and became false [FIXED]
+
+- Attempted: leave the surrounding comments alone, since only behaviour changed.
+- Symptom: `app.ts` ("read back before the next wipe", "the shell wipes the root"), and
+  `modalFx.ts` ("the wiped backdrop is handed to `leaveModal`"), and `zineStore.ts` ("the
+  shell wipes the root and rebuilds it") all described a mechanism that no longer exists.
+  A comment that asserts a mechanism is worse than no comment once it is wrong.
+- Resolution: all four updated to describe what the code does now, including the two
+  search fields whose "deferred until pane-scoped renders" notes are still true for a
+  different reason (their list and their modal are still rebuilt).
+- Lesson: grepping for the *name* of the mechanism being removed (`wipe`) finds these;
+  grepping for the symbol that changed does not.
+
+### Nothing exercises the region sync against a real DOM [OPEN]
+
+- Attempted: verify the change beyond `tsc`.
+- Symptom: `planRegionSync` is pure and has 10 unit tests, and `paneScroll` has 6. But
+  `syncRegions`, `rebuildAround`, `syncChatPane`, `updateMainChat`, `syncConclavesPane`,
+  and `updateConclaveDetail` are DOM code with no test — this repo has no DOM test
+  environment (`node --test` on TypeScript, no jsdom). The app cannot be run in this
+  environment either (no display, and the daemon/relay are not up), so no manual pass was
+  possible. Specifically unverified: that the 1:1 message list is genuinely never
+  detached on a render where only the header changed; that the conclave transplant lands
+  the parts in the right order; and that `content-visibility` on the message rows does not
+  move the pinned-to-bottom detection past its 48 px tolerance in practice.
+- What is needed: run the app and work the checklist added to
+  `docs/tasks/app-smoothness.md` ("Pane persistence"), watching
+  `window.__HUSH_RENDER_COUNT__`. Until then, treat the persistence and the
+  `content-visibility` addition as reasoned, not demonstrated.
+- Lesson: for a DOM-level refactor with no DOM test harness, say which specific
+  behaviours are unverified rather than letting a green `tsc` and a green build stand in
+  for a test.
+
+## 2026-10-18 — App smoothness item 4 (idle awareness)
+
+### The parallelization win is smaller than the plan claims [FIXED]
+
+- Attempted: implement item 4's "parallelize or batch `pollRecv`'s sequential awaits —
+  fewer chained round trips is lower latency", then state the result plainly.
+- Symptom: after wiring the `Promise.all`, checked the daemon side. `presenceHeartbeat`,
+  `recv`, and `contacts` all dispatch through the same single worker actor
+  (`account_worker.rs:2239`, `call` over a one-slot channel), so three of the four reads
+  serialize daemon-side no matter how the UI issues them. Only `voice_state` is
+  independent (it reads `state.voices` directly, `main.rs:6569`). So "4 round trips → 1"
+  is not a 4x latency cut; the real gain is the removed UI↔daemon hop between the three
+  worker calls plus the voice read overlapping `recv`'s relay fetch. No benchmark was
+  possible here to size it.
+- Resolution: kept the change (it is strictly no worse and the voice overlap is real),
+  but the item 4 status now says what the change actually buys instead of repeating the
+  plan's unqualified claim.
+- Lesson: a plan's stated mechanism ("fewer chained round trips") is a hypothesis about
+  where the latency lives. Trace the server side before repeating it as the result.
+
+### The planned poll backoff was not free: the poll is what receives messages [FIXED]
+
+- Attempted: implement item 4's "exponential backoff for polls that return unchanged N
+  times in a row", the way the doc frames it — a lever that lowers idle CPU at no cost.
+- Symptom: before writing it, checked what `/api/recv` actually does. It is not a read of
+  a locally buffered inbox; it fetches from the relay over HTTP every call
+  (`crates/hush-core/src/account.rs:4339` builds the queue list and fetches per queue;
+  there is no push connection and nothing buffers arrivals daemon-side). So the UI poll
+  interval *is* the message-receipt latency. Any ceiling on the backoff is a worst-case
+  delay before an arriving message is even pulled down — which contradicts the same
+  item's stated expectation, "state changes land sooner". The doc's plan had the two
+  halves of item 4 pulling in opposite directions and did not notice.
+- Resolution: declined the backoff, with the reasoning recorded in the item 4 status.
+  Parallelization was implemented instead. The user chose this explicitly after being
+  shown the trade-off.
+- Lesson: before implementing a "free" efficiency lever from a plan doc, check the
+  mechanism it sits on. "Poll" here meant "receive", and the plan's author (a previous
+  session) had not traced `/api/recv` to the relay fetch. Surface the conflict rather
+  than implementing the plan literally.
+
+### Parallelizing `pollRecv` could have silently dropped a received page [FIXED]
+
+- Attempted: fold `pollRecv`'s four sequential awaits (heartbeat, `recv`, `contacts`,
+  voice rooms) into one `Promise.all`, as item 4 asks.
+- Symptom: a naive `Promise.all([beat, recv, contacts, voice])` is wrong here. `recv` is
+  the call that *consumes* the inbox — the daemon acks the page it returns. If the
+  heartbeat rejects first, `Promise.all` rejects immediately, the `recv` promise that was
+  already in flight resolves into a discarded value, and those messages are gone from the
+  relay and never reach the UI. Today's sequential code cannot hit this: a heartbeat
+  failure means `recv` is never issued at all. Caught by reasoning about the ordering
+  before running anything, not by a test.
+- Resolution: the heartbeat settles on its own with a local `.catch(() => {})`, outside
+  the group, and is awaited after it; the group holds only reads whose responses are safe
+  to use together (`recv`, `contacts`, voice). Same shape for the mailbox/conclave
+  re-reads, which touch separate stores. `tsc` clean, 124/124 unit tests pass, production
+  build succeeds — but this path is DOM/network wiring with no test harness, so the
+  behavior is reasoned, not exercised.
+- Lesson: "these awaits are independent, parallelize them" fails when one of them has a
+  side effect that cannot be undone by discarding its result. A consuming read must be
+  the one whose result is always awaited.
+
+## 2026-10-18 — App smoothness item 3 (patch background deltas in place)
+
+### The pane patch is verified statically only; no run of the app was possible here [OPEN]
+
+- Attempted: verify item 3 the way the doc's "How we will know it worked" demands —
+  against the running app, not by reading code.
+- Symptom: the patch is DOM wiring plus two pure decisions. The pure decisions are
+  covered (`lib/messageAppend.test.ts`, 13 tests; the new `grewOnly` in
+  `lib/conclaveStore.test.ts`, 7 tests), and `tsc` plus the production build pass. What is
+  NOT covered by any test is the wiring: that `[data-msg-id]` comes back in document
+  order, that the continuing run's old last bubble loses its `tail`, that the day heading
+  repeats exactly when the first paint would repeat it, that a conclave group's
+  `.conclave-body` is where the bubbles go, and that the composer's draft and caret
+  survive its replacement. The app is a Tauri/WebKitGTK webview, so the browser tooling
+  available in this session cannot attach to it, and the dev server alone has no daemon
+  behind it — a browser check would only prove the unlock screen renders.
+- Resolution: not resolved. The remaining checks in the doc's verification section still
+  have to be run against the running app, and the item-3 wiring needs a manual pass:
+  type in an open chat while a presence flip lands, confirm the caret and the draft
+  survive, and confirm the tail and day heading on an appended message match a rebuild.
+- Lesson: extracting the *decision* into a tested pure module is the right seam, but it
+  moves the risk into the wiring, and the wiring is exactly the part this environment
+  cannot exercise. Say so rather than letting "124 tests pass" stand in for "it works".
+
+### A near-no-op edit silently joined two lines of code [FIXED]
+
+- Attempted: insert a new helper above `torPhaseLabel` with `StrReplace`, using the
+  function's doc comment and signature as the anchor.
+- Symptom: the anchor and the replacement differed only by a trailing newline, so the edit
+  deleted that newline and produced `function torPhaseLabel(phase: TorPhase): string {  switch (phase) {`.
+  `tsc` would have caught it, but it would have read as a mystery until then.
+- Resolution: fixed immediately by reading the region back and rewriting both the helper
+  and the signature. No other edit in the slice used an anchor that was a prefix of its
+  replacement.
+- Lesson: after any edit whose old and new strings are nearly identical, read the region
+  back before moving on. A "no-op" diff is a diff.
+
+## 2026-10-18 — Auditing docs/tasks/app-smoothness.md against the code
+
+### Item 6's plane audit is already satisfied in code, but the doc still reads as outstanding [FIXED]
+
+- Attempted: answer "is there something still not done here" by checking each ranked item
+  against the code rather than trusting the doc's per-item status lines.
+- Symptom: item 6 ("daemon allocator hygiene") bundles two things — the allocator lever
+  and an audit that `paper_planes`/`voice_planes` are dropped on room close/lock. The
+  allocator half is genuinely untouched (no `MALLOC_ARENA_MAX`, `mimalloc`, `jemalloc`, or
+  `malloc_trim` anywhere in the repo, including `packaging/`), but the audit half is
+  already done: `paper_planes_shutdown`/`voice_planes_shutdown` on lock
+  (`crates/hush-daemon/src/main.rs:528,533`), `paper_plane_reset` (line 6126) and
+  `voice_plane_drop` (line 6192) removing one plane on close, and the unit test
+  `locking_the_vault_closes_the_paper_planes` (line 9335). The doc had no status line for
+  item 6, so it read as wholly unstarted. Cost one extra grep pass to establish.
+- Resolution: closed by the item-3 slice, which split item 6's status in
+  `docs/tasks/app-smoothness.md` into "allocator: untouched" and "audit: satisfied in
+  code". The runtime behavior of the close paths is still not exercised; the claim rests
+  on the code plus that one unit test, and the status line says so.
+- Lesson: an item that bundles a research task with an implementation task needs a status
+  per half, or a done audit hides behind an undone lever.
+
 ## 2026-10-17 — Conclave chat: the collapsed bubbles and the scroll carry
 
 ### Incoming conclave bubbles collapsed to one character per line [FIXED]
@@ -471,7 +2341,7 @@ go with it. Nothing else in the repo changed.
 
 ## 2026-10-17 — App smoothness slice (render coalescing)
 
-### Rail search fields drop the caret after one character [OPEN]
+### Rail search fields drop the caret after one character [FIXED]
 
 - Attempted: while auditing every `this.render()` call site for the swap to a coalesced
   `scheduleRender()`, classify which sites depend on the render completing synchronously.
@@ -484,12 +2354,14 @@ go with it. Nothing else in the repo changed.
   new tree and re-focusing ("without this the field drops the caret after one character");
   the four rail search fields have no such fix. Not reproduced in the running app —
   inferred from the code plus that comment.
-- Resolution: left unchanged in this slice. Their renders were kept synchronous, so
-  behavior is exactly as before. The fix already exists as a pattern twice over: the
-  Trusts and Zines filters patch the row children in place inside `oninput` and never
-  re-render; the four search fields should adopt that (or be obviated by pane-scoped
-  renders, smoothness doc item 5).
-- Status: OPEN. Pre-existing, not introduced by this slice.
+- Resolution (2026-10-18): the four fields no longer render at all. Each list now draws
+  every row and a keystroke hides the ones that do not match, which is the Trusts and
+  Conclaves pattern the entry named, extracted into `lib/rowFilter.ts` and used by all six
+  filters. A keystroke touches only rows, so the field it came from is still in the
+  document and still has the caret. See the 2026-10-18 section above for what the change
+  cost and what it could not cover.
+- Status: FIXED in code; not verified in a running app (see the 2026-10-18 section).
+  Pre-existing, not introduced by the render-coalescing slice.
 
 ## 2026-10-17 — Runtime memory inspection of the AppImage
 

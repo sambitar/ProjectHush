@@ -2,3 +2,8 @@
 identifier = "allow-chat-sound"
 description = "Play the chat arrival sound through the host audio device"
 commands.allow = ["play_chat_sound"]
+
+[[permission]]
+identifier = "allow-voice-cue"
+description = "Loop or stop the voice call ringtone and ringback tone"
+commands.allow = ["set_voice_cue"]

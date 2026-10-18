@@ -80,10 +80,10 @@ function htmlFromDoc(doc: PMNode): string {
  * Build the draft editor into `container`.
  *
  * Idempotent for the same container: the App builds the host once per draft
- * and re-parents it on every re-render (the shell wipes the root and rebuilds
- * it), so a second call for the same host returns without touching anything.
- * Rebuilding would drop the undo history and the caret, and the caret is where
- * the author was typing.
+ * and re-parents it on every re-render (the Zines rail's pane is rebuilt each
+ * pass, not keyed), so a second call for the same host returns without touching
+ * anything. Rebuilding would drop the undo history and the caret, and the caret
+ * is where the author was typing.
  *
  * `onChange` fires on every document change. It must not re-render the pane:
  * the editor is a third-party view and re-parenting it mid-keystroke is how a

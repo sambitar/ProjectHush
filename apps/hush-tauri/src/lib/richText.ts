@@ -16,6 +16,8 @@
  * cannot re-open for a draft.
  */
 
+import { memoizeLru } from "./memo.ts";
+
 /** Elements removed with their whole subtree: keeping their text would leak
  *  script/style bodies into the message. */
 const DROP_TAGS = new Set([
@@ -82,6 +84,16 @@ const ALLOWED_ATTRS: Record<string, ReadonlySet<string>> = {
 /** Only absolute http(s) and mailto links survive; everything else (notably
  *  `javascript:` and `data:`) is dropped. */
 const SAFE_URL = /^(https?:\/\/|mailto:)/i;
+
+/**
+ * How many flattened bodies `htmlToText` keeps.
+ *
+ * Sized for the working set the mail list redraws in one pass — a long folder —
+ * rather than for the whole store. The map holds a reference to the body string
+ * the store already owns plus the flattened text, so a full cache costs roughly
+ * the size of a few hundred previews, not a few hundred messages.
+ */
+const TEXT_CACHE_MAX = 512;
 
 export function escapeHtml(text: string): string {
   return text
@@ -185,10 +197,30 @@ export function bodyToDisplayHtml(body: string): string {
  *
  * Block boundaries become newlines so a two-paragraph message does not read as
  * one run-on line in the list.
+ *
+ * Memoized, because this is not a string operation. `sanitizeHtml` is a
+ * `DOMParser` document parse, a recursive walk and a serialize; the flattened
+ * result is then parsed again into a `div` and swept twice. Measured in a
+ * browser at ~0.1 ms for a 170-character body with a list and a link, and the
+ * mail list asks for the same body's text twice per row — once for the search
+ * haystack, once for the snippet — on every fill. A 200-message folder was
+ * therefore ~40 ms of main thread per fill, on a path that runs on every mail
+ * reload rather than only when the folder is opened. The body cannot change
+ * under a given string, so the answer is computed once.
  */
+const flattenBody = memoizeLru(parseBodyText, TEXT_CACHE_MAX);
+
 export function htmlToText(html: string): string {
   if (!html) return "";
+  // Plain text is already its own flattening. Returning early keeps the common
+  // case — a body that never went through the rich-text composer — off the
+  // cache entirely, which is also why the cache only ever holds tagged bodies.
   if (!hasHtmlTags(html)) return html;
+  return flattenBody(html);
+}
+
+/** `htmlToText`'s parse, split out so the memo can wrap it. */
+function parseBodyText(html: string): string {
   const div = document.createElement("div");
   div.innerHTML = sanitizeHtml(html);
   for (const br of Array.from(div.querySelectorAll("br"))) {

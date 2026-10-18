@@ -144,14 +144,69 @@ export function paperSession(): PaperSession | null {
   return session;
 }
 
-function stopTimers(s: PaperSession): void {
+/**
+ * Arm the session's polling loops, unless the window is hidden.
+ *
+ * Visibility is read from the document rather than remembered in a flag: the
+ * shell pauses these loops from a `visibilitychange` handler that returns early
+ * while the vault is locked, so a remembered "paused" could outlive the pause
+ * and leave a paper that is opened later with no loops at all.
+ */
+function startLoops(s: PaperSession): void {
+  if (document.visibilityState !== "visible") return;
+  if (s.exists && s.pollTimer === null) {
+    s.pollTimer = window.setInterval(() => void pollPaper(s), PAPER_POLL_MS);
+  }
+  if (s.presenceStarted && s.presencePollTimer === null) {
+    s.presencePollTimer = window.setInterval(
+      () => void pollPresence(s),
+      PAPER_PRESENCE_POLL_MS,
+    );
+  }
+}
+
+/** Stop the session's polling loops, leaving the one-shot flush timers alone. */
+function stopLoops(s: PaperSession): void {
   if (s.pollTimer !== null) window.clearInterval(s.pollTimer);
-  if (s.flushTimer !== null) window.clearTimeout(s.flushTimer);
   if (s.presencePollTimer !== null) window.clearInterval(s.presencePollTimer);
-  if (s.presenceFlushTimer !== null) window.clearTimeout(s.presenceFlushTimer);
   s.pollTimer = null;
-  s.flushTimer = null;
   s.presencePollTimer = null;
+}
+
+/**
+ * Stop polling while the window is hidden, and start again when it is back.
+ *
+ * The loops are the editor's only link to the merged state and to the peers'
+ * cursors, and neither is looked at while the window is away — so leaving them
+ * running is three daemon requests a second for a document nobody can see.
+ *
+ * Nothing is lost by the gap: an edit cannot be made while the window is
+ * hidden, `pollPaper` re-reads the merged state and Yjs folds it idempotently
+ * however much of it is new, and `pollPresence` re-reads the peers whose frames
+ * have not expired. The one-shot flush timers are deliberately left running: an
+ * edit made just before the window went away must still reach the daemon, and
+ * that is a single request rather than a loop.
+ *
+ * Resume polls once immediately, so the document and the cursors are current
+ * before the user looks at them rather than one interval later.
+ */
+export function pausePaperSync(): void {
+  if (session) stopLoops(session);
+}
+
+export function resumePaperSync(): void {
+  const s = session;
+  if (!s) return;
+  startLoops(s);
+  if (s.exists) void pollPaper(s);
+  if (s.presenceStarted) void pollPresence(s);
+}
+
+function stopTimers(s: PaperSession): void {
+  stopLoops(s);
+  if (s.flushTimer !== null) window.clearTimeout(s.flushTimer);
+  if (s.presenceFlushTimer !== null) window.clearTimeout(s.presenceFlushTimer);
+  s.flushTimer = null;
   s.presenceFlushTimer = null;
 }
 
@@ -328,12 +383,7 @@ function startPresence(s: PaperSession, me: string): void {
       schedulePresenceFlush(s);
     },
   );
-  if (s.presencePollTimer === null) {
-    s.presencePollTimer = window.setInterval(
-      () => void pollPresence(s),
-      PAPER_PRESENCE_POLL_MS,
-    );
-  }
+  startLoops(s);
 }
 
 /** One sync pass: pull the merged state and apply what is new. Applying the
@@ -396,10 +446,7 @@ export async function openPaper(conclaveId: string): Promise<PaperSession> {
     }
   }
   if (session.exists) {
-    session.pollTimer = window.setInterval(
-      () => void pollPaper(session as PaperSession),
-      PAPER_POLL_MS,
-    );
+    startLoops(session);
   }
   return session;
 }
@@ -417,10 +464,7 @@ export async function createPaper(
   s.title = created.paper.title;
   s.lastRev = Math.max(s.lastRev, created.revision);
   if (s.pollTimer === null) {
-    s.pollTimer = window.setInterval(
-      () => void pollPaper(s),
-      PAPER_POLL_MS,
-    );
+    startLoops(s);
   }
   return s;
 }

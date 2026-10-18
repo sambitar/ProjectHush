@@ -13,12 +13,12 @@
  * a background refresh can rebuild an open dialog the user never touched.
  * Those remounts must repaint instantly, so `enterModal` is told whether a
  * mount is a fresh open or a silent rebuild. Closing is a full re-render too
- * (a flag clears, `render()` wipes the tree), so the wiped backdrop is handed
- * to `leaveModal`, which reattaches it over the fresh UI, plays the reverse
- * zoom, and removes it. The launch point travels across rebuilds on inline
- * custom properties (`--fx-ox` / `--fx-oy`) that the caller copies from the
- * wiped element to its replacement, so a dialog closed after any number of
- * refreshes still zooms toward where it was opened from.
+ * (a flag clears, and `render()` drops the dialog), so the element the pass
+ * dropped is handed to `leaveModal`, which puts it over the fresh UI, plays the
+ * reverse zoom, and removes it. The launch point travels across rebuilds on
+ * inline custom properties (`--fx-ox` / `--fx-oy`) that the caller copies from
+ * the outgoing element to its replacement, so a dialog closed after any number
+ * of refreshes still zooms toward where it was opened from.
  */
 
 /** The last pointerdown anywhere, with when it happened. */
@@ -65,6 +65,21 @@ export function stampModalOrigin(back: HTMLElement): void {
 }
 
 /**
+ * Carry a dialog's launch point across a rebuild.
+ *
+ * A dialog that has to be rebuilt (its shape moved while it was open) repaints
+ * without the zoom, but the point it first came out of must survive: it is
+ * where the close will collapse back into, and by then the element that was
+ * stamped is long gone. Copied before the outgoing element is removed.
+ */
+export function copyModalOrigin(from: HTMLElement, to: HTMLElement): void {
+  const ox = from.style.getPropertyValue("--fx-ox");
+  const oy = from.style.getPropertyValue("--fx-oy");
+  if (ox) to.style.setProperty("--fx-ox", ox);
+  if (oy) to.style.setProperty("--fx-oy", oy);
+}
+
+/**
  * Play the zoom-in on a freshly mounted dialog. `animate` is false for a
  * rebuild of an already-open dialog, which must repaint without moving.
  */
@@ -79,10 +94,9 @@ export function enterModal(back: HTMLElement, animate: boolean): void {
 }
 
 /**
- * Reverse zoom for a dialog whose render pass just dropped it. The element was
- * wiped with the rest of the tree; reattach it over the fresh UI, collapse it
- * back into its launch point, then take it away. Reduced motion skips the
- * theater — the wipe already did the job.
+ * Reverse zoom for a dialog whose render pass just dropped it. Put it over the
+ * fresh UI, collapse it back into its launch point, then take it away. Reduced
+ * motion skips the theater — the dialog is already out of the tree.
  */
 export function leaveModal(back: HTMLElement): void {
   if (reducedMotion()) return;

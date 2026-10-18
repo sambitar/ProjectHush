@@ -1,4 +1,5 @@
 mod account_worker;
+mod alloc;
 mod notes_store;
 mod paper_data;
 mod voice_data;
@@ -557,8 +558,23 @@ fn install_tls_provider() {
 }
 
 /// libsignal protocol futures are not `Send`; account ops run on a dedicated worker thread.
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// The runtime is built here rather than by `#[tokio::main]` so the allocator is
+/// tuned while the process still has one thread — see `alloc`. The builder is
+/// the same one the attribute uses, and its `block_on` is the whole body.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Logged rather than silently applied: whether the arena cap took effect is
+    // the first thing a latency investigation needs, and it cannot be seen from
+    // outside the process.
+    eprintln!("hush-daemon allocator: {}", alloc::tune_arenas());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+/// The daemon, once there is a runtime to run it on.
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     install_tls_provider();
 
     let hardening = security::harden_process();

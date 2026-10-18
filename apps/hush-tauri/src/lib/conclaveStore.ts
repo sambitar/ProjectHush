@@ -171,8 +171,8 @@ function toInvite(dto: PendingInviteDto): PendingInvite {
 }
 
 /**
- * Everything the Conclaves rail renders, reduced to a comparable string, so the
- * poll can skip a repaint that would steal the caret for nothing.
+ * Everything the list renders, reduced to a comparable string, so the poll can
+ * skip a repaint that would steal the caret for nothing.
  */
 function signature(list: Conclave[]): string {
   return list
@@ -187,16 +187,60 @@ function signature(list: Conclave[]): string {
 }
 
 /**
- * Rebuild the conclave list from the daemon. Returns whether anything changed.
+ * Everything the list renders about a conclave except its messages: the set of
+ * conclaves, their names, their rosters, who convened them, and whether they
+ * have ended. Two loads with the same structure differ only by arriving
+ * messages.
+ */
+function structure(list: Conclave[]): string {
+  return list
+    .map((m) => {
+      const roster = m.trustees.map((t) => `${t.accountId}:${t.state}`).join(",");
+      return `${m.id}:${m.name}:${m.convener}:${roster}:${m.ended}`;
+    })
+    .join("|");
+}
+
+/**
+ * Did this load only add messages to conclaves that were already there?
+ *
+ * True means the list's structure is untouched and no log was pruned, so the
+ * only thing on screen that can have changed is a card's unread number and
+ * preview, or the chat of the open conclave — all of which can be painted in
+ * place. Anything else is a rebuild.
+ */
+function grewOnly(before: Conclave[], next: Conclave[]): boolean {
+  if (structure(before) !== structure(next)) return false;
+  const was = new Map(before.map((m) => [m.id, m.messages.length]));
+  return next.every((m) => m.messages.length >= (was.get(m.id) ?? 0));
+}
+
+/** What a load changed, and whether it was only arrivals. */
+export interface ConclaveLoad {
+  /** Anything the list renders changed. */
+  changed: boolean;
+  /**
+   * Everything that changed was a message arriving in a conclave that already
+   * existed — no conclave added, renamed, ended or pruned, and no roster
+   * change. The caller may then patch the cards and the open chat in place
+   * instead of rebuilding the shell under the reader.
+   */
+  grewOnly: boolean;
+}
+
+/**
+ * Rebuild the conclave list from the daemon. Returns what changed, and whether
+ * the change was only messages arriving (see `ConclaveLoad`).
  *
  * `activeId` is the conclave the user is reading (if any): growth there is
  * the user's own conversation, so it never counts as unread. Growth anywhere
  * else accumulates until that conclave is selected — the notification number
  * the list renders.
  */
-export function loadConclaves(dtos: ConclaveDto[], activeId?: string | null): boolean {
+export function loadConclaves(dtos: ConclaveDto[], activeId?: string | null): ConclaveLoad {
   const next = dtos.map(toConclave);
   const before = signature(conclaves);
+  const grew = grewOnly(conclaves, next);
   if (everLoaded) {
     const seen = new Map(conclaves.map((m) => [m.id, m.messages.length]));
     for (const m of next) {
@@ -215,7 +259,7 @@ export function loadConclaves(dtos: ConclaveDto[], activeId?: string | null): bo
   }
   everLoaded = true;
   conclaves = next;
-  return before !== signature(next);
+  return { changed: before !== signature(next), grewOnly: grew };
 }
 
 /** The pane is the read: selecting a conclave clears its number. */
@@ -247,6 +291,47 @@ export function loadPendingInvites(dtos: PendingInviteDto[]): boolean {
 /** Invitations awaiting an accept or decline, newest first. */
 export function listPendingInvites(): PendingInvite[] {
   return [...pendingInvites].sort((a, b) => b.receivedAt - a.receivedAt);
+}
+
+/** Which shape the Conclaves list column has. */
+export type ConclaveListShape = "empty" | "list";
+
+/**
+ * Whether the Conclaves column should show its empty state, or the list.
+ *
+ * Two callers need to agree on this and they are the two that can disagree
+ * without anyone noticing: the column's first paint, which draws one shape or the
+ * other, and the patch that paints an arriving invitation, which has to say
+ * whether the shape it found on screen is still the right one. An invitation
+ * arriving into the empty state changes the shape, and a rebuild is what draws
+ * that; nothing arriving into the empty state means there is nothing to paint.
+ */
+export function conclaveListShape(
+  conclaves: number,
+  invites: number,
+): ConclaveListShape {
+  return conclaves === 0 && invites === 0 ? "empty" : "list";
+}
+
+/**
+ * Whether the invitation cards on screen are the ones the store is holding, in
+ * the order it holds them.
+ *
+ * The patch that paints invitations asks this before touching the box. Its cards
+ * carry the buttons the user is about to press, and a background delta with
+ * nothing to do with invitations — a presence flip, an unread count — runs that
+ * patch many times for every time one actually arrives. Equal means leave the
+ * box exactly where it is; anything else means it has to be redrawn, because a
+ * card the store no longer holds is a card that can no longer be answered.
+ */
+export function invitesAreCurrent(
+  rendered: readonly string[],
+  pending: readonly PendingInvite[],
+): boolean {
+  return (
+    rendered.length === pending.length &&
+    rendered.every((id, i) => id === pending[i].conclaveId)
+  );
 }
 
 function toIntroRequest(dto: PendingIntroRequestDto): PendingIntroRequest {

@@ -907,8 +907,10 @@
   white-space: nowrap;
 }
 
-/* The button's own display would beat [hidden] (same as .trust-row and
-   .conclave-card below); restate it so the mic disappears when voice is off. */
+/* The button's own display would beat [hidden]; restate it so the mic
+   disappears when voice is off. (The row filter's restatement, which covers
+   every row it can hide, is keyed on `[data-filter-text]` at the end of this
+   file.) */
 .voice-led-btn[hidden] {
   display: none;
 }
@@ -1836,11 +1838,6 @@
   margin: var(--space-4) var(--space-5) var(--space-2);
 }
 
-/* A row's own display would beat [hidden]; restate it so the filter works. */
-.trust-row[hidden] {
-  display: none;
-}
-
 .trusts-filter-empty {
   padding: 0 var(--space-5) var(--space-5);
 }
@@ -2147,11 +2144,6 @@
   width: 100%;
   text-align: left;
   cursor: pointer;
-}
-
-/* The card's own display would otherwise beat [hidden] in the filter. */
-.conclave-card[hidden] {
-  display: none;
 }
 
 .conclave-card.selected {
@@ -5829,10 +5821,12 @@ fieldset.chat-history-section {
    last rendered height; the bare length is the estimate used before a
    row's first render, so the scrollbar stays plausible immediately.
 
-   Message panes (.chat-messages, .conclave-messages) are deliberately
-   excluded: their scroll-carry logic reads scrollHeight on every
-   rebuild and needs real heights until rendering is pane-scoped — see
-   docs/tasks/app-smoothness.md, item 2. */
+   Message panes joined this set once pane-scoped rendering landed:
+   their rows are no longer recreated on every render, so the heights
+   the containment rule remembers survive, which is what the
+   pinned-to-bottom check needs — it reads `scrollHeight`, and a
+   remembered height is the real one. Day separators are left out: they
+   are short and constant, and estimating them would only skew the sum. */
 
 .conv-rows > *,
 .mail-list > *,
@@ -5841,6 +5835,23 @@ fieldset.chat-history-section {
 .torrents-items > * {
   content-visibility: auto;
   contain-intrinsic-size: auto 72px;
+}
+
+.chat-messages > .bubble-group,
+.conclave-messages > .bubble-group {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
+}
+
+/* ------------------------------------------------------------------ */
+/* The row filter's one CSS dependency. A row's own `display` beats the
+   `hidden` attribute, so a row that the filter hides has to restate it.
+   Done once here, keyed on the attribute that marks a row as filterable,
+   rather than once per row class: Chats, Mail, Drops, the torrents
+   library, Trusts, and Conclaves all hide rows the same way. */
+
+[data-filter-text][hidden] {
+  display: none;
 }
 
 

@@ -190,6 +190,7 @@ pub fn run() {
             drops::drops_tor_start,
             drops::drops_tor_stop,
             sound::play_chat_sound,
+            sound::set_voice_cue,
             irc::commands::connect_server,
             irc::commands::disconnect_server,
             irc::commands::join_channel,
@@ -353,7 +354,10 @@ mod tests {
     ///
     /// Hand-parsed rather than with a TOML crate: the value is a flat array of
     /// quoted strings, and the shape is asserted below so a parser that silently
-    /// matched nothing fails loudly instead of passing.
+    /// matched nothing fails loudly instead of passing. A file may hold several
+    /// `[[permission]]` blocks, each with its own array, so every array is read
+    /// and not just the first — reading one made a permission that lives in a
+    /// second block invisible to this guard.
     fn permitted_commands(dir: &Path) -> BTreeSet<String> {
         let mut files: Vec<PathBuf> = fs::read_dir(dir)
             .unwrap_or_else(|e| panic!("permissions/ at {dir:?} is readable: {e}"))
@@ -366,32 +370,43 @@ mod tests {
         let mut allowed = BTreeSet::new();
         for path in files {
             let text = fs::read_to_string(&path).expect("a permission file reads");
-            let Some(start) = text.find("commands.allow") else {
-                continue;
-            };
-            let open = text[start..]
-                .find('[')
-                .map(|i| start + i)
-                .unwrap_or_else(|| panic!("{}: commands.allow has no array", path.display()));
-            let close = text[open..]
-                .find(']')
-                .map(|i| open + i)
-                .unwrap_or_else(|| panic!("{}: commands.allow array is unclosed", path.display()));
+            let mut rest = text.as_str();
+            let mut arrays = 0;
+            while let Some(start) = rest.find("commands.allow") {
+                let open = rest[start..]
+                    .find('[')
+                    .map(|i| start + i)
+                    .unwrap_or_else(|| panic!("{}: commands.allow has no array", path.display()));
+                let close = rest[open..]
+                    .find(']')
+                    .map(|i| open + i)
+                    .unwrap_or_else(|| {
+                        panic!("{}: commands.allow array is unclosed", path.display())
+                    });
 
-            let before = allowed.len();
-            for entry in text[open + 1..close].split('"').skip(1).step_by(2) {
-                let name = entry.trim();
+                let mut named = 0;
+                for entry in rest[open + 1..close].split('"').skip(1).step_by(2) {
+                    let name = entry.trim();
+                    assert!(
+                        !name.is_empty(),
+                        "{}: an empty command name in commands.allow",
+                        path.display()
+                    );
+                    allowed.insert(name.to_string());
+                    named += 1;
+                }
                 assert!(
-                    !name.is_empty(),
-                    "{}: an empty command name in commands.allow",
+                    named > 0,
+                    "{}: a commands.allow array parsed to nothing — the parser is out of \
+                     date with the file, not the file with the parser",
                     path.display()
                 );
-                allowed.insert(name.to_string());
+                arrays += 1;
+                rest = &rest[close + 1..];
             }
             assert!(
-                allowed.len() > before,
-                "{}: commands.allow parsed to nothing — the parser is out of date \
-                 with the file, not the file with the parser",
+                arrays > 0,
+                "{}: no commands.allow — a permission file must name the commands it allows",
                 path.display()
             );
         }

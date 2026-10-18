@@ -5,11 +5,13 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-request-user-attention",
     "allow-hush-files",
     "allow-hush-url",
     "allow-hush-api",
     "allow-drops",
     "allow-chat-sound",
+    "allow-voice-cue",
     "allow-irc",
     "updater:default",
     "process:allow-restart"
