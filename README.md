@@ -31,6 +31,33 @@ repository, so a fresh clone relies on the system copy. When `protoc` is missing
 `cargo build` and the run scripts print the install lines instead of failing
 inside prost-build.
 
+## Install the desktop app
+
+Release builds are published to `https://hushrelay.space/updates/` — the repository
+is private, so GitHub cannot serve them (see **Relays**). Linux ships as an
+AppImage, which is the one artifact the updater can replace in place.
+
+An AppImage installs nothing. A freshly downloaded copy therefore has no menu entry
+and no icon the desktop can find: the `.desktop` file and the PNGs live inside the
+file, and `AppRun` puts them on `XDG_DATA_DIRS` for the app's own processes only,
+never for the shell that draws the launcher. Register it once:
+
+```
+chmod +x ~/Applications/Hush_0.5.0_amd64.AppImage
+./scripts/install-appimage-desktop.sh
+```
+
+That copies the entry and the icons into `~/.local/share`, which is where the
+launcher already looks, and points `Exec` at the AppImage file so the app keeps
+updating itself in place. No root and no package are involved. `--dry-run` shows
+what it would write; `--uninstall` reverses it.
+
+Skipping this step is why the icon shows on one machine and not another. With no
+desktop entry visible to the shell, KDE Plasma falls back to the window's own icon
+on X11 and still shows the mark, while GNOME Shell has no such fallback and draws a
+placeholder. On Wayland there is no window icon at all, so neither desktop shows it
+until the entry is in place.
+
 ## Run it
 
 One vault, one daemon, one window. With no vault on the device, the window opens

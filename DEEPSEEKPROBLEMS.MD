@@ -120,6 +120,136 @@ resolution, and the status.
 - Lesson: an assertion that fails should be re-read as a claim about the code *or* about the
   assertion. A gap that equals `clientHeight` exactly is the harness, not the product.
 
+## 2026-10-17 — The Linux launcher icon: which desktop environment resolves it
+
+Started as an investigation and ended with one new script
+(`scripts/install-appimage-desktop.sh`) plus the README and RELEASING.md notes that
+go with it. Nothing else in the repo changed.
+
+### The launcher/taskbar icon is resolved by the shell, and GNOME has no fallback where KDE does [FIXED]
+
+- Attempted: explain a user report that the Hush logo shows on one Linux install and not on
+  another, and whether the icon genuinely differs between GNOME and KDE.
+- Symptom, from the built bundle. The generated desktop entry
+  (`target/release/bundle/appimage/Hush.AppDir/usr/share/applications/Hush.desktop`, and the same
+  file inside the published `Hush_0.2.0_amd64.AppImage`) is:
+
+  ```
+  [Desktop Entry]
+  Categories=
+  Exec=hush-tauri
+  StartupWMClass=hush-tauri
+  Icon=hush-tauri
+  Name=Hush
+  Terminal=false
+  Type=Application
+  ```
+
+  The desktop file is named `Hush.desktop`; the icon name and the WM class are `hush-tauri`.
+  Nothing is installed into a system icon theme: the only copies of `hush-tauri.png` live inside
+  the AppImage at `usr/share/icons/hicolor/{32x32,128x128,256x256@2,512x512}/apps/`. `AppRun`
+  prepends the AppDir to `XDG_DATA_DIRS` (`strings AppRun` → `XDG_DATA_DIRS=%s/usr/share/:%s`),
+  which reaches the app's own process tree only. The session's `XDG_DATA_DIRS` on this host is
+  `/usr/share/ubuntu:/usr/share/gnome:/home/sam/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/:/var/lib/snapd/desktop`
+  — no AppDir — and there is no `*ush*` desktop file or icon anywhere in the shell's search path.
+- Verified with `WAYLAND_DEBUG=1`: GTK3 sets `xdg_toplevel.set_app_id("hush-tauri")`, taken from
+  `g_get_prgname()` (the `argv[0]` basename). It is *not* affected by the GDK program class or by
+  a `GtkApplication` application ID — a probe with `Gdk.set_program_class("com.hush.capsule")` and
+  one with `Gtk.Application(application_id="com.hush.capsule")` both still emitted
+  `set_app_id("hush-tauri")`. So `enableGTKAppId` does not change the Wayland app_id; the
+  `StartupWMClass=hush-tauri` line the bundler writes is what makes the entry matchable.
+- Why GNOME and KDE then differ. With no desktop file visible to the shell, GNOME Shell's
+  `get_app_from_window_wmclass` (`gnome-shell/src/shell-window-tracker.c`) tries the WM class
+  against `StartupWMClass` and then against `.desktop` ids, and returns `NULL` when both miss —
+  there is no further fallback, so the window draws the generic placeholder. Plasma's task
+  manager keeps the window's own icon as a fallback (`PlasmaWindow::icon` serving "only as a
+  fallback" in `plasma-workspace` commit `a87f619`, the same way `KWindowSystem::icon` reads
+  `_NET_WM_ICON` on X11), and Tauri does set a window icon on Linux — `tauri-codegen` embeds
+  `bundle.icon`'s first `.png` (currently `icons/32x32.png`) as `default_window_icon`, which
+  `manager/window.rs` puts on the window builder. So KDE can still show the logo on X11 where
+  GNOME cannot. On a native Wayland session there is no `_NET_WM_ICON` at all, so that fallback
+  is empty too and neither desktop shows it.
+- Resolution: FIXED for a user who runs the new step, by
+  `scripts/install-appimage-desktop.sh`. It extracts the AppImage without FUSE,
+  copies `Hush.desktop` into `~/.local/share/applications` and every
+  `hicolor/<size>/apps/*.png` into `~/.local/share/icons/hicolor/`, rewrites only
+  `Exec=` (the bundle names the binary inside the mount, which exists only while the
+  AppImage runs) and adds `TryExec=` plus an `X-Hush-AppImage=` marker so
+  `--uninstall` is exact. Evidence from the run on this host: the entry validates,
+  `Gtk.IconTheme.lookup_icon("hush-tauri", 128, 0)` returns
+  `~/.local/share/icons/hicolor/128x128/apps/hush-tauri.png`, and
+  `Gio.AppInfo.get_all()` reports `id=Hush.desktop`, `icon=['hush-tauri', …]`,
+  `startup_wm_class=hush-tauri` — the icon name and the WM class the shell needs to
+  match. `--uninstall` was exercised and leaves nothing behind; re-running is a no-op.
+- Residual, still open: the release job does not do this, and cannot — it is a
+  per-user step, so a downloaded AppImage is iconless until someone runs the script.
+  README ("Install the desktop app") and RELEASING.md ("Platform notes") now say so.
+- Residual, still open: `Categories=` is empty in the generated entry, so the menu
+  entry lands under "Other" in GNOME and "Lost & Found" in Plasma. The installer
+  passes the bundle's keys through unchanged on purpose — one source of truth for the
+  entry — so this needs fixing in the bundler, not here.
+- Not verified: no KDE host was available, so the Plasma fallback is read from the
+  Plasma sources and the Tauri code path, not observed. The GNOME half and the whole
+  install path were measured on this machine.
+- Lesson: on Linux the launcher icon is not a property of the app. It is a *name* looked up in
+  the shell's own data directories, and whether that lookup has a second chance is per-desktop.
+  An AppImage that installs nothing is at the mercy of whichever desktop is running.
+
+### Assumed GTK needed `index.theme` in the AppImage's hicolor tree; it does not [FIXED]
+
+- Attempted: account for the missing icon by the AppImage's `usr/share/icons/hicolor/` carrying no
+  `index.theme` and no `icon-theme.cache`, unlike `/usr/share/icons/hicolor/index.theme`.
+- Symptom: plausible against the icon-theme spec — a theme directory without `index.theme` is not
+  a theme — and it survived until it was tested. Probe: a PNG placed in a synthetic
+  `hicolor/128x128/apps/` with no `index.theme`, that tree on `XDG_DATA_DIRS`, then
+  `Gtk.IconTheme.lookup_icon` under GTK 3.0:
+
+  ```
+  gtk3.0  probeicon    -> FOUND /tmp/icontest/noindex/usr/share/icons/hicolor/128x128/apps/probeicon.png
+  ```
+
+- Resolution: FIXED — the assumption is withdrawn. GTK3 resolves an icon from a `hicolor` tree with
+  no `index.theme`, so the missing file is not the cause and the tree does not need patching. The
+  cause is that the tree is absent from the *shell's* `XDG_DATA_DIRS`, which is the entry above.
+- Lesson: the icon-theme spec says what a tool is supposed to do; GTK does more than that. Test the
+  lookup before blaming the directory layout.
+
+### A failing last command in a function called through `$(...)` exits the script with no message [FIXED]
+
+- Attempted: find where `scripts/install-appimage-desktop.sh` should look for an AppImage, written
+  as `[[ -n "$best" ]] && printf '%s\n' "$best"` at the end of the helper.
+- Symptom: with nothing found, the script exited 1 before printing the "No Hush AppImage given"
+  message it has for exactly that case. The helper's exit status becomes the status of the
+  assignment (`APPIMAGE="$(newest_appimage)"`), and `set -e` treats a failed assignment as fatal.
+  Isolated:
+  ```
+  $ bash -c 'set -e; f(){ [[ -n "" ]] && echo x; }; x=$(f); echo "after assignment"'
+  $ echo $?
+  1
+  ```
+  Note the asymmetry that made this easy to miss: `((0)) && return 0` as a *statement* inside a
+  function does not trip `set -e` — the failing command is in an `&&` list and is not the command
+  following the final `&&`. Only the status escaping through the command substitution does.
+- Resolution: FIXED. Every helper used in a command substitution now ends in a command that cannot
+  fail (`if …; then printf; fi`, explicit `return 0`), and the guard is commented so the next edit
+  does not reintroduce it. Same fix applied to `installed_entries`.
+- Lesson: under `set -e`, `$(helper)` makes the helper's last statement part of the caller's error
+  handling. Helpers used that way need an unconditional exit status, or a silent early exit is the
+  failure mode.
+
+### `/dev/stdout` is not a usable redirect target in this environment [FIXED]
+
+- Attempted: implement `--dry-run` by writing the generated desktop entry to `/dev/stdout` so the
+  same `write_entry` function served both the real and the preview path.
+- Symptom: `./scripts/install-appimage-desktop.sh: line 171: /dev/stdout: No such device or
+  address`, exit 1, and the preview never printed. The redirection target is resolved by the shell
+  in this sandbox, where `/dev/stdout` does not point at a usable file, so this is a tooling
+  limitation rather than a bug in the script's logic.
+- Resolution: FIXED. The dry run writes to a preview file inside the script's own temp directory and
+  prints it with the `$(<file)` builtin. That is also easier to reason about than a special device.
+- Lesson: a `/dev/*` redirect target is environment-dependent. When a preview and a real write
+  should share one code path, give the shared function a normal file to write to.
+
 ## 2026-10-17 — Release v0.5.0 (Actions minutes exhausted)
 
 ### The mirror workflow could not start, so the relay was mirrored by hand [WORKED AROUND]

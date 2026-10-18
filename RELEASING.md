@@ -452,6 +452,11 @@ endpoint is baked into the binary.
   refuses the download, because an AppImage is not a deb. So the `.deb` the
   workflow publishes is for first installs; point anyone who wants in-place
   updates at the AppImage.
+  A downloaded AppImage also has to be registered with the desktop before it has
+  a menu entry or an icon the shell can resolve — `scripts/install-appimage-desktop.sh`
+  does that, and README's "Install the desktop app" explains why the icon shows on
+  some desktops and not others without it. It is a per-user step, so it is not part
+  of the release job; the AppImage cannot do it for itself.
 - **Windows: not built.** The leg is out of the matrix because the daemon cannot
   be built for Windows yet. It listens on a Unix socket —
   `tokio::net::UnixListener`, which does not exist on Windows; the build fails
