@@ -1,7 +1,10 @@
 # App smoothness — making Hush feel light
 
-**Status:** Backlog. Diagnosis grounded in code as of 2026-10-17; memory figures measured
+**Status:** Partially implemented 2026-10-17 (items 1, 2 in part, 4 in part — see each
+item's status). Diagnosis grounded in code as of 2026-10-17; memory figures measured
 the same day against the running `Hush_0.2.0_amd64.AppImage` (app v0.3.1 code).
+Verification so far is static (`tsc`, production build, 83/83 unit tests); the running-app
+checks in "How we will know it worked" are still pending.
 
 **Goal:** The app should *feel* light: typing and scrolling never stutter, background
 traffic never disturbs what the user is doing, the CPU idles when the user idles, and
@@ -72,6 +75,16 @@ scroll path.
 
 Expected: typing and scrolling stop competing with rebuilds; double-render wastes gone.
 
+**Status: DONE (2026-10-17).** `scheduleRender()` (user actions, rAF),
+`scheduleBackgroundRender()` (polls/store subscriptions, 100 ms trailing batch), and
+`flushRender()` live just after `render()` in `app.ts`; the batch length is
+`RENDER_BATCH_MS` in `lib/constants.ts`. All call sites swapped, except eight that
+stay synchronous on purpose: the two unlock-zoom sites (they measure a DOM rect, then
+need the new tree mounted in the same tick for `flyMarkToRail`), the four rail search
+fields and the atproto explore search (their caret survival is only guaranteed with
+the wipe in the same tick — and their caret loss after one character is a pre-existing
+bug, logged in `DEEPSEEKPROBLEMS.MD`), and the scheduler's own internals.
+
 ### 2. `content-visibility: auto` on long list rows
 
 One CSS rule per long list (chat history, conclave messages, mail list, torrents
@@ -81,6 +94,15 @@ without JS, supported by WebKitGTK ≥ 2.40.
 
 Expected: long panes stop costing O(n) per rebuild and per scroll; the biggest
 "lighter on modest hardware" lever for near-zero risk.
+
+**Status: PARTIAL (2026-10-17).** Applied to `.conv-rows`, `.mail-list`, `.reads-list`,
+`.zines-grid`, and `.torrents-items` rows (block at the end of `app.css`). The local
+WebKitGTK is 2.52.6, so the feature is live, not a graceful no-op. The message panes
+(`.chat-messages`, `.conclave-messages`) are deliberately excluded for now: their
+scroll-carry logic reads `scrollHeight` on every rebuild, and since every rebuild also
+recreates the rows from scratch, the remembered intrinsic sizes reset each time —
+estimate error could push the pinned-to-bottom detection past its 48 px tolerance.
+They join when pane-scoped rendering (item 5) stops recreating rows.
 
 ### 3. Patch in place for background-only changes
 
@@ -104,6 +126,14 @@ Expected: hover states, selections, and focus survive background traffic entirel
 
 Expected: idle CPU near zero, quieter fan, lower battery draw — the machine sounds as
 light as the UI looks; state changes land sooner.
+
+**Status: PARTIAL (2026-10-17).** The visibility listener now lives in the `App`
+constructor (once, instead of re-registered on every unlock cycle as before): while
+hidden, the recv, Tor-pill, and drops timers all stop; on visible they restart, the
+return is treated as a fresh read, and one coalesced render repaints from live state.
+Still open: the unchanged-streak backoff and parallelizing `pollRecv`'s sequential
+awaits. (The torrents store already polls adaptively with pane-open gating — no work
+needed there.)
 
 ### 5. Pane-scoped renders (structural)
 

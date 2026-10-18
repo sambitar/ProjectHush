@@ -131,7 +131,12 @@ import {
   toggleReaction,
   unreadTotal,
 } from "./lib/chatStore";
-import { MAX_FILE_BYTES, RECV_POLL_MS, STARTUP_UPDATE_DELAY_MS } from "./lib/constants";
+import {
+  MAX_FILE_BYTES,
+  RECV_POLL_MS,
+  RENDER_BATCH_MS,
+  STARTUP_UPDATE_DELAY_MS,
+} from "./lib/constants";
 import { invoke } from "@tauri-apps/api/core";
 import { isTauriShell } from "./lib/tauriEnv";
 import { playChatSound } from "./lib/chatSound";
@@ -571,6 +576,10 @@ export class App {
    * the scroll capture — the twin of `renderedNick` for chats. */
   private renderedConclaveId: string | null = null;
   private pollTimer: number | null = null;
+  /** Pending rAF handle for a coalesced render; null when none is queued. */
+  private renderRaf: number | null = null;
+  /** Pending trailing timer for a coalesced background render. */
+  private renderDelayTimer: number | null = null;
   private unlockedAt = 0;
   /** Relay-switch poller and last-seen state, so the pill repaints only on change. */
   private torPillTimer: number | null = null;
@@ -1094,6 +1103,29 @@ export class App {
 
   constructor(root: HTMLElement) {
     this.root = root;
+    // Registered once, here — startPoll runs again after every unlock cycle,
+    // and a listener registered there would accumulate. Hidden: the shell has
+    // no reader, so the interval timers stop and the CPU sleeps while the
+    // window is away. Visible: restart them, and treat the return as a fresh
+    // read — the conversation on screen opens on its newest message, so
+    // arriving messages are where the reader looks for them.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") {
+        this.stopPoll();
+        this.stopTorPoll();
+        this.stopDropsPoll();
+        return;
+      }
+      if (!this.status || this.status.locked) return;
+      this.startPoll();
+      if (this.rail === "drops") this.startDropsPoll();
+      if (this.rail === "chats" && this.selectedNick) {
+        this.bottomOnNextChatRender = true;
+      }
+      // The scheduled render repaints from live state and restarts the Tor
+      // pill poll on the way through render().
+      this.scheduleRender();
+    });
   }
 
   async start(): Promise<void> {
@@ -1128,7 +1160,7 @@ export class App {
       // Never clobber the Add field while the user is typing in it.
       const ae = document.activeElement;
       if (ae instanceof HTMLInputElement && ae.closest(".torrents-pane")) return;
-      this.render();
+      this.scheduleBackgroundRender();
     });
     subscribeWallet(() => {
       if (this.rail !== "vault" || !this.walletOpen) return;
@@ -1141,7 +1173,7 @@ export class App {
       if (ae instanceof HTMLInputElement && ae.closest(".wallet-pane")) return;
       if (ae instanceof HTMLTextAreaElement && ae.closest(".wallet-pane")) return;
       if (this.walletPhrase) return;
-      this.render();
+      this.scheduleBackgroundRender();
     });
     // IRC: the pane patches its own DOM, so this only keeps the rail badge
     // honest. While the rail is up the badge is patched in place; otherwise a
@@ -1155,7 +1187,7 @@ export class App {
       if (this.rail === "irc") {
         this.updateIrcRailBadge(total, mentions);
       } else {
-        this.render();
+        this.scheduleBackgroundRender();
       }
     });
     document.addEventListener("keydown", (e) => {
@@ -1174,7 +1206,7 @@ export class App {
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
         e.preventDefault();
         this.paletteOpen = !this.paletteOpen;
-        this.render();
+        this.scheduleRender();
       }
       // Ctrl+L / Cmd+L locks the vault from anywhere — the password-manager
       // convention, so a panic lock does not require finding the Vault page
@@ -1209,14 +1241,14 @@ export class App {
         this.torrentsDeleteId = null;
         // The IRC pane owns its own dialogs and menus; a repaint would drop
         // the caret out of its input for no reason.
-        if (this.rail !== "irc") this.render();
+        if (this.rail !== "irc") this.scheduleRender();
       }
     });
     // IRC runs its own sockets; wiring it up here (rather than on first visit
     // to the rail) means unread counts and live connections survive a switch.
     await initIrcStore();
     await this.refreshStatus();
-    this.render();
+    this.scheduleRender();
     this.startUpdateProbe();
   }
 
@@ -1236,14 +1268,14 @@ export class App {
       if (!version) return;
       this.appVersion = version;
       if (this.rail === "settings" && this.settingsSection === "about") {
-        this.render();
+        this.scheduleRender();
       }
     });
     window.setTimeout(() => {
       void checkForUpdates({ silent: true }).then((outcome) => {
         if (outcome.kind !== "available") return;
         this.pendingUpdate = outcome.update;
-        this.render();
+        this.scheduleRender();
       });
     }, STARTUP_UPDATE_DELAY_MS);
   }
@@ -1253,7 +1285,7 @@ export class App {
     if (this.updateCheckBusy) return;
     this.updateCheckBusy = true;
     this.updateNote = null;
-    this.render();
+    this.scheduleRender();
     const outcome = await checkForUpdates();
     this.updateCheckBusy = false;
     if (outcome.kind === "available") {
@@ -1267,7 +1299,7 @@ export class App {
         error: true,
       };
     }
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -1287,7 +1319,7 @@ export class App {
       percent: null,
       installing: false,
     };
-    this.render();
+    this.scheduleRender();
     try {
       await downloadAndInstallUpdate((p) => {
         this.updateProgress = p;
@@ -1299,7 +1331,7 @@ export class App {
       const message = e instanceof Error ? e.message : "The update failed.";
       this.closeUpdatePrompt();
       this.updateNote = { text: message, error: true };
-      this.render();
+      this.scheduleRender();
       showToast(message, { kind: "error" });
       await discardPendingUpdate();
     }
@@ -1308,7 +1340,7 @@ export class App {
   /** Close the prompt and let go of the backend's update handle. */
   private async dismissUpdatePrompt(): Promise<void> {
     this.closeUpdatePrompt();
-    this.render();
+    this.scheduleRender();
     await discardPendingUpdate();
   }
 
@@ -1482,16 +1514,6 @@ export class App {
   private startPoll(): void {
     if (this.pollTimer) return;
     this.pollTimer = window.setInterval(() => this.pollRecv(), RECV_POLL_MS);
-    // Coming back to the window is a fresh read: the conversation on screen
-    // opens on its newest message instead of where the window happened to be
-    // left, so arriving messages are where the reader looks for them.
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState !== "visible") return;
-      if (this.rail === "chats" && this.selectedNick) {
-        this.bottomOnNextChatRender = true;
-        this.render();
-      }
-    });
   }
 
   /** Pull the whole mailbox: messages and drafts arrive together so the two
@@ -1542,7 +1564,7 @@ export class App {
       this.contacts = fresh;
       setKnownContacts(fresh.map((c) => c.nickname));
       if (!r) {
-        if (presenceChanged) this.render();
+        if (presenceChanged) this.scheduleBackgroundRender();
         return;
       }
       for (const w of r.warnings) this.announce(w);
@@ -1604,7 +1626,7 @@ export class App {
         (r.messages.length || presenceChanged || mailboxChanged || conclavesChanged) &&
         !editing
       ) {
-        this.render();
+        this.scheduleBackgroundRender();
       }
     } catch {
       /* daemon busy */
@@ -1729,7 +1751,7 @@ export class App {
     this.unlockedAt = 0;
     this.stopPoll();
     await this.refreshStatus();
-    this.render();
+    this.scheduleRender();
   }
 
   private render(): void {
@@ -2001,6 +2023,48 @@ export class App {
     }
   }
 
+  /**
+   * Coalesced render entry point. Any number of calls between two frames
+   * become one rebuild, on the frame boundary: user actions never wait more
+   * than one frame, and a burst of state changes (a send plus its echo, an
+   * open plus its data) costs one rebuild instead of one each. The
+   * synchronous `render()` remains for the few paths that must repaint
+   * before yielding (status transitions, the lock screen).
+   */
+  private scheduleRender(): void {
+    this.flushRender();
+  }
+
+  /**
+   * The poll-driven twin of `scheduleRender`. Background traffic is worth a
+   * short trailing delay: a presence flip and a message arrival often land
+   * in the same second, and each alone would buy a full rebuild. A user
+   * action that renders meanwhile paints the batched state too, so its
+   * render cancels the pending timer rather than queueing behind it.
+   */
+  private scheduleBackgroundRender(): void {
+    if (this.renderDelayTimer !== null) return;
+    this.renderDelayTimer = window.setTimeout(() => {
+      this.renderDelayTimer = null;
+      this.flushRender();
+    }, RENDER_BATCH_MS);
+  }
+
+  /** At most one rebuild is ever in flight; the next frame paints whatever
+   *  the state holds by then, so collapsing callers need no bookkeeping. */
+  private flushRender(): void {
+    if (this.renderRaf !== null) return;
+    this.renderRaf = window.requestAnimationFrame(() => {
+      this.renderRaf = null;
+      // The queued background batch is painted by this same rebuild.
+      if (this.renderDelayTimer !== null) {
+        clearTimeout(this.renderDelayTimer);
+        this.renderDelayTimer = null;
+      }
+      this.render();
+    });
+  }
+
   private async maybeShowRecoveryCode(): Promise<void> {
     try {
       const pending = await api.recoveryPending();
@@ -2032,7 +2096,7 @@ export class App {
       await api.recoveryAcknowledge();
       this.recoveryModalCode = null;
       await this.refreshStatus();
-      this.render();
+      this.scheduleRender();
     };
     modal.append(pre, btn);
     back.appendChild(modal);
@@ -2386,17 +2450,19 @@ export class App {
         // pending edits flush before the timers stop.
         this.leavePaperTab();
       }
-      this.render();
+      this.scheduleRender();
       // The Mail rail reads the encrypted log, so pick up anything that landed
       // while another rail was showing.
       if (id === "mail") {
         void this.reloadMailbox().then((changed) => {
-          if (changed && this.rail === "mail" && !this.mailComposeOpen) this.render();
+          if (changed && this.rail === "mail" && !this.mailComposeOpen)
+            this.scheduleBackgroundRender();
         });
       }
       if (id === "conclaves") {
         void this.reloadConclaves().then((changed) => {
-          if (changed && this.rail === "conclaves" && !this.conclaveCreateOpen) this.render();
+          if (changed && this.rail === "conclaves" && !this.conclaveCreateOpen)
+            this.scheduleBackgroundRender();
         });
       }
       if (id === "zines") {
@@ -2412,14 +2478,14 @@ export class App {
         // have changed elsewhere / while locked only the built-in shows).
         void getReadsSources().then((sources) => {
           this.readsSources = sources;
-          if (this.rail === "reads") this.render();
+          if (this.rail === "reads") this.scheduleBackgroundRender();
         });
         if (!this.readsStories.length && !this.readsLoading) void this.readsLoad();
       }
       if (id === "torrents") {
         // The pipeline may have advanced while another rail was up.
         void refreshTorrents().then(() => {
-          if (this.rail === "torrents") this.render();
+          if (this.rail === "torrents") this.scheduleBackgroundRender();
         });
       }
       if (id === "vault") {
@@ -2427,7 +2493,8 @@ export class App {
         void this.notesEnsureLoaded();
         void refreshWallet()
           .then(() => {
-            if (this.rail === "vault" && !this.walletOpen) this.render();
+            if (this.rail === "vault" && !this.walletOpen)
+              this.scheduleBackgroundRender();
           })
           .catch(() => {});
       }
@@ -2456,7 +2523,7 @@ export class App {
     shield.onclick = () => {
       this.rail = "settings";
       this.settingsSection = "relay";
-      this.render();
+      this.scheduleRender();
     };
     shield.appendChild(relayMark(26, "state"));
     this.updateTorPillInto(shield);
@@ -2507,7 +2574,7 @@ export class App {
     plus.setAttribute("aria-label", "Add a trust");
     plus.onclick = () => {
       this.addFriendOpen = true;
-      this.render();
+      this.scheduleRender();
     };
     head.append(h, plus);
 
@@ -2536,6 +2603,9 @@ export class App {
     inp.value = this.search;
     inp.oninput = () => {
       this.search = inp.value;
+      // Synchronous, as before: the rebuilt field's focus/caret survival is
+      // only guaranteed with the wipe in the same tick. (Search fields stop
+      // rebuilding the shell once pane-scoped renders land.)
       this.render();
     };
     search.appendChild(inp);
@@ -2596,7 +2666,7 @@ export class App {
       row.onclick = () => {
         this.selectedNick = c.nickname;
         markRead(c.nickname);
-        this.render();
+        this.scheduleRender();
       };
       rows.appendChild(row);
     }
@@ -2623,7 +2693,7 @@ export class App {
         kind: "error",
       });
     }
-    this.render();
+    this.scheduleRender();
   }
 
   private renderMainChat(): HTMLElement {
@@ -2654,7 +2724,7 @@ export class App {
       b.textContent = "Add a trust";
       b.onclick = () => {
         this.addFriendOpen = true;
-        this.render();
+        this.scheduleRender();
       };
       empty.append(t, p, b);
       pane.appendChild(empty);
@@ -2695,7 +2765,7 @@ export class App {
           icon: "pencil",
           onSelect: () => {
             this.profileNick = nick;
-            this.render();
+            this.scheduleRender();
           },
         },
         {
@@ -2705,7 +2775,7 @@ export class App {
           checked: isChatSoundMuted(nick),
           onSelect: () => {
             void setChatSoundMuted(nick, !isChatSoundMuted(nick)).then(() =>
-              this.render(),
+              this.scheduleRender(),
             );
           },
         },
@@ -2716,7 +2786,7 @@ export class App {
           chevron: true,
           onSelect: () => {
             this.chatHistoryNick = nick;
-            this.render();
+            this.scheduleRender();
           },
         },
         {
@@ -2807,7 +2877,7 @@ export class App {
         };
         b.ondblclick = () => {
           toggleReaction(m.id, "❤");
-          this.render();
+          this.scheduleRender();
         };
         gEl.appendChild(b);
       });
@@ -2934,7 +3004,7 @@ export class App {
     const msg = addOutgoingText(nick, text);
     ta.value = "";
     send.classList.remove("ready");
-    this.render();
+    this.scheduleRender();
     try {
       await api.sendText(nick, text);
     } catch (e) {
@@ -2942,7 +3012,7 @@ export class App {
       showToast(e instanceof AppError ? e.message : "Couldn't send. Try again.", {
         kind: "error",
       });
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -2966,24 +3036,24 @@ export class App {
     }
     const buf = new Uint8Array(await file.arrayBuffer());
     const msg = addOutgoingFile(nick, file.name, file.size, buf);
-    this.render();
+    this.scheduleRender();
     try {
       for (let p = 20; p <= 100; p += 20) {
         setSendProgress(msg.id, p);
-        this.render();
+        this.scheduleRender();
         await sleep(80);
       }
       const b64 = await fileToBase64(file);
       const resp = await api.sendFileData(nick, file.name, b64);
       if (resp?.blob_id) setMessageBlobId(nick, msg.id, resp.blob_id);
       clearSendProgress(nick, msg.id);
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       removeOutgoingMessage(nick, msg.id);
       showToast(e instanceof AppError ? e.message : "Couldn't send. Try again.", {
         kind: "error",
       });
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -3206,7 +3276,7 @@ export class App {
       const walletWantsTor = wallet.exists && wallet.mode === "tor";
       if (!open.open && !walletWantsTor) await torStop();
       await this.refreshStatus();
-      this.render();
+      this.scheduleRender();
       return;
     }
     const st = await torStart();
@@ -3217,7 +3287,7 @@ export class App {
     }
     await api.setRelayMode(true, `socks5h://127.0.0.1:${st.socks_port}`);
     await this.refreshStatus();
-    this.render();
+    this.scheduleRender();
   }
 
   private stopDropsPoll(): void {
@@ -3241,7 +3311,7 @@ export class App {
     this.dropsTor = tor;
     this.dropsOpenId = openId;
     this.dropsDevAllowed = dev;
-    if (changed && this.rail === "drops") this.render();
+    if (changed && this.rail === "drops") this.scheduleBackgroundRender();
   }
 
   /** Bring Tor up explicitly and surface the reason if it cannot. */
@@ -3249,7 +3319,7 @@ export class App {
     if (this.dropsTorBusy) return;
     this.dropsTorBusy = true;
     this.dropsError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const status = await torStart(120_000);
       this.dropsTor = status;
@@ -3260,7 +3330,7 @@ export class App {
       }
     } finally {
       this.dropsTorBusy = false;
-      if (this.rail === "drops") this.render();
+      if (this.rail === "drops") this.scheduleRender();
     }
   }
 
@@ -3334,7 +3404,7 @@ export class App {
     cb.checked = this.dropsShowUnverified;
     cb.onchange = () => {
       this.dropsShowUnverified = cb.checked;
-      this.render();
+      this.scheduleRender();
     };
     unverified.append(cb, document.createTextNode("Show unverified entries"));
     controls.appendChild(unverified);
@@ -3524,7 +3594,7 @@ export class App {
     if (this.dropsOpeningId) return;
     this.dropsOpeningId = d.id;
     this.dropsError = null;
-    this.render();
+    this.scheduleRender();
     try {
       if (!dropsAvailable()) {
         throw new Error("Opening Drops needs the Hush desktop app.");
@@ -3537,7 +3607,7 @@ export class App {
       this.dropsError = e instanceof Error ? e.message : String(e);
     } finally {
       this.dropsOpeningId = null;
-      if (this.rail === "drops") this.render();
+      if (this.rail === "drops") this.scheduleRender();
     }
   }
 
@@ -3548,7 +3618,7 @@ export class App {
       this.dropsError = e instanceof Error ? e.message : String(e);
     }
     this.dropsOpenId = null;
-    if (this.rail === "drops") this.render();
+    if (this.rail === "drops") this.scheduleRender();
   }
 
   // --------------------------------------------------------------- trusts
@@ -3584,7 +3654,7 @@ export class App {
     add.textContent = "Add a trust";
     add.onclick = () => {
       this.addFriendOpen = true;
-      this.render();
+      this.scheduleRender();
     };
     head.append(titles, add);
     pane.appendChild(head);
@@ -3614,7 +3684,7 @@ export class App {
       b.textContent = "Add a trust";
       b.onclick = () => {
         this.addFriendOpen = true;
-        this.render();
+        this.scheduleRender();
       };
       empty.append(t, p, b);
       pane.appendChild(empty);
@@ -3771,7 +3841,7 @@ export class App {
         icon: "pencil",
         onSelect: () => {
           this.profileNick = c.nickname;
-          this.render();
+          this.scheduleRender();
         },
       },
       {
@@ -3818,7 +3888,7 @@ export class App {
     this.rail = "chats";
     this.selectedNick = nick;
     markRead(nick);
-    this.render();
+    this.scheduleRender();
   }
 
   /** Open the mail composer with a contact already chosen as the recipient. */
@@ -3846,7 +3916,7 @@ export class App {
           ? `${displayNick(c.nickname)} is now mail only.`
           : `${displayNick(c.nickname)} can chat and join conclaves.`,
       );
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't change how you reach them.", {
         kind: "error",
@@ -4025,7 +4095,7 @@ export class App {
         this.leavePaperTab();
       }
       this.conclaveId = m.id;
-      this.render();
+      this.scheduleRender();
     };
     return card;
   }
@@ -4125,7 +4195,7 @@ export class App {
       inviteBtn.onclick = () => {
         this.conclaveInviteOpen = true;
         this.conclaveInviteTrustees = [];
-        this.render();
+        this.scheduleRender();
       };
 
       const endBtn = document.createElement("button");
@@ -4234,7 +4304,7 @@ export class App {
               .inviteConclaveTrustee(conclave.id, trustee.nick)
               .then(() => {
                 this.announce(`Invite sent to ${displayNick(trustee.nick)}`);
-                this.render();
+                this.scheduleRender();
               })
               .catch((e) =>
                 showToast(e instanceof Error ? e.message : "Invite failed", {
@@ -4271,7 +4341,7 @@ export class App {
               target: trustee.accountId,
               targetNick: trustee.nick,
             };
-            this.render();
+            this.scheduleRender();
           },
         });
       }
@@ -4299,7 +4369,7 @@ export class App {
                 this.announce(
                   `Introduction to ${displayNick(trustee.nick)} requested`,
                 );
-                this.render();
+                this.scheduleRender();
               })
               .catch((e) =>
                 showToast(e instanceof Error ? e.message : "Request failed", {
@@ -4319,7 +4389,7 @@ export class App {
             nick: trustee.nick,
             accountId: trustee.accountId,
           };
-          this.render();
+          this.scheduleRender();
         },
       });
       if (canKick) {
@@ -4624,7 +4694,7 @@ export class App {
           .relayIntroRequest(r.conclaveId, r.seeker, r.target)
           .then(() => {
             this.announce("Introduction request forwarded");
-            this.render();
+            this.scheduleRender();
           })
           .catch((e) =>
             showToast(e instanceof Error ? e.message : "Forward failed", {
@@ -4639,7 +4709,7 @@ export class App {
       drop.onclick = () => {
         void api
           .dismissIntroRequest(r.conclaveId, r.seeker)
-          .then(() => this.render());
+          .then(() => this.scheduleRender());
       };
       b.append(p, fwd, drop);
       box.appendChild(b);
@@ -4665,7 +4735,7 @@ export class App {
           .then((contacts) => {
             if (contacts) this.contacts = contacts;
             this.announce(`${displayNick(nick)} added to your trusts`);
-            this.render();
+            this.scheduleRender();
           })
           .catch((e) =>
             showToast(e instanceof Error ? e.message : "Accept failed", {
@@ -4678,7 +4748,7 @@ export class App {
       drop.className = "btn-secondary pressable text-13";
       drop.textContent = "Dismiss";
       drop.onclick = () => {
-        void api.dismissIntro(i.conclaveId, i.target).then(() => this.render());
+        void api.dismissIntro(i.conclaveId, i.target).then(() => this.scheduleRender());
       };
       b.append(p, add, drop);
       box.appendChild(b);
@@ -4774,7 +4844,7 @@ export class App {
 
   private introPickerClose(): void {
     this.introPicker = null;
-    this.render();
+    this.scheduleRender();
   }
 
   /** The first introduction request addressed to this vault, if any. */
@@ -4815,7 +4885,7 @@ export class App {
     no.onclick = () => {
       void api
         .answerIntroRequest(r.conclaveId, r.seeker, false)
-        .then(() => this.render());
+        .then(() => this.scheduleRender());
     };
     const yes = document.createElement("button");
     yes.type = "button";
@@ -4826,7 +4896,7 @@ export class App {
         .answerIntroRequest(r.conclaveId, r.seeker, true)
         .then(() => {
           this.announce(`Invite shared with ${seekerName}`);
-          this.render();
+          this.scheduleRender();
         })
         .catch((e) =>
           showToast(e instanceof Error ? e.message : "Share failed", {
@@ -4872,7 +4942,7 @@ export class App {
         } else {
           this.conclaveTab = "paper";
         }
-        this.render();
+        this.scheduleRender();
       };
       tabs.appendChild(b);
     }
@@ -5014,7 +5084,7 @@ export class App {
       void openPaper(conclaveId)
         .then(() => {
           if (this.conclaveTab === "paper" && this.conclaveId === conclaveId) {
-            this.render();
+            this.scheduleBackgroundRender();
           }
         })
         .catch((e) => {
@@ -5048,7 +5118,7 @@ export class App {
         void createPaper(conclaveId, `${conclaveById(conclaveId)?.name ?? "Conclave"} paper`)
           .then(() => {
             this.paperHost = null;
-            if (this.conclaveTab === "paper") this.render();
+            if (this.conclaveTab === "paper") this.scheduleRender();
           })
           .catch((e) => {
             btn.disabled = false;
@@ -5162,7 +5232,7 @@ export class App {
     this.conclaveCreateOpen = true;
     this.conclaveCreateName = "";
     this.conclaveCreateTrustees = [];
-    this.render();
+    this.scheduleRender();
   }
 
   private renderConclaveCreateModal(): HTMLElement {
@@ -5211,7 +5281,7 @@ export class App {
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
       this.conclaveCreateOpen = false;
-      this.render();
+      this.scheduleRender();
     };
     const create = document.createElement("button");
     create.type = "button";
@@ -5271,7 +5341,7 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.conclaveCreateOpen = false;
-        this.render();
+        this.scheduleRender();
       }
     };
     queueMicrotask(() => nameInput.focus());
@@ -5306,7 +5376,7 @@ export class App {
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
       this.conclaveInviteOpen = false;
-      this.render();
+      this.scheduleRender();
     };
     const invite = document.createElement("button");
     invite.type = "button";
@@ -5355,7 +5425,7 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.conclaveInviteOpen = false;
-        this.render();
+        this.scheduleRender();
       }
     };
     return back;
@@ -5375,7 +5445,7 @@ export class App {
       await this.reloadConclaves();
       if (created) this.conclaveId = created.id;
       this.announce(`${name} created. Invites sent.`);
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't create the conclave.", {
         kind: "error",
@@ -5393,7 +5463,7 @@ export class App {
       this.conclaveInviteOpen = false;
       this.conclaveInviteTrustees = [];
       await this.reloadConclaves();
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't send that invite.", {
         kind: "error",
@@ -5408,7 +5478,7 @@ export class App {
     try {
       await api.kickConclaveTrustee(conclaveId, nickname);
       await this.reloadConclaves();
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't remove that trustee.", {
         kind: "error",
@@ -5424,7 +5494,7 @@ export class App {
         this.conclaveId = null;
       }
       await this.reloadConclaves();
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't leave the conclave.", {
         kind: "error",
@@ -5441,7 +5511,7 @@ export class App {
         this.conclaveId = joined.id;
       }
       this.announce("Invite accepted.");
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't accept the invite.", {
         kind: "error",
@@ -5453,7 +5523,7 @@ export class App {
     try {
       await api.declineConclaveInvite(conclaveId);
       await this.reloadConclaves();
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't decline the invite.", {
         kind: "error",
@@ -5474,7 +5544,7 @@ export class App {
       ta.value = "";
       send.classList.remove("ready");
       await this.reloadConclaves();
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't send. Try again.", {
         kind: "error",
@@ -5500,7 +5570,7 @@ export class App {
       const b64 = await fileToBase64(file);
       await api.sendConclaveFileData(conclaveId, file.name, b64);
       await this.reloadConclaves();
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't share the file. Try again.", {
         kind: "error",
@@ -5511,7 +5581,7 @@ export class App {
   /** Open the end dialog for a conclave, always with an empty confirmation. */
   private openConclaveEnd(id: string): void {
     this.conclaveEndId = id;
-    this.render();
+    this.scheduleRender();
   }
 
   /** Close the end dialog. */
@@ -5579,7 +5649,7 @@ export class App {
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
       this.closeConclaveEnd();
-      this.render();
+      this.scheduleRender();
     };
 
     row.append(keepBtn, delBtn, cancel);
@@ -5588,7 +5658,7 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.closeConclaveEnd();
-        this.render();
+        this.scheduleRender();
       }
     };
     // Focus the common choice, not the destructive one, so a stray Enter
@@ -5615,7 +5685,7 @@ export class App {
       this.announce(
         "Conclave ended and deleted. Files it shared stay in your vault.",
       );
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(
         e instanceof AppError
@@ -5624,7 +5694,7 @@ export class App {
         { kind: "error" },
       );
       await this.reloadConclaves();
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -5633,7 +5703,7 @@ export class App {
       await api.endConclave(id);
       this.closeConclaveEnd();
       await this.reloadConclaves();
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't end the conclave.", {
         kind: "error",
@@ -5645,7 +5715,7 @@ export class App {
   private openConclaveDelete(id: string): void {
     this.conclaveDeleteId = id;
     this.conclaveDeleteConfirm = "";
-    this.render();
+    this.scheduleRender();
   }
 
   /** Close the delete dialog and forget anything typed into it. */
@@ -5715,7 +5785,7 @@ export class App {
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
       this.closeConclaveDelete();
-      this.render();
+      this.scheduleRender();
     };
     const del = document.createElement("button");
     del.type = "button";
@@ -5747,7 +5817,7 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.closeConclaveDelete();
-        this.render();
+        this.scheduleRender();
       }
     };
     // Focus the field, not the destructive button, so a stray Enter cannot
@@ -5766,7 +5836,7 @@ export class App {
       }
       await this.reloadConclaves();
       this.announce("Conclave deleted. Files it shared stay in your vault.");
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't delete the conclave.", {
         kind: "error",
@@ -5778,7 +5848,7 @@ export class App {
   private openTrustDelete(nick: string): void {
     this.trustDeleteNick = nick;
     this.trustDeleteConfirm = "";
-    this.render();
+    this.scheduleRender();
   }
 
   /** Close the delete dialog and forget anything typed into it. */
@@ -5846,7 +5916,7 @@ export class App {
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
       this.closeTrustDelete();
-      this.render();
+      this.scheduleRender();
     };
     const del = document.createElement("button");
     del.type = "button";
@@ -5879,7 +5949,7 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.closeTrustDelete();
-        this.render();
+        this.scheduleRender();
       }
     };
     // Focus the field, not the destructive button, so a stray Enter cannot
@@ -5930,13 +6000,13 @@ export class App {
       this.closeTrustDelete();
       await this.reloadMailbox();
       this.announce(`${nick} removed from your circle`);
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       this.closeTrustDelete();
       showToast(e instanceof AppError ? e.message : "Could not remove contact", {
         kind: "error",
       });
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -6017,13 +6087,13 @@ export class App {
     this.notesEditorOpen = false;
     this.notesEditingId = null;
     this.filesContactNick = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private filesBackToVault(): void {
     this.filesOpen = false;
     this.filesContactNick = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private renderFiles(): HTMLElement {
@@ -6095,7 +6165,7 @@ export class App {
       row.onclick = () => {
         this.filesContactNick = nick;
         this.filesDirection = "received";
-        this.render();
+        this.scheduleRender();
       };
       list.appendChild(row);
     }
@@ -6122,7 +6192,7 @@ export class App {
     back.textContent = "← All contacts";
     back.onclick = () => {
       this.filesContactNick = null;
-      this.render();
+      this.scheduleRender();
     };
 
     const h = document.createElement("h1");
@@ -6143,7 +6213,7 @@ export class App {
     recvTab.textContent = "Received";
     recvTab.onclick = () => {
       this.filesDirection = "received";
-      this.render();
+      this.scheduleRender();
     };
     const sentTab = document.createElement("button");
     sentTab.type = "button";
@@ -6151,7 +6221,7 @@ export class App {
     sentTab.textContent = "Sent";
     sentTab.onclick = () => {
       this.filesDirection = "sent";
-      this.render();
+      this.scheduleRender();
     };
     tabs.append(recvTab, sentTab);
 
@@ -6222,7 +6292,7 @@ export class App {
           this.selectedNick = nick;
           this.filesOpen = false;
           this.filesContactNick = null;
-          this.render();
+          this.scheduleRender();
         };
       }
       if (mail || chatTarget) card.appendChild(link);
@@ -6281,7 +6351,7 @@ export class App {
       this.readsStories = [];
       this.readsPage = 0;
     }
-    this.render();
+    this.scheduleRender();
     try {
       const resp = await loadReadsFeed(this.readsSource, page);
       this.readsStories = page === 0 ? resp.stories : [...this.readsStories, ...resp.stories];
@@ -6291,7 +6361,7 @@ export class App {
       this.readsError = e instanceof Error ? e.message : String(e);
     } finally {
       this.readsLoading = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -6321,13 +6391,13 @@ export class App {
     const typed = this.readsSourceDraft.trim();
     if (!typed) {
       this.readsAddError = "Paste an RSS feed URL to add.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     const url = /^[a-z][a-z0-9+.-]*:\/\//i.test(typed) ? typed : `https://${typed}`;
     this.readsSourceBusy = true;
     this.readsAddError = null;
-    this.render();
+    this.scheduleRender();
     try {
       this.readsSources = await addReadsSource(url);
       this.readsSourceDraft = "";
@@ -6335,11 +6405,11 @@ export class App {
       this.readsAddOpen = false;
       const added = this.readsSources.find((s) => !s.built_in && s.url === url);
       if (added) this.readsOpenSource(added.id);
-      else this.render();
+      else this.scheduleRender();
     } catch (e) {
       this.readsSourceBusy = false;
       this.readsAddError = e instanceof Error ? e.message : String(e);
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -6347,10 +6417,10 @@ export class App {
     try {
       this.readsSources = await removeReadsSource(id);
       if (this.readsSource === id) this.readsOpenSource(HK_NEWS.id);
-      else this.render();
+      else this.scheduleRender();
     } catch (e) {
       this.readsError = e instanceof Error ? e.message : String(e);
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -6366,7 +6436,7 @@ export class App {
   private async readsLoadSaved(): Promise<void> {
     this.readsLoading = true;
     this.readsError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const state = await getReadsState();
       this.readsStories = state.saved.map((x) => ({
@@ -6379,7 +6449,7 @@ export class App {
       this.readsError = e instanceof Error ? e.message : String(e);
     } finally {
       this.readsLoading = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -6397,7 +6467,7 @@ export class App {
     const isHn = Boolean(listed?.hn_url);
     this.readsView = isHn && !listed?.url ? "comments" : "reader";
     this.readsDetailLoading = isHn;
-    this.render();
+    this.scheduleRender();
     if (isHn) {
       void loadReadsStory(id)
         .then((detail) => {
@@ -6411,7 +6481,7 @@ export class App {
         })
         .finally(() => {
           this.readsDetailLoading = false;
-          this.render();
+          this.scheduleRender();
         });
     } else if (listed?.url) {
       this.readsLoadReader(listed.url);
@@ -6422,7 +6492,7 @@ export class App {
       void markReadsRead(id, title)
         .then(() => {
           listed.read = true;
-          if (this.rail === "reads") this.render();
+          if (this.rail === "reads") this.scheduleRender();
         })
         .catch(() => {
           /* read markers are best-effort */
@@ -6433,12 +6503,12 @@ export class App {
   private readsLoadReader(url: string): void {
     this.readsView = "reader";
     if (this.readsReaderHtml !== null) {
-      this.render();
+      this.scheduleRender();
       return;
     }
     this.readsReaderLoading = true;
     this.readsReaderError = null;
-    this.render();
+    this.scheduleRender();
     void loadReadsReader(url)
       .then((r) => {
         this.readsReaderHtml = r.html;
@@ -6448,7 +6518,7 @@ export class App {
       })
       .finally(() => {
         this.readsReaderLoading = false;
-        this.render();
+        this.scheduleRender();
       });
   }
 
@@ -6461,7 +6531,7 @@ export class App {
       return;
     }
     this.readsView = "comments";
-    this.render();
+    this.scheduleRender();
   }
 
   private async readsSave(id: string): Promise<void> {
@@ -6479,7 +6549,7 @@ export class App {
       }
     } catch (e) {
       this.readsError = e instanceof Error ? e.message : String(e);
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -6497,7 +6567,7 @@ export class App {
     } catch (e) {
       this.readsError = e instanceof Error ? e.message : String(e);
     }
-    this.render();
+    this.scheduleRender();
   }
 
   /** Re-annotate list rows from fresh personal state. */
@@ -6506,13 +6576,13 @@ export class App {
       s.saved = state.saved.some((x) => x.story.id === s.id);
       s.read = state.read.some((m) => m.id === s.id);
     }
-    this.render();
+    this.scheduleRender();
   }
 
   /** Every external link routes through the confirm modal; never auto-open. */
   private confirmExternalOpen(url: string): void {
     this.readsConfirmUrl = url;
-    this.render();
+    this.scheduleRender();
   }
 
   private readsHostOf(url: string): string {
@@ -6543,7 +6613,7 @@ export class App {
   private async zinesLoad(): Promise<void> {
     this.zinesLoading = true;
     this.zinesError = null;
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
     try {
       const view = await api.zinesIndex();
       this.zinesView = view ?? null;
@@ -6552,7 +6622,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't load your zines.";
     }
     this.zinesLoading = false;
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
     // The public lane rides along: it is part of the same page, and reading its
     // cache is not egress, so the pane can know whether to offer the switch.
     void this.atprotoLoad();
@@ -6579,7 +6649,7 @@ export class App {
           : "Couldn't read the public documents this vault holds.";
     }
     this.atprotoLoading = false;
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   /**
@@ -6594,7 +6664,7 @@ export class App {
     if (this.atprotoLoading) return;
     this.atprotoLoading = true;
     this.atprotoError = null;
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
     try {
       const out = await api.atprotoRefresh();
       if (!out) throw new Error("The daemon sent no answer.");
@@ -6607,7 +6677,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't read the publications.";
     }
     this.atprotoLoading = false;
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   /**
@@ -6621,7 +6691,7 @@ export class App {
   private atprotoExploreOpenDialog(): void {
     this.atprotoExploreOpen = true;
     this.atprotoExploreError = null;
-    this.render();
+    this.scheduleRender();
     void this.atprotoExploreLoad().then(() => {
       if (this.atprotoExploreView?.crawled_unix) return;
       void this.atprotoExploreCrawl();
@@ -6631,7 +6701,7 @@ export class App {
   private atprotoExploreClose(): void {
     if (this.atprotoExploreBusy) return;
     this.atprotoExploreOpen = false;
-    this.render();
+    this.scheduleRender();
   }
 
   /** The cached directory. Reads the vault, never the network. */
@@ -6645,7 +6715,7 @@ export class App {
       this.atprotoExploreError =
         e instanceof AppError ? e.message : "Couldn't read the directory.";
     }
-    this.render();
+    this.scheduleRender();
   }
 
   /** One hop from the seeds, replacing the directory with what it found. */
@@ -6653,7 +6723,7 @@ export class App {
     if (this.atprotoExploreBusy) return;
     this.atprotoExploreBusy = true;
     this.atprotoExploreError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const out = await api.atprotoExploreRefresh();
       if (!out) throw new Error("The daemon sent no answer.");
@@ -6666,7 +6736,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't look for publications.";
     }
     this.atprotoExploreBusy = false;
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -6687,7 +6757,7 @@ export class App {
 
     this.atprotoExploreBusyDid = entry.did;
     this.atprotoExploreError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const out = await api.atprotoSetFollows(next);
       if (!out) throw new Error("The daemon sent no answer.");
@@ -6701,7 +6771,7 @@ export class App {
             : "Couldn't follow that publication.";
     }
     this.atprotoExploreBusyDid = null;
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -6786,9 +6856,10 @@ export class App {
       search.setAttribute("aria-label", "Filter publications");
       search.oninput = () => {
         this.atprotoExploreFilter = search.value;
+        // Synchronous: the re-queried input below must be the new tree's,
+        // so the caret survives the keystroke. (Deferred until the render
+        // itself stops rebuilding the modal — pane-scoped renders.)
         this.render();
-        // Re-render replaces the input, so focus and caret are put back by hand;
-        // without this the field drops the caret after one character.
         const next = this.root.querySelector<HTMLInputElement>(
           ".atproto-explore-search",
         );
@@ -6922,7 +6993,7 @@ export class App {
     ) {
       this.zinesSection = null;
     }
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -6977,7 +7048,7 @@ export class App {
       this.zinesSection = null;
     }
     this.pendingZinesScroll = null;
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -6996,7 +7067,7 @@ export class App {
     this.zinesDetail = null;
     this.zinesDetailError = null;
     this.pendingZinesScroll = null;
-    this.render();
+    this.scheduleRender();
   }
 
   /** Every post this vault's pen name wrote, newest first. */
@@ -7023,7 +7094,7 @@ export class App {
     this.zinesCommentDraft = "";
     this.zinesCommentError = null;
     this.zinesCommentBusyHash = null;
-    this.render();
+    this.scheduleRender();
     try {
       // A late reply must not paint over whatever the user is looking at now, so
       // every path below re-checks the selection before it stores anything.
@@ -7047,7 +7118,7 @@ export class App {
       if (source === "post") this.atprotoDetailError = message;
       else this.zinesDetailError = message;
     }
-    if (this.rail === "zines" && this.zinesOpenId === id) this.render();
+    if (this.rail === "zines" && this.zinesOpenId === id) this.scheduleRender();
   }
 
   /**
@@ -7084,7 +7155,7 @@ export class App {
     this.zinesDraftSections = sections;
     this.zinesDraftSeedHtml = seedHtml;
     this.zinesPublishBtn = null;
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -7158,7 +7229,7 @@ export class App {
       if (publishedId) {
         void this.zinesOpen(publishedId, "zine");
       } else if (this.rail === "zines") {
-        this.render();
+        this.scheduleRender();
       }
     } catch (e) {
       // The draft survives a refusal: the daemon validates the body it is
@@ -7196,7 +7267,7 @@ export class App {
         kind: "error",
       });
     }
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   private async zinesForget(zineId: string): Promise<void> {
@@ -7214,7 +7285,7 @@ export class App {
         kind: "error",
       });
     }
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   /**
@@ -7230,12 +7301,12 @@ export class App {
     if (!zineId) return;
     if (!contact) {
       this.zinesShareError = "Choose a contact to send it to.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     this.zinesShareBusy = true;
     this.zinesShareError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const view = await api.zinesGrant(zineId, contact);
       if (view) this.zinesView = view;
@@ -7249,7 +7320,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't send that key.";
     }
     this.zinesShareBusy = false;
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   /**
@@ -7266,12 +7337,12 @@ export class App {
     const text = this.zinesCommentDraft.trim();
     if (!text) {
       this.zinesCommentError = "An empty comment is not worth publishing.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     this.zinesCommentBusy = true;
     this.zinesCommentError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const view = await api.zinesComment(zineId, text);
       if (view) this.zinesView = view;
@@ -7290,7 +7361,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't publish that comment.";
     }
     this.zinesCommentBusy = false;
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   /**
@@ -7303,7 +7374,7 @@ export class App {
     const zineId = this.zinesOpenId;
     if (!zineId || this.zinesCommentBusyHash) return;
     this.zinesCommentBusyHash = hash;
-    this.render();
+    this.scheduleRender();
     try {
       const view = await api.zinesAcceptComment(zineId, hash);
       if (view) this.zinesView = view;
@@ -7330,7 +7401,7 @@ export class App {
     const zineId = this.zinesOpenId;
     if (!zineId || this.zinesCommentBusyHash) return;
     this.zinesCommentBusyHash = hash;
-    this.render();
+    this.scheduleRender();
     try {
       const detail = await api.zinesDiscardComment(zineId, hash);
       // The pile is inside the zine, so the detail is patched from the answer
@@ -7343,7 +7414,7 @@ export class App {
       });
     }
     this.zinesCommentBusyHash = null;
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   /**
@@ -7363,7 +7434,7 @@ export class App {
           e instanceof AppError ? e.message : "Couldn't open that zine.";
       }
     }
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   private async zinesSavePenName(): Promise<void> {
@@ -7371,13 +7442,13 @@ export class App {
     const name = this.zinesPenNameDraft.trim();
     if (!name) {
       this.zinesPenNameError = "A pen name needs a byline.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     // Minting the pen name's key and sealing it into the vault takes a moment;
     // the modal says so instead of sitting there looking frozen.
     this.zinesPenNameBusy = true;
-    this.render();
+    this.scheduleRender();
     try {
       const view = await api.zinesSetPenName(name);
       if (view) this.zinesView = view;
@@ -7395,7 +7466,7 @@ export class App {
     } finally {
       this.zinesPenNameBusy = false;
     }
-    if (this.rail === "zines") this.render();
+    if (this.rail === "zines") this.scheduleRender();
   }
 
   /**
@@ -7437,7 +7508,7 @@ export class App {
         this.zinesPenNameOpen = true;
         this.zinesPenNameDraft = penName.name;
         this.zinesPenNameError = null;
-        this.render();
+        this.scheduleRender();
       };
       card.append(byline, addr, rename);
     } else {
@@ -7453,7 +7524,7 @@ export class App {
         this.zinesPenNameOpen = true;
         this.zinesPenNameDraft = "";
         this.zinesPenNameError = null;
-        this.render();
+        this.scheduleRender();
       };
       card.append(p, btn);
     }
@@ -7800,7 +7871,7 @@ export class App {
       // A new filter is a new page: open it at the masthead rather than at
       // wherever the last one happened to be scrolled to.
       this.pendingZinesScroll = null;
-      this.render();
+      this.scheduleRender();
     };
     return btn;
   }
@@ -8056,7 +8127,7 @@ export class App {
           // Landing on the front page under a new filter: it starts at the
           // masthead, not where this reader left the unfiltered page.
           this.pendingZinesScroll = null;
-          this.render();
+          this.scheduleRender();
         };
         tags.appendChild(tag);
       }
@@ -8169,7 +8240,7 @@ export class App {
     this.zinesCommentHost = null;
     this.zinesCommentDraft = "";
     this.zinesCommentError = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private renderZineArticle(detail: ZineViewDto): HTMLElement {
@@ -8230,7 +8301,7 @@ export class App {
           // Landing on the front page under a new filter: it starts at the
           // masthead, not where this reader left the unfiltered page.
           this.pendingZinesScroll = null;
-          this.render();
+          this.scheduleRender();
         };
         tags.appendChild(tag);
       }
@@ -8280,7 +8351,7 @@ export class App {
         this.zinesPenNameOpen = true;
         this.zinesPenNameDraft = this.zinesView?.pen_name?.name ?? descriptor.pen_name;
         this.zinesPenNameError = null;
-        this.render();
+        this.scheduleRender();
       };
       actions.appendChild(rename);
     }
@@ -8308,7 +8379,7 @@ export class App {
         this.zinesShareId = descriptor.zine_id;
         this.zinesShareContact = "";
         this.zinesShareError = null;
-        this.render();
+        this.scheduleRender();
       };
       actions.appendChild(share);
     }
@@ -8321,7 +8392,7 @@ export class App {
         "Stop holding this zine. Not a retraction: other holders keep their copy.";
       forget.onclick = () => {
         this.zinesForgetId = descriptor.zine_id;
-        this.render();
+        this.scheduleRender();
       };
       actions.appendChild(forget);
     }
@@ -8609,7 +8680,7 @@ export class App {
     cancel.textContent = "Discard";
     cancel.onclick = () => {
       this.zinesDiscardDraft();
-      this.render();
+      this.scheduleRender();
     };
     footer.append(publish, cancel);
     form.appendChild(footer);
@@ -8689,7 +8760,7 @@ export class App {
       if (this.zinesPenNameBusy) return;
       this.zinesPenNameOpen = false;
       this.zinesPenNameError = null;
-      this.render();
+      this.scheduleRender();
     };
     row.append(save, cancel);
     modal.appendChild(row);
@@ -8699,7 +8770,7 @@ export class App {
       if (e.target === back && !this.zinesPenNameBusy) {
         this.zinesPenNameOpen = false;
         this.zinesPenNameError = null;
-        this.render();
+        this.scheduleRender();
       }
     };
     return back;
@@ -8743,14 +8814,14 @@ export class App {
     this.zinesPublishId = zineId;
     this.zinesPublishResult = null;
     this.zinesPublishError = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private zinesPublishClose(): void {
     this.zinesPublishId = null;
     this.zinesPublishResult = null;
     this.zinesPublishError = null;
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -8766,7 +8837,7 @@ export class App {
     if (!zineId || this.zinesPublishBusy) return;
     this.zinesPublishBusy = true;
     this.zinesPublishError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const out = await api.zinesPublish(zineId);
       if (this.zinesPublishId !== zineId) return;
@@ -8791,7 +8862,7 @@ export class App {
       this.zinesPublishError = e instanceof Error ? e.message : String(e);
     } finally {
       this.zinesPublishBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -8981,14 +9052,14 @@ export class App {
       .map((f) => f.handle || f.did)
       .join("\n");
     this.atprotoPassword = "";
-    this.render();
+    this.scheduleRender();
   }
 
   private atprotoSetupClose(): void {
     this.atprotoSetupOpen = false;
     this.atprotoSetupError = null;
     this.atprotoPassword = "";
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -9234,12 +9305,12 @@ export class App {
     const password = this.atprotoPassword;
     if (!pds || !identifier || !password) {
       this.atprotoSetupError = "A server, a handle and an app password are all needed.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     this.atprotoConnectBusy = true;
     this.atprotoSetupError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const view = await api.atprotoConnect(pds, identifier, password);
       this.atprotoView = view;
@@ -9252,7 +9323,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't sign in to that server.";
     }
     this.atprotoConnectBusy = false;
-    this.render();
+    this.scheduleRender();
   }
 
   /** Forget the session. The reading list and the cache stay. */
@@ -9260,7 +9331,7 @@ export class App {
     if (this.atprotoConnectBusy) return;
     this.atprotoConnectBusy = true;
     this.atprotoSetupError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const view = await api.atprotoDisconnect();
       this.atprotoView = view;
@@ -9272,7 +9343,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't sign out.";
     }
     this.atprotoConnectBusy = false;
-    this.render();
+    this.scheduleRender();
   }
 
   /** Write (or replace) the publication this vault's documents belong to. */
@@ -9282,12 +9353,12 @@ export class App {
     const url = this.atprotoPubUrl.trim();
     if (!name || !url) {
       this.atprotoSetupError = "A publication needs a name and an address.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     this.atprotoPublicationBusy = true;
     this.atprotoSetupError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const view = await api.atprotoSetPublication(name, url);
       this.atprotoView = view;
@@ -9297,7 +9368,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't save that publication.";
     }
     this.atprotoPublicationBusy = false;
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -9319,7 +9390,7 @@ export class App {
       );
     this.atprotoFollowsBusy = true;
     this.atprotoSetupError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const view = await api.atprotoSetFollows(follows);
       this.atprotoView = view;
@@ -9334,7 +9405,7 @@ export class App {
         e instanceof AppError ? e.message : "Couldn't save that reading list.";
     }
     this.atprotoFollowsBusy = false;
-    this.render();
+    this.scheduleRender();
   }
 
   private renderZinesForgetModal(): HTMLElement {
@@ -9370,7 +9441,7 @@ export class App {
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
       this.zinesForgetId = null;
-      this.render();
+      this.scheduleRender();
     };
     actions.append(confirm, cancel);
     modal.appendChild(actions);
@@ -9379,7 +9450,7 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.zinesForgetId = null;
-        this.render();
+        this.scheduleRender();
       }
     };
     return back;
@@ -9459,7 +9530,7 @@ export class App {
     cancel.onclick = () => {
       this.zinesShareId = null;
       this.zinesShareError = null;
-      this.render();
+      this.scheduleRender();
     };
     const send = document.createElement("button");
     send.type = "button";
@@ -9475,7 +9546,7 @@ export class App {
       if (e.target === back) {
         this.zinesShareId = null;
         this.zinesShareError = null;
-        this.render();
+        this.scheduleRender();
       }
     };
     return back;
@@ -9530,7 +9601,7 @@ export class App {
     addBtn.onclick = () => {
       this.readsAddOpen = true;
       this.readsAddError = null;
-      this.render();
+      this.scheduleRender();
     };
     list.appendChild(addBtn);
 
@@ -9874,7 +9945,7 @@ export class App {
     head.onclick = () => {
       if (this.readsCollapsed.has(c.id)) this.readsCollapsed.delete(c.id);
       else this.readsCollapsed.add(c.id);
-      this.render();
+      this.scheduleRender();
     };
     wrap.appendChild(head);
 
@@ -9973,7 +10044,7 @@ export class App {
   private closeReadsAdd(): void {
     this.readsAddOpen = false;
     this.readsAddError = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private renderReadsConfirm(): HTMLElement {
@@ -9998,7 +10069,7 @@ export class App {
     cancel.textContent = "Stay here";
     cancel.onclick = () => {
       this.readsConfirmUrl = null;
-      this.render();
+      this.scheduleRender();
     };
     const open = document.createElement("button");
     open.type = "button";
@@ -10013,7 +10084,7 @@ export class App {
       } else {
         window.open(url, "_blank", "noopener,noreferrer");
       }
-      this.render();
+      this.scheduleRender();
     };
     row.append(cancel, open);
     modal.append(h, p, row);
@@ -10102,10 +10173,10 @@ export class App {
       // state can say the useful thing ("publish one") rather than a shrug.
       void api.dropsKey().then((k) => {
         this.dropInboxKey = k;
-        if (this.mailFolder === "drops") this.render();
+        if (this.mailFolder === "drops") this.scheduleRender();
       });
     }
-    this.render();
+    this.scheduleRender();
   }
 
   // ----------------------------------------------------------- main pane
@@ -10138,6 +10209,7 @@ export class App {
     inp.value = this.mailSearch;
     inp.oninput = () => {
       this.mailSearch = inp.value;
+      // Synchronous, as before — same reason as the conv-list search.
       this.render();
     };
     search.appendChild(inp);
@@ -10282,11 +10354,11 @@ export class App {
     this.mailOpenId = m.id;
     this.mailComposeOpen = false;
     this.mailDraftId = null;
-    this.render();
+    this.scheduleRender();
     // The read flags are a prefs write, so the pane opens first and the unread
     // dot clears a moment later rather than holding up the click.
     void this.markThreadRead(m.threadId).then(() => {
-      if (this.mailThreadId === m.threadId) this.render();
+      if (this.mailThreadId === m.threadId) this.scheduleRender();
     });
   }
 
@@ -10320,7 +10392,7 @@ export class App {
     back.onclick = () => {
       this.mailThreadId = null;
       this.mailOpenId = null;
-      this.render();
+      this.scheduleRender();
     };
 
     const titles = document.createElement("div");
@@ -10543,7 +10615,7 @@ export class App {
       this.mailOpenId = null;
       this.dropInboxOpenId = null;
     }
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -10578,7 +10650,7 @@ export class App {
     this.dropInboxOpenId = null;
     await this.reloadMailbox();
     this.announce("Message deleted");
-    this.render();
+    this.scheduleRender();
   }
 
   // ------------------------------------------------------ incoming drops
@@ -10588,7 +10660,7 @@ export class App {
   /** Open a filed drop: show it quarantined, and mark it seen. */
   private openDrop(id: string): void {
     this.dropInboxOpenId = id;
-    this.render();
+    this.scheduleRender();
     // Look the drop up in the mail drop store, not the Tor Drops directory:
     // same id shape, different records, and the registry lookup would always
     // miss and skip the read flag.
@@ -10599,7 +10671,7 @@ export class App {
     const read = new Set(flags.read);
     read.add(id);
     void patchUiPrefs({ mail_read: [...read] }).then(() => {
-      if (this.dropInboxOpenId === id) this.render();
+      if (this.dropInboxOpenId === id) this.scheduleRender();
     });
   }
 
@@ -10621,6 +10693,7 @@ export class App {
     inp.value = this.dropInboxSearch;
     inp.oninput = () => {
       this.dropInboxSearch = inp.value;
+      // Synchronous, as before — same reason as the conv-list search.
       this.render();
     };
     search.appendChild(inp);
@@ -10654,14 +10727,14 @@ export class App {
             .dropsKeyCreate()
             .then((k) => {
               this.dropInboxKey = k;
-              this.render();
+              this.scheduleRender();
             })
             .catch((e) => {
               showToast(
                 e instanceof AppError ? e.message : "Could not generate the drop key.",
                 { kind: "error" },
               );
-              this.render();
+              this.scheduleRender();
             });
         };
         empty.appendChild(btn);
@@ -10752,7 +10825,7 @@ export class App {
     back.setAttribute("aria-label", "Back to Drops");
     back.onclick = () => {
       this.dropInboxOpenId = null;
-      this.render();
+      this.scheduleRender();
     };
     const titles = document.createElement("div");
     titles.className = "mail-read-titles";
@@ -11034,7 +11107,7 @@ export class App {
     this.mailComposeTo = opts.to ?? draft?.to ?? "";
     this.mailComposeSubject = draft?.subject ?? opts.subject ?? "";
     this.mailComposeBody = opts.body ?? draft?.body ?? "";
-    this.render();
+    this.scheduleRender();
 
     // Editing a draft — or forwarding — carries attachments over, and the log
     // only kept blob ids, so the bytes come back out of the vault.
@@ -11061,7 +11134,7 @@ export class App {
     // The composer may have been closed while those fetches were in flight.
     if (!this.mailComposeOpen) return;
     this.mailComposeFiles = loaded;
-    this.render();
+    this.scheduleRender();
   }
 
   private closeCompose(): void {
@@ -11074,7 +11147,7 @@ export class App {
     this.mailComposeTo = "";
     this.mailComposeSubject = "";
     this.mailComposeBody = "";
-    this.render();
+    this.scheduleRender();
   }
 
   private renderMailCompose(): HTMLElement {
@@ -11164,7 +11237,7 @@ export class App {
     attach.className = "btn-secondary text-13 pressable";
     attach.onclick = () => files.click();
 
-    // Rebuilt in place rather than through `this.render()`, so adding or
+    // Rebuilt in place rather than through `this.scheduleRender()`, so adding or
     // removing a file leaves the caret in the body where it was.
     const renderChips = () => {
       preview.innerHTML = "";
@@ -11215,13 +11288,13 @@ export class App {
     attachNote.textContent = "Attach note";
     attachNote.onclick = () => {
       this.mailNotePickerOpen = true;
-      this.render();
+      this.scheduleRender();
       // The cache can still be empty on a first open from the mail pane;
       // once the board is in, rebuild with the rows (a no-op when cached).
       void getNotesState().then((loaded) => {
         if (!this.mailNotePickerOpen) return;
         this.notesState = loaded;
-        this.render();
+        this.scheduleRender();
       });
     };
 
@@ -11413,7 +11486,7 @@ export class App {
       this.mailDraftId = null;
       this.mailComposeFiles = [];
       this.announce("Draft discarded");
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       btn.disabled = false;
       err.hidden = false;
@@ -11474,7 +11547,7 @@ export class App {
             ? "Reply sent"
             : "Mail sent",
       );
-      this.render();
+      this.scheduleRender();
     } catch (e) {
       input.err.hidden = false;
       input.err.textContent =
@@ -11495,13 +11568,13 @@ export class App {
   private walletOpenWallet(): void {
     this.walletOpen = true;
     this.notesOpen = false;
-    this.render();
+    this.scheduleRender();
   }
 
   /** Leave the wallet for the Vault bento. The phrase card survives a trip out. */
   private walletBackToVault(): void {
     this.walletOpen = false;
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -11643,7 +11716,7 @@ export class App {
         if (active || !chain.available) return;
         this.walletChain = opt.id;
         this.walletError = null;
-        this.render();
+        this.scheduleRender();
       };
       capsule.appendChild(b);
     }
@@ -11752,7 +11825,7 @@ export class App {
     done.textContent = "I have written it down";
     done.onclick = () => {
       this.walletPhrase = null;
-      this.render();
+      this.scheduleRender();
     };
     actions.append(copy, done);
     card.append(h, p, words, actions);
@@ -11931,7 +12004,7 @@ export class App {
         // The amount's unit just changed, so what is typed is no longer the
         // amount the user meant.
         this.walletSendAmount = "";
-        this.render();
+        this.scheduleRender();
       };
       card.appendChild(picker);
     }
@@ -12175,7 +12248,7 @@ export class App {
   private async walletCreateNow(): Promise<void> {
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const mode = getWalletState().mode;
       if (mode === "tor") await this.ensureWalletTor();
@@ -12189,7 +12262,7 @@ export class App {
         e instanceof AppError ? e.message : "The wallet could not be created.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -12197,12 +12270,12 @@ export class App {
     const phrase = this.walletRestoreInput.trim();
     if (!phrase) {
       this.walletError = "Enter the recovery phrase first.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const mode = getWalletState().mode;
       if (mode === "tor") await this.ensureWalletTor();
@@ -12221,14 +12294,14 @@ export class App {
         e instanceof AppError ? e.message : "That phrase could not be restored.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
   private async walletNewAddress(): Promise<void> {
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       await newReceiveAddress(this.walletChain);
     } catch (e) {
@@ -12236,14 +12309,14 @@ export class App {
         e instanceof AppError ? e.message : "A new address could not be made.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
   private async walletSyncNow(): Promise<void> {
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       const state = await syncWallet(this.walletChain);
       const view = chainState(state, this.walletChain);
@@ -12262,7 +12335,7 @@ export class App {
         e instanceof AppError ? e.message : "The wallet could not reach the chain.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -12270,7 +12343,7 @@ export class App {
     const to = this.walletSendTo.trim();
     if (!to) {
       this.walletError = "Enter a destination address.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     const state = getWalletState();
@@ -12288,18 +12361,18 @@ export class App {
         this.walletSendAmount.trim() === ""
           ? `Enter an amount in ${unit}.`
           : `That amount is not a number of ${unit} this wallet can send exactly.`;
-      this.render();
+      this.scheduleRender();
       return;
     }
     if (amount === "0") {
       this.walletError = "Enter an amount greater than zero.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     const feeRate = Number.parseInt(this.walletSendFee, 10);
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       this.walletLastTx = await sendPayment({
         chain: this.walletChain,
@@ -12319,7 +12392,7 @@ export class App {
         e instanceof AppError ? e.message : "The payment could not be sent.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -12328,7 +12401,7 @@ export class App {
     if (!address) return;
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       await addToken(address);
       this.walletTokenInput = "";
@@ -12338,14 +12411,14 @@ export class App {
         e instanceof AppError ? e.message : "That token could not be added.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
   private async walletRemoveToken(address: string): Promise<void> {
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       await removeToken(address);
       // A token that is no longer tracked must not stay selected for a send.
@@ -12355,7 +12428,7 @@ export class App {
         e instanceof AppError ? e.message : "That token could not be removed.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -12381,7 +12454,7 @@ export class App {
   private async walletChangeMode(mode: WalletNetworkMode): Promise<void> {
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       // Tor first: the daemon refuses to build a Tor wallet without a route,
       // so switching the mode before the proxy is known would fail the switch.
@@ -12392,14 +12465,14 @@ export class App {
         e instanceof AppError ? e.message : "The network could not be changed.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
   private async walletWipeNow(): Promise<void> {
     this.walletBusy = true;
     this.walletError = null;
-    this.render();
+    this.scheduleRender();
     try {
       await wipeWallet();
       this.walletLastTx = null;
@@ -12410,7 +12483,7 @@ export class App {
         e instanceof AppError ? e.message : "The wallet could not be removed.";
     } finally {
       this.walletBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -12461,7 +12534,7 @@ export class App {
     settingsBtn.onclick = () => {
       this.rail = "settings";
       this.settingsSection = "torbox";
-      this.render();
+      this.scheduleRender();
     };
     head.append(title, settingsBtn);
     pane.appendChild(head);
@@ -12488,7 +12561,7 @@ export class App {
       b.onclick = () => {
         this.torrentsView = t.id;
         this.torrentsLibraryPath = [];
-        this.render();
+        this.scheduleRender();
       };
       tabs.appendChild(b);
     }
@@ -12521,7 +12594,7 @@ export class App {
     btn.onclick = () => {
       this.rail = "settings";
       this.settingsSection = "torbox";
-      this.render();
+      this.scheduleRender();
     };
     wrap.append(ic, h, p, btn);
     return wrap;
@@ -12619,16 +12692,16 @@ export class App {
     this.torrentsAddError = null;
     if (!source) {
       this.torrentsAddError = "Paste a magnet link or .torrent URL first.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     if (!looksLikeTorrentSource(source)) {
       this.torrentsAddError = "That doesn't look like a magnet link or a .torrent URL.";
-      this.render();
+      this.scheduleRender();
       return;
     }
     this.torrentsAddBusy = true;
-    this.render();
+    this.scheduleRender();
     try {
       await addTorrent(source);
       this.torrentsAddInput = "";
@@ -12639,7 +12712,7 @@ export class App {
         e instanceof AppError ? e.message : "Could not add that torrent.";
     } finally {
       this.torrentsAddBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -12647,11 +12720,11 @@ export class App {
     this.torrentsAddError = null;
     if (!/\.torrent$/i.test(file.name) && file.type !== "application/x-bittorrent") {
       this.torrentsAddError = "Drop a .torrent file (not a video or archive).";
-      this.render();
+      this.scheduleRender();
       return;
     }
     this.torrentsAddBusy = true;
-    this.render();
+    this.scheduleRender();
     try {
       const b64 = await readFileAsBase64(file);
       await addTorrentFile(file.name, b64);
@@ -12662,7 +12735,7 @@ export class App {
         e instanceof AppError ? e.message : "Could not read that torrent file.";
     } finally {
       this.torrentsAddBusy = false;
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -12788,7 +12861,7 @@ export class App {
         kind: "error",
       });
     } finally {
-      this.render();
+      this.scheduleRender();
     }
   }
 
@@ -12805,7 +12878,7 @@ export class App {
     rootBtn.textContent = "Library";
     rootBtn.onclick = () => {
       this.torrentsLibraryPath = [];
-      this.render();
+      this.scheduleRender();
     };
     crumbs.appendChild(rootBtn);
     for (let i = 0; i < this.torrentsLibraryPath.length; i++) {
@@ -12823,7 +12896,7 @@ export class App {
           : seg;
       b.onclick = () => {
         this.torrentsLibraryPath = this.torrentsLibraryPath.slice(0, i + 1);
-        this.render();
+        this.scheduleRender();
       };
       crumbs.appendChild(b);
     }
@@ -12840,6 +12913,7 @@ export class App {
     si.value = this.torrentsLibrarySearch;
     si.oninput = () => {
       this.torrentsLibrarySearch = si.value;
+      // Synchronous, as before — same reason as the conv-list search.
       this.render();
     };
     search.appendChild(si);
@@ -12858,7 +12932,7 @@ export class App {
     sortSel.value = this.torrentsLibrarySort;
     sortSel.onchange = () => {
       this.torrentsLibrarySort = sortSel.value as "date" | "name" | "size";
-      this.render();
+      this.scheduleRender();
     };
     const viewToggle = document.createElement("div");
     viewToggle.className = "segmented torrents-view";
@@ -12870,7 +12944,7 @@ export class App {
       b.setAttribute("aria-label", v === "list" ? "List view" : "Grid view");
       b.onclick = () => {
         this.torrentsLibraryView = v;
-        this.render();
+        this.scheduleRender();
       };
       viewToggle.appendChild(b);
     }
@@ -12941,7 +13015,7 @@ export class App {
     deleteRow.appendChild(
       this.torrentActionBtn("Delete torrent", "trash", async () => {
         this.torrentsDeleteId = entry.id;
-        this.render();
+        this.scheduleRender();
       }),
     );
     wrap.appendChild(deleteRow);
@@ -12960,7 +13034,7 @@ export class App {
         n.folder
           ? this.renderLibraryFolder(n.name, () => {
               this.torrentsLibraryPath = [...this.torrentsLibraryPath, n.name];
-              this.render();
+              this.scheduleRender();
             })
           : this.renderLibraryFile(n.file!),
       );
@@ -12973,7 +13047,7 @@ export class App {
     const open = () => {
       this.torrentsLibraryPath = [e.id];
       this.torrentsLibrarySearch = "";
-      this.render();
+      this.scheduleRender();
     };
     const el = this.libraryItemShell("folder", e.name, formatBytes(e.size), open);
     const meta = document.createElement("span");
@@ -12989,7 +13063,7 @@ export class App {
     del.appendChild(icon("trash"));
     del.onclick = () => {
       this.torrentsDeleteId = e.id;
-      this.render();
+      this.scheduleRender();
     };
     actions.appendChild(del);
     el.appendChild(actions);
@@ -13143,14 +13217,14 @@ export class App {
       `Decrypting ${name} (${formatBytes(size)})…`,
       { kind: "info", timeoutMs: 0 },
     );
-    this.render();
+    this.scheduleRender();
   }
 
   private endTorrentsBusy(): void {
     this.torrentsBusyBlob = null;
     this.torrentsBusyToast?.();
     this.torrentsBusyToast = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private renderTorrentsDeleteModal(): HTMLElement {
@@ -13182,7 +13256,7 @@ export class App {
     cancel.textContent = "Cancel";
     cancel.onclick = () => {
       this.torrentsDeleteId = null;
-      this.render();
+      this.scheduleRender();
     };
     const del = document.createElement("button");
     del.type = "button";
@@ -13201,7 +13275,7 @@ export class App {
       } finally {
         this.torrentsDeleteId = null;
         this.torrentsLibraryPath = [];
-        this.render();
+        this.scheduleRender();
       }
     };
     row.append(cancel, del);
@@ -13210,7 +13284,7 @@ export class App {
     back.onclick = (ev) => {
       if (ev.target === back) {
         this.torrentsDeleteId = null;
-        this.render();
+        this.scheduleRender();
       }
     };
     return back;
@@ -13267,7 +13341,7 @@ export class App {
     toggle.appendChild(icon(this.torboxKeyVisible ? "hide" : "eye"));
     toggle.onclick = () => {
       this.torboxKeyVisible = !this.torboxKeyVisible;
-      this.render();
+      this.scheduleRender();
     };
     field.append(input, toggle);
     body.append(label, field);
@@ -13284,7 +13358,7 @@ export class App {
       this.torboxBusy = true;
       this.torboxTestOk = null;
       this.torboxTestError = null;
-      this.render();
+      this.scheduleRender();
       try {
         const info = await testTorboxKey(this.torboxKeyDraft);
         this.torboxTestOk = `Connected — ${info.plan_label} plan${info.email ? ` (${info.email})` : ""}.`;
@@ -13292,7 +13366,7 @@ export class App {
         this.torboxTestError = e instanceof AppError ? e.message : "TorBox rejected that key.";
       } finally {
         this.torboxBusy = false;
-        this.render();
+        this.scheduleRender();
       }
     };
     const save = document.createElement("button");
@@ -13306,7 +13380,7 @@ export class App {
       this.torboxBusy = true;
       this.torboxTestOk = null;
       this.torboxTestError = null;
-      this.render();
+      this.scheduleRender();
       try {
         await saveTorboxKey(this.torboxKeyDraft);
         this.torboxKeyDraft = "";
@@ -13315,7 +13389,7 @@ export class App {
         this.torboxTestError = e instanceof AppError ? e.message : "Could not save that key.";
       } finally {
         this.torboxBusy = false;
-        this.render();
+        this.scheduleRender();
       }
     };
     actions.append(test, save);
@@ -13327,7 +13401,7 @@ export class App {
       remove.disabled = this.torboxBusy;
       remove.onclick = async () => {
         this.torboxBusy = true;
-        this.render();
+        this.scheduleRender();
         try {
           await saveTorboxKey("");
           this.torboxKeyDraft = "";
@@ -13337,7 +13411,7 @@ export class App {
             e instanceof AppError ? e.message : "Could not remove that key.";
         } finally {
           this.torboxBusy = false;
-          this.render();
+          this.scheduleRender();
         }
       };
       actions.appendChild(remove);
@@ -13379,7 +13453,7 @@ export class App {
         showToast(e instanceof AppError ? e.message : "Could not change that.", {
           kind: "error",
         });
-        this.render();
+        this.scheduleRender();
       }
     };
     const concHint = document.createElement("p");
@@ -13402,7 +13476,7 @@ export class App {
       } catch (e) {
         showToast(e instanceof AppError ? e.message : "Could not refresh.", { kind: "error" });
       } finally {
-        this.render();
+        this.scheduleRender();
       }
     };
     const open = document.createElement("button");
@@ -13411,7 +13485,7 @@ export class App {
     open.textContent = "Open Torrents";
     open.onclick = () => {
       this.rail = "torrents";
-      this.render();
+      this.scheduleRender();
     };
     footer.append(refresh, open);
     body.appendChild(footer);
@@ -13457,7 +13531,7 @@ export class App {
         if (r) await downloadBase64File(r.filename, r.data_base64);
         await this.refreshStatus();
         this.announce("Backup downloaded");
-        this.render();
+        this.scheduleRender();
       } catch (e) {
         showToast(e instanceof AppError ? e.message : "Backup failed", { kind: "error" });
       }
@@ -13481,7 +13555,7 @@ export class App {
     torrentsTile.innerHTML = `<div class="text-15">Torrents</div><div class="muted text-13">${torrentsHint}</div><button type="button" class="btn-secondary pressable torrents-tile-btn" style="margin-top:12px">Open Torrents</button>`;
     torrentsTile.querySelector(".torrents-tile-btn")!.addEventListener("click", () => {
       this.rail = "torrents";
-      this.render();
+      this.scheduleRender();
     });
     const notesCount = peekNotesState().notes.length;
     const notesTile = document.createElement("div");
@@ -13537,7 +13611,7 @@ export class App {
       })
       .finally(() => {
         this.notesLoading = false;
-        if (this.rail === "vault") this.render();
+        if (this.rail === "vault") this.scheduleRender();
       });
   }
 
@@ -13548,7 +13622,7 @@ export class App {
     this.notesEditorOpen = false;
     this.notesEditingId = null;
     this.notesError = null;
-    this.render();
+    this.scheduleRender();
     this.notesEnsureLoaded();
   }
 
@@ -13559,7 +13633,7 @@ export class App {
     this.notesDeleteId = null;
     this.notesViewingId = null;
     this.notesSearch = "";
-    this.render();
+    this.scheduleRender();
   }
 
   private notesBackToList(): void {
@@ -13569,7 +13643,7 @@ export class App {
     this.notesDraftBody = "";
     this.notesDeleteId = null;
     this.notesViewingId = null;
-    this.render();
+    this.scheduleRender();
   }
 
   /** Open a blank editor; the note is created on first save, not here. */
@@ -13581,7 +13655,7 @@ export class App {
     this.notesDeleteId = null;
     this.notesViewingId = null;
     this.notesSearch = "";
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -13591,13 +13665,13 @@ export class App {
   private notesViewNote(id: string): void {
     this.notesViewingId = id;
     this.notesDeleteId = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private notesCloseView(): void {
     this.notesViewingId = null;
     this.notesDeleteId = null;
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -13692,7 +13766,7 @@ export class App {
   private mailNotePickerClose(): void {
     this.mailNotePickerOpen = false;
     this.mailNotePickerQuery = "";
-    this.render();
+    this.scheduleRender();
   }
 
   /**
@@ -13891,7 +13965,7 @@ export class App {
       void patchUiPrefs({ chat_auto_delete: next })
         .then(() => {
           this.announce("Auto-delete rules saved");
-          this.render();
+          this.scheduleRender();
         })
         .catch((e) =>
           showToast(e instanceof Error ? e.message : "Save failed", {
@@ -13954,12 +14028,12 @@ export class App {
     const history = await api.messages();
     if (history) loadHistory(history);
     // The dialog stays open over the trimmed thread.
-    this.render();
+    this.scheduleRender();
   }
 
   private chatHistoryClose(): void {
     this.chatHistoryNick = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private notesOpenNote(id: string): void {
@@ -13971,14 +14045,14 @@ export class App {
     this.notesDraftBody = note.body;
     this.notesDeleteId = null;
     this.notesViewingId = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private notesSaveDraft(): void {
     if (this.notesSaving) return;
     this.notesSaving = true;
     this.notesError = null;
-    this.render();
+    this.scheduleRender();
     void saveNote({
       id: this.notesEditingId ?? undefined,
       title: this.notesDraftTitle,
@@ -13991,24 +14065,24 @@ export class App {
         this.notesEditingId = null;
         this.notesDraftTitle = "";
         this.notesDraftBody = "";
-        this.render();
+        this.scheduleRender();
         showToast("Note saved", { kind: "success" });
       })
       .catch((e) => {
         this.notesSaving = false;
         this.notesError = e instanceof Error ? e.message : String(e);
-        this.render();
+        this.scheduleRender();
       });
   }
 
   private notesRequestDelete(id: string): void {
     this.notesDeleteId = id;
-    this.render();
+    this.scheduleRender();
   }
 
   private notesCancelDelete(): void {
     this.notesDeleteId = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private notesConfirmDelete(): void {
@@ -14023,13 +14097,13 @@ export class App {
         } else if (this.notesViewingId === id) {
           this.notesCloseView();
         } else {
-          this.render();
+          this.scheduleRender();
         }
         showToast("Note deleted");
       })
       .catch((e) => {
         this.notesError = e instanceof Error ? e.message : String(e);
-        this.render();
+        this.scheduleRender();
       });
   }
 
@@ -14415,7 +14489,7 @@ export class App {
         await api.changePassphrase(current.value, next.value);
         for (const f of fields) f.value = "";
         this.announce("Passphrase changed. Your recovery code still works.");
-        this.render();
+        this.scheduleRender();
       } catch (e) {
         showError(
           e instanceof AppError ? e.message : "Could not change the passphrase.",
@@ -14489,7 +14563,7 @@ export class App {
           e instanceof AppError ? e.message : "The switch could not be applied.";
         sw.input.checked = !want;
         sw.input.disabled = false;
-        this.render();
+        this.scheduleRender();
       }
     };
     const swLabel = document.createElement("span");
@@ -14757,7 +14831,7 @@ export class App {
       b.textContent = s.label;
       b.onclick = () => {
         this.settingsSection = s.id;
-        this.render();
+        this.scheduleRender();
       };
       nav.appendChild(b);
     }
@@ -14772,7 +14846,7 @@ export class App {
         b.className = getThemeMode() === mode ? "active" : "";
         b.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
         b.onclick = () => {
-          void setThemeMode(mode).then(() => this.render());
+          void setThemeMode(mode).then(() => this.scheduleRender());
         };
         seg.appendChild(b);
       }
@@ -14828,7 +14902,7 @@ export class App {
           await api.setMailHandle(raw);
           await this.refreshStatus();
           this.announce("Mail address saved");
-          this.render();
+          this.scheduleRender();
         } catch (e) {
           err.hidden = false;
           err.textContent =
@@ -14901,7 +14975,7 @@ export class App {
       sel.value = String(getAutoLockMinutes());
       sel.onchange = () => {
         const v = Number(sel.value);
-        void patchUiPrefs({ auto_lock_minutes: v }).then(() => this.render());
+        void patchUiPrefs({ auto_lock_minutes: v }).then(() => this.scheduleRender());
       };
       body.append(label, sel, this.renderChangePassphraseForm());
     } else if (this.settingsSection === "recovery") {
@@ -15017,7 +15091,7 @@ export class App {
       // First open of the pane: ask the daemon, then re-render.
       void api.dropsKey().then((k) => {
         this.dropInboxKey = k;
-        if (this.settingsSection === "drops") this.render();
+        if (this.settingsSection === "drops") this.scheduleRender();
       });
       const loading = busyNote("Loading…");
       body.appendChild(loading);
@@ -15036,7 +15110,7 @@ export class App {
           .then((k) => {
             this.dropInboxKey = k;
             this.announce("Drop key generated");
-            this.render();
+            this.scheduleRender();
           })
           .catch((e) => {
             showToast(
@@ -15124,7 +15198,7 @@ export class App {
     rotate.onclick = () => {
       if (!this.dropRotateArmed) {
         this.dropRotateArmed = true;
-        this.render();
+        this.scheduleRender();
         return;
       }
       rotate.disabled = true;
@@ -15134,7 +15208,7 @@ export class App {
           this.dropInboxKey = k;
           this.dropRotateArmed = false;
           this.announce("Drop key rotated");
-          this.render();
+          this.scheduleRender();
         })
         .catch((e) => {
           showToast(
@@ -15142,7 +15216,7 @@ export class App {
             { kind: "error" },
           );
           this.dropRotateArmed = false;
-          this.render();
+          this.scheduleRender();
         });
     };
     body.appendChild(rotate);
@@ -15173,12 +15247,12 @@ export class App {
             : report.remaining
               ? `${report.remaining} drop${report.remaining === 1 ? "" : "s"} could not be opened; left in place.`
               : "No drops waiting.";
-          this.render();
+          this.scheduleRender();
         })
         .catch((e) => {
           this.dropDrainNote =
             e instanceof AppError ? e.message : "Could not reach the relay.";
-          this.render();
+          this.scheduleRender();
         });
     };
     body.appendChild(drain);
@@ -15197,7 +15271,7 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.paletteOpen = false;
-        this.render();
+        this.scheduleRender();
       }
     };
     const modal = document.createElement("div");
@@ -15237,7 +15311,7 @@ export class App {
         label: "Toggle theme",
         run: () => {
           void setThemeMode(getThemeMode() === "dark" ? "light" : "dark").then(
-            () => this.render(),
+            () => this.scheduleRender(),
           );
         },
       },
@@ -15255,7 +15329,7 @@ export class App {
           btn.onclick = () => {
             a.run();
             this.paletteOpen = false;
-            this.render();
+            this.scheduleRender();
           };
           list.appendChild(btn);
         });
@@ -15274,7 +15348,7 @@ export class App {
     back.onclick = (e) => {
       if (e.target === back) {
         this.addFriendOpen = false;
-        this.render();
+        this.scheduleRender();
       }
     };
     const modal = document.createElement("div");
@@ -15468,7 +15542,7 @@ export class App {
             setKnownContacts(this.contacts.map((c) => c.nickname));
             this.addFriendOpen = false;
             this.announce(`Added ${nick.value.trim()}.`);
-            this.render();
+            this.scheduleRender();
           } catch (e) {
             err.hidden = false;
             err.textContent =
@@ -15507,7 +15581,7 @@ export class App {
     close.style.marginTop = "16px";
     close.onclick = () => {
       this.addFriendOpen = false;
-      this.render();
+      this.scheduleRender();
     };
     modal.append(title, tabs, body, close);
     back.appendChild(modal);
@@ -15613,7 +15687,7 @@ export class App {
 
   private identityClose(): void {
     this.identityTarget = null;
-    this.render();
+    this.scheduleRender();
   }
 
   private renderProfile(): HTMLElement {    const nick = this.profileNick!;
@@ -15644,7 +15718,7 @@ export class App {
     close.textContent = "Cancel";
     close.onclick = () => {
       this.profileNick = null;
-      this.render();
+      this.scheduleRender();
     };
     const save = document.createElement("button");
     save.type = "button";
@@ -15653,7 +15727,7 @@ export class App {
     save.onclick = () => {
       void setNickOverride(nick, name.value).then(() => {
         this.profileNick = null;
-        this.render();
+        this.scheduleRender();
       });
     };
     actions.append(close, save);

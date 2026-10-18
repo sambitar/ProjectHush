@@ -5663,3 +5663,25 @@ fieldset.chat-history-section {
   color: var(--danger);
 }
 
+/* ------------------------------------------------------------------ */
+/* Scroll-cost containment. Long lists lay out and paint only what is
+   near the viewport: a 2,000-row list costs the same per frame as a
+   ten-row one. `auto` in contain-intrinsic-size remembers each row's
+   last rendered height; the bare length is the estimate used before a
+   row's first render, so the scrollbar stays plausible immediately.
+
+   Message panes (.chat-messages, .conclave-messages) are deliberately
+   excluded: their scroll-carry logic reads scrollHeight on every
+   rebuild and needs real heights until rendering is pane-scoped — see
+   docs/tasks/app-smoothness.md, item 2. */
+
+.conv-rows > *,
+.mail-list > *,
+.reads-list > *,
+.zines-grid > *,
+.torrents-items > * {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
+}
+
+

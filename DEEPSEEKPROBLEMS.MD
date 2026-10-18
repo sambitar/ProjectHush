@@ -7,6 +7,28 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-17 — App smoothness slice (render coalescing)
+
+### Rail search fields drop the caret after one character [OPEN]
+
+- Attempted: while auditing every `this.render()` call site for the swap to a coalesced
+  `scheduleRender()`, classify which sites depend on the render completing synchronously.
+- Symptom: `render()` wipes `this.root.innerHTML = ""` and restores focus afterwards only
+  for composer textareas (keyed by `data-composer-key`). Search inputs that re-render in
+  their own `oninput` — Chats (`this.search`), Mail (`this.mailSearch`), Drops
+  (`this.dropInboxSearch`), torrents library (`this.torrentsLibrarySearch`) — are destroyed
+  mid-typing, so focus falls to `body` and the second keystroke goes nowhere. The atproto
+  explore search documents the identical mechanism in-repo and fixes it by re-querying the
+  new tree and re-focusing ("without this the field drops the caret after one character");
+  the four rail search fields have no such fix. Not reproduced in the running app —
+  inferred from the code plus that comment.
+- Resolution: left unchanged in this slice. Their renders were kept synchronous, so
+  behavior is exactly as before. The fix already exists as a pattern twice over: the
+  Trusts and Zines filters patch the row children in place inside `oninput` and never
+  re-render; the four search fields should adopt that (or be obviated by pane-scoped
+  renders, smoothness doc item 5).
+- Status: OPEN. Pre-existing, not introduced by this slice.
+
 ## 2026-10-17 — Runtime memory inspection of the AppImage
 
 ### hush-daemon PSS unreadable: /proc smaps_rollup permission denied [WORKED AROUND]
