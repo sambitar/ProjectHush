@@ -106,8 +106,12 @@ GitHub release cannot serve that: the repository is private and GitHub 404s unau
 release downloads, which is exactly what the updater makes. The same directory is also the
 public download location for the installers, which the private release page cannot be.
 
-**Caddy route.** One block ahead of the proxy in `/etc/caddy/Caddyfile`. `handle_path`
-strips the `/updates` prefix, so `latest.json` lives at the root of the served directory:
+**Caddy route.** Two static routes ahead of the proxy as of 2026-10-18 (the
+marketing site was added; the relay moved from catch-all proxy to an explicit
+path set). `handle_path` strips the `/updates` prefix, so `latest.json` lives
+at the root of the served directory. The relay's route prefixes are mirrored
+from `crates/hush-relay/src/app.rs` — if the relay ever grows a new top-level
+route, add it to the `@relay` matcher or the site's 404 will swallow it:
 
 ```caddyfile
 hushrelay.space {
@@ -118,7 +122,21 @@ hushrelay.space {
 		file_server
 	}
 
-	reverse_proxy 127.0.0.1:8787
+	# Relay API (loopback). Route prefixes from crates/hush-relay/src/app.rs:
+	#   /health, /drop, /k/{account_id}, /q/{queue_id}..., /b/{queue_id}
+	@relay path /health /drop /drop/* /k/* /q/* /b/*
+	handle @relay {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# Marketing site (Astro static build, deployed from HushWebsite/dist).
+	handle {
+		root * /var/www/hush-site
+		# HTML revalidates via ETag, so deploys land immediately.
+		header Cache-Control "no-cache"
+		file_server
+	}
+
 	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	request_body {
 		max_size 2MB
@@ -173,13 +191,42 @@ By hand, from the workstation:
 scripts/publish-updates-to-relay.sh --tag v0.1.1                 # downloads, uploads, verifies
 scripts/publish-updates-to-relay.sh --tag v0.1.1 --dry-run       # uploads nothing
 ```
-
 Check the origin directly:
 
 ```sh
 curl -sS https://hushrelay.space/updates/latest.json | jq '{version, platforms: (.platforms | keys)}'
 curl -sSI https://hushrelay.space/updates/Hush_aarch64.app.tar.gz | head -1
 ```
+
+## Marketing site (2026-10-18)
+
+The storefront lives at the domain root: `https://hushrelay.space/` serves the
+Astro static build from the separate `HushWebsite` repo. `/var/www/hush-site`
+holds the build (`index.html`, `_astro/`, `og-card.png`, `llms.txt`,
+`llms-full.txt`, `robots.txt`, sitemaps, brand marks); the Caddy block above
+routes `/updates/*` and the relay API around it. HTML is served `no-cache`, so
+a re-deploy lands on the next request.
+
+Deploy, from the workstation:
+
+```sh
+cd /home/sam/HushWebsite
+npm run build
+rsync -a --chmod=D755,F644 dist/ hush-relay-prod:/tmp/hush-site/
+ssh hush-relay-prod 'sudo rsync -a --delete --chmod=D755,F644 /tmp/hush-site/ /var/www/hush-site/ && rm -rf /tmp/hush-site'
+```
+
+`-s`-style permission flags are not cosmetic here either: Caddy runs as
+`caddy` and needs the world-readable bits. `--delete` makes the target match
+the build, so stale hashed `_astro` assets do not accumulate.
+
+Verified 2026-10-18 after first deploy: `/` → 200 (site HTML),
+`/health` → 200 (relay proxied, counters incrementing),
+`/q/probe` → 401 (API route still registered, not swallowed by the site),
+`/updates/latest.json` → v0.5.0 manifest intact, robots/llms/og-card/sitemap
+all 200 with correct types. Live Caddyfile backup:
+`/etc/caddy/Caddyfile.bak-20261018`.
+
 
 **Names and accumulation.** The Linux bundles carry the version
 (`Hush_0.1.0_amd64.AppImage`), so releases accumulate; the macOS updater artifacts do not
