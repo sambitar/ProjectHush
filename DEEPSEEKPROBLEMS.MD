@@ -7,6 +7,50 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-17 — Release v0.5.0 (Actions minutes exhausted)
+
+### The mirror workflow could not start, so the relay was mirrored by hand [WORKED AROUND]
+
+- Attempted: cut v0.5.0 the documented way (RELEASING.md): tag `v0.5.0`, let
+  `.github/workflows/release.yml` build all three legs, publish the draft, and let publishing
+  fire `publish-updates.yml` to mirror the manifest and bundles to the relay.
+- Symptom: the account is out of Actions minutes (private repo, user account). The release
+  run itself survived — run `39093788679` completed with all three legs green, because every
+  job had already started before the limit was reached and GitHub lets a running job finish:
+  macOS aarch64 (staging 3m06s, build 2m25s), macOS x86_64 (3m27s, 2m17s), Linux
+  (staging 14m15s, build ~8m). Publishing the draft then fired run `39095405679`, whose only
+  job failed without running a single step:
+
+  ```
+  The job was not started because recent account payments have failed or your spending
+  limit needs to be increased. Please check the 'Billing & plans' section in your settings
+  ```
+
+  So the last step of the pipeline is not a build but a workflow run, and a billing block
+  stops it while leaving the artifacts intact.
+- Resolution: WORKED AROUND. `publish-updates.yml` only calls
+  `scripts/publish-updates-to-relay.sh`, which runs from a workstation, so the mirror was run
+  locally: `scripts/publish-updates-to-relay.sh --tag v0.5.0 --repo sambitar/ProjectHush`
+  (dry run first). It verified all 6 platform entries against their `.sig`, uploaded 8
+  bundles, HEAD-checked each over HTTPS (all 200), then published the manifest last and
+  confirmed the relay serves 0.5.0. Verified from outside with
+  `scripts/verify-update-signature.py --manifest https://hushrelay.space/updates/latest.json
+  --all`: 6/6 OK against the public key in `tauri.conf.json`. The failed workflow run was left
+  in place — it is idempotent and re-runnable from the Actions tab once minutes are back.
+- Ordering deviation: the relay went live before the GitHub release page, because publishing
+  the draft was expected to (and did) fail to start the workflow. Installed copies read only
+  the relay, so they are correct either way; only the sequence differs from RELEASING.md.
+- Severity: this is an account/billing problem, not a repo problem. Nothing in the repo needs
+  fixing. What it does expose is that the pipeline has no fallback path for a blocked runner,
+  and the docs do not say the mirror is runnable locally.
+- Not verified here: the actual minute balance. The billing endpoint
+  (`/users/sambitar/settings/billing/actions`) returns 404 for this token, which carries
+  `repo`, `workflow`, `gist`, `delete_repo`, `read:org` but not `user`. The macOS legs
+  dominate whatever the balance is: private-repo macOS runner time bills at 10x, so ~6
+  minutes of runner time each is ~60 billed minutes, against ~22 for the Linux leg.
+- Lesson: a release is not finished when the tag builds. Check that the mirror actually ran
+  rather than assuming the `release: published` trigger fired it.
+
 ## 2026-10-17 — Conclave attention slice (ring, unread badges, chat polish)
 
 ### Conclave chat misread as IRC-backed [FIXED]
