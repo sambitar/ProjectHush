@@ -878,6 +878,36 @@
   height: 16px;
 }
 
+/* In flight: the action's round trip (or a slow daemon) has the controls
+   quiet. Dim the pill so the quiet reads as intended, not as a hang. */
+.voice-led-btn:disabled,
+.voice-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Settings → Voice: the input meter. A track the level bar fills; "dead"
+   (no input device open) greys it so a still bar reads as honest. */
+.voice-meter {
+  width: 100%;
+  max-width: 420px;
+  height: 8px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.voice-meter-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--success-text);
+  transition: width 0.12s linear;
+}
+
+.voice-meter-fill.dead {
+  background: var(--surface-2);
+}
+
 .voice-led {
   position: absolute;
   top: -3px;

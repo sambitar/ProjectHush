@@ -112,7 +112,24 @@ struct App {
     /// created on demand when a room opens or an offer arrives. Same contract
     /// as `paper_planes`: runtime-only, a peer-connection map, safe to lose.
     voice_planes: Mutex<HashMap<String, Arc<voice_data::VoicePlane>>>,
+    /// A device probe for Settings — a plane in Device mode with no peers,
+    /// opened so the meter, the speaker test, and the health panel have
+    /// something real to read between calls. Runtime-only; a watchdog drops
+    /// it after the panel stops asking (a mic left hot with no panel is a
+    /// lie the user can see in their hardware).
+    device_probe: Mutex<Option<DeviceProbe>>,
 }
+
+/// The Settings-side device probe and its last-use stamp. The watchdog takes
+/// the whole entry when the panel has not touched it for a minute.
+struct DeviceProbe {
+    plane: Arc<voice_data::VoicePlane>,
+    last_used: Arc<Mutex<Instant>>,
+}
+
+/// How long an untouched probe survives before the watchdog closes its
+/// streams.
+const PROBE_IDLE_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -333,6 +350,15 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/voice/{conclave_id}/stats", get(voice_stats))
         .route("/api/voice/{conclave_id}", get(voice_get))
         .route("/api/voice/state", get(voice_state))
+        // Voice devices (Settings). The literal `devices` segment matches
+        // ahead of the `{conclave_id}` parameter, and cannot collide with a
+        // room's conclave: an id is a minted uuid.
+        .route(
+            "/api/voice/devices",
+            get(voice_devices).post(voice_select_devices),
+        )
+        .route("/api/voice/devices/meter", get(voice_input_meter))
+        .route("/api/voice/devices/test", post(voice_test_output))
         // Zines (Task 21). The literal `pen-name` segment is matched ahead of
         // the `{zine_id}` parameter, and cannot collide with a real zine: an id
         // is a minted uuid.
@@ -568,6 +594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paper_planes: Mutex::new(HashMap::new()),
         voices: Mutex::new(VoiceManager::new()),
         voice_planes: Mutex::new(HashMap::new()),
+        device_probe: Mutex::new(None),
     };
     let state = Arc::new(app);
 
@@ -6120,15 +6147,21 @@ fn voice_media_mode() -> voice_data::MediaMode {
 }
 
 /// The plane for `session_id`, created on demand (a room's opener never
-/// dials, so its plane stays idle until the first inbound offer).
+/// dials, so its plane stays idle until the first inbound offer). The device
+/// preference comes from the config file, so a Settings choice applies to
+/// the next room a vault opens.
 async fn voice_plane_for(state: &Arc<App>, session_id: &str) -> Arc<voice_data::VoicePlane> {
     let mut planes = state.voice_planes.lock().await;
     planes
         .entry(session_id.to_string())
         .or_insert_with(|| {
-            Arc::new(voice_data::VoicePlane::new(
+            Arc::new(voice_data::VoicePlane::with_selector(
                 hush_core::config::resolve_stun_url(&state.dir),
                 voice_media_mode(),
+                voice_data::DeviceSelector {
+                    input: hush_core::config::resolve_voice_input_device(&state.dir),
+                    output: hush_core::config::resolve_voice_output_device(&state.dir),
+                },
             ))
         })
         .clone()
@@ -6332,26 +6365,38 @@ async fn voice_join(
             .expect("the join just landed");
         (voice_view_of(live, &me), session_id, existing)
     };
+    // Dial in the background. `plane.offer` gathers ICE inline — up to the
+    // handshake deadline per dialed peer — and awaiting that before the join's
+    // response made the UI's Voice click read as dead for seconds. The room
+    // state is committed and the view computed above; the offers are
+    // best-effort fan-out and can land after the response returns. A leave
+    // that races the dial just fails the offer (logged, skipped) — the same
+    // degraded posture the dial already had.
     let plane = voice_plane_for(&state, &session_id).await;
-    for peer in existing.iter().filter(|p| *p != &me) {
-        // One gathered offer per pair, sent over the room's fan-out. The
-        // wire format carries no destination (Phase 3's known seam): with
-        // two trustees the fan-out's only recipient *is* the dialed peer.
-        let offer = match plane.offer(&peer).await {
-            Ok(offer) => offer,
-            Err(e) => {
-                eprintln!("hush-daemon: voice offer to {peer} failed: {e}");
-                continue;
+    let worker = state.worker.clone();
+    let dial_conclave = conclave_id.clone();
+    let dial_session = session_id.clone();
+    let peers: Vec<String> = existing.iter().filter(|p| *p != &me).cloned().collect();
+    tokio::spawn(async move {
+        for peer in peers {
+            // One gathered offer per pair, sent over the room's fan-out. The
+            // wire format carries no destination (Phase 3's known seam): with
+            // two trustees the fan-out's only recipient *is* the dialed peer.
+            let offer = match plane.offer(&peer).await {
+                Ok(offer) => offer,
+                Err(e) => {
+                    eprintln!("hush-daemon: voice offer to {peer} failed: {e}");
+                    continue;
+                }
+            };
+            if let WorkResult::Err(e) = worker
+                .send_voice_offer(&dial_conclave, &dial_session, &offer)
+                .await
+            {
+                eprintln!("hush-daemon: voice offer fan-out failed: {e}");
             }
-        };
-        if let WorkResult::Err(e) = state
-            .worker
-            .send_voice_offer(&conclave_id, &session_id, &offer)
-            .await
-        {
-            eprintln!("hush-daemon: voice offer fan-out failed: {e}");
         }
-    }
+    });
     Ok(Json(view))
 }
 
@@ -6540,6 +6585,250 @@ async fn voice_stats(
         peers_live: s.peers_live,
     }))
 }
+
+// --- Voice devices (Settings): what is in use, what is available, and a way
+// --- to test it without a live call. The daemon owns the devices (cpal
+// --- streams are !Send and live on its device threads), so every device
+// --- question is a daemon question.
+
+/// The probe used by the Settings panel: a Device-mode plane with no peers.
+/// Its device thread opens the selected devices exactly as a room would, so
+/// the meter and the speaker test exercise the same path a call would.
+async fn voice_probe_ensure(
+    state: &Arc<App>,
+) -> Result<(Arc<voice_data::VoicePlane>, Arc<Mutex<Instant>>), (StatusCode, Json<ApiError>)> {
+    if voice_media_mode() != voice_data::MediaMode::Device {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "this daemon's voice runs the test tone (HUSH_VOICE_TEST_TONE); \
+                        there are no devices to probe"
+                    .into(),
+            }),
+        ));
+    }
+    let mut probe = state.device_probe.lock().await;
+    if let Some(p) = probe.as_ref() {
+        *p.last_used.lock().await = Instant::now();
+        return Ok((p.plane.clone(), p.last_used.clone()));
+    }
+    let plane = Arc::new(voice_data::VoicePlane::with_selector(
+        hush_core::config::resolve_stun_url(&state.dir),
+        voice_data::MediaMode::Device,
+        voice_data::DeviceSelector {
+            input: hush_core::config::resolve_voice_input_device(&state.dir),
+            output: hush_core::config::resolve_voice_output_device(&state.dir),
+        },
+    ));
+    let last_used = Arc::new(Mutex::new(Instant::now()));
+    // The watchdog: a probe whose panel stopped asking is closed whole —
+    // streams and all. A mic left hot with no panel watching it is visible
+    // on the hardware and is not ours to hold.
+    let wd_state = Arc::clone(state);
+    let wd_last = Arc::clone(&last_used);
+    let wd_plane = Arc::clone(&plane);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let last = *wd_last.lock().await;
+            if last.elapsed() > PROBE_IDLE_AFTER {
+                wd_plane.shutdown();
+                let mut probe = wd_state.device_probe.lock().await;
+                if probe
+                    .as_ref()
+                    .is_some_and(|cur| Arc::ptr_eq(&cur.plane, &wd_plane))
+                {
+                    *probe = None;
+                }
+                break;
+            }
+        }
+    });
+    *probe = Some(DeviceProbe {
+        plane: plane.clone(),
+        last_used: last_used.clone(),
+    });
+    Ok((plane, last_used))
+}
+
+/// The current selection, read back from the config — what the pickers show.
+fn voice_selected(state: &Arc<App>) -> voice_data::DeviceSelector {
+    voice_data::DeviceSelector {
+        input: hush_core::config::resolve_voice_input_device(&state.dir),
+        output: hush_core::config::resolve_voice_output_device(&state.dir),
+    }
+}
+
+#[derive(Serialize)]
+struct VoiceDevicesResponse {
+    /// Whether this daemon's voice runs on real devices (false: the tone
+    /// test mode — there is nothing to pick or test).
+    device_mode: bool,
+    /// The system's device names, as cpal reports them.
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    /// The names on file in the config; `null` is the OS default.
+    selected_input: Option<String>,
+    selected_output: Option<String>,
+    /// What a live room's device thread actually opened, when a room exists.
+    /// Every session's plane follows the same selection, so the first is
+    /// what the panel shows.
+    session: Option<voice_data::DeviceHealth>,
+    /// What the Settings probe holds, when one is open.
+    probe: Option<voice_data::DeviceHealth>,
+}
+
+async fn voice_devices(
+    State(state): State<Arc<App>>,
+) -> Result<Json<VoiceDevicesResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    paper_account_id(&state).await?;
+    let list = if voice_media_mode() == voice_data::MediaMode::Device {
+        voice_data::list_devices()
+    } else {
+        voice_data::DeviceList::default()
+    };
+    let session = {
+        let planes = state.voice_planes.lock().await;
+        planes.values().next().and_then(|p| p.device_health())
+    };
+    let probe = state
+        .device_probe
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|p| p.plane.device_health());
+    let selected = voice_selected(&state);
+    Ok(Json(VoiceDevicesResponse {
+        device_mode: voice_media_mode() == voice_data::MediaMode::Device,
+        inputs: list.inputs,
+        outputs: list.outputs,
+        selected_input: selected.input,
+        selected_output: selected.output,
+        session,
+        probe,
+    }))
+}
+
+#[derive(Deserialize)]
+struct VoiceDeviceSelectRequest {
+    /// `Some(Some(name))` picks a device, `Some(None)` resets to the OS
+    /// default, absent leaves the side unchanged.
+    input: Option<Option<String>>,
+    output: Option<Option<String>>,
+}
+
+/// Persist a device choice and reopen every live device thread on it — a
+/// selection takes effect now, not "on the next call".
+async fn voice_select_devices(
+    State(state): State<Arc<App>>,
+    Json(req): Json<VoiceDeviceSelectRequest>,
+) -> Result<Json<VoiceDevicesResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    paper_account_id(&state).await?;
+    if voice_media_mode() != voice_data::MediaMode::Device {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "this daemon's voice runs the test tone; there are no \
+                        devices to select"
+                    .into(),
+            }),
+        ));
+    }
+    let mut cfg = hush_core::config::load(&state.dir);
+    if let Some(v) = req.input {
+        cfg.voice_input_device = v;
+    }
+    if let Some(v) = req.output {
+        cfg.voice_output_device = v;
+    }
+    hush_core::config::save(&state.dir, &cfg)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: e })))?;
+    let selector = voice_selected(&state);
+    {
+        let planes = state.voice_planes.lock().await;
+        for plane in planes.values() {
+            plane.reopen_devices(selector.clone());
+        }
+    }
+    if let Some(p) = state.device_probe.lock().await.as_ref() {
+        p.plane.reopen_devices(selector.clone());
+        *p.last_used.lock().await = Instant::now();
+    }
+    voice_devices(State(state)).await
+}
+
+#[derive(Serialize)]
+struct VoiceMeterResponse {
+    /// Whether a real input device is open (false: silence by degradation,
+    /// and the meter says so rather than sitting still for no reason).
+    input_live: bool,
+    input_name: Option<String>,
+    /// Peak |sample| of the latest input callback, 0.0..1.0.
+    level: f32,
+}
+
+/// The input meter's snapshot. Polled by the panel while it is open; the
+/// poll is also what keeps the probe alive.
+async fn voice_input_meter(
+    State(state): State<Arc<App>>,
+) -> Result<Json<VoiceMeterResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    paper_account_id(&state).await?;
+    let (plane, _) = voice_probe_ensure(&state).await?;
+    let health = plane.device_health().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError { error: "no device queues".into() }),
+        )
+    })?;
+    Ok(Json(VoiceMeterResponse {
+        input_live: health.input_live,
+        input_name: health.input_name,
+        level: health.input_level,
+    }))
+}
+
+#[derive(Deserialize)]
+struct VoiceTestRequest {
+    /// How long the tone plays. Default: long enough to hear and let go.
+    ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct VoiceTestResponse {
+    /// Whether the tone will actually be audible — false when no output
+    /// device opened, which is the panel's answer, not an error to hide.
+    audible: bool,
+    output_name: Option<String>,
+}
+
+/// The speaker test: a tone on the selected output, through the same device
+/// thread a call would use.
+async fn voice_test_output(
+    State(state): State<Arc<App>>,
+    Json(req): Json<VoiceTestRequest>,
+) -> Result<Json<VoiceTestResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    paper_account_id(&state).await?;
+    let (plane, last_used) = voice_probe_ensure(&state).await?;
+    // A probe created by this very request needs a beat to open its output
+    // stream; poll briefly rather than reporting a false "not audible".
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut health = plane.device_health();
+    while health.as_ref().is_none_or(|h| !h.output_live) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        health = plane.device_health();
+    }
+    let audible = plane.play_test_tone(req.ms.unwrap_or(2_000));
+    *last_used.lock().await = Instant::now();
+    Ok(Json(VoiceTestResponse {
+        audible,
+        output_name: health.and_then(|h| h.output_name),
+    }))
+}
+
 
 /// Apply one voice payload received from a peer to the local manager and the
 /// media plane.
@@ -7071,7 +7360,8 @@ mod drops_api_tests {
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
-        voice_planes: Mutex::new(HashMap::new()),
+            voice_planes: Mutex::new(HashMap::new()),
+            device_probe: Mutex::new(None),
         })
     }
 
@@ -7351,7 +7641,8 @@ mod wallet_api_tests {
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
-        voice_planes: Mutex::new(HashMap::new()),
+            voice_planes: Mutex::new(HashMap::new()),
+            device_probe: Mutex::new(None),
         });
         app.wallet
             .apply_relay(false, Some(TEST_SOCKS.to_string()))
@@ -7873,7 +8164,8 @@ mod notes_api_tests {
             relay_probe_inflight: AtomicBool::new(false),
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
-        voice_planes: Mutex::new(HashMap::new()),
+            voice_planes: Mutex::new(HashMap::new()),
+            device_probe: Mutex::new(None),
         })
     }
 
@@ -9025,6 +9317,14 @@ mod voice_api_tests {
             ("POST", "/api/voice/c-1/join", None),
             ("POST", "/api/voice/c-1/leave", None),
             ("POST", "/api/voice/c-1/mute", Some(r#"{"muted":true}"#)),
+            ("GET", "/api/voice/devices", None),
+            (
+                "POST",
+                "/api/voice/devices",
+                Some(r#"{"input":"microphone"}"#),
+            ),
+            ("GET", "/api/voice/devices/meter", None),
+            ("POST", "/api/voice/devices/test", Some(r#"{}"#)),
         ] {
             let (status, _) = request(&router, method, path, body).await;
             assert_eq!(

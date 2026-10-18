@@ -30,7 +30,10 @@ import type {
   WalletNetworkMode,
   WalletSendDto,
   WalletStateDto,
+  VoiceDevicesDto,
+  VoiceMeterDto,
   VoiceStateDto,
+  VoiceTestDto,
   VoiceViewDto,
   ZineDraftDto,
   ZinesViewDto,
@@ -522,6 +525,21 @@ export const api = {
     request<VoiceViewDto>(`/api/voice/${encodeURIComponent(conclaveId)}/mute`, {
       method: "POST",
       body: JSON.stringify({ muted }),
+    }),
+  // Voice devices (Settings): enumerate, select, and test without a call.
+  // A selection takes effect immediately — the daemon reopens its device
+  // threads on it, live rooms included.
+  voiceDevices: () => request<VoiceDevicesDto>("/api/voice/devices"),
+  voiceSelectDevices: (sel: { input?: string | null; output?: string | null }) =>
+    request<VoiceDevicesDto>("/api/voice/devices", {
+      method: "POST",
+      body: JSON.stringify(sel),
+    }),
+  voiceDeviceMeter: () => request<VoiceMeterDto>("/api/voice/devices/meter"),
+  voiceDeviceTest: (ms?: number) =>
+    request<VoiceTestDto>("/api/voice/devices/test", {
+      method: "POST",
+      body: JSON.stringify(ms != null ? { ms } : {}),
     }),
   // --- Torrents (TorBox-powered client). The API key lives in the vault
   // sidecar and is never sent back; the daemon does all TorBox traffic. ---

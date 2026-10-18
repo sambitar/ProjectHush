@@ -260,6 +260,7 @@ import {
   verificationLabel,
 } from "./lib/drops/verification";
 import type { Drop } from "./lib/drops/types";
+import type { VoiceDevicesDto } from "./lib/api/types";
 import {
   closeDrop,
   devEnabled,
@@ -310,6 +311,7 @@ type SettingsSection =
   | "relay"
   | "drops"
   | "torbox"
+  | "voice"
   | "notifications"
   | "security"
   | "recovery"
@@ -587,6 +589,8 @@ export class App {
   private torActionError: string | null = null;
   private search = "";
   private settingsSection: SettingsSection = "appearance";
+  /** The Voice section's input meter poll; null when the section is closed. */
+  private voiceMeterTimer: number | null = null;
   private liveRegion!: HTMLElement;
   private addFriendOpen = false;
   private profileNick: string | null = null;
@@ -1468,9 +1472,9 @@ export class App {
       await this.reloadMailbox();
       await this.reloadConclaves();
     } catch {
-      this.announce(
-        "Some data could not be loaded. It will be retried on the next sync.",
-      );
+      showToast("Some data could not be loaded. It will be retried on the next sync.", {
+        kind: "error",
+      });
     }
     this.startPoll();
   }
@@ -2615,9 +2619,9 @@ export class App {
       if (on) await api.presenceOffline().catch(() => {});
       else await api.presenceHeartbeat().catch(() => {});
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Presence could not be changed.",
-      );
+      showToast(e instanceof AppError ? e.message : "Presence could not be changed.", {
+        kind: "error",
+      });
     }
     this.render();
   }
@@ -2920,11 +2924,11 @@ export class App {
     // keyboard path, or a stale pane could still reach here; the daemon would
     // refuse it, and this is the same answer with copy instead of an error.
     if (contact && contact.reach !== "full") {
-      this.announce(`${displayNick(nick)} is mail only. Use Mail to reach them.`);
+      showToast(`${displayNick(nick)} is mail only. Use Mail to reach them.`, { kind: "error" });
       return;
     }
     if (!contact?.online) {
-      this.announce(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`);
+      showToast(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`, { kind: "error" });
       return;
     }
     const msg = addOutgoingText(nick, text);
@@ -2935,7 +2939,9 @@ export class App {
       await api.sendText(nick, text);
     } catch (e) {
       removeOutgoingMessage(nick, msg.id);
-      this.announce(e instanceof AppError ? e.message : "Couldn't send. Try again.");
+      showToast(e instanceof AppError ? e.message : "Couldn't send. Try again.", {
+        kind: "error",
+      });
       this.render();
     }
   }
@@ -2945,15 +2951,17 @@ export class App {
     // Same guard as `sendText`: a file is a live surface, and a mail-only trust
     // has none. A dropped file must not look like it sent.
     if (contact && contact.reach !== "full") {
-      this.announce(`${displayNick(nick)} is mail only. Use Mail to reach them.`);
+      showToast(`${displayNick(nick)} is mail only. Use Mail to reach them.`, { kind: "error" });
       return;
     }
     if (!contact?.online) {
-      this.announce(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`);
+      showToast(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`, { kind: "error" });
       return;
     }
     if (file.size > MAX_FILE_BYTES) {
-      this.announce(`Files are limited to ${Math.round(MAX_FILE_BYTES / 1024)} KB for now`);
+      showToast(`Files are limited to ${Math.round(MAX_FILE_BYTES / 1024)} KB for now`, {
+        kind: "error",
+      });
       return;
     }
     const buf = new Uint8Array(await file.arrayBuffer());
@@ -2972,7 +2980,9 @@ export class App {
       this.render();
     } catch (e) {
       removeOutgoingMessage(nick, msg.id);
-      this.announce(e instanceof AppError ? e.message : "Couldn't send. Try again.");
+      showToast(e instanceof AppError ? e.message : "Couldn't send. Try again.", {
+        kind: "error",
+      });
       this.render();
     }
   }
@@ -3838,9 +3848,9 @@ export class App {
       );
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't change how you reach them.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't change how you reach them.", {
+        kind: "error",
+      });
     }
   }
 
@@ -4227,9 +4237,9 @@ export class App {
                 this.render();
               })
               .catch((e) =>
-                this.announce(
-                  e instanceof Error ? e.message : "Invite failed",
-                ),
+                showToast(e instanceof Error ? e.message : "Invite failed", {
+                  kind: "error",
+                }),
               );
           },
         });
@@ -4292,9 +4302,9 @@ export class App {
                 this.render();
               })
               .catch((e) =>
-                this.announce(
-                  e instanceof Error ? e.message : "Request failed",
-                ),
+                showToast(e instanceof Error ? e.message : "Request failed", {
+                  kind: "error",
+                }),
               );
           },
         });
@@ -4617,7 +4627,9 @@ export class App {
             this.render();
           })
           .catch((e) =>
-            this.announce(e instanceof Error ? e.message : "Forward failed"),
+            showToast(e instanceof Error ? e.message : "Forward failed", {
+              kind: "error",
+            }),
           );
       };
       const drop = document.createElement("button");
@@ -4656,7 +4668,9 @@ export class App {
             this.render();
           })
           .catch((e) =>
-            this.announce(e instanceof Error ? e.message : "Accept failed"),
+            showToast(e instanceof Error ? e.message : "Accept failed", {
+              kind: "error",
+            }),
           );
       };
       const drop = document.createElement("button");
@@ -4735,7 +4749,9 @@ export class App {
             this.introPickerClose();
           })
           .catch((e) =>
-            this.announce(e instanceof Error ? e.message : "Introduce failed"),
+            showToast(e instanceof Error ? e.message : "Introduce failed", {
+              kind: "error",
+            }),
           );
       };
       list.appendChild(row);
@@ -4813,7 +4829,9 @@ export class App {
           this.render();
         })
         .catch((e) =>
-          this.announce(e instanceof Error ? e.message : "Share failed"),
+          showToast(e instanceof Error ? e.message : "Share failed", {
+            kind: "error",
+          }),
         );
     };
     actions.append(no, yes);
@@ -4916,11 +4934,23 @@ export class App {
     actions.prepend(micBtn, toggle);
 
     const run = (p: Promise<unknown>, done: string): void => {
+      // Quiet while in flight: a second click must not fire a second join,
+      // and the dimmed pill is the feedback the click otherwise lacked —
+      // the state only moves when the daemon answers and the refresh lands.
+      toggle.disabled = true;
+      micBtn.disabled = true;
+      leave.disabled = true;
       void p.then(() => {
         this.announce(done);
         refresh();
       }).catch((e: unknown) => {
-        this.announce(e instanceof AppError ? e.message : "Voice action failed.");
+        showToast(e instanceof AppError ? e.message : "Voice action failed.", {
+          kind: "error",
+        });
+      }).finally(() => {
+        toggle.disabled = false;
+        micBtn.disabled = false;
+        leave.disabled = false;
       });
     };
 
@@ -4930,9 +4960,10 @@ export class App {
         .catch(() => null) // 404: no room is open — the start state
         .then((view) => {
           const s = voicePill(view, me);
-          toggle.onclick = null;
-          micBtn.onclick = null;
-          leave.onclick = null;
+          // The handlers rebind to the fetched state below, and the previous
+          // binding stays live until then. Nulling them first left a dead
+          // window on every render — on a slow daemon, seconds of clicks
+          // that simply vanished.
           leave.hidden = true;
           // The voice toggle is the one-button on/off: out of the room it
           // joins (or opens), in it, it leaves. Dark means off, so an unlit
@@ -5021,8 +5052,9 @@ export class App {
           })
           .catch((e) => {
             btn.disabled = false;
-            this.announce(
+            showToast(
               e instanceof AppError ? e.message : "Couldn't start the paper.",
+              { kind: "error" },
             );
           });
       };
@@ -5043,9 +5075,23 @@ export class App {
       saveNoteBtn.textContent = "Save as note";
       saveNoteBtn.title = "Save this paper as a note in your vault";
       saveNoteBtn.onclick = () => {
+        if (saveNoteBtn.disabled) return;
         saveNoteBtn.disabled = true;
-        void this.savePaperAsNote(conclaveId).finally(() => {
-          saveNoteBtn.disabled = false;
+        saveNoteBtn.textContent = "Saving…";
+        void this.savePaperAsNote(conclaveId).then((saved) => {
+          // The pane's DOM is stable across re-renders (the paperHost
+          // doctrine), so the outcome written on the button is what the user
+          // sees; the toast carries the words.
+          if (saved) {
+            saveNoteBtn.textContent = "Saved ✓";
+            window.setTimeout(() => {
+              saveNoteBtn.textContent = "Save as note";
+              saveNoteBtn.disabled = false;
+            }, 1600);
+          } else {
+            saveNoteBtn.textContent = "Save as note";
+            saveNoteBtn.disabled = false;
+          }
         });
       };
       actions.appendChild(saveNoteBtn);
@@ -5078,7 +5124,7 @@ export class App {
    * is on and after it has ended — the note belongs to this vault alone;
    * nothing is sent to the other trustees.
    */
-  private async savePaperAsNote(conclaveId: string): Promise<void> {
+  private async savePaperAsNote(conclaveId: string): Promise<boolean> {
     const title = conclaveById(conclaveId)?.name ?? "Conclave";
     try {
       // The button lives on the paper's own surface, so the session is
@@ -5091,17 +5137,24 @@ export class App {
         const body = s ? paperPlainText(s) : "";
         if (!body.trim()) {
           showToast("The paper is empty — nothing to save.", { kind: "error" });
-          return;
+          return false;
         }
         await saveNote({ title, body });
         showToast("Paper saved as a note", { kind: "success" });
+        return true;
       } finally {
         if (!wasOpen) closePaper();
       }
     } catch (e) {
-      this.announce(
+      // A failed save must be as visible as a saved one: announce() alone is
+      // screen-reader-only, which is how a failed save looked like a dead
+      // button. The toast carries role="status", so assistive tech still
+      // hears it.
+      showToast(
         e instanceof AppError ? e.message : "Couldn't save the paper as a note.",
+        { kind: "error" },
       );
+      return false;
     }
   }
 
@@ -5311,7 +5364,9 @@ export class App {
   private async createConclave(): Promise<void> {
     const name = this.conclaveCreateName.trim();
     if (!name || this.conclaveCreateTrustees.length === 0) {
-      this.announce("A conclave needs a name and at least one trustee to invite.");
+      showToast("A conclave needs a name and at least one trustee to invite.", {
+        kind: "error",
+      });
       return;
     }
     try {
@@ -5322,9 +5377,9 @@ export class App {
       this.announce(`${name} created. Invites sent.`);
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't create the conclave.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't create the conclave.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5340,9 +5395,9 @@ export class App {
       await this.reloadConclaves();
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't send that invite.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't send that invite.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5355,9 +5410,9 @@ export class App {
       await this.reloadConclaves();
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't remove that trustee.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't remove that trustee.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5371,9 +5426,9 @@ export class App {
       await this.reloadConclaves();
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't leave the conclave.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't leave the conclave.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5388,9 +5443,9 @@ export class App {
       this.announce("Invite accepted.");
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't accept the invite.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't accept the invite.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5400,9 +5455,9 @@ export class App {
       await this.reloadConclaves();
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't decline the invite.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't decline the invite.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5421,9 +5476,9 @@ export class App {
       await this.reloadConclaves();
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't send. Try again.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't send. Try again.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5436,9 +5491,9 @@ export class App {
    */
   private async sendConclaveFile(conclaveId: string, file: File): Promise<void> {
     if (file.size > MAX_FILE_BYTES) {
-      this.announce(
-        `Files are limited to ${Math.round(MAX_FILE_BYTES / 1024)} KB for now`,
-      );
+      showToast(`Files are limited to ${Math.round(MAX_FILE_BYTES / 1024)} KB for now`, {
+        kind: "error",
+      });
       return;
     }
     try {
@@ -5447,9 +5502,9 @@ export class App {
       await this.reloadConclaves();
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't share the file. Try again.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't share the file. Try again.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5562,10 +5617,11 @@ export class App {
       );
       this.render();
     } catch (e) {
-      this.announce(
+      showToast(
         e instanceof AppError
           ? e.message
           : "Ended, but this vault's copy may remain — delete it from the ended conclave.",
+        { kind: "error" },
       );
       await this.reloadConclaves();
       this.render();
@@ -5579,9 +5635,9 @@ export class App {
       await this.reloadConclaves();
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't end the conclave.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't end the conclave.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5712,9 +5768,9 @@ export class App {
       this.announce("Conclave deleted. Files it shared stay in your vault.");
       this.render();
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't delete the conclave.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't delete the conclave.", {
+        kind: "error",
+      });
     }
   }
 
@@ -5877,7 +5933,9 @@ export class App {
       this.render();
     } catch (e) {
       this.closeTrustDelete();
-      this.announce(e instanceof AppError ? e.message : "Could not remove contact");
+      showToast(e instanceof AppError ? e.message : "Could not remove contact", {
+        kind: "error",
+      });
       this.render();
     }
   }
@@ -7107,9 +7165,9 @@ export class App {
       // given, and a rejected publish must not cost the author their writing.
       btn.disabled = false;
       btn.textContent = "Publish";
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't publish that zine.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't publish that zine.", {
+        kind: "error",
+      });
     }
   }
 
@@ -7134,7 +7192,9 @@ export class App {
         open.muted = view?.zines.find((z) => z.zine_id === zineId)?.muted ?? muted;
       }
     } catch (e) {
-      this.announce(e instanceof AppError ? e.message : "Couldn't change that.");
+      showToast(e instanceof AppError ? e.message : "Couldn't change that.", {
+        kind: "error",
+      });
     }
     if (this.rail === "zines") this.render();
   }
@@ -7150,9 +7210,9 @@ export class App {
         this.zinesDetailError = null;
       }
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't forget that zine.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't forget that zine.", {
+        kind: "error",
+      });
     }
     if (this.rail === "zines") this.render();
   }
@@ -7257,9 +7317,9 @@ export class App {
           : `Merged into revision ${view?.revision ?? 0} and republished.`,
       );
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't merge that comment.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't merge that comment.", {
+        kind: "error",
+      });
     }
     this.zinesCommentBusyHash = null;
     await this.zinesRefreshDetail(zineId);
@@ -7278,9 +7338,9 @@ export class App {
       if (detail && this.zinesOpenId === zineId) this.zinesDetail = detail;
       this.announce("Comment dropped. It was never merged, so nothing is retracted.");
     } catch (e) {
-      this.announce(
-        e instanceof AppError ? e.message : "Couldn't drop that comment.",
-      );
+      showToast(e instanceof AppError ? e.message : "Couldn't drop that comment.", {
+        kind: "error",
+      });
     }
     this.zinesCommentBusyHash = null;
     if (this.rail === "zines") this.render();
@@ -10498,7 +10558,9 @@ export class App {
     try {
       await api.deleteMail(id);
     } catch (e) {
-      this.announce(e instanceof AppError ? e.message : "Could not delete.");
+      showToast(e instanceof AppError ? e.message : "Could not delete.", {
+        kind: "error",
+      });
       return;
     }
     // Drop the id from the flag lists too, or they accumulate ids for records
@@ -10595,8 +10657,9 @@ export class App {
               this.render();
             })
             .catch((e) => {
-              this.announce(
+              showToast(
                 e instanceof AppError ? e.message : "Could not generate the drop key.",
+                { kind: "error" },
               );
               this.render();
             });
@@ -10894,7 +10957,11 @@ export class App {
       void navigator.clipboard
         .writeText(href)
         .then(() => this.announce("Link copied to clipboard"))
-        .catch(() => this.announce(href));
+        .catch(() =>
+          showToast("Couldn't copy the link — select it and copy it by hand.", {
+            kind: "error",
+          }),
+        );
     });
   }
 
@@ -10988,7 +11055,7 @@ export class App {
           loaded.push({ name: a.name, dataBase64: r.data_base64, size: a.size });
         }
       } catch {
-        this.announce(`Could not load ${a.name} from the vault`);
+        showToast(`Could not load ${a.name} from the vault`, { kind: "error" });
       }
     }
     // The composer may have been closed while those fetches were in flight.
@@ -13392,7 +13459,7 @@ export class App {
         this.announce("Backup downloaded");
         this.render();
       } catch (e) {
-        this.announce(e instanceof AppError ? e.message : "Backup failed");
+        showToast(e instanceof AppError ? e.message : "Backup failed", { kind: "error" });
       }
     });
     const filesTile = document.createElement("div");
@@ -13689,7 +13756,9 @@ export class App {
         btn.disabled = true;
         action()
           .catch((e) =>
-            this.announce(e instanceof Error ? e.message : "Delete failed"),
+            showToast(e instanceof Error ? e.message : "Delete failed", {
+              kind: "error",
+            }),
           )
           .finally(() => {
             // A success re-renders and rebuilds this dialog; a failure has
@@ -13825,7 +13894,9 @@ export class App {
           this.render();
         })
         .catch((e) =>
-          this.announce(e instanceof Error ? e.message : "Save failed"),
+          showToast(e instanceof Error ? e.message : "Save failed", {
+            kind: "error",
+          }),
         );
     };
     auto.appendChild(save);
@@ -13872,7 +13943,7 @@ export class App {
       );
       this.announce("Chat exported");
     } catch {
-      this.announce("Chat export failed");
+      showToast("Chat export failed", { kind: "error" });
     } finally {
       btn.disabled = false;
     }
@@ -14436,7 +14507,233 @@ export class App {
     return wrap;
   }
 
+  /**
+   * Settings → Voice: which devices the daemon's voice uses, whether they
+   * are actually alive, and a way to test both without a call. The daemon
+   * owns the devices (cpal streams live on its threads), so the panel is a
+   * view over `/api/voice/devices`: the pickers re-post the selection —
+   * which reopens the daemon's device threads, live rooms included — the
+   * meter polls the probe, the speaker test plays a tone.
+   */
+  private renderVoiceSettings(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `<h2 class="text-22">Voice</h2>`;
+    const note = document.createElement("p");
+    note.className = "muted text-13";
+    note.textContent =
+      "Conclave voice opens the system's devices through the daemon. Pick them here; a choice takes effect immediately, live rooms included.";
+    wrap.appendChild(note);
+
+    // The device view fills in place: a re-render here would restart the
+    // section (and the meter poll) on every fetch.
+    const status = document.createElement("div");
+    wrap.appendChild(status);
+
+    const meterLabel = document.createElement("p");
+    meterLabel.className = "muted";
+    meterLabel.style.marginTop = "var(--space-4)";
+    meterLabel.textContent = "Microphone level — speak and watch the bar";
+    const meter = document.createElement("div");
+    meter.className = "voice-meter";
+    const meterFill = document.createElement("div");
+    meterFill.className = "voice-meter-fill";
+    meter.appendChild(meterFill);
+    const meterNote = document.createElement("p");
+    meterNote.className = "muted text-13";
+    wrap.append(meterLabel, meter, meterNote);
+
+    const testBtn = document.createElement("button");
+    testBtn.type = "button";
+    testBtn.className = "btn-secondary pressable";
+    testBtn.style.marginTop = "var(--space-3)";
+    testBtn.textContent = "Play test tone";
+    wrap.appendChild(testBtn);
+
+    const healthLine = (
+      label: string,
+      name: string | null,
+      live: boolean,
+      rate: number | null,
+    ): HTMLElement => {
+      const row = document.createElement("p");
+      row.className = "text-15";
+      if (name == null) {
+        row.textContent = `${label}: none opened`;
+        row.style.color = "var(--danger)";
+      } else {
+        const hz = rate ? ` at ${rate / 1000} kHz` : "";
+        row.textContent = `${label}: ${name}${hz} — ${live ? "live" : "not opening"}`;
+        if (!live) row.style.color = "var(--warning)";
+      }
+      return row;
+    };
+
+    const fill = (d: VoiceDevicesDto | null): void => {
+      if (!d) {
+        status.textContent = "The daemon did not answer.";
+        return;
+      }
+      if (!d.device_mode) {
+        status.innerHTML =
+          `<p class="text-15">This daemon's voice runs the synthetic test tone ` +
+          `(HUSH_VOICE_TEST_TONE) — there are no devices to pick or test.</p>`;
+        testBtn.hidden = true;
+        meter.hidden = true;
+        meterLabel.hidden = true;
+        return;
+      }
+      status.replaceChildren();
+      // What carries audio right now: a live room's device thread when one
+      // exists, else the probe the meter keeps open.
+      const health = d.session ?? d.probe;
+      if (health) {
+        status.append(
+          healthLine("Microphone", health.input_name, health.input_live, health.in_rate),
+          healthLine("Speaker", health.output_name, health.output_live, null),
+        );
+        if (health.last_error) {
+          const e = document.createElement("p");
+          e.className = "text-13";
+          e.style.color = "var(--danger)";
+          e.textContent = `Device error: ${health.last_error}`;
+          status.appendChild(e);
+        }
+      } else {
+        status.appendChild(
+          document.createTextNode("No device is open yet — open the meter or a voice room."),
+        );
+      }
+      // A selection the system cannot honor must be visible, not silent —
+      // the daemon fell back to the default and only this comparison says so.
+      const mismatch = (
+        want: string | null,
+        got: string | null,
+        label: string,
+      ): void => {
+        if (
+          want &&
+          got &&
+          got.trim().toLowerCase() !== want.trim().toLowerCase()
+        ) {
+          const e = document.createElement("p");
+          e.className = "text-13";
+          e.style.color = "var(--warning)";
+          e.textContent = `The ${label.toLowerCase()} you picked is not available; using ${got}.`;
+          status.appendChild(e);
+        }
+      };
+      mismatch(d.selected_input, health?.input_name ?? null, "microphone");
+      mismatch(d.selected_output, health?.output_name ?? null, "speaker");
+
+      const pick = (
+        label: string,
+        names: string[],
+        selected: string | null,
+        side: "input" | "output",
+      ): void => {
+        const l = document.createElement("p");
+        l.className = "muted";
+        l.style.marginTop = "var(--space-4)";
+        l.textContent = label;
+        const sel = document.createElement("select");
+        sel.className = "input-field";
+        const def = document.createElement("option");
+        def.value = "";
+        def.textContent = "System default";
+        sel.appendChild(def);
+        for (const n of names) {
+          const o = document.createElement("option");
+          o.value = n;
+          o.textContent = n;
+          sel.appendChild(o);
+        }
+        sel.value = selected ?? "";
+        if (sel.value !== (selected ?? "")) sel.value = "";
+        sel.onchange = () => {
+          const choice = sel.value || null;
+          void api
+            .voiceSelectDevices({ [side]: choice })
+            .then((d2) => {
+              showToast(choice ? `Using ${choice}.` : `${label}: system default.`, {
+                kind: "success",
+              });
+              fill(d2);
+            })
+            .catch((e: unknown) => {
+              showToast(e instanceof AppError ? e.message : "The choice did not save.", {
+                kind: "error",
+              });
+            });
+        };
+        wrap.appendChild(sel);
+      };
+      pick("Microphone", d.inputs, d.selected_input, "input");
+      pick("Speaker", d.outputs, d.selected_output, "output");
+    };
+
+    // The meter poll is the panel's pulse: it moves the bar, keeps the
+    // daemon's probe alive, and stops itself if the daemon goes away. It is
+    // cleared the moment another section renders.
+    const poll = (): void => {
+      void api
+        .voiceDeviceMeter()
+        .then((m) => {
+          if (!m) return;
+          meterFill.style.width = `${Math.min(100, Math.round(m.level * 100))}%`;
+          meterFill.classList.toggle("dead", !m.input_live);
+          meterNote.textContent = m.input_live
+            ? `Meter: ${m.input_name ?? "input"}`
+            : "No input device is open — the meter cannot move.";
+        })
+        .catch(() => {
+          if (this.voiceMeterTimer !== null) {
+            clearInterval(this.voiceMeterTimer);
+            this.voiceMeterTimer = null;
+          }
+          meterNote.textContent =
+            "The daemon did not answer; reopen this section to retry.";
+        });
+    };
+    poll();
+    this.voiceMeterTimer = window.setInterval(poll, 250);
+
+    testBtn.onclick = () => {
+      testBtn.disabled = true;
+      void api
+        .voiceDeviceTest(2_000)
+        .then((r) => {
+          if (r?.audible) {
+            showToast(`Test tone played on ${r.output_name ?? "the output"}.`, {
+              kind: "success",
+            });
+          } else {
+            showToast("No output device opened — nothing to hear.", { kind: "error" });
+          }
+        })
+        .catch((e: unknown) => {
+          showToast(e instanceof AppError ? e.message : "The test could not play.", {
+            kind: "error",
+          });
+        })
+        .finally(() => {
+          testBtn.disabled = false;
+        });
+    };
+
+    void api.voiceDevices().then((d) => fill(d ?? null)).catch(() => {
+      status.textContent = "The daemon did not answer.";
+    });
+    return wrap;
+  }
+
   private renderSettings(): HTMLElement {
+    // The meter poll belongs to this render's Voice section: any repaint
+    // (of this section or any other) tears it down, and the Voice branch
+    // re-arms it. Never stack two.
+    if (this.voiceMeterTimer !== null) {
+      clearInterval(this.voiceMeterTimer);
+      this.voiceMeterTimer = null;
+    }
     const pane = document.createElement("div");
     pane.className = "main-pane settings-layout";
     const nav = document.createElement("nav");
@@ -14447,6 +14744,7 @@ export class App {
       { id: "relay", label: "Relay" },
       { id: "drops", label: "Drops" },
       { id: "torbox", label: "TorBox" },
+      { id: "voice", label: "Voice" },
       { id: "notifications", label: "Notifications" },
       { id: "security", label: "Security" },
       { id: "recovery", label: "Recovery" },
@@ -14483,6 +14781,8 @@ export class App {
       body.appendChild(this.renderRelaySettings());
     } else if (this.settingsSection === "torbox") {
       body.appendChild(this.renderTorboxSettings());
+    } else if (this.settingsSection === "voice") {
+      body.appendChild(this.renderVoiceSettings());
     } else if (this.settingsSection === "profile") {
       body.innerHTML = `<h2 class="text-22">Profile</h2><p class="muted text-13">Your mail address is a label bound to your keys, shared inside your invite. There is no public directory — contacts learn it only when you add each other.</p>`;
       const current = document.createElement("p");
@@ -14739,8 +15039,9 @@ export class App {
             this.render();
           })
           .catch((e) => {
-            this.announce(
+            showToast(
               e instanceof AppError ? e.message : "Could not generate the drop key.",
+              { kind: "error" },
             );
             gen.disabled = false;
           });
@@ -14768,7 +15069,11 @@ export class App {
       void navigator.clipboard
         .writeText(pk)
         .then(() => this.announce("Drop key copied"))
-        .catch(() => this.announce(pk));
+        .catch(() =>
+          showToast("Couldn't copy — select the key and copy it by hand.", {
+            kind: "error",
+          }),
+        );
     keyRow.append(keyText, copyKey);
     body.appendChild(keyLabel);
     body.appendChild(keyRow);
@@ -14791,7 +15096,11 @@ export class App {
       void navigator.clipboard
         .writeText(pageUrl)
         .then(() => this.announce("Drop page URL copied"))
-        .catch(() => this.announce(pageUrl));
+        .catch(() =>
+          showToast("Couldn't copy — select the URL and copy it by hand.", {
+            kind: "error",
+          }),
+        );
     urlRow.append(urlText, copyUrl);
     body.appendChild(urlLabel);
     body.appendChild(urlRow);
@@ -14828,8 +15137,9 @@ export class App {
           this.render();
         })
         .catch((e) => {
-          this.announce(
+          showToast(
             e instanceof AppError ? e.message : "Could not rotate the drop key.",
+            { kind: "error" },
           );
           this.dropRotateArmed = false;
           this.render();
@@ -15043,7 +15353,9 @@ export class App {
             navigator.clipboard.writeText(inv.invite).then(
               () => this.announce("Invitation code copied."),
               () =>
-                this.announce("Copy failed. Select the code and copy it by hand."),
+                showToast("Copy failed. Select the code and copy it by hand.", {
+                  kind: "error",
+                }),
             );
           };
           const note = document.createElement("p");
@@ -15282,7 +15594,9 @@ export class App {
         .catch(() =>
           // The webview can refuse the clipboard; the id is select-all, so
           // a manual copy is one drag away. Say so instead of hanging.
-          this.announce("Copy blocked — select the id and copy manually"),
+          showToast("Copy blocked — select the id and copy manually", {
+            kind: "error",
+          }),
         );
     };
     const done = document.createElement("button");

@@ -7,6 +7,153 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-17 — Runtime memory inspection of the AppImage
+
+### hush-daemon PSS unreadable: /proc smaps_rollup permission denied [WORKED AROUND]
+
+- Attempted: measure proportional set size (PSS) for every Hush process while checking the
+  RAM footprint of the running `Hush_0.2.0_amd64.AppImage`. `smaps_rollup` read fine for
+  `hush-tauri` and both WebKit helper processes.
+- Symptom: `cat /proc/2703138/smaps_rollup` → "Permission denied"; `/proc/2703138/{exe,cwd,root}`
+  symlinks also unreadable, although the daemon runs as the same user (`sam`) and `ps` plus
+  `/proc/PID/status` work normally. Cause unidentified (kernel hardening / ptrace scope
+  suspected, not verified). PSS for the daemon is unmeasurable without root here.
+- Resolution: worked around for the question asked — `/proc/PID/status` exposes `VmRSS`
+  (62,596 kB) and `VmSwap` (9,900 kB) without special permissions, which was enough for the
+  total-footprint answer. Daemon fair-share PSS remains unverified.
+- Tooling/environment-related, not a repo problem.
+
+## 2026-10-17 — Paper save feedback and the announce() sweep
+
+### announce() is sighted-invisible, so most error feedback never showed [FIXED]
+
+- Attempted: add "saved" feedback to the paper's Save-as-note button after the user
+  reported none. The success toast was already there; the real gap was elsewhere.
+- Symptom: `App.announce` writes to an `sr-only` aria-live region — deliberate per the
+  toast.ts header — so every error path that only called `announce()` (paper save/start,
+  chat sends, conclave create/invite/kick/leave/end/delete, presence, zines, mail delete,
+  drop keys, backups, clipboard failures — 52 sites) was invisible to sighted users. A
+  failed save looked exactly like a dead button. The paper-save button also disabled
+  with no label change, so a slow daemon (1–33 s, see the peer-A entry below) read as
+  "nothing happened".
+- Resolution: FIXED in two steps. (1) The paper pane's Save-as-note button now shows
+  "Saving…" → "Saved ✓" in place (safe because `paperHost` DOM is stable across
+  re-renders), and its failure paths toast. (2) User approved a sweep: all
+  announce-only error/refusal paths now `showToast(..., { kind: "error" })` (toasts
+  carry `role="status"`, so SR support is kept, no double-announce). 51 announce() sites
+  remain, all success confirmations, ambient arrivals, or already paired with a visible
+  inline error. `tsc --noEmit` clean, node tests 83/83, no lint errors.
+- Lesson: an a11y channel is not user feedback. Success-path announce()-only sites
+  ("Invite sent", "Mail sent", copy confirmations) remain invisible to sighted users —
+  a deliberate scope cut for this pass; they are the natural next sweep if the
+  pattern proves itself.
+
+## 2026-10-17 — Voice device settings (Settings → Voice)
+
+### The device thread never wrote the input rates it opened [FIXED]
+
+- Attempted: build the device health panel on the existing `DeviceAudio.in_rate` /
+  `in_channels` fields.
+- Symptom: the comment claimed "the real rates are written by the device thread" but no
+  write existed — the fields kept their 48 kHz mono construction defaults forever. A mic
+  opened at 44.1 kHz (HDA analog's common default) or in stereo was resampled as if it
+  ran 48 kHz mono: wrong speed and doubled samples, i.e. garbled voice.
+- Resolution: FIXED — fields are atomics written from the config actually opened; the
+  device-tap test now asserts the opened rate is the device's real one.
+- Lesson: a comment that promises a write is not a write; the health panel exists
+  precisely because this class of silent wrongness had nowhere to surface.
+
+### Malformed JSON rejects before the lock check on POST routes [FIXED]
+
+- Attempted: assert every `/api/voice/*` route answers 401 while locked, including the
+  new device routes.
+- Symptom: `POST /api/voice/devices` with a malformed body returned 422 (and a bodyless
+  `POST` to a `Json<T>` route returned 415) instead of 401 — axum's extractor rejects the
+  request before the handler's lock check runs.
+- Resolution: FIXED for the test (valid JSON bodies); the pre-auth rejection itself is
+  API-wide, pre-existing behavior, and leaks nothing (a body shape error says nothing
+  about rooms). Left as-is, logged so it is not re-diagnosed.
+- Lesson: extractor rejections happen before handler auth; a 401-sweep must use bodies
+  the extractor accepts.
+
+### First open of the selected "pipewire" input takes seconds [OPEN]
+
+- Attempted: select the `pipewire` input by name through `POST /api/voice/devices` and
+  watch the probe's meter go live.
+- Symptom: `input_live` stayed false for ~3–11 s, then came up with real levels. The
+  slow part is pipewire's ALSA plugin negotiating its first open; the API answered 200s
+  in ~2 ms the whole time (the open lives on the device thread, as designed).
+- Resolution: OPEN, environment (ALSA/pipewire on this box), not a repo bug. The health
+  panel renders the wait honestly ("not opening" then "live"); if it bothers someone,
+  the fix is a pre-open warmup or a native pipewire host, not this panel.
+- Lesson: "selected device not yet live" and "daemon hung" must be distinguishable from
+  the outside — the meter's `input_live` plus the responsive API is that distinction.
+
+### A `&`-backgrounded `&&` chain loses its variables [FIXED]
+
+- Attempted: scratch-daemon curl check as one compound line ending in `... init ... && ... daemon ... &`.
+- Symptom: `&` backgrounds the whole chain, so `T=$(mktemp -d)` existed only inside it —
+  every following command saw an empty `$T` and curl hit nothing.
+- Resolution: FIXED by backgrounding only the daemon (`... daemon ... & DPID=$!`) with the
+  setup chain in the foreground.
+- Lesson: `&` binds to the entire preceding `&&`/`;` list, not the last command.
+
+## 2026-10-17 — Voice after the relay drain update
+
+### The daemon's device-tap test flakes under parallel load: fixed 500 ms sleep [FIXED]
+
+- Attempted: `cargo test -p hush-daemon voice` to verify the voice plane after the relay
+  drain update (`cc3c567`).
+- Symptom: `a_real_device_feeds_the_capture_tap` failed once with "the device thread must
+  mark the input side live" — then passed in isolation and on re-run. The test gave the
+  device thread a fixed 500 ms to open the input stream; the two loopback WebRTC tests run
+  in parallel and stretch the open (the output also re-requests 48 kHz over a 44.1 kHz
+  default) past half a second on a busy machine.
+- Resolution: FIXED in `crates/hush-daemon/src/voice_data.rs` — the fixed sleep is now a
+  10 s poll on `input_live` (the file's own `wait_until` pattern). Two consecutive full
+  runs green.
+- Lesson: a fixed sleep guarding another thread's open races whichever tests run in
+  parallel; poll the flag the thread actually sets.
+
+### `git diff --stat HEAD` dies with SIGBUS (core dumped) [OPEN]
+
+- Attempted: inspect the working-tree diff during the voice-after-relay check.
+- Symptom: `git diff --stat HEAD` exited 135 with "Bus error (core dumped)" on this
+  machine; `git log`, `git show`, and `git status` ran fine on the same repo.
+- Resolution: OPEN, tooling (git or filesystem on this box), not a repo problem. Worked
+  around by reading specific files instead of diffing.
+
+## 2026-10-17 — AppImage version forensics
+
+### Reading the running version off the AppImage filename is wrong [FIXED]
+
+- Attempted: report which version the prod AppImage instance runs, judged from the
+  filename `/home/sam/Applications/Hush_0.2.0_amd64.AppImage` — told the user they were
+  on 0.2.0 while the relay serves 0.3.1.
+- Symptom: user corrected it — the running instance reports 0.3.1. The updater rewrites
+  the AppImage **in place** (the documented RELEASING.md behavior via the `APPIMAGE` env
+  var) and never renames the file, so the filename is the first-install version, not the
+  running one. File mtime (2026-10-17 18:18) is the last update, not the install.
+- Resolution: diagnosis corrected with evidence. The live tree (hush-tauri pid 2584826,
+  daemon 2584908) executes from `/tmp/.mount_Hush_0PLCcGP`, whose binaries are stamped
+  23:10 UTC — the v0.3.1 workflow build (tag created 22:48 UTC, published 23:15 UTC);
+  instance started 23:18 UTC. The on-disk file carries the same v0.3.1 content. The
+  daemon API cannot answer this: `/api/status` has no version field.
+- Lesson: version questions are answered by `/proc/<pid>/exe` + the mount's binary
+  mtimes mapped against `gh release view` build times — never by the AppImage filename.
+
+### The updater leaves a childless husk process after an in-place update [OPEN]
+
+- Attempted: reconcile two `Hush_0.2.0_amd64.AppImage` PIDs (15:51 and 18:18) with the
+  user's "both instances are 0.3.1".
+- Symptom: pid 2334948 (15:51) has exe `/home/sam/Applications/tauri_current_appLY2QUj/
+  current_app.AppImage (deleted)` — the updater's staging copy from the afternoon's
+  v0.3.0 relaunch — with no children (no hush-tauri, no daemon), 2 threads, and no mount
+  of its own. It looks like a second running instance in `ps` but runs nothing.
+- Resolution: OPEN (cosmetic). Harmless; can be killed. The exact relaunch choreography
+  that strands it was not investigated — updater internals, not an app bug.
+- Lesson: count Hush instances by `hush-tauri` + daemon processes, not AppImage PIDs.
+
 ## 2026-10-17 — Conclave invite button investigation
 
 ### Prod "fresh meeting" invite can never arrive: mahmood is on the old relay [OPEN]

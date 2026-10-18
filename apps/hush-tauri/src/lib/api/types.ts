@@ -527,6 +527,47 @@ export interface VoiceStateDto {
   rooms: VoiceViewDto[];
 }
 
+/** One side of the voice device pair, as the daemon's thread opened it. */
+export interface VoiceDeviceHealthDto {
+  input_name: string | null;
+  output_name: string | null;
+  input_live: boolean;
+  output_live: boolean;
+  in_rate: number;
+  in_channels: number;
+  /** Peak |sample| of the latest input callback, 0.0–1.0. */
+  input_level: number;
+  last_error: string | null;
+}
+
+/** `GET /api/voice/devices` — what is available, selected, and in use. */
+export interface VoiceDevicesDto {
+  /** False when the daemon's voice runs the synthetic test tone. */
+  device_mode: boolean;
+  inputs: string[];
+  outputs: string[];
+  selected_input: string | null;
+  selected_output: string | null;
+  /** A live room's device thread, when a room exists. */
+  session: VoiceDeviceHealthDto | null;
+  /** The Settings probe's device thread, when one is open. */
+  probe: VoiceDeviceHealthDto | null;
+}
+
+/** `GET /api/voice/devices/meter` — the input meter's snapshot. */
+export interface VoiceMeterDto {
+  input_live: boolean;
+  input_name: string | null;
+  level: number;
+}
+
+/** `POST /api/voice/devices/test` — the speaker test's outcome. */
+export interface VoiceTestDto {
+  audible: boolean;
+  output_name: string | null;
+}
+
+
 // --- Torrents (TorBox-powered client) ------------------------------------------
 
 /** Where a queued item's data came from. */

@@ -108,6 +108,16 @@ pub struct ClientConfig {
     /// Unix socket path for the daemon API, overriding the runtime-dir default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_socket: Option<String>,
+    /// Preferred input (microphone) device name for conclave voice, as cpal
+    /// reports it. Absent means the OS default device. A name the system no
+    /// longer has falls back to the default, with the mismatch surfaced
+    /// through the voice device endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_input_device: Option<String>,
+    /// Preferred output (speaker) device name for conclave voice. Same rules
+    /// as [`ClientConfig::voice_input_device`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_output_device: Option<String>,
 }
 
 fn default_version() -> u32 {
@@ -116,15 +126,17 @@ fn default_version() -> u32 {
 
 impl Default for ClientConfig {
     fn default() -> Self {
-            Self {
-                v: 1,
-                relay_url: None,
-                onion_relay: None,
-                stun_url: None,
-                atproto_plc_url: None,
-                daemon_addr: None,
-                daemon_socket: None,
-            }
+        Self {
+            v: 1,
+            relay_url: None,
+            onion_relay: None,
+            stun_url: None,
+            atproto_plc_url: None,
+            daemon_addr: None,
+            daemon_socket: None,
+            voice_input_device: None,
+            voice_output_device: None,
+        }
     }
 }
 
@@ -303,6 +315,20 @@ pub fn resolve_daemon_socket_with_source(
 /// Effective daemon Unix socket path.
 pub fn resolve_daemon_socket(data_dir: &Path, explicit: Option<&str>) -> PathBuf {
     resolve_daemon_socket_with_source(data_dir, explicit).0
+}
+
+/// The preferred voice input device name, when one is on file.
+///
+/// Unlike the relay and STUN settings there is no env override and no
+/// default: a device is a per-machine preference, not a deployment decision,
+/// and `None` honestly means "the OS default device".
+pub fn resolve_voice_input_device(data_dir: &Path) -> Option<String> {
+    non_empty(load(data_dir).voice_input_device.as_deref()).map(str::to_string)
+}
+
+/// The preferred voice output device name, when one is on file.
+pub fn resolve_voice_output_device(data_dir: &Path) -> Option<String> {
+    non_empty(load(data_dir).voice_output_device.as_deref()).map(str::to_string)
 }
 
 fn non_empty(v: Option<&str>) -> Option<&str> {
@@ -495,6 +521,34 @@ mod tests {
             std::fs::write(config_path(dir.path()), b"{ not json").unwrap();
             assert_eq!(load(dir.path()), ClientConfig::default());
             assert_eq!(resolve_relay_url(dir.path(), None), DEFAULT_RELAY_URL);
+        });
+    }
+
+    /// Voice devices round-trip through the file and stay absent by default.
+    /// No env override exists on purpose: a device is per-machine, not a
+    /// deployment setting like the relay or STUN.
+    #[test]
+    fn voice_devices_absent_by_default_and_round_trip() {
+        with_clean_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(resolve_voice_input_device(dir.path()), None);
+            assert_eq!(resolve_voice_output_device(dir.path()), None);
+
+            save(
+                dir.path(),
+                &ClientConfig {
+                    voice_input_device: Some("ALC236 Analog".into()),
+                    voice_output_device: Some("  ".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                resolve_voice_input_device(dir.path()),
+                Some("ALC236 Analog".to_string())
+            );
+            // A blank name is not a choice — it resolves back to the default.
+            assert_eq!(resolve_voice_output_device(dir.path()), None);
         });
     }
 }
