@@ -27,6 +27,16 @@ Tracked in [`docs/plans/knowledge-layer-roadmap.md`](plans/knowledge-layer-roadm
 - Private messaging rooms vs a public “circle” — **DESIGN** favors capsule rooms first (Task **15.3**)
 - Library AI: on-device model vs user API key vs defer
 
+## Postal bridge (not blocking v1)
+
+Tracked in [`docs/plans/hush-postal-bridge.md`](plans/hush-postal-bridge.md):
+
+- Final QR payload layout and ECC level
+- Which print/mail provider is primary (compare Lob, PostGrid, Click2Mail on price and certified mail)
+- Service return address type (PO box vs registered agent)
+- Whether Mode 2 sealed letters use key-in-QR, recipient public key, or passphrase split by default
+- Wallet payment flow for per-letter orders and how the gateway verifies payment without learning identity
+
 ## Not blocking v1 spec
 
 These can wait until implementation or a later pass:
