@@ -43,6 +43,10 @@ resolution, and the status.
 - Severity: this is an account/billing problem, not a repo problem. Nothing in the repo needs
   fixing. What it does expose is that the pipeline has no fallback path for a blocked runner,
   and the docs do not say the mirror is runnable locally.
+- Path chosen: wait for the monthly allowance to reset. No local build path was set up, so a
+  hotfix before the reset needs one — the Linux AppImage can be built on this workstation
+  (needs the signing key password, plus `patchelf` and `libevent-2.1-7`), and the two macOS
+  legs cannot be built here at all. The mirror, by contrast, is always runnable locally.
 - Not verified here: the actual minute balance. The billing endpoint
   (`/users/sambitar/settings/billing/actions`) returns 404 for this token, which carries
   `repo`, `workflow`, `gist`, `delete_repo`, `read:org` but not `user`. The macOS legs
