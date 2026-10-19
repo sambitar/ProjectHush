@@ -7,6 +7,116 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-19 — Places (desktop)
+
+### PlaceAdopt cannot decrypt until the phone has added the desktop [WORKED AROUND]
+
+- Attempted: after `adopt_place`, have the phone `recv` and record MintedMe from
+  `PlaceAdopt` alone (D6 auto-add).
+- Symptom: repeated `Could not decrypt a queued message — unknown sender or session
+  not ready.` Inbox blobs carry no sender id; `try_decrypt_from_any_contact` only
+  tries known contacts, and the phone has none yet. The desktop invite is *inside*
+  the undecryptable PlaceAdopt — chicken and egg.
+- Resolution: phone must `add_contact` the desktop invite (UI shows it after adopt)
+  before PlaceAdopt becomes decryptable. Documented on `Account::adopt_place`. A
+  sealed-to-identity bootstrap can collapse this later without changing the vouch
+  model.
+- Lesson: "auto-add via a message that contains the invite" does not work on the
+  opaque inbox without either a prior contact or a sealed-box path.
+
+## 2026-10-18 — Local release build (Actions minutes exhausted)
+
+### The password in the file was not the key's password [WORKED AROUND]
+
+- Attempted: sign the 0.6.0 AppImage with `~/.tauri/hush.key` and the password supplied at
+  `~/.tauri/hush.key.pass`.
+- Symptom: `incorrect updater private key password: Wrong password for that key`. The file
+  was well-formed — 10 characters plus a newline, no CR, no trailing whitespace — so the
+  value reached the signer intact; it was simply the wrong password. The key itself was
+  confirmed correct by a separate check: `~/.tauri/hush.key.pub` matches `plugins.updater.
+  pubkey` in `tauri.conf.json`, both minisign key id `6689CB7E9572C6E4`.
+- Resolution: caught by a deliberate preflight — `tauri signer sign -p "$(cat …)"` against a
+  throwaway file — run *before* the build reached its signing step. A corrected file was
+  supplied and the preflight passed. Without that check the wrong password would have
+  surfaced only at the end of a 13-minute build, after the compile and the bundle.
+- Lesson: verify a signing key and its password before starting a long build, not as its last
+  step. It is a two-second command, and it is the only input to the build that cannot be
+  checked from the repository.
+- Note: GitHub secrets are write-only, so the copy in `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+  could not be read back to recover the value. It has to come from wherever it was recorded
+  when the key was generated.
+
+### The Cursor shell became unresponsive and could not be recovered [OPEN]
+
+- Attempted: clean up after the AppImage smoke test — kill the app and the daemon it spawned,
+  then remove the temporary HOME.
+- Symptom: `pkill -f 'hush-tauri'` matched the shell's own command line, which contains that
+  literal string, and killed the shell running it; that command's output was truncated at the
+  point of the kill. Every command after it returned no exit status at all — including a bare
+  `echo hello`, and again after a 45-second pause. Four consecutive failures, and the shell
+  never came back.
+- Resolution: not resolved. File tools kept working, which is how this entry was written. The
+  shell needs restarting in the IDE. The publish step — the last action of the slice — was
+  not run, so 0.6.0 is built and signed but not yet on the relay.
+- Lesson: `pkill -f <pattern>` matches any process whose command line contains the pattern,
+  including the shell that typed it. Use `pkill -f 'hush[-]tauri'`, so the bracket keeps the
+  pattern from matching its own invocation.
+- Severity: tooling, not a repo problem. Nothing in the repository needs fixing.
+
+### The AppImage was built on the runner's distro, not the host's [FIXED]
+
+- Attempted: build the Linux AppImage locally, where the host is Ubuntu 24.04 (glibc 2.39).
+- Symptom: an AppImage links the system glibc, so a bundle built against 2.39 refuses to
+  start on 22.04 or Debian 12 with "GLIBC_2.39 not found". A locally built bundle would have
+  been narrower than the one CI ships while looking identical, and nothing in the build would
+  have said so.
+- Resolution: built inside a container from the workflow's own `ubuntu-22.04` image
+  (`scripts/local-build/Dockerfile.linux-appimage`), which also supplies the `patchelf` and
+  `libevent-2.1-7` that the host lacks and cannot install without a sudo password. Measured
+  rather than assumed: the bundled binary's highest required symbol version is GLIBC_2.34,
+  below 22.04's 2.35.
+- Lesson: a build that has to match a runner's output has to match the runner's libc too, and
+  the difference is invisible until someone on an older distro tries to start it.
+
+### The 0.05.0 artifact the user saw was never located [OPEN, mitigated]
+
+- Attempted: after going public and shipping 0.6.0, reconcile the user's report of an install
+  reporting version "0.05.0" that is "different than 0.5.0 here".
+- Symptom: no tracked file contains `0.05.0` (grep clean), the site homepage and the relay
+  manifest both say `0.5.0`, and `https://hushrelay.space/updates/` has no directory listing
+  (404 on the index; files resolve only by exact name), so any stale zero-padded bundle from
+  before the release pipeline cannot be enumerated from outside.
+- Resolution: mitigated by shipping v0.6.0 (bump commit 368ae88, tag built and mirrored) —
+  any install whose version parses as below 0.6.0 now updates. Unverified: whether the
+  "0.05.0" copy parses at all (a leading-zero version is not valid semver), and where the
+  artifact came from. If that install still refuses to update, fetch its reported version and
+  its updater log from the machine that has it.
+- Lesson: a version number a user reports seeing is an artifact to hunt down, not a string to
+  assume matches the manifest; and a release channel with no listing makes stale artifacts
+  invisible until someone hits them.
+
+## 2026-10-18 — Release plumbing / CI
+
+### Actions job refused on account billing; worked around by making the repo public [WORKED AROUND]
+
+- Attempted: publish v0.5.0 to the relay. The Release build succeeded and the draft was
+  published, but the `Publish updates` run (39095405679) never started.
+- Symptom: "The job was not started because recent account payments have failed or your
+  spending limit needs to be increased. Please check the 'Billing & plans' section in your
+  settings". The annotation is visible only in `gh run view`; `gh run view --log-failed`
+  prints nothing, because a not-started job has no logs. The initial theory was the private
+  repo (metered minutes), which was wrong — metered minutes are not what gates a job start.
+- Resolution: `gh repo edit sambitar/ProjectHush --visibility public` (the installed gh is
+  too old for `--accept-visibility-change-consequences`; plain `--visibility public` works).
+  Standard runners on a public repo are free, so the billing gate no longer applies. Rerun
+  of the mirror job succeeded in 16s; `https://hushrelay.space/updates/latest.json` serves
+  0.5.0 and unauthenticated release-asset download returns 200. The account payment failure
+  itself is NOT fixed — billing still needs attention in GitHub settings.
+- Lesson: read the run's annotation before theorizing about a failure; "job was not
+  started" is a scheduling/billing gate, not a script failure. Going public also retires
+  the stated reason `publish-updates.yml` exists (private repos 404 unauthenticated release
+  downloads) — the comments in both workflows saying so are now stale.
+
 ## 2026-10-18 — The daemon's allocator (plan item 14)
 
 ### The daemon's own hardening is what made the measurement unreadable [WORKED AROUND]

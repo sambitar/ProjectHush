@@ -25,7 +25,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use account_worker::{AccountWorker, ContactDto, IntroLists, PenNameDto, WorkResult};
+use account_worker::{AccountWorker, ContactDto, IntroLists, PenNameDto, PlaceDto, WorkResult};
 use axum::{
     extract::{Path, Query, State},
     http::{header, Method, StatusCode},
@@ -217,6 +217,25 @@ struct SetContactReachRequest {
 #[derive(Deserialize)]
 struct RemoveContactRequest {
     nickname: String,
+}
+
+#[derive(Deserialize)]
+struct AdoptPlaceRequest {
+    nickname: String,
+    invite: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct DetachPlaceRequest {
+    account_id: String,
+}
+
+#[derive(Deserialize)]
+struct IntroducePlaceRequest {
+    place_account_id: String,
+    contact_nickname: String,
 }
 
 #[derive(Deserialize)]
@@ -457,6 +476,10 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/contacts/add", post(add_contact))
         .route("/api/contacts/remove", post(remove_contact))
         .route("/api/contacts/reach", post(set_contact_reach))
+        .route("/api/places", get(places))
+        .route("/api/places/adopt", post(adopt_place))
+        .route("/api/places/detach", post(detach_place))
+        .route("/api/places/introduce", post(introduce_place))
         .route("/api/outbox/retry", post(outbox_retry))
         .route("/api/send", post(send_text))
         .route("/api/send-file", post(send_file))
@@ -1961,6 +1984,59 @@ async fn remove_contact(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn places(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<PlaceDto>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.places().await)?;
+    match result {
+        WorkResult::Places(list) => Ok(Json(list)),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+async fn adopt_place(
+    State(state): State<Arc<App>>,
+    Json(body): Json<AdoptPlaceRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .adopt_place(&body.nickname, &body.invite, &body.label)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn detach_place(
+    State(state): State<Arc<App>>,
+    Json(body): Json<DetachPlaceRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.detach_place(&body.account_id).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn introduce_place(
+    State(state): State<Arc<App>>,
+    Json(body): Json<IntroducePlaceRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .introduce_place(&body.place_account_id, &body.contact_nickname)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Flush the Outbox on demand: queued mail, queued reach announcements and
 /// conclave copies the relay refused.
 ///
@@ -2433,6 +2509,8 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         MessagePayload::QueueGrant { .. }
         | MessagePayload::ZineGrant { .. }
         | MessagePayload::Reach { .. }
+        | MessagePayload::PlaceAdopt { .. }
+        | MessagePayload::PlaceIntroduce { .. }
         | MessagePayload::ConclaveInvite { .. }
         | MessagePayload::ConclaveAccept { .. }
         | MessagePayload::ConclaveDecline { .. }

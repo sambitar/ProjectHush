@@ -432,6 +432,7 @@ type SettingsSection =
   | "torbox"
   | "voice"
   | "notifications"
+  | "places"
   | "security"
   | "recovery"
   | "backup"
@@ -4193,6 +4194,15 @@ export class App {
     name.className = "text-15";
     name.style.fontWeight = "500";
     name.textContent = displayNick(c.nickname);
+    if (c.place_of) {
+      const placeChip = document.createElement("div");
+      placeChip.className = "text-12 muted";
+      const anchor = this.contacts.find((x) => x.protocol_name === c.place_of);
+      placeChip.textContent = anchor
+        ? `place of ${displayNick(anchor.nickname)}`
+        : "place of a contact";
+      meta.append(name, placeChip);
+    }
     const prev = lastPreview(c.nickname);
     const sub = document.createElement("div");
     sub.className = "text-13 muted";
@@ -4201,7 +4211,8 @@ export class App {
     sub.style.whiteSpace = "nowrap";
     sub.dataset.convPreview = "1";
     sub.textContent = prev?.text ?? (c.inbound_ready ? "Ready to chat" : "Waiting for them to add you");
-    meta.append(name, sub);
+    if (!c.place_of) meta.append(name);
+    meta.append(sub);
     const time = document.createElement("span");
     time.className = "text-12 faint";
     time.dataset.convTime = "1";
@@ -5483,6 +5494,16 @@ export class App {
     name.className = "text-15 trust-row-name";
     name.textContent = displayNick(c.nickname);
     titleRow.appendChild(name);
+    if (c.place_of) {
+      const placeBadge = document.createElement("span");
+      placeBadge.className = "trust-reach-badge";
+      const anchor = this.contacts.find((x) => x.protocol_name === c.place_of);
+      placeBadge.textContent = anchor
+        ? `place of ${displayNick(anchor.nickname)}`
+        : "place";
+      placeBadge.title = "Vouched as another Place of someone you trust.";
+      titleRow.appendChild(placeBadge);
+    }
     if (c.reach === "mail_only") {
       const badge = document.createElement("span");
       badge.className = "trust-reach-badge";
@@ -17791,7 +17812,136 @@ export class App {
 
   /**
    * Rotate the vault passphrase.
-   *
+  /**
+   * Settings → Places: adopt another vault, list minted / minted-me, detach,
+   * introduce to a contact. After adopt, show this vault's invite so the other
+   * Place can add us (inbox blobs have no sender — see DEEPSEEKPROBLEMS).
+   */
+  private renderPlacesSettings(): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `<h2 class="text-22">Places</h2>
+      <p class="muted text-13">Each Place is its own vault and its own threads. Peers see them as separate contacts. After you adopt a Place, show them your invite so they can add you back — then their next sync records the relationship.</p>`;
+
+    const listHost = document.createElement("div");
+    listHost.style.marginTop = "var(--space-4)";
+    listHost.className = "muted text-13";
+    listHost.textContent = "Loading…";
+    wrap.appendChild(listHost);
+
+    void api.places().then((places) => {
+      listHost.replaceChildren();
+      if (!places || places.length === 0) {
+        const empty = document.createElement("p");
+        empty.className = "muted text-13";
+        empty.textContent = "No Places yet.";
+        listHost.appendChild(empty);
+        return;
+      }
+      for (const p of places) {
+        const row = document.createElement("div");
+        row.style.marginTop = "var(--space-3)";
+        row.style.display = "flex";
+        row.style.gap = "var(--space-2)";
+        row.style.alignItems = "center";
+        row.style.flexWrap = "wrap";
+        const label = document.createElement("span");
+        label.className = "text-15";
+        const role =
+          p.role === "minted_by_me" ? "you minted" : "minted you";
+        label.textContent = `${p.nickname}${p.label ? ` (${p.label})` : ""} — ${role}`;
+        row.appendChild(label);
+        if (p.role === "minted_by_me") {
+          const intro = document.createElement("button");
+          intro.type = "button";
+          intro.className = "btn-secondary pressable";
+          intro.textContent = "Introduce…";
+          intro.onclick = async () => {
+            const nick = window.prompt(
+              "Introduce this Place to which contact nickname?",
+            );
+            if (!nick?.trim()) return;
+            try {
+              await api.introducePlace(p.account_id, nick.trim());
+              this.announce(`Introduced to ${nick.trim()}`);
+            } catch (e) {
+              window.alert(String(e));
+            }
+          };
+          row.appendChild(intro);
+        }
+        const detach = document.createElement("button");
+        detach.type = "button";
+        detach.className = "btn-secondary pressable";
+        detach.textContent = "Detach";
+        detach.onclick = async () => {
+          if (!window.confirm(`Remove ${p.nickname} from My places? The contact stays.`)) {
+            return;
+          }
+          try {
+            await api.detachPlace(p.account_id);
+            this.scheduleRender();
+          } catch (e) {
+            window.alert(String(e));
+          }
+        };
+        row.appendChild(detach);
+        listHost.appendChild(row);
+      }
+    });
+
+    const form = document.createElement("form");
+    form.style.marginTop = "var(--space-6)";
+    const h3 = document.createElement("h3");
+    h3.className = "text-15";
+    h3.textContent = "Add a Place";
+    const nickIn = document.createElement("input");
+    nickIn.className = "input-field";
+    nickIn.placeholder = "Nickname";
+    nickIn.style.marginTop = "var(--space-3)";
+    const labelIn = document.createElement("input");
+    labelIn.className = "input-field";
+    labelIn.placeholder = "Label (phone, laptop, …)";
+    labelIn.style.marginTop = "var(--space-2)";
+    const inviteIn = document.createElement("textarea");
+    inviteIn.className = "input-field";
+    inviteIn.placeholder = "Their invite";
+    inviteIn.rows = 3;
+    inviteIn.style.marginTop = "var(--space-2)";
+    inviteIn.style.width = "100%";
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.className = "btn-primary pressable";
+    submit.style.marginTop = "var(--space-3)";
+    submit.textContent = "Adopt Place";
+    const after = document.createElement("p");
+    after.className = "muted text-13";
+    after.style.marginTop = "var(--space-3)";
+    form.onsubmit = async (ev) => {
+      ev.preventDefault();
+      try {
+        await api.adoptPlace(
+          nickIn.value.trim(),
+          inviteIn.value.trim(),
+          labelIn.value.trim(),
+        );
+        const inv = await api.invite();
+        after.textContent = inv?.invite
+          ? `Adopted. Have them add this invite, then sync: ${inv.invite}`
+          : "Adopted. Have them add your invite, then sync.";
+        nickIn.value = "";
+        labelIn.value = "";
+        inviteIn.value = "";
+        this.scheduleRender();
+      } catch (e) {
+        window.alert(String(e));
+      }
+    };
+    form.append(h3, nickIn, labelIn, inviteIn, submit, after);
+    wrap.appendChild(form);
+    return wrap;
+  }
+
+  /**
    * The daemon re-wraps the vault key rather than re-encrypting anything, so
    * this is fast regardless of vault size and the recovery code keeps working.
    * All three fields are validated here so an obvious typo never reaches the
@@ -18363,6 +18513,7 @@ export class App {
       { id: "torbox", label: "TorBox" },
       { id: "voice", label: "Voice" },
       { id: "notifications", label: "Notifications" },
+      { id: "places", label: "Places" },
       { id: "security", label: "Security" },
       { id: "recovery", label: "Recovery" },
       { id: "backup", label: "Backup" },
@@ -18506,6 +18657,8 @@ export class App {
       hint.textContent =
         "Per contact, the sound can be turned off from the chat's menu (the … button).";
       body.appendChild(hint);
+    } else if (this.settingsSection === "places") {
+      body.appendChild(this.renderPlacesSettings());
     } else if (this.settingsSection === "security") {
       body.innerHTML = `<h2 class="text-22">Security</h2><p class="muted text-13">Idle auto-lock is enforced by the daemon. Suspend / sleep also locks the vault on Linux when logind is available.</p>`;
       const label = document.createElement("p");

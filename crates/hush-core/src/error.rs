@@ -92,6 +92,14 @@ pub enum Error {
     VoiceCapReached,
     #[error("you are not in this voice session")]
     VoiceNotJoined,
+    #[error("place not found")]
+    PlaceNotFound,
+    #[error("invalid place vouch")]
+    InvalidPlace,
+    #[error("place vouch chain is too long")]
+    PlaceChainTooLong,
+    #[error("that place is already on file")]
+    PlaceExists,
 }
 
 impl From<argon2::Error> for Error {

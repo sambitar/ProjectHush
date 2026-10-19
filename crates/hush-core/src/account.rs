@@ -206,6 +206,10 @@ pub struct Contact {
     /// [`Contact::reach`]: a surface is usable only when both sides allow it.
     #[serde(default)]
     pub peer_reach: TrusteeReach,
+    /// Account id of the Place this contact was vouched under, when a peer
+    /// introduce verified ("place of …"). `None` for ordinary contacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place_of: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Contact {
@@ -256,6 +260,8 @@ impl<'de> Deserialize<'de> for Contact {
                 reach: TrusteeReach,
                 #[serde(default)]
                 peer_reach: TrusteeReach,
+                #[serde(default)]
+                place_of: Option<String>,
             },
             Devices {
                 nickname: String,
@@ -294,6 +300,7 @@ impl<'de> Deserialize<'de> for Contact {
                 heard_from,
                 reach,
                 peer_reach,
+                place_of,
             } => Contact {
                 nickname,
                 account_id,
@@ -307,6 +314,7 @@ impl<'de> Deserialize<'de> for Contact {
                 heard_from,
                 reach,
                 peer_reach,
+                place_of,
             },
             Repr::Devices {
                 nickname,
@@ -335,6 +343,7 @@ impl<'de> Deserialize<'de> for Contact {
                     heard_from,
                     reach: TrusteeReach::Full,
                     peer_reach: TrusteeReach::Full,
+                    place_of: None,
                 }
             }
             Repr::Legacy {
@@ -359,6 +368,7 @@ impl<'de> Deserialize<'de> for Contact {
                     heard_from,
                     reach: TrusteeReach::Full,
                     peer_reach: TrusteeReach::Full,
+                    place_of: None,
                 }
             }
         })
@@ -551,6 +561,28 @@ struct AccountState {
     /// substitution the pin exists to stop.
     #[serde(default)]
     identity_restored: bool,
+    /// Places this vault minted or was minted by (Settings → My places).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    places: Vec<PlaceRecord>,
+}
+
+/// Whether this vault minted the Place or was adopted by it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceRole {
+    MintedByMe,
+    MintedMe,
+}
+
+/// One entry in Settings → My places.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaceRecord {
+    pub account_id: String,
+    pub nickname: String,
+    pub label: String,
+    pub role: PlaceRole,
+    pub chain: crate::place::VouchChain,
+    pub added_unix: u64,
 }
 
 /// One queued reach announcement: who it is for and what scope it carries.
@@ -802,6 +834,7 @@ impl Account {
             pending_conclave: Vec::new(),
             regrant_all: false,
             identity_restored: false,
+            places: Vec::new(),
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
@@ -1297,6 +1330,303 @@ impl Account {
         Ok(encoded)
     }
 
+    /// Places recorded in this vault (minted by me and who minted me).
+    pub fn places(&self) -> &[PlaceRecord] {
+        &self.state.places
+    }
+
+    /// Adopt another vault as a Place of this one.
+    ///
+    /// Scans `invite_str` (D15), adds the vault as a contact if needed, signs a
+    /// vouch hop, stores a MintedByMe record, and sends [`MessagePayload::PlaceAdopt`]
+    /// carrying our invite + chain.
+    ///
+    /// The adopted vault can only decrypt that message once it has added **this**
+    /// vault as a contact (inbox blobs carry no sender id). The UI must show our
+    /// invite to the phone after adopt so it can add us; then its next `recv`
+    /// applies PlaceAdopt and records MintedMe (D6). A later sealed-bootstrap
+    /// can collapse that to one scan without changing the vouch model.
+    pub async fn adopt_place(
+        &mut self,
+        nickname: &str,
+        invite_str: &str,
+        label: &str,
+    ) -> Result<(), Error> {
+        let nickname = nickname.trim();
+        if nickname.is_empty() {
+            return Err(Error::InvalidHandle);
+        }
+        let payload = self.decode_invite(invite_str).await?;
+        let place_id = payload.protocol_name.clone();
+        if place_id == self.state.protocol_name {
+            return Err(Error::InvalidPlace);
+        }
+        if self.state.places.iter().any(|p| p.account_id == place_id) {
+            return Err(Error::PlaceExists);
+        }
+
+        if !self
+            .state
+            .contacts
+            .iter()
+            .any(|c| c.account_id == place_id)
+        {
+            self.add_contact(nickname, invite_str).await?;
+        }
+
+        let key = self.device.identity_key_pair().await?;
+        let mut chain = self
+            .state
+            .places
+            .iter()
+            .find(|p| matches!(p.role, PlaceRole::MintedMe))
+            .map(|p| p.chain.clone())
+            .unwrap_or_default();
+        // Keep room for the new hop under the badge cap (D13).
+        while chain.hops.len() >= crate::place::MAX_PLACE_CHAIN_HOPS {
+            chain.hops.remove(0);
+        }
+        chain.sign_hop(
+            &key,
+            crate::place::PlaceHop {
+                minter_account_id: self.state.protocol_name.clone(),
+                place_account_id: place_id.clone(),
+                label: label.to_string(),
+                signed_unix: crate::place::place_now_unix(),
+            },
+        )?;
+
+        let nick = self
+            .contact_nick_for_protocol(&place_id)
+            .unwrap_or_else(|| nickname.to_string());
+        self.state.places.push(PlaceRecord {
+            account_id: place_id,
+            nickname: nick.clone(),
+            label: label.to_string(),
+            role: PlaceRole::MintedByMe,
+            chain: chain.clone(),
+            added_unix: crate::place::place_now_unix(),
+        });
+
+        let our_invite = self.invite().await?;
+        self.send_payload_inner(
+            &nick,
+            MessagePayload::PlaceAdopt {
+                invite: our_invite,
+                chain,
+                label: label.to_string(),
+            },
+            false,
+        )
+        .await?;
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Drop a Place from My places. The contact row is left alone (D12).
+    pub async fn detach_place(&mut self, account_id: &str) -> Result<(), Error> {
+        let before = self.state.places.len();
+        self.state.places.retain(|p| p.account_id != account_id);
+        if self.state.places.len() == before {
+            return Err(Error::PlaceNotFound);
+        }
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Introduce one of our MintedByMe Places to a contact (D8, D16).
+    pub async fn introduce_place(
+        &mut self,
+        place_account_id: &str,
+        contact_nickname: &str,
+    ) -> Result<(), Error> {
+        let place = self
+            .state
+            .places
+            .iter()
+            .find(|p| {
+                p.account_id == place_account_id && matches!(p.role, PlaceRole::MintedByMe)
+            })
+            .cloned()
+            .ok_or(Error::PlaceNotFound)?;
+        if self
+            .state
+            .contacts
+            .iter()
+            .find(|c| c.nickname == contact_nickname)
+            .is_none()
+        {
+            return Err(Error::ContactNotFound);
+        }
+        let invite = self.pointer_invite_for_account(&place.account_id)?;
+        self.send_payload_inner(
+            contact_nickname,
+            MessagePayload::PlaceIntroduce {
+                invite,
+                chain: place.chain,
+                label: place.label,
+            },
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Rebuild a pointer invite for a contact we already hold (for introduce).
+    fn pointer_invite_for_account(&self, account_id: &str) -> Result<String, Error> {
+        let contact = self
+            .state
+            .contacts
+            .iter()
+            .find(|c| c.account_id == account_id)
+            .ok_or(Error::ContactNotFound)?;
+        let default = crate::invite::default_relay();
+        let relay = if normalize_relay(&self.state.relay) == normalize_relay(default) {
+            None
+        } else {
+            Some(self.state.relay.clone())
+        };
+        ShortInvite {
+            relay,
+            protocol_name: contact.account_id.clone(),
+            queue_id: contact.queue_id.clone(),
+            queue_token: contact.queue_token.clone(),
+            handle: contact.mail_handle.clone(),
+            vault: contact.mail_vault.clone(),
+        }
+        .encode()
+    }
+
+    /// Apply a PlaceAdopt from the minting Place (we are the adopted vault).
+    async fn apply_place_adopt(
+        &mut self,
+        from_account: &str,
+        invite: &str,
+        chain: crate::place::VouchChain,
+        label: &str,
+    ) -> Result<bool, Error> {
+        chain.verify()?;
+        let leaf = chain.leaf_account_id().ok_or(Error::InvalidPlace)?;
+        if leaf != self.state.protocol_name {
+            return Err(Error::InvalidPlace);
+        }
+        let last = chain.hops.last().ok_or(Error::InvalidPlace)?;
+        if last.hop.minter_account_id != from_account {
+            return Err(Error::InvalidPlace);
+        }
+        if self
+            .state
+            .places
+            .iter()
+            .any(|p| p.account_id == from_account)
+        {
+            return Ok(false);
+        }
+
+        let base_nick = if label.trim().is_empty() {
+            "place".to_string()
+        } else {
+            label.trim().to_string()
+        };
+        let nick = self.unique_contact_nick(&base_nick);
+
+        if !self
+            .state
+            .contacts
+            .iter()
+            .any(|c| c.account_id == from_account)
+        {
+            self.add_contact(&nick, invite).await?;
+        }
+
+        let stored_nick = self
+            .contact_nick_for_protocol(from_account)
+            .unwrap_or(nick);
+        self.state.places.push(PlaceRecord {
+            account_id: from_account.to_string(),
+            nickname: stored_nick,
+            label: label.to_string(),
+            role: PlaceRole::MintedMe,
+            chain,
+            added_unix: crate::place::place_now_unix(),
+        });
+        self.save().await?;
+        Ok(true)
+    }
+
+    /// Apply a PlaceIntroduce from a known contact.
+    async fn apply_place_introduce(
+        &mut self,
+        from_account: &str,
+        invite: &str,
+        chain: crate::place::VouchChain,
+        label: &str,
+    ) -> Result<bool, Error> {
+        if self.contact_nick_for_protocol(from_account).is_none() {
+            return Err(Error::ContactNotFound);
+        }
+        chain.verify()?;
+        let leaf = chain
+            .leaf_account_id()
+            .ok_or(Error::InvalidPlace)?
+            .to_string();
+        if leaf == self.state.protocol_name {
+            return Err(Error::InvalidPlace);
+        }
+
+        let trusted: Vec<&str> = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| c.account_id.as_str())
+            .collect();
+        let anchor = chain
+            .trusted_anchor(&trusted)
+            .map(|s| s.to_string());
+
+        let mut changed = false;
+        if !self.state.contacts.iter().any(|c| c.account_id == leaf) {
+            let base = if label.trim().is_empty() {
+                short_name(&leaf)
+            } else {
+                label.trim().to_string()
+            };
+            let nick = self.unique_contact_nick(&base);
+            self.add_contact(&nick, invite).await?;
+            changed = true;
+        }
+        if let Some(anchor_id) = anchor {
+            if let Some(contact) = self
+                .state
+                .contacts
+                .iter_mut()
+                .find(|c| c.account_id == leaf)
+            {
+                if contact.place_of.as_deref() != Some(anchor_id.as_str()) {
+                    contact.place_of = Some(anchor_id);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.save().await?;
+        }
+        Ok(changed)
+    }
+
+    fn unique_contact_nick(&self, base: &str) -> String {
+        if !self.state.contacts.iter().any(|c| c.nickname == base) {
+            return base.to_string();
+        }
+        for i in 2..1000 {
+            let candidate = format!("{base}-{i}");
+            if !self.state.contacts.iter().any(|c| c.nickname == candidate) {
+                return candidate;
+            }
+        }
+        format!("{base}-{}", &Uuid::new_v4().to_string()[..8])
+    }
+
     pub async fn add_contact(&mut self, nickname: &str, invite_str: &str) -> Result<(), Error> {
         let payload = self.decode_invite(invite_str).await?;
         self.validate_contact(nickname, &payload)?;
@@ -1414,6 +1744,7 @@ impl Account {
             heard_from: false,
             reach: TrusteeReach::Full,
             peer_reach: TrusteeReach::Full,
+            place_of: None,
         });
         // Adding a contact clears any revocation left from a previous delete, so
         // a re-added contact is granted a queue again instead of being treated
@@ -4563,6 +4894,46 @@ impl Account {
                     continue;
                 }
 
+                if let MessagePayload::PlaceAdopt {
+                    invite,
+                    chain,
+                    label,
+                } = &payload
+                {
+                    match self
+                        .apply_place_adopt(&from_account, invite, chain.clone(), label)
+                        .await
+                    {
+                        Ok(true) => dirty = true,
+                        Ok(false) => {}
+                        Err(e) => warnings.push(format!(
+                            "A place-adopt from {nick} was refused: {e}"
+                        )),
+                    }
+                    consume!(blob_id);
+                    continue;
+                }
+
+                if let MessagePayload::PlaceIntroduce {
+                    invite,
+                    chain,
+                    label,
+                } = &payload
+                {
+                    match self
+                        .apply_place_introduce(&from_account, invite, chain.clone(), label)
+                        .await
+                    {
+                        Ok(true) => dirty = true,
+                        Ok(false) => {}
+                        Err(e) => warnings.push(format!(
+                            "A place-introduce from {nick} was refused: {e}"
+                        )),
+                    }
+                    consume!(blob_id);
+                    continue;
+                }
+
                 // Conclave control payloads. Membership is consensual, so an
                 // invite, accept, decline, leave, update or end changes local
                 // state and is never surfaced as a chat message. Only an
@@ -4820,7 +5191,9 @@ impl Account {
                     | MessagePayload::ZineGrant { .. }
                     // Applied above, into `peer_reach`: a reach announcement is
                     // not a chat message either.
-                    | MessagePayload::Reach { .. } => {
+                    | MessagePayload::Reach { .. }
+                    | MessagePayload::PlaceAdopt { .. }
+                    | MessagePayload::PlaceIntroduce { .. } => {
                         unreachable!("control payload handled above")
                     }
                     // A paper payload is not a chat message, so it must not
@@ -5279,6 +5652,7 @@ mod tests {
             pending_conclave: Vec::new(),
             regrant_all: false,
             identity_restored: false,
+            places: Vec::new(),
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
         fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();
@@ -5655,6 +6029,7 @@ mod tests {
             heard_from: false,
             reach: TrusteeReach::Full,
             peer_reach: TrusteeReach::Full,
+            place_of: None,
         });
     }
 

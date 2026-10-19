@@ -311,6 +311,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     MessagePayload::QueueGrant { .. }
                     | MessagePayload::ZineGrant { .. }
                     | MessagePayload::Reach { .. }
+                    | MessagePayload::PlaceAdopt { .. }
+                    | MessagePayload::PlaceIntroduce { .. }
                     | MessagePayload::ConclaveInvite { .. }
                     | MessagePayload::ConclaveAccept { .. }
                     | MessagePayload::ConclaveDecline { .. }

@@ -71,6 +71,17 @@ export interface ContactDto {
   reach: TrusteeReach;
   /** This vault's own choice of reach. What the toggle edits. */
   my_reach: TrusteeReach;
+  /** Account id this contact was vouched under ("place of …"), when set. */
+  place_of?: string | null;
+}
+
+/** One row of Settings → My places. */
+export interface PlaceDto {
+  account_id: string;
+  nickname: string;
+  label: string;
+  role: "minted_by_me" | "minted_me" | string;
+  added_unix: number;
 }
 
 export interface MailAttachmentDto {

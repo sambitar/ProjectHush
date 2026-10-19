@@ -10,6 +10,7 @@ import type {
   NotesStateDto,
   PaperPresenceDto,
   PaperViewDto,
+  PlaceDto,
   ConclaveDto,
   PendingInviteDto,
   RecvResponse,
@@ -197,6 +198,22 @@ export const api = {
     request<null>("/api/contacts/remove", {
       method: "POST",
       body: JSON.stringify({ nickname }),
+    }),
+  places: () => request<PlaceDto[]>("/api/places"),
+  adoptPlace: (nickname: string, invite: string, label: string) =>
+    request<null>("/api/places/adopt", {
+      method: "POST",
+      body: JSON.stringify({ nickname, invite, label }),
+    }),
+  detachPlace: (account_id: string) =>
+    request<null>("/api/places/detach", {
+      method: "POST",
+      body: JSON.stringify({ account_id }),
+    }),
+  introducePlace: (place_account_id: string, contact_nickname: string) =>
+    request<null>("/api/places/introduce", {
+      method: "POST",
+      body: JSON.stringify({ place_account_id, contact_nickname }),
     }),
   sendText: (to: string, text: string) =>
     request<null>("/api/send", {

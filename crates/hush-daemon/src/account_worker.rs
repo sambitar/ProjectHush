@@ -3,7 +3,8 @@ use std::thread;
 
 use hush_core::{
   Account, ChatRecord, ChatRetention, ConclaveRecord, InboxResult, MessagePayload,
-  PaperDescriptor, PendingInvite, PendingIntroRequest, QueueMap, TrusteeReach, VoiceDescriptor,
+  PaperDescriptor, PendingInvite, PendingIntroRequest, PlaceRecord, PlaceRole, QueueMap,
+  TrusteeReach, VoiceDescriptor,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -155,6 +156,24 @@ enum Work {
     },
     RemoveContact {
         nickname: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    Places {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    AdoptPlace {
+        nickname: String,
+        invite: String,
+        label: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    DetachPlace {
+        account_id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    IntroducePlace {
+        place_account_id: String,
+        contact_nickname: String,
         reply: oneshot::Sender<WorkResult>,
     },
     SendText {
@@ -640,6 +659,35 @@ pub struct ContactDto {
     /// This vault's **own** choice of reach, independent of the peer's. What the
     /// reach toggle edits; `reach` above is what the pair actually gets.
     pub my_reach: TrusteeReach,
+    /// Account id this contact was vouched under ("place of …"), when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place_of: Option<String>,
+}
+
+/// One row of Settings → My places.
+#[derive(Clone, serde::Serialize)]
+pub struct PlaceDto {
+    pub account_id: String,
+    pub nickname: String,
+    pub label: String,
+    /// `minted_by_me` or `minted_me`.
+    pub role: String,
+    pub added_unix: u64,
+}
+
+impl From<&PlaceRecord> for PlaceDto {
+    fn from(p: &PlaceRecord) -> Self {
+        Self {
+            account_id: p.account_id.clone(),
+            nickname: p.nickname.clone(),
+            label: p.label.clone(),
+            role: match p.role {
+                PlaceRole::MintedByMe => "minted_by_me".into(),
+                PlaceRole::MintedMe => "minted_me".into(),
+            },
+            added_unix: p.added_unix,
+        }
+    }
 }
 
 /// The zines pen name, as the UI sees it: a byline and two public keys. No
@@ -699,6 +747,7 @@ pub enum WorkResult {
     Exists,
     Invite(String),
     Contacts(Vec<ContactDto>),
+    Places(Vec<PlaceDto>),
     /// The relay queues this vault drains and delivers into, for diagnosis.
     Queues(QueueMap),
     Inbox(InboxResult),
@@ -981,9 +1030,63 @@ impl AccountWorker {
                                             // sides' choices (Task 24).
                                             reach: c.reach.narrow(c.peer_reach),
                                             my_reach: c.reach,
+                                            place_of: c.place_of.clone(),
                                         });
                                     }
                                     WorkResult::Contacts(list)
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::Places { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::Places(
+                                    a.places().iter().map(PlaceDto::from).collect(),
+                                ),
+                            };
+                            (reply, result)
+                        }
+                        Work::AdoptPlace {
+                            nickname,
+                            invite,
+                            label,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.adopt_place(&nickname, &invite, &label).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::DetachPlace { account_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.detach_place(&account_id).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::IntroducePlace {
+                            place_account_id,
+                            contact_nickname,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a
+                                        .introduce_place(&place_account_id, &contact_nickname)
+                                        .await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
                                 }
                             };
                             (reply, result)
@@ -2315,6 +2418,46 @@ impl AccountWorker {
     pub async fn remove_contact(&self, nickname: &str) -> WorkResult {
         self.call(|reply| Work::RemoveContact {
             nickname: nickname.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn places(&self) -> WorkResult {
+        self.call(|reply| Work::Places { reply }).await
+    }
+
+    pub async fn adopt_place(
+        &self,
+        nickname: &str,
+        invite: &str,
+        label: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::AdoptPlace {
+            nickname: nickname.to_string(),
+            invite: invite.to_string(),
+            label: label.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn detach_place(&self, account_id: &str) -> WorkResult {
+        self.call(|reply| Work::DetachPlace {
+            account_id: account_id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn introduce_place(
+        &self,
+        place_account_id: &str,
+        contact_nickname: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::IntroducePlace {
+            place_account_id: place_account_id.to_string(),
+            contact_nickname: contact_nickname.to_string(),
             reply,
         })
         .await

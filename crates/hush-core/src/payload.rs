@@ -525,6 +525,30 @@ pub enum MessagePayload {
         /// chain from the start.
         latest_hash: String,
     },
+    /// The minting Place telling a newly adopted Place about the relationship.
+    ///
+    /// Sent by the Place that scanned the invite (Settings → Add place). The
+    /// recipient verifies the vouch chain, adds the sender as a contact from
+    /// `invite`, and records a MintedMe place entry. See
+    /// `docs/plans/2026-10-19-places-desktop.md`.
+    PlaceAdopt {
+        /// The minter's standing invite (pointer or legacy).
+        invite: String,
+        /// Vouch chain ending at the recipient.
+        chain: crate::place::VouchChain,
+        /// Suggested label stamped at adopt time ("phone", …).
+        label: String,
+    },
+    /// Opt-in introduction of one of the sender's Places to a contact.
+    ///
+    /// The recipient verifies the chain against contacts they already trust,
+    /// adds the place as a contact from `invite`, and may show a "place of …"
+    /// badge when a trusted anchor is found.
+    PlaceIntroduce {
+        invite: String,
+        chain: crate::place::VouchChain,
+        label: String,
+    },
     /// A payload whose tag this build does not know.
     ///
     /// Decoded rather than rejected so a peer running a newer build can send
