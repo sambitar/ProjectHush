@@ -61,8 +61,8 @@ export function chatRowShapes(
  * The rail: which button is current, and the one badge nothing patches.
  *
  * The Chats, Mail and Conclaves badges are not here. `patchRailBadges` rewrites
- * them in place on every background delta, and the IRC badge has a writer of its
- * own, so an unread count moving must not rebuild the rail. The torrents badge
+ * them in place on every background delta, so an unread count moving must not
+ * rebuild the rail. The torrents badge
  * has no writer: the rail's first paint draws it and so does the Torrents pane,
  * so a count that moved is a count the rail has to redraw. The relay shield is
  * not here either — the poll repaints its state into the element it finds.

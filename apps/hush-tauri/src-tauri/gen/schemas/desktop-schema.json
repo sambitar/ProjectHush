@@ -207,12 +207,6 @@
           "markdownDescription": "Open external http(s) links in the user's browser"
         },
         {
-          "description": "IRC: multi-server connections, channel and query windows, and non-secret settings",
-          "type": "string",
-          "const": "allow-irc",
-          "markdownDescription": "IRC: multi-server connections, channel and query windows, and non-secret settings"
-        },
-        {
           "description": "Loop or stop the voice call ringtone and ringback tone",
           "type": "string",
           "const": "allow-voice-cue",

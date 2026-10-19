@@ -4530,33 +4530,23 @@ name = "hush-tauri"
 version = "0.6.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
  "bytes",
- "data-encoding",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
  "open",
- "rand 0.8.8",
- "rcgen 0.13.2",
  "rfd",
  "rodio",
- "rustls",
- "rustls-native-certs",
  "serde",
  "serde_json",
- "sha2 0.11.0",
- "sha3",
  "tauri",
  "tauri-build",
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "tokio",
- "tokio-rustls",
  "tower-service",
  "url",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -7215,19 +7205,6 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
-dependencies = [
- "pem 3.0.6",
- "ring",
- "rustls-pki-types",
- "time",
- "yasna 0.5.2",
-]
-
-[[package]]
-name = "rcgen"
 version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
@@ -7237,7 +7214,7 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "x509-parser 0.18.1",
- "yasna 0.6.0",
+ "yasna",
 ]
 
 [[package]]
@@ -7511,7 +7488,7 @@ dependencies = [
  "log",
  "pem 3.0.6",
  "rand 0.10.3",
- "rcgen 0.14.10",
+ "rcgen",
  "rtc-crypto",
  "rtc-datachannel",
  "rtc-dtls",
@@ -7580,7 +7557,7 @@ dependencies = [
  "der-parser 9.0.0",
  "log",
  "pem 3.0.6",
- "rcgen 0.14.10",
+ "rcgen",
  "rkyv",
  "rtc-crypto",
  "rtc-shared",
@@ -10226,15 +10203,6 @@ checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
 name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.9",
-]
-
-[[package]]
-name = "webpki-roots"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
@@ -10825,15 +10793,6 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
-]
-
-[[package]]
-name = "yasna"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
-dependencies = [
- "time",
 ]
 
 [[package]]

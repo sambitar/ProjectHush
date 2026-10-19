@@ -12,7 +12,6 @@
     "allow-drops",
     "allow-chat-sound",
     "allow-voice-cue",
-    "allow-irc",
     "updater:default",
     "process:allow-restart"
   ]

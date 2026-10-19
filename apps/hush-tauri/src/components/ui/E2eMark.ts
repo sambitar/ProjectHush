@@ -13,9 +13,9 @@ import { icon } from "../../lib/icons";
  * before it is parked. In every one of those cases the relay holds ciphertext
  * it has no key for.
  *
- * Surfaces that cannot make the claim, and so must not use this: Reads,
- * Torrents and IRC talk to services outside the members-only envelope, and
- * Notes never leave the vault at all.
+ * Surfaces that cannot make the claim, and so must not use this: Reads and
+ * Torrents talk to services outside the members-only envelope, and Notes never
+ * leave the vault at all.
  */
 export function e2eMark(): HTMLElement {
   const el = document.createElement("span");
