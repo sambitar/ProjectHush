@@ -3,7 +3,6 @@ use tauri::Manager;
 mod daemon_client;
 mod daemon_supervisor;
 mod drops;
-mod irc;
 mod sound;
 mod tor;
 
@@ -173,7 +172,6 @@ pub fn run() {
     let window_title = std::env::var("HUSH_WINDOW_TITLE").unwrap_or_else(|_| "Hush".to_string());
 
     let mut builder = tauri::Builder::default()
-        .manage(irc::IrcState::new())
         .manage(DaemonState::default())
         .invoke_handler(tauri::generate_handler![
             hush_save_file,
@@ -190,23 +188,7 @@ pub fn run() {
             drops::drops_tor_start,
             drops::drops_tor_stop,
             sound::play_chat_sound,
-            sound::set_voice_cue,
-            irc::commands::connect_server,
-            irc::commands::disconnect_server,
-            irc::commands::join_channel,
-            irc::commands::part_channel,
-            irc::commands::send_message,
-            irc::commands::send_raw,
-            irc::commands::change_nick,
-            irc::commands::open_query,
-            irc::commands::list_channels,
-            irc::commands::get_state,
-            irc::commands::irc_settings_load,
-            irc::commands::irc_settings_save,
-            irc::commands::irc_cert_status,
-            irc::commands::irc_cert_generate,
-            irc::commands::irc_cert_forget,
-            irc::commands::irc_cert_authorize
+            sound::set_voice_cue
         ]);
 
     // Updating in place is a desktop concern: the mobile targets ship through
@@ -416,8 +398,8 @@ mod tests {
     /// Tauri refuses a command the webview was never granted, with
     /// `"command not found"` — at click time, in the UI only. Nothing else
     /// catches it: the command is registered, the frontend type-checks, and
-    /// `cargo test` has no opinion. This has now shipped three times (Drops, the
-    /// chat sound, the IRC certificate commands), so it is checked mechanically.
+    /// `cargo test` has no opinion. This has now shipped more than once (Drops,
+    /// the chat sound), so it is checked mechanically.
     #[test]
     fn every_registered_command_is_named_by_a_permission() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

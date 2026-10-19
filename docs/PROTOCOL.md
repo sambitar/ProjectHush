@@ -378,7 +378,7 @@ screen — a surface may only show it when the relay holds ciphertext it has no 
 | Drops | Sealed to the recipient's published drop key before they are parked, so the relay cannot open them or name the sender. |
 | Zines | The body is encrypted to a per-post read key, and that key is handed over inside a 1:1 session — never through the bulletin. |
 
-**Surfaces that must not use it.** Reads, Torrents and IRC talk to services outside the members-only
+**Surfaces that must not use it.** Reads and Torrents talk to services outside the members-only
 envelope, so their content is not ours to promise anything about. Notes never leave the vault, which
 is a stronger property than end-to-end, not the same one. And on the Zines reader the mark belongs to
 the member zine branch only: the ATProto document branch is a **public** post, which is precisely the

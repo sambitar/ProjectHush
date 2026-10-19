@@ -367,14 +367,6 @@ import { e2eMark } from "./components/ui/E2eMark";
 import { OverflowMenu, type OverflowMenuItem } from "./components/ui/OverflowMenu";
 import { bodyToDisplayHtml, isBlankHtml, sanitizeHtml } from "./lib/richText";
 import { applyTheme, getThemeMode, setThemeMode, type ThemeMode } from "./lib/theme";
-import { IrcPane } from "./features/irc/ircPane";
-import {
-  getIrcState,
-  initIrcStore,
-  ircMentionCount,
-  ircUnreadTotal,
-  subscribeIrc,
-} from "./features/irc/ircStore";
 import QRCode from "qrcode";
 
 type Rail =
@@ -384,7 +376,6 @@ type Rail =
   | "zines"
   | "reads"
   | "torrents"
-  | "irc"
   | "mail"
   | "drops"
   | "vault"
@@ -699,11 +690,6 @@ export class App {
    * hidden, and a ring is discovered only by reading the voice state, so this
    * is the one poll that survives — see `startVoiceRingPoll`. */
   private voiceRingTimer: number | null = null;
-  /** The mounted IRC pane, kept so its store subscription is torn down when
-   * the rail changes instead of patching a detached DOM. */
-  private ircPane: IrcPane | null = null;
-  /** Last IRC unread total, so the rail badge repaints only on a change. */
-  private lastIrcUnread = -1;
   /**
    * The shell element, created once and never detached.
    *
@@ -1352,34 +1338,7 @@ export class App {
       if (ae instanceof HTMLTextAreaElement && ae.closest(".wallet-pane")) return;
       this.scheduleBackgroundRender();
     });
-    // IRC: the pane patches its own DOM, so this only keeps the rail badge
-    // honest. While the rail is up the badge is patched in place; otherwise a
-    // repaint refreshes it along with everything else.
-    subscribeIrc(() => {
-      const total = ircUnreadTotal();
-      const mentions = ircMentionCount();
-      const key = total + mentions * 100000;
-      if (key === this.lastIrcUnread) return;
-      this.lastIrcUnread = key;
-      if (this.rail === "irc") {
-        this.updateIrcRailBadge(total, mentions);
-      } else {
-        this.scheduleBackgroundRender();
-      }
-    });
     document.addEventListener("keydown", (e) => {
-      // IRC keeps its own shortcuts while its rail is up: Ctrl+Tab cycles
-      // windows, Ctrl+W closes the active one.
-      if (this.rail === "irc" && (e.ctrlKey || e.metaKey) && e.key === "Tab") {
-        e.preventDefault();
-        this.ircPane?.cycle(e.shiftKey ? -1 : 1);
-        return;
-      }
-      if (this.rail === "irc" && (e.ctrlKey || e.metaKey) && (e.key === "w" || e.key === "W")) {
-        e.preventDefault();
-        this.ircPane?.closeActive();
-        return;
-      }
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
         e.preventDefault();
         this.paletteOpen = !this.paletteOpen;
@@ -1416,14 +1375,9 @@ export class App {
         this.closeConclaveEnd();
         this.closeConclaveDelete();
         this.torrentsDeleteId = null;
-        // The IRC pane owns its own dialogs and menus; a repaint would drop
-        // the caret out of its input for no reason.
-        if (this.rail !== "irc") this.scheduleRender();
+        this.scheduleRender();
       }
     });
-    // IRC runs its own sockets; wiring it up here (rather than on first visit
-    // to the rail) means unread counts and live connections survive a switch.
-    await initIrcStore();
     await this.refreshStatus();
     this.scheduleRender();
     this.startUpdateProbe();
@@ -2253,10 +2207,6 @@ export class App {
     // own sync sets below.
     this.chatToBottom = false;
     this.conclaveToBottom = false;
-    // The IRC pane holds a live store subscription; tear it down before its
-    // DOM is discarded, or it would keep patching a detached tree.
-    this.ircPane?.unmount();
-    this.ircPane = null;
     // Take the dialogs the previous render mounted, before the shell is synced.
     // Their elements drive the zoom choreography: kept for the close zoom,
     // copied from for a silent rebuild, absent for a fresh open.
@@ -2456,8 +2406,6 @@ export class App {
       });
     } else if (this.rail === "torrents") {
       regions.push(this.torrentsPaneRegion());
-    } else if (this.rail === "irc") {
-      regions.push({ key: null, build: () => this.renderIrc() });
     } else if (this.rail === "mail") {
       regions.push({
         key: mailFoldersKey(this.mailAddress()),
@@ -3111,8 +3059,7 @@ export class App {
   }
 
   /**
-   * The rail's unread badges, repainted from the stores. IRC is not here: its
-   * badge carries a mention dot as well, and its store subscription owns it.
+   * The rail's unread badges, repainted from the stores.
    *
    * This is what keeps the rail's key free of the counts: the three badges below
    * are rewritten where they stand, so a count moving must not rebuild the rail
@@ -4058,11 +4005,6 @@ export class App {
         activeTorrentCount(getTorrentsState()),
       ),
     );
-    // The IRC badge has two parts, so it has one writer: the same one the store
-    // subscription uses while the rail is up.
-    const irc = this.railBtn("irc", "IRC", "irc");
-    this.updateIrcRailBadge(ircUnreadTotal(), ircMentionCount(), irc);
-    rail.appendChild(irc);
     rail.appendChild(this.railBtn("drops", "Drops", "lock"));
     const spacer = document.createElement("div");
     spacer.style.height = "40px";
@@ -15337,48 +15279,6 @@ export class App {
     } finally {
       this.walletBusy = false;
       this.scheduleRender();
-    }
-  }
-
-  /** The IRC rail. The pane builds and patches its own subtree; the app mounts
-   *  it once and otherwise leaves it alone. */
-  private renderIrc(): HTMLElement {
-    const host = document.createElement("div");
-    host.className = "main-pane irc-pane";
-    this.ircPane = new IrcPane(host);
-    this.ircPane.mount();
-    return host;
-  }
-
-  /**
-   * The IRC rail badge, which is the one badge with two parts: the unread count
-   * and a mention dot. One writer, because the store subscription patches it in
-   * place while the rail is up and the rail's first paint draws it from the same
-   * place — a render used to drop a mention dot that was already on screen,
-   * because the subscription only fires when the count changes.
-   */
-  private updateIrcRailBadge(
-    total: number,
-    mentions: number,
-    btn: HTMLElement | null = this.root.querySelector<HTMLElement>(
-      '.rail-btn[data-rail="irc"]',
-    ),
-  ): void {
-    if (!btn) return;
-    btn.querySelector(".rail-count")?.remove();
-    btn.querySelector(".rail-badge")?.remove();
-    if (total > 0) {
-      const pill = document.createElement("span");
-      pill.className = "rail-count";
-      pill.textContent = total > 99 ? "99+" : String(total);
-      pill.setAttribute("aria-label", `${total} unread`);
-      btn.appendChild(pill);
-    }
-    if (mentions > 0) {
-      const dot = document.createElement("span");
-      dot.className = "rail-badge";
-      dot.setAttribute("aria-label", "You were mentioned");
-      btn.appendChild(dot);
     }
   }
 

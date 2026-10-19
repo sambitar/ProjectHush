@@ -2,7 +2,6 @@ import "./styles/tokens.css";
 import "./styles/base.css";
 import "./styles/motion.css";
 import "./styles/app.css";
-import "./styles/irc.css";
 import { initThemeFromDaemon } from "./lib/theme";
 import { initPerfGuard } from "./lib/perf";
 import { App } from "./app";

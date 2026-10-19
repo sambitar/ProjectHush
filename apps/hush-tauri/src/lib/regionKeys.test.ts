@@ -43,7 +43,7 @@ const row = (name: string, shape: string): RowShape => ({ name, shape });
 test("the rail key is the current rail and the torrent count, and nothing else", () => {
   // Pinned exactly, on purpose. An unread count added to this key would rebuild
   // the rail on every arrival, and those counts are precisely what
-  // `patchRailBadges` and the IRC writer keep up to date without a rebuild.
+  // `patchRailBadges` keeps up to date without a rebuild.
   assert.equal(railKey("chats", 0), "chats\n0");
   assert.equal(railKey("torrents", 3), "torrents\n3");
 });
