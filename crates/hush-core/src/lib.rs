@@ -12,6 +12,7 @@ mod lockfile;
 mod mail;
 mod message;
 mod payload;
+mod place;
 pub mod prekey;
 mod recovery;
 mod relay_client;
@@ -25,7 +26,7 @@ mod wire;
 
 pub use account::{
   Account, Contact, ContactQueues, DropInboxReport, MailOutcome, PendingInvite, PendingIntro,
-  PendingIntroRequest, QueueMap,
+  PendingIntroRequest, PlaceRecord, PlaceRole, QueueMap,
 };
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{
@@ -61,6 +62,9 @@ pub use payload::{
     ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeReach,
     TrusteeState, VoiceDescriptor, MailAttachment, DEFAULT_PAPER_TITLE, MAX_INLINE_FILE_BYTES,
     MAX_MAIL_ATTACHMENTS,
+};
+pub use place::{
+    place_now_unix, PlaceHop, SignedHop, VouchChain, MAX_PLACE_CHAIN_HOPS,
 };
 pub use voice::{VoiceEffect, VoiceManager, VoiceMember, VoiceSession, MAX_VOICE_SPEAKERS};
 pub use prekey::{OneTimePreKey, PreKeyRecord};
