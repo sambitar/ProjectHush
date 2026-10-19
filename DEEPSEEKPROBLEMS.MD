@@ -7,6 +7,55 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-19 — IRC removed
+
+### The IRC sections below now describe code that is not in the tree [OPEN]
+
+- What happened: the IRC rail pane and its SASL EXTERNAL certificate work were removed from the
+  project in full — 18 files, the rail entry, `permissions/irc.toml`, the four certificate
+  commands, and 10 Cargo dependencies that only `irc/` used. The removal itself was clean on the
+  first run: `tsc`, `vite build`, 280 UI tests and `cargo test -p hush-tauri --lib` all passed.
+- Symptom for a future reader: the two `2026-10-11` IRC sections below still stand, including
+  three entries marked `OPEN`. They name `src-tauri/src/irc/`, `features/irc/`, `ircStore`,
+  `updateIrcRailBadge` and `permissions/irc.toml` — none of which exist any more. Following them
+  means searching for code that is gone.
+- Why they were not deleted: this log is a record of what was tried and what was never proven,
+  not a changelog. Deleting the sections would erase an open problem with the feature. One of
+  them in particular is not about IRC at all and still applies: `AccountWorker::call` has no
+  timeout, so one slow item stalls every request behind it, which is a live daemon hazard.
+- Needed to resolve: nothing is broken. If IRC is ever restored, these entries are still the
+  starting point. If it is not, a later pass should mark them superseded in place rather than
+  delete them.
+- Lesson: removing a feature does not close its open problems. They move from "unverified code"
+  to "no code at all", and that change of state is worth writing down, because the entries read
+  as live instructions until someone says otherwise.
+
+## 2026-10-19 — Notes 16.2–16.4 (canvas, regions, checklists)
+
+### The canvas replaced the Notes list view instead of joining it [FIXED]
+
+- Attempted: implement 16.2–16.4 (bounded canvas, regions, checklists) by rewriting the
+  Notes view in `app.ts`. The board became the canvas and the existing list renderer —
+  `notesRenderRows`, the `notes-search-bar`, the list empty state — was deleted in the
+  working tree.
+- Symptom: the reader reported "when u updated the notes.. everything i worked on before
+  went into the winds". Nothing was lost in git — `master` still holds the whole list
+  surface, the branch carried zero commits, and the new `Note`/`Region` fields are all
+  `#[serde(default)]` so the existing `notes-state.enc` still decoded. The loss was real
+  to the reader all the same: the surface they used every day had been swapped out, and
+  the working tree was the only place that showed it.
+- Resolution: reverted. The whole slice is stashed as
+  `notes canvas+regions+checklists (16.2-16.4), reverted 2026-10-19` (tracked + untracked),
+  with a belt-and-braces patch at `/tmp/notes-canvas-reverted-2026-10-19.patch`. The tree
+  is byte-identical to `master` for every file in the slice; `scripts/local-build/` was
+  excluded from the stash because it predates the slice. Verified after the revert:
+  `tsc` clean, 280 UI tests pass, `cargo check -p hush-daemon` clean.
+- Lesson: "additive" is a claim about the reader's screen, not about git. Rewriting an
+  existing surface is a destructive change to the person using it even when the history is
+  intact, so a surface swap needs to be asked for before it is built — not defended with
+  `git log` afterwards. The correct shape here was a second view beside the list, decided
+  before writing the first line of the rewrite.
+
 ## 2026-10-19 — Places (desktop)
 
 ### PlaceAdopt cannot decrypt until the phone has added the desktop [WORKED AROUND]
