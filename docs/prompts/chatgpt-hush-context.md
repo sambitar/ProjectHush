@@ -39,7 +39,7 @@ First audience: people who **already** want private chat (privacy-aware friends/
 - **UI never loads code/HTML from the network** — local Tauri assets only; daemon is the only unlock path for keys.
 - **Do not invent a new crypto ratchet** — libsignal for 1:1; transport is invites + queues.
 - **Vault is per person** — no shared cloud drive; fan-out sends duplicate encrypted copies per contact in v1.
-- **Unpaid users keep the vault** — subscription pays for relay/updates/storage tier, not decryption rights.
+- **Unpaid users keep the vault** — subscription pays for relay and official updates, not decryption rights.
 - **Future hardened Linux/USB distro** is a vision; app code should use configurable data root, no plaintext secrets on disk, prefer Unix socket daemon — but don’t scope-creep v1 into an OS project.
 
 ## What to propose (aligned ideas)

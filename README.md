@@ -33,8 +33,8 @@ inside prost-build.
 
 ## Install the desktop app
 
-Release builds are published to `https://hushrelay.space/updates/` — the repository
-is private, so GitHub cannot serve them (see **Relays**). Linux ships as an
+Release builds are published to `https://hushrelay.space/updates/` — served from the
+relay so an installer can be downloaded without a GitHub account (see **Relays**). Linux ships as an
 AppImage, which is the one artifact the updater can replace in place.
 
 An AppImage installs nothing. A freshly downloaded copy therefore has no menu entry
@@ -169,9 +169,8 @@ and the onion key backup are in `docs/ops/relay-prod-vps.md`.
 
 The same origin serves the releases: `https://hushrelay.space/updates/` holds the
 installers and the updater manifest (`latest.json`) that installed copies poll.
-That is not a convenience — this repository is private, and GitHub 404s
-unauthenticated release downloads, so a private repo cannot serve its own
-updates or hand an installer to someone without a GitHub account. Publishing is
+That is not a convenience — the GitHub release page cannot hand an installer to
+someone without a GitHub account, and the updater fetches without credentials. Publishing is
 automatic when a release is published, via
 `.github/workflows/publish-updates.yml`; the whole path is in `RELEASING.md`.
 

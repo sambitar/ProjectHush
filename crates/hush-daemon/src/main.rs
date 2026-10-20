@@ -36,7 +36,8 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
 use hush_core::{
     ChatRecord, ConclaveRecord, Error, MessagePayload, PaperDescriptor, PendingInvite,
-    QueueMap, ReceivedMessage, TrusteeReach, VoiceEffect, VoiceManager, VoiceSession,
+    QueueMap, ReceivedMessage, SignalBody, SignalPolicy, TrusteeReach, VoiceEffect, VoiceManager,
+    VoiceSession,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -212,6 +213,29 @@ struct AddContactRequest {
 struct SetContactReachRequest {
     nickname: String,
     reach: TrusteeReach,
+}
+
+#[derive(Deserialize)]
+struct SetContactSignalsRequest {
+    nickname: String,
+    policy: SignalPolicy,
+}
+
+#[derive(Deserialize)]
+struct SendSignalRequest {
+    nickname: String,
+    body: SignalBody,
+    /// Absolute Unix-millisecond deadline; absent means durable.
+    #[serde(default)]
+    expires_ms: Option<u64>,
+    /// Ask the receiver to send a `SignalAck`.
+    #[serde(default)]
+    ack: bool,
+}
+
+#[derive(Serialize)]
+struct SendSignalResponse {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -476,6 +500,9 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/contacts/add", post(add_contact))
         .route("/api/contacts/remove", post(remove_contact))
         .route("/api/contacts/reach", post(set_contact_reach))
+        .route("/api/contacts/signals", post(set_contact_signals))
+        .route("/api/contacts/{nickname}/signals", get(contact_signals))
+        .route("/api/signals/send", post(send_signal))
         .route("/api/places", get(places))
         .route("/api/places/adopt", post(adopt_place))
         .route("/api/places/detach", post(detach_place))
@@ -1975,6 +2002,62 @@ async fn set_contact_reach(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Turn the trustee sideband on or off for one contact.
+async fn set_contact_signals(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SetContactSignalsRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .set_contact_signals(&body.nickname, body.policy)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Send a typed sideband signal; returns the id for correlating its ack.
+async fn send_signal(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SendSignalRequest>,
+) -> Result<Json<SendSignalResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(
+        state
+            .worker
+            .send_signal(&body.nickname, body.body, body.expires_ms, body.ack)
+            .await,
+    )?;
+    match result {
+        WorkResult::SignalId(id) => Ok(Json(SendSignalResponse { id })),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+/// One trustee's signal audit log, newest first.
+async fn contact_signals(
+    State(state): State<Arc<App>>,
+    Path(nickname): Path<String>,
+) -> Result<Json<Vec<hush_core::SignalRecord>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.contact_signals(&nickname).await)?;
+    match result {
+        WorkResult::Signals(list) => Ok(Json(list)),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
 async fn remove_contact(
     State(state): State<Arc<App>>,
     Json(body): Json<RemoveContactRequest>,
@@ -2116,6 +2199,10 @@ async fn send_file_data(
 #[derive(Serialize)]
 struct RecvResponse {
     messages: Vec<ReceivedDto>,
+    /// Accepted trustee signals, out of band. Never chat rows.
+    signals: Vec<hush_core::ReceivedSignal>,
+    /// Acknowledgements for signals this vault sent.
+    signal_acks: Vec<hush_core::ReceivedSignalAck>,
     warnings: Vec<String>,
 }
 
@@ -2420,6 +2507,8 @@ async fn recv(
     }
     Ok(Json(RecvResponse {
         messages: inbox.messages.into_iter().filter_map(to_dto).collect(),
+        signals: inbox.signals,
+        signal_acks: inbox.signal_acks,
         warnings: inbox.warnings,
     }))
 }
@@ -2510,6 +2599,7 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         | MessagePayload::ZineGrant { .. }
         | MessagePayload::Reach { .. }
         | MessagePayload::PlaceAdopt { .. }
+        | MessagePayload::PlaceAdoptAck { .. }
         | MessagePayload::PlaceIntroduce { .. }
         | MessagePayload::ConclaveInvite { .. }
         | MessagePayload::ConclaveAccept { .. }
@@ -2518,7 +2608,9 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         | MessagePayload::ConclaveUpdate { .. }
         | MessagePayload::ConclaveEnd { .. }
         | MessagePayload::ConclaveIntroReq { .. }
-        | MessagePayload::ConclaveIntro { .. } => None,
+        | MessagePayload::ConclaveIntro { .. }
+        | MessagePayload::Signal { .. }
+        | MessagePayload::SignalAck { .. } => None,
         // A paper payload is not a chat message either: it is routed into the
         // paper store, never the inbox. A voice payload (Task 23) likewise
         // never renders in the inbox — its state surfaces through /api/voice/*.

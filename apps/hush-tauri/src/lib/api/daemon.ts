@@ -15,6 +15,10 @@ import type {
   PendingInviteDto,
   RecvResponse,
   RelayConfigResponse,
+  SendSignalResponse,
+  SignalBodyDto,
+  SignalPolicy,
+  SignalRecordDto,
   StatusResponse,
   ReadsFeedResponse,
   ReadsReaderDto,
@@ -193,6 +197,29 @@ export const api = {
     request<null>("/api/contacts/reach", {
       method: "POST",
       body: JSON.stringify({ nickname, reach }),
+    }),
+  setContactSignals: (nickname: string, policy: SignalPolicy) =>
+    request<null>("/api/contacts/signals", {
+      method: "POST",
+      body: JSON.stringify({ nickname, policy }),
+    }),
+  contactSignals: (nickname: string) =>
+    request<SignalRecordDto[]>(
+      `/api/contacts/${encodeURIComponent(nickname)}/signals`,
+    ),
+  sendSignal: (
+    nickname: string,
+    body: SignalBodyDto,
+    opts?: { expires_ms?: number | null; ack?: boolean },
+  ) =>
+    request<SendSignalResponse>("/api/signals/send", {
+      method: "POST",
+      body: JSON.stringify({
+        nickname,
+        body,
+        expires_ms: opts?.expires_ms ?? null,
+        ack: opts?.ack ?? false,
+      }),
     }),
   removeContact: (nickname: string) =>
     request<null>("/api/contacts/remove", {

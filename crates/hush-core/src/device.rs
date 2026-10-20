@@ -113,7 +113,7 @@ impl DeviceKeys {
     /// Generate a brand-new device identity and persist it.
     pub async fn create(dir: &Path, master: &[u8; MASTER_KEY_LEN]) -> Result<Self, Error> {
         let keys = Self {
-            store: crate::signal::new_protocol_store()?,
+            store: crate::signal_protocol::new_protocol_store()?,
             queue_id: Uuid::new_v4().to_string(),
             read_token: hex::encode(random_bytes::<32>()),
             queue_rotated: false,
@@ -281,7 +281,7 @@ impl DeviceKeys {
         &mut self,
         one_time_count: usize,
     ) -> Result<crate::prekey::PreKeyRecord, Error> {
-        crate::signal::mint_publishable_prekeys(&mut self.store, DEVICE_ID, one_time_count).await
+        crate::signal_protocol::mint_publishable_prekeys(&mut self.store, DEVICE_ID, one_time_count).await
     }
 
     pub async fn identity_public(&self) -> Result<Vec<u8>, Error> {

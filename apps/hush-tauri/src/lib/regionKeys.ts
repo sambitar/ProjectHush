@@ -115,10 +115,15 @@ export function trustRowShape(c: {
   my_reach: string;
   mail_handle?: string | null;
   mail_vault?: string | null;
+  signals?: string;
 }): string {
-  return [c.reach, c.my_reach, c.mail_handle ?? "", c.mail_vault ?? ""].join(
-    "\n",
-  );
+  return [
+    c.reach,
+    c.my_reach,
+    c.mail_handle ?? "",
+    c.mail_vault ?? "",
+    c.signals ?? "",
+  ].join("\n");
 }
 
 /** Which of the two shapes the Conclaves column is in. */

@@ -12,12 +12,13 @@ use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::signal::protocol_name_from_identity;
+use crate::signal_protocol::protocol_name_from_identity;
 
 /// Longest vouch chain that still earns a peer badge (desktop → phone → tablet).
 pub const MAX_PLACE_CHAIN_HOPS: usize = 2;
 
 const VOUCH_PREFIX: &str = "hush-place-vouch-v1";
+const ACCEPT_PREFIX: &str = "hush-place-accept-v1";
 
 /// One adoption claim: `minter` adopted `place`, optionally with a short label.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,10 +33,26 @@ pub struct PlaceHop {
 }
 
 /// A hop plus the minter's signature over [`place_vouch_signing_bytes`].
+///
+/// `accept` is the adopted vault's counter-signature over
+/// [`place_accept_signing_bytes`]. A hop is a **claim** until it carries one;
+/// [`VouchChain::verify_accepted`] is the check a peer badge requires.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignedHop {
     pub hop: PlaceHop,
     pub signature: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept: Option<Vec<u8>>,
+}
+
+impl SignedHop {
+    /// Whether this hop carries a valid counter-signature from the place it names.
+    pub fn accepted(&self) -> bool {
+        self.accept
+            .as_deref()
+            .map(|signature| verify_accept_signature(&self.hop, signature))
+            .unwrap_or(false)
+    }
 }
 
 /// Ordered hops from an earlier ancestor toward the place being introduced.
@@ -50,6 +67,18 @@ pub struct VouchChain {
 pub fn place_vouch_signing_bytes(hop: &PlaceHop) -> Vec<u8> {
     format!(
         "{VOUCH_PREFIX}\n{}\n{}\n{}\n{}",
+        hop.minter_account_id, hop.place_account_id, hop.label, hop.signed_unix
+    )
+    .into_bytes()
+}
+
+/// Canonical bytes covered by the adopted vault's counter-signature.
+///
+/// The same hop fields under a different prefix, so a vouch signature can never
+/// be replayed as an acceptance (or the reverse).
+pub fn place_accept_signing_bytes(hop: &PlaceHop) -> Vec<u8> {
+    format!(
+        "{ACCEPT_PREFIX}\n{}\n{}\n{}\n{}",
         hop.minter_account_id, hop.place_account_id, hop.label, hop.signed_unix
     )
     .into_bytes()
@@ -80,7 +109,11 @@ impl VouchChain {
             .calculate_signature(&place_vouch_signing_bytes(&hop), &mut csprng)
             .map(|sig| sig.into_vec())
             .map_err(|_| Error::Corrupt)?;
-        self.hops.push(SignedHop { hop, signature });
+        self.hops.push(SignedHop {
+            hop,
+            signature,
+            accept: None,
+        });
         Ok(())
     }
 
@@ -106,6 +139,42 @@ impl VouchChain {
         Ok(())
     }
 
+    /// Counter-sign the last hop as the place it names.
+    ///
+    /// This is the adopted vault's consent. `place` must be the identity the
+    /// last hop's `place_account_id` names, so one vault cannot accept a hop
+    /// made out to another.
+    pub fn accept_last_hop(&mut self, place: &IdentityKeyPair) -> Result<(), Error> {
+        let signer_id = protocol_name_from_identity(place);
+        let last = self.hops.last_mut().ok_or(Error::InvalidPlace)?;
+        if last.hop.place_account_id != signer_id {
+            return Err(Error::InvalidPlace);
+        }
+        let mut csprng = OsRng.unwrap_err();
+        let signature = place
+            .private_key()
+            .calculate_signature(&place_accept_signing_bytes(&last.hop), &mut csprng)
+            .map(|sig| sig.into_vec())
+            .map_err(|_| Error::Corrupt)?;
+        last.accept = Some(signature);
+        Ok(())
+    }
+
+    /// Verify the whole chain *and* every hop's counter-signature.
+    ///
+    /// This is the badge rule: a chain where any hop is unconfirmed is the
+    /// minter's claim alone and must not travel to a peer. Older stored chains
+    /// carry no `accept` and read as unconfirmed, which is the safe direction:
+    /// the badge disappears until the pair re-adopts.
+    pub fn verify_accepted(&self) -> Result<(), Error> {
+        self.verify()?;
+        if self.hops.iter().all(|hop| hop.accepted()) {
+            Ok(())
+        } else {
+            Err(Error::PlaceNotAccepted)
+        }
+    }
+
     /// Earliest hop whose minter is in `trusted`. Caller must `verify` first.
     ///
     /// That minter is the badge anchor ("place of …").
@@ -126,6 +195,17 @@ impl VouchChain {
     pub fn leaf_account_id(&self) -> Option<&str> {
         self.hops.last().map(|h| h.hop.place_account_id.as_str())
     }
+}
+
+fn verify_accept_signature(hop: &PlaceHop, signature: &[u8]) -> bool {
+    let Ok(key_bytes) = hex::decode(&hop.place_account_id) else {
+        return false;
+    };
+    let Ok(key) = libsignal_protocol::IdentityKey::try_from(key_bytes.as_slice()) else {
+        return false;
+    };
+    key.public_key()
+        .verify_signature(&place_accept_signing_bytes(hop), signature)
 }
 
 fn verify_hop_signature(signed: &SignedHop) -> bool {
@@ -261,5 +341,84 @@ mod tests {
             .sign_hop(&other, hop(&desktop, &phone_id, "phone"))
             .unwrap_err();
         assert!(matches!(err, Error::InvalidPlace));
+    }
+
+    fn accepted_chain() -> VouchChain {
+        let minter = keypair();
+        let place = keypair();
+        let place_id = protocol_name_from_identity(&place);
+        let mut chain = VouchChain::default();
+        chain
+            .sign_hop(&minter, hop(&minter, &place_id, "phone"))
+            .unwrap();
+        chain.accept_last_hop(&place).unwrap();
+        chain
+    }
+
+    #[test]
+    fn an_unaccepted_hop_is_not_an_accepted_chain() {
+        let minter = keypair();
+        let place = keypair();
+        let place_id = protocol_name_from_identity(&place);
+        let mut chain = VouchChain::default();
+        chain
+            .sign_hop(&minter, hop(&minter, &place_id, "phone"))
+            .unwrap();
+        chain.verify().unwrap();
+        assert!(!chain.hops[0].accepted());
+        assert!(matches!(
+            chain.verify_accepted(),
+            Err(Error::PlaceNotAccepted)
+        ));
+    }
+
+    #[test]
+    fn an_accepted_chain_verifies_and_only_the_named_place_can_sign() {
+        let chain = accepted_chain();
+        chain.verify_accepted().unwrap();
+
+        // A different key cannot accept someone else's hop.
+        let mut unsigned = chain.clone();
+        unsigned.hops[0].accept = None;
+        let stranger = keypair();
+        assert!(matches!(
+            unsigned.accept_last_hop(&stranger),
+            Err(Error::InvalidPlace)
+        ));
+
+        // Tampering after acceptance invalidates it.
+        let mut tampered = chain.clone();
+        tampered.hops[0].hop.label = "tablet".into();
+        assert!(tampered.verify_accepted().is_err());
+    }
+
+    #[test]
+    fn a_vouch_signature_cannot_be_replayed_as_an_acceptance() {
+        let mut chain = accepted_chain();
+        chain.hops[0].accept = Some(chain.hops[0].signature.clone());
+        assert!(matches!(
+            chain.verify_accepted(),
+            Err(Error::PlaceNotAccepted)
+        ));
+    }
+
+    #[test]
+    fn an_acceptance_stolen_from_another_hop_is_refused() {
+        let a = keypair();
+        let b = keypair();
+        let c = keypair();
+        let b_id = protocol_name_from_identity(&b);
+        let c_id = protocol_name_from_identity(&c);
+        let mut chain = VouchChain::default();
+        chain.sign_hop(&a, hop(&a, &b_id, "phone")).unwrap();
+        chain.sign_hop(&b, hop(&b, &c_id, "tablet")).unwrap();
+        chain.accept_last_hop(&c).unwrap();
+
+        // Moving the leaf's acceptance onto the parent must not validate it.
+        chain.hops[0].accept = chain.hops[1].accept.clone();
+        assert!(matches!(
+            chain.verify_accepted(),
+            Err(Error::PlaceNotAccepted)
+        ));
     }
 }

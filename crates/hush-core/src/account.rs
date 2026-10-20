@@ -2,9 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use libsignal_protocol::{IdentityKeyStore, SessionStore};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use libsignal_protocol::{IdentityKeyStore, SessionStore};
 use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
@@ -13,29 +13,36 @@ use crate::backup::{export_vault, import_vault};
 use crate::chat_log::{
     ChatLog, ChatRecordPayload, ChatRetention, ConclaveRecord, MailAttachmentRecord, MailState,
 };
-use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeReach, TrusteeState};
-use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
-use crate::prekey::PreKeyRecord;
-use crate::recovery::{ensure_recovery_files, generate_recovery_code, recovery_files_exist, unwrap_master_with_recovery};
 use crate::crypto::{decrypt, encrypt};
+use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
 use crate::error::Error;
 use crate::invite::{InvitePayload, ShortInvite};
 use crate::message::{
     InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper, ReceivedVoice,
 };
+use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeReach, TrusteeState};
 use crate::payload::{
     MailAttachment, MessagePayload, PaperDescriptor, VoiceDescriptor, MAX_INLINE_FILE_BYTES,
     MAX_MAIL_ATTACHMENTS,
 };
+use crate::prekey::PreKeyRecord;
+use crate::recovery::{
+    ensure_recovery_files, generate_recovery_code, recovery_files_exist,
+    unwrap_master_with_recovery,
+};
 use crate::relay_client::{
     normalize_relay_base, validate_onion_relay, BulletinBlob, DrainedBlob, RelayClient,
 };
-use crate::signal::{
+use crate::signal_persist::import_store;
+use crate::signal_protocol::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
     process_contact_bundle, protocol_address, protocol_name_from_identity, sign_queue_grant,
     verify_queue_grant,
 };
-use crate::signal_persist::import_store;
+use crate::signals::{
+    prune_signal_log, ReceivedSignal, ReceivedSignalAck, SignalBody, SignalPolicy, SignalRecord,
+    SignalStatus, MAX_SIGNAL_BYTES,
+};
 use crate::vault::{BlobId, DropDrainKey, Vault};
 use crate::wire::{decode_relay_blob, encode_relay_blob};
 
@@ -210,6 +217,14 @@ pub struct Contact {
     /// introduce verified ("place of …"). `None` for ordinary contacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place_of: Option<String>,
+    /// Whether this relationship carries signals.
+    ///
+    /// A local choice, defaulting to `Allow` for every trustee: the sideband is
+    /// part of the trust, not a separate opt-in. `Deny` turns it off in both
+    /// directions; the peer is not told, and its signals are dropped without an
+    /// acknowledgement so a denied relationship produces no extra traffic.
+    #[serde(default)]
+    pub signals: SignalPolicy,
 }
 
 impl<'de> Deserialize<'de> for Contact {
@@ -262,6 +277,8 @@ impl<'de> Deserialize<'de> for Contact {
                 peer_reach: TrusteeReach,
                 #[serde(default)]
                 place_of: Option<String>,
+                #[serde(default)]
+                signals: SignalPolicy,
             },
             Devices {
                 nickname: String,
@@ -301,6 +318,7 @@ impl<'de> Deserialize<'de> for Contact {
                 reach,
                 peer_reach,
                 place_of,
+                signals,
             } => Contact {
                 nickname,
                 account_id,
@@ -315,6 +333,7 @@ impl<'de> Deserialize<'de> for Contact {
                 reach,
                 peer_reach,
                 place_of,
+                signals,
             },
             Repr::Devices {
                 nickname,
@@ -344,6 +363,7 @@ impl<'de> Deserialize<'de> for Contact {
                     reach: TrusteeReach::Full,
                     peer_reach: TrusteeReach::Full,
                     place_of: None,
+                    signals: SignalPolicy::Allow,
                 }
             }
             Repr::Legacy {
@@ -369,6 +389,7 @@ impl<'de> Deserialize<'de> for Contact {
                     reach: TrusteeReach::Full,
                     peer_reach: TrusteeReach::Full,
                     place_of: None,
+                    signals: SignalPolicy::Allow,
                 }
             }
         })
@@ -564,6 +585,10 @@ struct AccountState {
     /// Places this vault minted or was minted by (Settings → My places).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     places: Vec<PlaceRecord>,
+    /// Accepted trustee signals, newest last: the sideband's audit log and the
+    /// duplicate-suppression window. Bounded by [`crate::signals::MAX_SIGNAL_LOG`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signal_log: Vec<SignalRecord>,
 }
 
 /// Whether this vault minted the Place or was adopted by it.
@@ -770,7 +795,10 @@ async fn fetch_queue(
             blobs,
         });
     }
-    match relay.drain(&queue_id, &read_token, DRAIN_PAGE_LIMIT).await? {
+    match relay
+        .drain(&queue_id, &read_token, DRAIN_PAGE_LIMIT)
+        .await?
+    {
         // A relay without the drain route: walk per blob this poll and latch
         // the discovery so later polls skip the probe.
         None => {
@@ -835,6 +863,7 @@ impl Account {
             regrant_all: false,
             identity_restored: false,
             places: Vec::new(),
+            signal_log: Vec::new(),
         };
         let recovery_code = generate_recovery_code();
         ensure_recovery_files(dir, &master, &recovery_code)?;
@@ -1173,8 +1202,7 @@ impl Account {
         let key = if self.state.use_tor_relay {
             let base = self.state.onion_relay.as_deref().ok_or_else(|| {
                 Error::Relay(
-                    "Tor relay mode is on, but no onion address is on file for this vault."
-                        .into(),
+                    "Tor relay mode is on, but no onion address is on file for this vault.".into(),
                 )
             })?;
             // The daemon carries the shell-reported port in memory; the CLI
@@ -1285,7 +1313,8 @@ impl Account {
         // contact only ever needs to put messages in this inbox, never to
         // read or burn it.
         let pointer = ShortInvite {
-            relay: if normalize_relay(&self.state.relay) == normalize_relay(crate::invite::default_relay())
+            relay: if normalize_relay(&self.state.relay)
+                == normalize_relay(crate::invite::default_relay())
             {
                 None
             } else {
@@ -1341,6 +1370,12 @@ impl Account {
     /// vouch hop, stores a MintedByMe record, and sends [`MessagePayload::PlaceAdopt`]
     /// carrying our invite + chain.
     ///
+    /// The hop we sign is **unconfirmed** until the adopted vault counter-signs
+    /// it and sends the chain back ([`MessagePayload::PlaceAdoptAck`]); only a
+    /// confirmed chain can be introduced to a contact. Re-running this on a
+    /// place we already minted is the repair path for that reply going missing,
+    /// not a conflict.
+    ///
     /// The adopted vault can only decrypt that message once it has added **this**
     /// vault as a contact (inbox blobs carry no sender id). The UI must show our
     /// invite to the phone after adopt so it can add us; then its next `recv`
@@ -1361,16 +1396,20 @@ impl Account {
         if place_id == self.state.protocol_name {
             return Err(Error::InvalidPlace);
         }
-        if self.state.places.iter().any(|p| p.account_id == place_id) {
+        // Re-adopting a place we minted is a repair: our hop may still be
+        // waiting on their counter-signature, and the reply is lost for good if
+        // the relay was down when it was sent. A place that minted *us* is a
+        // different relationship and cannot be re-signed into this one.
+        if self
+            .state
+            .places
+            .iter()
+            .any(|p| p.account_id == place_id && !matches!(p.role, PlaceRole::MintedByMe))
+        {
             return Err(Error::PlaceExists);
         }
 
-        if !self
-            .state
-            .contacts
-            .iter()
-            .any(|c| c.account_id == place_id)
-        {
+        if !self.state.contacts.iter().any(|c| c.account_id == place_id) {
             self.add_contact(nickname, invite_str).await?;
         }
 
@@ -1399,14 +1438,29 @@ impl Account {
         let nick = self
             .contact_nick_for_protocol(&place_id)
             .unwrap_or_else(|| nickname.to_string());
-        self.state.places.push(PlaceRecord {
-            account_id: place_id,
-            nickname: nick.clone(),
-            label: label.to_string(),
-            role: PlaceRole::MintedByMe,
-            chain: chain.clone(),
-            added_unix: crate::place::place_now_unix(),
-        });
+        match self
+            .state
+            .places
+            .iter_mut()
+            .find(|p| p.account_id == place_id)
+        {
+            // Repair: the same relationship, a freshly signed hop. The old hop
+            // may never have been counter-signed, and a chain carries the
+            // signatures, not the history.
+            Some(existing) => {
+                existing.nickname = nick.clone();
+                existing.label = label.to_string();
+                existing.chain = chain.clone();
+            }
+            None => self.state.places.push(PlaceRecord {
+                account_id: place_id,
+                nickname: nick.clone(),
+                label: label.to_string(),
+                role: PlaceRole::MintedByMe,
+                chain: chain.clone(),
+                added_unix: crate::place::place_now_unix(),
+            }),
+        }
 
         let our_invite = self.invite().await?;
         self.send_payload_inner(
@@ -1435,6 +1489,12 @@ impl Account {
     }
 
     /// Introduce one of our MintedByMe Places to a contact (D8, D16).
+    ///
+    /// Refuses a place whose vouch the adopted vault has not counter-signed:
+    /// handing over a one-sided claim would only tell the contact that a
+    /// relationship exists which the other end never agreed to, and their own
+    /// badge check would reject it anyway. Failing here is where the reason is
+    /// legible.
     pub async fn introduce_place(
         &mut self,
         place_account_id: &str,
@@ -1444,11 +1504,10 @@ impl Account {
             .state
             .places
             .iter()
-            .find(|p| {
-                p.account_id == place_account_id && matches!(p.role, PlaceRole::MintedByMe)
-            })
+            .find(|p| p.account_id == place_account_id && matches!(p.role, PlaceRole::MintedByMe))
             .cloned()
             .ok_or(Error::PlaceNotFound)?;
+        place.chain.verify_accepted()?;
         if self
             .state
             .contacts
@@ -1498,6 +1557,12 @@ impl Account {
     }
 
     /// Apply a PlaceAdopt from the minting Place (we are the adopted vault).
+    ///
+    /// This is where the adopted vault **consents**. After checking that the
+    /// chain ends at our own account and that the hop naming us came from the
+    /// account that sent it, we counter-sign that hop and send the chain back.
+    /// The minter cannot produce that signature, so a peer badge built on the
+    /// chain means both ends agreed rather than one end asserting.
     async fn apply_place_adopt(
         &mut self,
         from_account: &str,
@@ -1514,47 +1579,136 @@ impl Account {
         if last.hop.minter_account_id != from_account {
             return Err(Error::InvalidPlace);
         }
-        if self
+
+        let existing_idx = self
             .state
             .places
             .iter()
-            .any(|p| p.account_id == from_account)
-        {
+            .position(|p| p.account_id == from_account);
+        let suggested = if existing_idx.is_none() {
+            let base_nick = if label.trim().is_empty() {
+                "place".to_string()
+            } else {
+                label.trim().to_string()
+            };
+            let nick = self.unique_contact_nick(&base_nick);
+            if !self
+                .state
+                .contacts
+                .iter()
+                .any(|c| c.account_id == from_account)
+            {
+                self.add_contact(&nick, invite).await?;
+            }
+            Some(nick)
+        } else {
+            None
+        };
+
+        // Consent, in the only form a third party can check: our own signature
+        // over the hop that names us.
+        let mut chain = chain;
+        let key = self.device.identity_key_pair().await?;
+        chain.accept_last_hop(&key)?;
+
+        let mut changed = false;
+        match existing_idx {
+            Some(idx) => {
+                if self.state.places[idx].chain != chain {
+                    self.state.places[idx].chain = chain.clone();
+                    changed = true;
+                }
+            }
+            None => {
+                let stored_nick = self
+                    .contact_nick_for_protocol(from_account)
+                    .unwrap_or_else(|| suggested.unwrap_or_else(|| "place".to_string()));
+                self.state.places.push(PlaceRecord {
+                    account_id: from_account.to_string(),
+                    nickname: stored_nick,
+                    label: label.to_string(),
+                    role: PlaceRole::MintedMe,
+                    chain: chain.clone(),
+                    added_unix: crate::place::place_now_unix(),
+                });
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.save().await?;
+        }
+
+        // The chain goes back even when our own record was already correct: the
+        // minter is the one who needs the counter-signature, and a repeat ack
+        // for a chain they already hold is a no-op on their side.
+        //
+        // Saved before sending, deliberately. If the relay is down the send
+        // fails and the caller warns, but our record stands — so the outcome is
+        // "we hold a place the minter has not confirmed", which is inert. The
+        // other order would leave a confirmed chain in the minter's hands with
+        // no record here, and a badge nobody local agreed to.
+        let nick = self
+            .contact_nick_for_protocol(from_account)
+            .unwrap_or_else(|| short_name(from_account));
+        self.send_payload_inner(&nick, MessagePayload::PlaceAdoptAck { chain }, false)
+            .await?;
+        Ok(changed)
+    }
+
+    /// Apply a PlaceAdoptAck: the adopted vault has counter-signed its hop.
+    ///
+    /// Only the place itself may confirm its own hop, and only on a record we
+    /// minted, so no contact can volunteer an acceptance on someone else's
+    /// behalf. Until this lands our hop is unconfirmed and
+    /// [`Self::introduce_place`] refuses to hand it to anyone.
+    async fn apply_place_adopt_ack(
+        &mut self,
+        from_account: &str,
+        chain: crate::place::VouchChain,
+    ) -> Result<bool, Error> {
+        chain.verify()?;
+        let leaf = chain.leaf_account_id().ok_or(Error::InvalidPlace)?;
+        if leaf != from_account {
+            return Err(Error::InvalidPlace);
+        }
+        let last = chain.hops.last().ok_or(Error::InvalidPlace)?;
+        if last.hop.minter_account_id != self.state.protocol_name {
+            return Err(Error::InvalidPlace);
+        }
+        // Only the last hop is checked here: it is the one this vault minted,
+        // so it is the only one whose acceptance is this message's business.
+        // Whether the whole chain is accepted is the question
+        // `VouchChain::verify_accepted` answers for whoever we introduce it to.
+        if !last.accepted() {
+            return Err(Error::PlaceNotAccepted);
+        }
+
+        let Some(place) = self
+            .state
+            .places
+            .iter_mut()
+            .find(|p| p.account_id == from_account)
+        else {
+            return Ok(false);
+        };
+        if !matches!(place.role, PlaceRole::MintedByMe) {
             return Ok(false);
         }
-
-        let base_nick = if label.trim().is_empty() {
-            "place".to_string()
-        } else {
-            label.trim().to_string()
-        };
-        let nick = self.unique_contact_nick(&base_nick);
-
-        if !self
-            .state
-            .contacts
-            .iter()
-            .any(|c| c.account_id == from_account)
-        {
-            self.add_contact(&nick, invite).await?;
+        if place.chain == chain {
+            return Ok(false);
         }
-
-        let stored_nick = self
-            .contact_nick_for_protocol(from_account)
-            .unwrap_or(nick);
-        self.state.places.push(PlaceRecord {
-            account_id: from_account.to_string(),
-            nickname: stored_nick,
-            label: label.to_string(),
-            role: PlaceRole::MintedMe,
-            chain,
-            added_unix: crate::place::place_now_unix(),
-        });
+        place.chain = chain;
         self.save().await?;
         Ok(true)
     }
 
     /// Apply a PlaceIntroduce from a known contact.
+    ///
+    /// The chain must be counter-signed by every Place it names, so the badge
+    /// this can set means both ends of each hop agreed. A one-sided claim — a
+    /// minter naming a vault that never signed back — is refused outright rather
+    /// than shown as a weaker badge.
     async fn apply_place_introduce(
         &mut self,
         from_account: &str,
@@ -1565,7 +1719,7 @@ impl Account {
         if self.contact_nick_for_protocol(from_account).is_none() {
             return Err(Error::ContactNotFound);
         }
-        chain.verify()?;
+        chain.verify_accepted()?;
         let leaf = chain
             .leaf_account_id()
             .ok_or(Error::InvalidPlace)?
@@ -1580,9 +1734,7 @@ impl Account {
             .iter()
             .map(|c| c.account_id.as_str())
             .collect();
-        let anchor = chain
-            .trusted_anchor(&trusted)
-            .map(|s| s.to_string());
+        let anchor = chain.trusted_anchor(&trusted).map(|s| s.to_string());
 
         let mut changed = false;
         if !self.state.contacts.iter().any(|c| c.account_id == leaf) {
@@ -1707,7 +1859,10 @@ impl Account {
     /// the relay must match, and the account must be new.
     fn validate_contact(&self, nickname: &str, payload: &InvitePayload) -> Result<(), Error> {
         if normalize_relay(&payload.relay) != normalize_relay(&self.state.relay) {
-            return Err(Error::RelayMismatch(payload.relay.clone(), self.state.relay.clone()));
+            return Err(Error::RelayMismatch(
+                payload.relay.clone(),
+                self.state.relay.clone(),
+            ));
         }
         if self
             .state
@@ -1745,6 +1900,7 @@ impl Account {
             reach: TrusteeReach::Full,
             peer_reach: TrusteeReach::Full,
             place_of: None,
+            signals: SignalPolicy::Allow,
         });
         // Adding a contact clears any revocation left from a previous delete, so
         // a re-added contact is granted a queue again instead of being treated
@@ -1802,6 +1958,137 @@ impl Account {
         self.save().await
     }
 
+    /// Send a typed sideband signal to a trustee.
+    ///
+    /// Signals are store-and-forward, like mail: the peer may be away, and the
+    /// relay queue holds the encrypted payload until their next drain. Unlike
+    /// mail, a signal never appears in any inbox — the receiver's `recv`
+    /// reports it out of band, and only the audit log remembers it.
+    ///
+    /// `expires_ms` is an absolute Unix-millisecond deadline. A signal already
+    /// past it is refused here; a receiver drops one that expires in flight.
+    /// `ack` asks the peer to send a `SignalAck` back, which is useful for a
+    /// state-changing kind and unnecessary noise for a heartbeat.
+    ///
+    /// Returns the id of the sent signal, for correlating an ack.
+    pub async fn send_signal(
+        &mut self,
+        nickname: &str,
+        body: SignalBody,
+        expires_ms: Option<u64>,
+        ack: bool,
+    ) -> Result<String, Error> {
+        body.validate()?;
+        let allowed = self
+            .find_contact(nickname)
+            .map(|c| c.signals.allows())
+            .ok_or(Error::ContactNotFound)?;
+        if !allowed {
+            return Err(Error::SignalsDisabled);
+        }
+        let now = now_ms();
+        if let Some(expires) = expires_ms {
+            if expires <= now {
+                return Err(Error::InvalidSignal);
+            }
+        }
+        let id = Uuid::new_v4().to_string();
+        let payload = MessagePayload::Signal {
+            id: id.clone(),
+            sent_ms: Some(now),
+            expires_ms,
+            ack,
+            body,
+        };
+        // Check the whole encoded payload, not just the body: the envelope is
+        // small but a future kind may carry more than its own validation saw.
+        if payload.encode()?.len() > MAX_SIGNAL_BYTES {
+            return Err(Error::SignalTooLarge(MAX_SIGNAL_BYTES));
+        }
+        self.send_payload_inner(nickname, payload, false).await?;
+        Ok(id)
+    }
+
+    /// Acknowledge a signal this vault received.
+    ///
+    /// Normally `recv` sends this itself when the sender asked for it; the
+    /// method is public so a feature that applies a signal after the drain —
+    /// a download that only finishes later, say — can send a `Failed` or
+    /// `Delivered` status once it knows the outcome.
+    pub async fn send_signal_ack(
+        &mut self,
+        nickname: &str,
+        id: &str,
+        status: SignalStatus,
+    ) -> Result<(), Error> {
+        let allowed = self
+            .find_contact(nickname)
+            .map(|c| c.signals.allows())
+            .ok_or(Error::ContactNotFound)?;
+        if !allowed {
+            return Err(Error::SignalsDisabled);
+        }
+        self.send_payload_inner(
+            nickname,
+            MessagePayload::SignalAck {
+                id: id.to_string(),
+                status,
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Turn the sideband on or off for one trustee.
+    ///
+    /// The choice is local and is not announced: `Deny` simply stops accepting
+    /// and sending. That is deliberate — a peer learning that its signals are
+    /// refused would turn a quiet preference into a social signal.
+    pub async fn set_contact_signals(
+        &mut self,
+        nickname: &str,
+        policy: SignalPolicy,
+    ) -> Result<(), Error> {
+        let changed = {
+            let contact = self
+                .state
+                .contacts
+                .iter_mut()
+                .find(|c| c.nickname == nickname)
+                .ok_or(Error::ContactNotFound)?;
+            if contact.signals == policy {
+                false
+            } else {
+                contact.signals = policy;
+                true
+            }
+        };
+        if changed {
+            self.save().await?;
+        }
+        Ok(())
+    }
+
+    /// The audit log for one trustee, newest first.
+    ///
+    /// Ids and kinds only, never the bodies: this is the "show me what the
+    /// sideband did" surface, not a second message archive.
+    pub fn signals_for(&self, nickname: &str) -> Result<Vec<SignalRecord>, Error> {
+        let account_id = self
+            .find_contact(nickname)
+            .ok_or(Error::ContactNotFound)?
+            .account_id
+            .clone();
+        Ok(self
+            .state
+            .signal_log
+            .iter()
+            .filter(|r| r.from_account == account_id)
+            .cloned()
+            .rev()
+            .collect())
+    }
+
     /// Forget a contact without revoking it.
     ///
     /// Used where a contact must simply stop being surfaced (and by the older
@@ -1814,10 +2101,16 @@ impl Account {
             .iter()
             .position(|c| c.nickname == nickname)
             .ok_or(Error::ContactNotFound)?;
+        let account_id = self.state.contacts[pos].account_id.clone();
         self.state.contacts.remove(pos);
         // A queued reach announcement for a contact that no longer exists
         // could never deliver; dropping it here keeps the drain pass quiet.
         self.state.pending_reach.retain(|p| p.nickname != nickname);
+        // The sideband's audit log belongs to the relationship, not the vault:
+        // once the trust is gone, its records have no owner to be shown under.
+        self.state
+            .signal_log
+            .retain(|r| r.from_account != account_id);
         self.save().await?;
         Ok(())
     }
@@ -1847,6 +2140,9 @@ impl Account {
         // failing against the burned queue forever; the revocation is the
         // stronger statement about the relationship.
         self.state.pending_reach.retain(|p| p.nickname != nickname);
+        self.state
+            .signal_log
+            .retain(|r| r.from_account != account_id);
         if !self.state.revoked.contains(&account_id) {
             self.state.revoked.push(account_id.clone());
         }
@@ -1903,8 +2199,7 @@ impl Account {
         )
         .await?;
         let master = *self.vault.master_key();
-        self.chat_log
-            .append_text(&master, nickname, true, text)?;
+        self.chat_log.append_text(&master, nickname, true, text)?;
         self.enforce_chat_retention();
         Ok(())
     }
@@ -1939,14 +2234,8 @@ impl Account {
         )
         .await?;
         let master = *self.vault.master_key();
-        self.chat_log.append_file(
-            &master,
-            nickname,
-            true,
-            name,
-            &blob_id,
-            data.len() as u64,
-        )?;
+        self.chat_log
+            .append_file(&master, nickname, true, name, &blob_id, data.len() as u64)?;
         self.enforce_chat_retention();
         Ok(blob_id)
     }
@@ -2062,18 +2351,13 @@ impl Account {
     /// rather than rejected — an oversized attachment is skipped with a note,
     /// never a drain failure — so one crafted drop cannot park itself in the
     /// member's drain forever by refusing to parse.
-    fn open_drop(
-        &mut self,
-        key: &DropDrainKey,
-        slot: &str,
-        body: &[u8],
-    ) -> Result<bool, Error> {
+    fn open_drop(&mut self, key: &DropDrainKey, slot: &str, body: &[u8]) -> Result<bool, Error> {
         let pair = key.keypair();
         let pkg = match crate::open_with_key(body, &pair) {
             Ok(pkg) => pkg,
-            Err(
-                Error::DropNotForThisKey | Error::BadDrop | Error::UnsupportedDrop,
-            ) => return Ok(false),
+            Err(Error::DropNotForThisKey | Error::BadDrop | Error::UnsupportedDrop) => {
+                return Ok(false)
+            }
             Err(e) => return Err(e),
         };
 
@@ -2314,11 +2598,7 @@ impl Account {
                 continue;
             }
             match self
-                .send_payload_inner(
-                    &p.nickname,
-                    MessagePayload::Reach { scope: p.scope },
-                    false,
-                )
+                .send_payload_inner(&p.nickname, MessagePayload::Reach { scope: p.scope }, false)
                 .await
             {
                 Ok(()) => delivered += 1,
@@ -2459,7 +2739,10 @@ impl Account {
     /// retention failure must not fail the send.
     fn enforce_chat_retention(&mut self) {
         let master = *self.vault.master_key();
-        if let Err(e) = self.chat_log.retain_for_auto_delete(&master, self.chat_retention) {
+        if let Err(e) = self
+            .chat_log
+            .retain_for_auto_delete(&master, self.chat_retention)
+        {
             eprintln!("hush: chat auto-delete pass failed: {e}");
         }
     }
@@ -2568,7 +2851,11 @@ impl Account {
         let descriptor = descriptor_of(&record);
         // Invite each invitee. Store-and-forward, so an offline invitee still
         // receives it on their next drain.
-        for trustee in record.trustees.iter().filter(|m| m.state == TrusteeState::Invited) {
+        for trustee in record
+            .trustees
+            .iter()
+            .filter(|m| m.state == TrusteeState::Invited)
+        {
             if self.find_contact(&trustee.nick).is_some() {
                 self.send_payload_inner(
                     &trustee.nick,
@@ -3224,8 +3511,15 @@ impl Account {
         self.queue_conclave_retry(conclave_id, &payload, out.refused)
             .await?;
         let master = *self.vault.master_key();
-        self.chat_log
-            .append_conclave_file(&master, conclave_id, true, None, name, &blob_id, data.len() as u64)?;
+        self.chat_log.append_conclave_file(
+            &master,
+            conclave_id,
+            true,
+            None,
+            name,
+            &blob_id,
+            data.len() as u64,
+        )?;
         Ok(blob_id)
     }
 
@@ -3270,10 +3564,9 @@ impl Account {
             nick: nickname.to_string(),
             state: TrusteeState::Invited,
         };
-        self.chat_log
-            .update_conclave(&master, conclave_id, |c| {
-                c.upsert_trustee(&invited);
-            })?;
+        self.chat_log.update_conclave(&master, conclave_id, |c| {
+            c.upsert_trustee(&invited);
+        })?;
         let record = self
             .chat_log
             .conclave(conclave_id)
@@ -3332,15 +3625,14 @@ impl Account {
                 &roster,
             )?;
         } else {
-            self.chat_log
-                .update_conclave(&master, conclave_id, |c| {
-                    if c.convener.is_empty() {
-                        c.convener = invite.convener.clone();
-                    }
-                    for m in &roster {
-                        c.upsert_trustee(m);
-                    }
-                })?;
+            self.chat_log.update_conclave(&master, conclave_id, |c| {
+                if c.convener.is_empty() {
+                    c.convener = invite.convener.clone();
+                }
+                for m in &roster {
+                    c.upsert_trustee(m);
+                }
+            })?;
         }
         self.state
             .pending_invites
@@ -3352,12 +3644,8 @@ impl Account {
             .ok_or(Error::ConclaveNotFound)?;
         let descriptor = descriptor_of(&record);
         if let Some(nick) = self.contact_nick_for_protocol(&invite.from_account) {
-            self.send_payload_inner(
-                &nick,
-                MessagePayload::ConclaveAccept { descriptor },
-                false,
-            )
-            .await?;
+            self.send_payload_inner(&nick, MessagePayload::ConclaveAccept { descriptor }, false)
+                .await?;
         }
         self.save().await?;
         Ok(record)
@@ -3681,10 +3969,7 @@ impl Account {
                     // Best effort: the contact edge works one way if the
                     // courier is down, and the card can be re-earned by
                     // repeating the introduction.
-                    if let Err(e) = self
-                        .send_payload_inner(&via_nick, reverse, false)
-                        .await
-                    {
+                    if let Err(e) = self.send_payload_inner(&via_nick, reverse, false).await {
                         eprintln!(
                             "hush: intro return-card to {} failed: {e}",
                             short_name(target_account)
@@ -3698,7 +3983,11 @@ impl Account {
     }
 
     /// Dismiss a received introduction without adding the contact.
-    pub async fn dismiss_intro(&mut self, conclave_id: &str, target_account: &str) -> Result<(), Error> {
+    pub async fn dismiss_intro(
+        &mut self,
+        conclave_id: &str,
+        target_account: &str,
+    ) -> Result<(), Error> {
         self.state
             .pending_intros
             .retain(|i| !(i.conclave_id == conclave_id && i.target == target_account));
@@ -3920,10 +4209,9 @@ impl Account {
             nick: String::new(),
             state: TrusteeState::Left,
         };
-        self.chat_log
-            .update_conclave(&master, conclave_id, |c| {
-                c.upsert_trustee(&left);
-            })?;
+        self.chat_log.update_conclave(&master, conclave_id, |c| {
+            c.upsert_trustee(&left);
+        })?;
         let record = self
             .chat_log
             .conclave(conclave_id)
@@ -3976,10 +4264,9 @@ impl Account {
             nick: nickname.to_string(),
             state: TrusteeState::Kicked,
         };
-        self.chat_log
-            .update_conclave(&master, conclave_id, |c| {
-                c.upsert_trustee(&kicked);
-            })?;
+        self.chat_log.update_conclave(&master, conclave_id, |c| {
+            c.upsert_trustee(&kicked);
+        })?;
         let record = self
             .chat_log
             .conclave(conclave_id)
@@ -4148,7 +4435,12 @@ impl Account {
     /// pre-consent record is sendable rather than only listable.
     fn hydrate_conclaves(&mut self) -> Result<(), Error> {
         let me = self.state.protocol_name.clone();
-        let ids: Vec<String> = self.chat_log.conclaves().iter().map(|c| c.id.clone()).collect();
+        let ids: Vec<String> = self
+            .chat_log
+            .conclaves()
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
         let master = *self.vault.master_key();
         for id in ids {
             let contacts: Vec<(String, String)> = self
@@ -4157,13 +4449,12 @@ impl Account {
                 .iter()
                 .map(|c| (c.nickname.clone(), c.account_id.clone()))
                 .collect();
-            self.chat_log
-                .hydrate_trustees(&master, &id, &me, |nick| {
-                    contacts
-                        .iter()
-                        .find(|(n, _)| n == nick)
-                        .map(|(_, id)| id.clone())
-                })?;
+            self.chat_log.hydrate_trustees(&master, &id, &me, |nick| {
+                contacts
+                    .iter()
+                    .find(|(n, _)| n == nick)
+                    .map(|(_, id)| id.clone())
+            })?;
         }
         Ok(())
     }
@@ -4441,7 +4732,9 @@ impl Account {
             return Ok(true);
         }
         let queue_id = self.device.contact_queue_id(&contact.account_id);
-        let delivery_token = self.device.contact_queue_delivery_token(&contact.account_id);
+        let delivery_token = self
+            .device
+            .contact_queue_delivery_token(&contact.account_id);
         let key = self.device.identity_key_pair().await?;
         let signature = sign_queue_grant(&key, &queue_id, &delivery_token)?;
         let plain = MessagePayload::QueueGrant {
@@ -4694,6 +4987,8 @@ impl Account {
         let mut papers = Vec::new();
         let mut voices = Vec::new();
         let mut zine_grants = Vec::new();
+        let mut signals = Vec::new();
+        let mut signal_acks = Vec::new();
         let mut warnings = Vec::new();
         let mut dirty = false;
         // Who was joined before this poll, so a trustee that joins during it can
@@ -4723,343 +5018,529 @@ impl Account {
         // replaces.
         let mut pending: Vec<(Option<String>, String, String)> = queues;
         while !pending.is_empty() {
-        // Phase 1 — fetch one page per queue. Every queue is fetched
-        // concurrently: the client's pool spreads the requests over separate
-        // connections, so a contact count no longer multiplies the wall-clock
-        // cost of a poll. The batches themselves are what turn a drain into
-        // one round trip per page instead of one `get` and one `delete` per
-        // message.
-        let drain_supported = self.drain_supported;
-        let mut handles = Vec::new();
-        for (expected_contact, queue_id, read_token) in std::mem::take(&mut pending) {
-            let relay = relay.clone();
-            handles.push(tokio::spawn(async move {
-                fetch_queue(
-                    relay,
-                    expected_contact,
-                    queue_id,
-                    read_token,
-                    drain_supported,
-                )
-                .await
-            }));
-        }
-        let mut fetched: Vec<FetchedQueue> = Vec::with_capacity(handles.len());
-        for handle in handles {
-            match handle.await {
-                Ok(result) => fetched.push(result?),
-                Err(join_err) => return Err(Error::Relay(format!("fetch task: {join_err}"))),
+            // Phase 1 — fetch one page per queue. Every queue is fetched
+            // concurrently: the client's pool spreads the requests over separate
+            // connections, so a contact count no longer multiplies the wall-clock
+            // cost of a poll. The batches themselves are what turn a drain into
+            // one round trip per page instead of one `get` and one `delete` per
+            // message.
+            let drain_supported = self.drain_supported;
+            let mut handles = Vec::new();
+            for (expected_contact, queue_id, read_token) in std::mem::take(&mut pending) {
+                let relay = relay.clone();
+                handles.push(tokio::spawn(async move {
+                    fetch_queue(
+                        relay,
+                        expected_contact,
+                        queue_id,
+                        read_token,
+                        drain_supported,
+                    )
+                    .await
+                }));
             }
-        }
-        // Latch what the probes found, so a legacy relay is walked directly
-        // from the next poll on.
-        if self.drain_supported.is_none() {
-            self.drain_supported = fetched.iter().find_map(|f| f.drain_discovered);
-        }
+            let mut fetched: Vec<FetchedQueue> = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.await {
+                    Ok(result) => fetched.push(result?),
+                    Err(join_err) => return Err(Error::Relay(format!("fetch task: {join_err}"))),
+                }
+            }
+            // Latch what the probes found, so a legacy relay is walked directly
+            // from the next poll on.
+            if self.drain_supported.is_none() {
+                self.drain_supported = fetched.iter().find_map(|f| f.drain_discovered);
+            }
 
-        // Phase 2 — file, serially: decryption and payload application mutate
-        // session and account state. A blob fetched through the drain is
-        // already out of the "delete per blob" business — it is confirmed
-        // with one ack per queue once everything in the page that could be
-        // filed has been filed.
-        let mut acks: Vec<(String, String, Vec<String>)> = Vec::new();
-        let mut repeek: Vec<(Option<String>, String, String)> = Vec::new();
-        for mut fetched_queue in fetched {
-            let drained = fetched_queue.drained;
-            let expected_contact = fetched_queue.expected_contact.take();
-            let queue_id = std::mem::take(&mut fetched_queue.queue_id);
-            let read_token = std::mem::take(&mut fetched_queue.read_token);
-            let mut acked: Vec<String> = Vec::new();
-            // Consume a blob the way its transport demands: a drained page
-            // records the id for the queue's single ack; the legacy walk
-            // deletes the blob here, exactly as it always did.
-            macro_rules! consume {
-                ($id:ident) => {
-                    if drained {
-                        acked.push($id.clone());
-                    } else {
-                        relay.delete(&queue_id, &read_token, &$id).await?;
-                    }
-                };
-            }
-            for DrainedBlob { id: blob_id, body } in std::mem::take(&mut fetched_queue.blobs) {
-                let (ct, legacy_from) = decode_relay_blob(&body)?;
-                let decrypted = match &expected_contact {
-                    // A per-contact queue can only carry that contact's messages.
-                    Some(account_id) => self
-                        .decrypt_from(account_id, &ct)
-                        .await
-                        .map(|plain| (plain, account_id.clone())),
-                    None => match legacy_from {
-                        Some(from) => self.decrypt_from(&from, &ct).await.map(|plain| (plain, from)),
-                        None => self.try_decrypt_from_any_contact(&ct).await,
-                    },
-                };
-                let (plain, from_account) = match decrypted {
-                    Ok(v) => v,
-                    Err(Error::Session) => {
-                        warnings.push(
+            // Phase 2 — file, serially: decryption and payload application mutate
+            // session and account state. A blob fetched through the drain is
+            // already out of the "delete per blob" business — it is confirmed
+            // with one ack per queue once everything in the page that could be
+            // filed has been filed.
+            let mut acks: Vec<(String, String, Vec<String>)> = Vec::new();
+            let mut repeek: Vec<(Option<String>, String, String)> = Vec::new();
+            for mut fetched_queue in fetched {
+                let drained = fetched_queue.drained;
+                let expected_contact = fetched_queue.expected_contact.take();
+                let queue_id = std::mem::take(&mut fetched_queue.queue_id);
+                let read_token = std::mem::take(&mut fetched_queue.read_token);
+                let mut acked: Vec<String> = Vec::new();
+                // Consume a blob the way its transport demands: a drained page
+                // records the id for the queue's single ack; the legacy walk
+                // deletes the blob here, exactly as it always did.
+                macro_rules! consume {
+                    ($id:ident) => {
+                        if drained {
+                            acked.push($id.clone());
+                        } else {
+                            relay.delete(&queue_id, &read_token, &$id).await?;
+                        }
+                    };
+                }
+                for DrainedBlob { id: blob_id, body } in std::mem::take(&mut fetched_queue.blobs) {
+                    let (ct, legacy_from) = decode_relay_blob(&body)?;
+                    let decrypted = match &expected_contact {
+                        // A per-contact queue can only carry that contact's messages.
+                        Some(account_id) => self
+                            .decrypt_from(account_id, &ct)
+                            .await
+                            .map(|plain| (plain, account_id.clone())),
+                        None => match legacy_from {
+                            Some(from) => self
+                                .decrypt_from(&from, &ct)
+                                .await
+                                .map(|plain| (plain, from)),
+                            None => self.try_decrypt_from_any_contact(&ct).await,
+                        },
+                    };
+                    let (plain, from_account) = match decrypted {
+                        Ok(v) => v,
+                        Err(Error::Session) => {
+                            warnings.push(
                             "Could not decrypt a queued message — unknown sender or session not ready.".into(),
                         );
-                        continue;
-                    }
-                    Err(e) => {
-                        // Surface the error, but not at the cost of the page's
-                        // filing progress: confirm what already filed, so the
-                        // next poll does not re-file — and duplicate — it.
-                        if drained && !acked.is_empty() {
-                            let _ = relay.ack_drain(&queue_id, &read_token, &acked).await;
-                        }
-                        return Err(e);
-                    }
-                };
-
-                // A deleted contact must not be able to keep delivering into the
-                // shared inbox and be surfaced. Its session may still be in
-                // memory on the device that did the delete, so the blob can be
-                // decrypted and attributed; drop it instead of filing it.
-                if self.state.revoked.contains(&from_account) {
-                consume!(blob_id);
-                    dirty = true;
-                    continue;
-                }
-
-                let payload = decode_legacy_payload(&plain)?;
-
-                // A queue grant: the sender tells us where to deliver this
-                // account's messages for it. The signature is verified against
-                // the identity key the sender pinned in their invite, so an
-                // unauthenticated write to the public grant channel cannot name
-                // a queue the sender does not own.
-                if let MessagePayload::QueueGrant {
-                    queue_id: granted_id,
-                    delivery_token,
-                    signature,
-                } = &payload
-                {
-                    if self.apply_queue_grant(&from_account, granted_id, delivery_token, signature)?
-                    {
-                        dirty = true;
-                    }
-                consume!(blob_id);
-                    continue;
-                }
-
-                let nick = self
-                    .contact_nick_for_protocol(&from_account)
-                    .unwrap_or_else(|| short_name(&from_account));
-
-                // A zine grant: a contact hands over the read key of one post.
-                // It is not a chat message and is never surfaced as one; the
-                // daemon applies it to its zines sidecar and then sweeps the
-                // bulletin for blobs that have just become readable. Nothing is
-                // verified, by design — any holder may re-share a key they hold,
-                // and a grant can only confer read of a post the sender could
-                // already read.
-                if let MessagePayload::ZineGrant {
-                    zine_id,
-                    key,
-                    latest_hash,
-                } = &payload
-                {
-                    zine_grants.push(crate::message::ReceivedZineGrant {
-                        from_account: from_account.clone(),
-                        from_nick: nick.clone(),
-                        zine_id: zine_id.clone(),
-                        key: key.clone(),
-                        latest_hash: latest_hash.clone(),
-                    });
-                consume!(blob_id);
-                    continue;
-                }
-
-                // A reach announcement: the sender tells us which surfaces they
-                // will use with us (Task 24). Applied only from a known contact
-                // — the session is the authentication — and it can only ever
-                // narrow, because the effective reach is the narrower of the
-                // two sides' choices. A stranger's announcement is dropped.
-                if let MessagePayload::Reach { scope } = &payload {
-                    if let Some(contact) = self
-                        .state
-                        .contacts
-                        .iter_mut()
-                        .find(|c| c.account_id == from_account)
-                    {
-                        if contact.peer_reach != *scope {
-                            contact.peer_reach = *scope;
-                            dirty = true;
-                        }
-                    }
-                consume!(blob_id);
-                    continue;
-                }
-
-                if let MessagePayload::PlaceAdopt {
-                    invite,
-                    chain,
-                    label,
-                } = &payload
-                {
-                    match self
-                        .apply_place_adopt(&from_account, invite, chain.clone(), label)
-                        .await
-                    {
-                        Ok(true) => dirty = true,
-                        Ok(false) => {}
-                        Err(e) => warnings.push(format!(
-                            "A place-adopt from {nick} was refused: {e}"
-                        )),
-                    }
-                    consume!(blob_id);
-                    continue;
-                }
-
-                if let MessagePayload::PlaceIntroduce {
-                    invite,
-                    chain,
-                    label,
-                } = &payload
-                {
-                    match self
-                        .apply_place_introduce(&from_account, invite, chain.clone(), label)
-                        .await
-                    {
-                        Ok(true) => dirty = true,
-                        Ok(false) => {}
-                        Err(e) => warnings.push(format!(
-                            "A place-introduce from {nick} was refused: {e}"
-                        )),
-                    }
-                    consume!(blob_id);
-                    continue;
-                }
-
-                // Conclave control payloads. Membership is consensual, so an
-                // invite, accept, decline, leave, update or end changes local
-                // state and is never surfaced as a chat message. Only an
-                // explicit accept ever materialises a conclave.
-                match &payload {
-                    MessagePayload::ConclaveInvite { descriptor } => {
-                        // A mail-only relationship has no conclaves (Task 24).
-                        // Refused before a pending invite is materialised, so a
-                        // peer that ignored the reach cannot pull us in.
-                        if !self.effective_reach_for_account(&from_account).allows_live() {
-                            warnings.push(format!(
-                                "An invite from {nick} was refused — this is a mail-only relationship."
-                            ));
-                    consume!(blob_id);
-                            dirty = true;
                             continue;
                         }
-                        if self.receive_conclave_invite(descriptor, &from_account, &nick)? {
-                            dirty = true;
+                        Err(e) => {
+                            // Surface the error, but not at the cost of the page's
+                            // filing progress: confirm what already filed, so the
+                            // next poll does not re-file — and duplicate — it.
+                            if drained && !acked.is_empty() {
+                                let _ = relay.ack_drain(&queue_id, &read_token, &acked).await;
+                            }
+                            return Err(e);
                         }
-                    consume!(blob_id);
+                    };
+
+                    // A deleted contact must not be able to keep delivering into the
+                    // shared inbox and be surfaced. Its session may still be in
+                    // memory on the device that did the delete, so the blob can be
+                    // decrypted and attributed; drop it instead of filing it.
+                    if self.state.revoked.contains(&from_account) {
+                        consume!(blob_id);
+                        dirty = true;
                         continue;
                     }
-                    MessagePayload::ConclaveAccept { descriptor } => {
-                        if self.receive_conclave_accept(descriptor).await? {
+
+                    let payload = decode_legacy_payload(&plain)?;
+
+                    // A queue grant: the sender tells us where to deliver this
+                    // account's messages for it. The signature is verified against
+                    // the identity key the sender pinned in their invite, so an
+                    // unauthenticated write to the public grant channel cannot name
+                    // a queue the sender does not own.
+                    if let MessagePayload::QueueGrant {
+                        queue_id: granted_id,
+                        delivery_token,
+                        signature,
+                    } = &payload
+                    {
+                        if self.apply_queue_grant(
+                            &from_account,
+                            granted_id,
+                            delivery_token,
+                            signature,
+                        )? {
                             dirty = true;
                         }
-                    consume!(blob_id);
+                        consume!(blob_id);
                         continue;
                     }
-                    MessagePayload::ConclaveDecline { conclave_id, member } => {
-                        if self.receive_conclave_decline(conclave_id, member)? {
-                            dirty = true;
-                        }
-                    consume!(blob_id);
+
+                    let nick = self
+                        .contact_nick_for_protocol(&from_account)
+                        .unwrap_or_else(|| short_name(&from_account));
+
+                    // A zine grant: a contact hands over the read key of one post.
+                    // It is not a chat message and is never surfaced as one; the
+                    // daemon applies it to its zines sidecar and then sweeps the
+                    // bulletin for blobs that have just become readable. Nothing is
+                    // verified, by design — any holder may re-share a key they hold,
+                    // and a grant can only confer read of a post the sender could
+                    // already read.
+                    if let MessagePayload::ZineGrant {
+                        zine_id,
+                        key,
+                        latest_hash,
+                    } = &payload
+                    {
+                        zine_grants.push(crate::message::ReceivedZineGrant {
+                            from_account: from_account.clone(),
+                            from_nick: nick.clone(),
+                            zine_id: zine_id.clone(),
+                            key: key.clone(),
+                            latest_hash: latest_hash.clone(),
+                        });
+                        consume!(blob_id);
                         continue;
                     }
-                    MessagePayload::ConclaveLeave { descriptor } => {
-                        if self.receive_conclave_leave(descriptor).await? {
-                            dirty = true;
-                        }
-                    consume!(blob_id);
-                        continue;
-                    }
-                    MessagePayload::ConclaveUpdate { descriptor }
-                    | MessagePayload::ConclaveEnd { descriptor } => {
-                        if self.receive_conclave_update(descriptor, &from_account)? {
-                            dirty = true;
-                        }
-                    consume!(blob_id);
-                        continue;
-                    }
-                    MessagePayload::ConclaveIntroReq {
-                        conclave_id,
-                        name,
-                        seeker,
-                        seeker_nick,
-                        target,
-                        target_nick,
-                    } => {
-                        if self
-                            .receive_intro_req(
-                                &conclave_id,
-                                &name,
-                                &seeker,
-                                &seeker_nick,
-                                &target,
-                                &target_nick,
-                                &from_account,
-                            )
-                            .await?
+
+                    // A reach announcement: the sender tells us which surfaces they
+                    // will use with us (Task 24). Applied only from a known contact
+                    // — the session is the authentication — and it can only ever
+                    // narrow, because the effective reach is the narrower of the
+                    // two sides' choices. A stranger's announcement is dropped.
+                    if let MessagePayload::Reach { scope } = &payload {
+                        if let Some(contact) = self
+                            .state
+                            .contacts
+                            .iter_mut()
+                            .find(|c| c.account_id == from_account)
                         {
-                            dirty = true;
+                            if contact.peer_reach != *scope {
+                                contact.peer_reach = *scope;
+                                dirty = true;
+                            }
                         }
-                    consume!(blob_id);
+                        consume!(blob_id);
                         continue;
                     }
-                    MessagePayload::ConclaveIntro {
-                        conclave_id,
-                        name,
-                        target,
-                        target_nick,
-                        seeker,
+
+                    // A trustee signal: a typed sideband payload. It is consumed
+                    // here and never rendered as a chat message; the daemon gets
+                    // the decoded body and decides what the kind means.
+                    if let MessagePayload::Signal {
+                        id,
+                        sent_ms,
+                        expires_ms,
+                        ack,
+                        body,
+                    } = &payload
+                    {
+                        // The sender checked the encoded size before sending;
+                        // this is the same check on the exact bytes that
+                        // arrived, so a crafted peer cannot park a megabyte in
+                        // the sideband and call it a note.
+                        if plain.len() > MAX_SIGNAL_BYTES {
+                            warnings.push(format!(
+                                "A signal from {nick} was too large and was dropped."
+                            ));
+                            consume!(blob_id);
+                            continue;
+                        }
+                        let Some(contact) = self
+                            .state
+                            .contacts
+                            .iter()
+                            .find(|c| c.account_id == from_account)
+                            .cloned()
+                        else {
+                            // A sender with no contact edge cannot be answered and
+                            // has no audit owner; drop it rather than file it.
+                            consume!(blob_id);
+                            continue;
+                        };
+                        if !contact.signals.allows() {
+                            // Deny is silent in both directions: drop without an
+                            // ack, so the peer cannot probe the preference.
+                            consume!(blob_id);
+                            continue;
+                        }
+                        if id.is_empty() || id.len() > 128 {
+                            warnings.push(format!(
+                                "A signal from {nick} had an invalid id and was dropped."
+                            ));
+                            consume!(blob_id);
+                            continue;
+                        }
+                        let expired = expires_ms.map(|e| e <= now_ms()).unwrap_or(false);
+                        let duplicate = self
+                            .state
+                            .signal_log
+                            .iter()
+                            .any(|r| r.from_account == from_account && r.id == *id);
+                        if expired || duplicate {
+                            // Expired signals are never applied. A duplicate is
+                            // consumed, but an ack is re-sent when one was asked
+                            // for: the first ack may be the packet that was lost,
+                            // and the sender is still waiting for it.
+                            if *ack {
+                                let status = if expired {
+                                    SignalStatus::Expired
+                                } else {
+                                    // A retried ack must say what the first one
+                                    // would have said. The log holds that answer
+                                    // for the duplicate; a pruned id falls back
+                                    // to the optimistic `Delivered`.
+                                    let supported = self
+                                        .state
+                                        .signal_log
+                                        .iter()
+                                        .find(|r| r.from_account == from_account && r.id == *id)
+                                        .map(|r| r.supported)
+                                        .unwrap_or(true);
+                                    if supported {
+                                        SignalStatus::Delivered
+                                    } else {
+                                        SignalStatus::Unsupported
+                                    }
+                                };
+                                let reply = MessagePayload::SignalAck {
+                                    id: id.clone(),
+                                    status,
+                                };
+                                if let Ok(plain) = reply.encode() {
+                                    let _ = self.deliver(&contact, &plain).await;
+                                }
+                            }
+                            consume!(blob_id);
+                            continue;
+                        }
+                        let supported = body.is_supported();
+                        self.state.signal_log.push(SignalRecord {
+                            id: id.clone(),
+                            from_account: from_account.clone(),
+                            from_nick: nick.clone(),
+                            kind: body.kind().to_string(),
+                            received_ms: now_ms(),
+                            expires_ms: *expires_ms,
+                            supported,
+                        });
+                        prune_signal_log(&mut self.state.signal_log);
+                        if *ack {
+                            let reply = MessagePayload::SignalAck {
+                                id: id.clone(),
+                                status: if supported {
+                                    SignalStatus::Delivered
+                                } else {
+                                    SignalStatus::Unsupported
+                                },
+                            };
+                            if let Ok(plain) = reply.encode() {
+                                if let Err(e) = self.deliver(&contact, &plain).await {
+                                    warnings.push(format!(
+                                        "Could not acknowledge a signal from {nick}: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        // An unknown kind is audited and acknowledged but never
+                        // handed to a feature: there is nothing here that could
+                        // apply it.
+                        if supported {
+                            signals.push(ReceivedSignal {
+                                from_account: from_account.clone(),
+                                from_nick: nick.clone(),
+                                id: id.clone(),
+                                sent_ms: *sent_ms,
+                                expires_ms: *expires_ms,
+                                body: body.clone(),
+                            });
+                        }
+                        consume!(blob_id);
+                        dirty = true;
+                        continue;
+                    }
+
+                    // An acknowledgement of a signal this vault sent. Like the
+                    // signal itself it is control traffic: handed to the caller,
+                    // never filed as an inbox item.
+                    if let MessagePayload::SignalAck { id, status } = &payload {
+                        let allowed = self
+                            .state
+                            .contacts
+                            .iter()
+                            .find(|c| c.account_id == from_account)
+                            .map(|c| c.signals.allows())
+                            .unwrap_or(false);
+                        if allowed && !id.is_empty() && id.len() <= 128 {
+                            signal_acks.push(ReceivedSignalAck {
+                                from_account: from_account.clone(),
+                                from_nick: nick.clone(),
+                                id: id.clone(),
+                                status: *status,
+                            });
+                        }
+                        consume!(blob_id);
+                        continue;
+                    }
+
+                    if let MessagePayload::PlaceAdopt {
                         invite,
-                        reverse,
-                    } => {
-                        if self
-                            .receive_intro(
-                                &conclave_id,
-                                &name,
-                                &target,
-                                &target_nick,
-                                &seeker,
-                                &invite,
-                                &from_account,
-                                *reverse,
-                            )
-                            .await?
+                        chain,
+                        label,
+                    } = &payload
+                    {
+                        match self
+                            .apply_place_adopt(&from_account, invite, chain.clone(), label)
+                            .await
                         {
-                            dirty = true;
+                            Ok(true) => dirty = true,
+                            Ok(false) => {}
+                            Err(e) => warnings
+                                .push(format!("A place-adopt from {nick} was not completed: {e}")),
                         }
-                    consume!(blob_id);
+                        consume!(blob_id);
                         continue;
                     }
-                    _ => {}
-                }
 
-                // A live chat line or file from a mail-only relationship is
-                // refused at the boundary (Task 24), not merely hidden in the
-                // sender's UI: a peer that has not yet learned the reach, or
-                // ignored it, must not get through. Mail is the floor and is
-                // never gated.
-                if matches!(
-                    &payload,
-                    MessagePayload::Text { .. } | MessagePayload::File { .. }
-                ) && !self.effective_reach_for_account(&from_account).allows_live()
-                {
-                    warnings.push(format!(
-                        "A chat from {nick} was refused — this is a mail-only relationship."
-                    ));
-                consume!(blob_id);
-                    dirty = true;
-                    continue;
-                }
+                    if let MessagePayload::PlaceAdoptAck { chain } = &payload {
+                        match self
+                            .apply_place_adopt_ack(&from_account, chain.clone())
+                            .await
+                        {
+                            Ok(true) => dirty = true,
+                            Ok(false) => {}
+                            Err(e) => warnings
+                                .push(format!("A place confirmation from {nick} was refused: {e}")),
+                        }
+                        consume!(blob_id);
+                        continue;
+                    }
 
-                let (file_blob_id, mail_attachments) = match &payload {
+                    if let MessagePayload::PlaceIntroduce {
+                        invite,
+                        chain,
+                        label,
+                    } = &payload
+                    {
+                        match self
+                            .apply_place_introduce(&from_account, invite, chain.clone(), label)
+                            .await
+                        {
+                            Ok(true) => dirty = true,
+                            Ok(false) => {}
+                            Err(e) => warnings
+                                .push(format!("A place-introduce from {nick} was refused: {e}")),
+                        }
+                        consume!(blob_id);
+                        continue;
+                    }
+
+                    // Conclave control payloads. Membership is consensual, so an
+                    // invite, accept, decline, leave, update or end changes local
+                    // state and is never surfaced as a chat message. Only an
+                    // explicit accept ever materialises a conclave.
+                    match &payload {
+                        MessagePayload::ConclaveInvite { descriptor } => {
+                            // A mail-only relationship has no conclaves (Task 24).
+                            // Refused before a pending invite is materialised, so a
+                            // peer that ignored the reach cannot pull us in.
+                            if !self
+                                .effective_reach_for_account(&from_account)
+                                .allows_live()
+                            {
+                                warnings.push(format!(
+                                "An invite from {nick} was refused — this is a mail-only relationship."
+                            ));
+                                consume!(blob_id);
+                                dirty = true;
+                                continue;
+                            }
+                            if self.receive_conclave_invite(descriptor, &from_account, &nick)? {
+                                dirty = true;
+                            }
+                            consume!(blob_id);
+                            continue;
+                        }
+                        MessagePayload::ConclaveAccept { descriptor } => {
+                            if self.receive_conclave_accept(descriptor).await? {
+                                dirty = true;
+                            }
+                            consume!(blob_id);
+                            continue;
+                        }
+                        MessagePayload::ConclaveDecline {
+                            conclave_id,
+                            member,
+                        } => {
+                            if self.receive_conclave_decline(conclave_id, member)? {
+                                dirty = true;
+                            }
+                            consume!(blob_id);
+                            continue;
+                        }
+                        MessagePayload::ConclaveLeave { descriptor } => {
+                            if self.receive_conclave_leave(descriptor).await? {
+                                dirty = true;
+                            }
+                            consume!(blob_id);
+                            continue;
+                        }
+                        MessagePayload::ConclaveUpdate { descriptor }
+                        | MessagePayload::ConclaveEnd { descriptor } => {
+                            if self.receive_conclave_update(descriptor, &from_account)? {
+                                dirty = true;
+                            }
+                            consume!(blob_id);
+                            continue;
+                        }
+                        MessagePayload::ConclaveIntroReq {
+                            conclave_id,
+                            name,
+                            seeker,
+                            seeker_nick,
+                            target,
+                            target_nick,
+                        } => {
+                            if self
+                                .receive_intro_req(
+                                    &conclave_id,
+                                    &name,
+                                    &seeker,
+                                    &seeker_nick,
+                                    &target,
+                                    &target_nick,
+                                    &from_account,
+                                )
+                                .await?
+                            {
+                                dirty = true;
+                            }
+                            consume!(blob_id);
+                            continue;
+                        }
+                        MessagePayload::ConclaveIntro {
+                            conclave_id,
+                            name,
+                            target,
+                            target_nick,
+                            seeker,
+                            invite,
+                            reverse,
+                        } => {
+                            if self
+                                .receive_intro(
+                                    &conclave_id,
+                                    &name,
+                                    &target,
+                                    &target_nick,
+                                    &seeker,
+                                    &invite,
+                                    &from_account,
+                                    *reverse,
+                                )
+                                .await?
+                            {
+                                dirty = true;
+                            }
+                            consume!(blob_id);
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    // A live chat line or file from a mail-only relationship is
+                    // refused at the boundary (Task 24), not merely hidden in the
+                    // sender's UI: a peer that has not yet learned the reach, or
+                    // ignored it, must not get through. Mail is the floor and is
+                    // never gated.
+                    if matches!(
+                        &payload,
+                        MessagePayload::Text { .. } | MessagePayload::File { .. }
+                    ) && !self
+                        .effective_reach_for_account(&from_account)
+                        .allows_live()
+                    {
+                        warnings.push(format!(
+                            "A chat from {nick} was refused — this is a mail-only relationship."
+                        ));
+                        consume!(blob_id);
+                        dirty = true;
+                        continue;
+                    }
+
+                    let (file_blob_id, mail_attachments) = match &payload {
                     MessagePayload::File { data, name } => {
                         let id = self.vault.put_blob(data)?;
                         let master = *self.vault.master_key();
@@ -5193,7 +5674,10 @@ impl Account {
                     // not a chat message either.
                     | MessagePayload::Reach { .. }
                     | MessagePayload::PlaceAdopt { .. }
-                    | MessagePayload::PlaceIntroduce { .. } => {
+                    | MessagePayload::PlaceAdoptAck { .. }
+                    | MessagePayload::PlaceIntroduce { .. }
+                    | MessagePayload::Signal { .. }
+                    | MessagePayload::SignalAck { .. } => {
                         unreachable!("control payload handled above")
                     }
                     // A paper payload is not a chat message, so it must not
@@ -5304,43 +5788,43 @@ impl Account {
                         continue;
                     }
                 };
-                // A message we filed is proof they added us. Readiness itself is
-                // read off the grant we hold, but `add_contact` sends a grant
-                // once, best effort, so a grant lost at add time would otherwise
-                // leave a working trust reading as pending forever.
-                if let Some(c) = self
-                    .state
-                    .contacts
-                    .iter_mut()
-                    .find(|c| c.account_id == from_account)
-                {
-                    c.heard_from = true;
+                    // A message we filed is proof they added us. Readiness itself is
+                    // read off the grant we hold, but `add_contact` sends a grant
+                    // once, best effort, so a grant lost at add time would otherwise
+                    // leave a working trust reading as pending forever.
+                    if let Some(c) = self
+                        .state
+                        .contacts
+                        .iter_mut()
+                        .find(|c| c.account_id == from_account)
+                    {
+                        c.heard_from = true;
+                    }
+                    out.push(ReceivedMessage {
+                        from_nick: nick,
+                        payload,
+                        file_blob_id,
+                        mail_attachments,
+                    });
+                    consume!(blob_id);
+                    dirty = true;
                 }
-                out.push(ReceivedMessage {
-                    from_nick: nick,
-                    payload,
-                    file_blob_id,
-                    mail_attachments,
-                });
-                consume!(blob_id);
-                dirty = true;
+                // A drained queue that filed something this round gets its acks
+                // sent and another peek next round; a drained queue that filed
+                // nothing (everything held) waits for the next poll. The legacy
+                // walk already deleted per blob, so it has nothing to ack.
+                if drained && !acked.is_empty() {
+                    repeek.push((expected_contact, queue_id.clone(), read_token.clone()));
+                    acks.push((queue_id, read_token, acked));
+                }
             }
-            // A drained queue that filed something this round gets its acks
-            // sent and another peek next round; a drained queue that filed
-            // nothing (everything held) waits for the next poll. The legacy
-            // walk already deleted per blob, so it has nothing to ack.
-            if drained && !acked.is_empty() {
-                repeek.push((expected_contact, queue_id.clone(), read_token.clone()));
-                acks.push((queue_id, read_token, acked));
+            // Phase 3 — confirm the filed blobs, one request per queue. The ack
+            // is what moves the next peek past this page: a peek alone never
+            // consumes, so re-peeking without the ack would return the same rows.
+            for (queue_id, read_token, ids) in acks {
+                relay.ack_drain(&queue_id, &read_token, &ids).await?;
             }
-        }
-        // Phase 3 — confirm the filed blobs, one request per queue. The ack
-        // is what moves the next peek past this page: a peek alone never
-        // consumes, so re-peeking without the ack would return the same rows.
-        for (queue_id, read_token, ids) in acks {
-            relay.ack_drain(&queue_id, &read_token, &ids).await?;
-        }
-        pending = repeek;
+            pending = repeek;
         }
         if dirty {
             self.save().await?;
@@ -5384,6 +5868,8 @@ impl Account {
             messages: out,
             papers,
             voices,
+            signals,
+            signal_acks,
             joined,
             departed,
             zine_grants,
@@ -5442,7 +5928,10 @@ impl Account {
     }
 
     fn contact_by_account(&self, account_id: &str) -> Option<&Contact> {
-        self.state.contacts.iter().find(|c| c.account_id == account_id)
+        self.state
+            .contacts
+            .iter()
+            .find(|c| c.account_id == account_id)
     }
 
     /// The reach this vault uses with a contact: the narrower of this vault's
@@ -5510,7 +5999,9 @@ impl Account {
             .iter()
             .map(|c| (c.account_id.clone(), DEVICE_ID))
             .collect();
-        self.device.save(&self.dir, master, &session_addresses).await?;
+        self.device
+            .save(&self.dir, master, &session_addresses)
+            .await?;
         Ok(())
     }
 }
@@ -5610,14 +6101,11 @@ mod tests {
         let vault = Vault::create(dir, passphrase).unwrap();
         let master = *vault.master_key();
         let mut device = DeviceKeys::create(dir, &master).await.unwrap();
-        let _ = mint_prekey_bundle(device.store_mut(), DEVICE_ID).await.unwrap();
-        let protocol_name = protocol_name_from_identity(
-            &device
-                .store_mut()
-                .get_identity_key_pair()
-                .await
-                .unwrap(),
-        );
+        let _ = mint_prekey_bundle(device.store_mut(), DEVICE_ID)
+            .await
+            .unwrap();
+        let protocol_name =
+            protocol_name_from_identity(&device.store_mut().get_identity_key_pair().await.unwrap());
         let identity = device.identity_public().await.unwrap();
         let queue_id = device.queue_id().to_string();
         // The pre-split layout had one token doing both jobs, and it was
@@ -5653,9 +6141,14 @@ mod tests {
             regrant_all: false,
             identity_restored: false,
             places: Vec::new(),
+            signal_log: Vec::new(),
         };
         let state_bytes = serde_json::to_vec(&state).unwrap();
-        fs::write(dir.join("account.enc"), encrypt(&master, &state_bytes).unwrap()).unwrap();
+        fs::write(
+            dir.join("account.enc"),
+            encrypt(&master, &state_bytes).unwrap(),
+        )
+        .unwrap();
 
         // The whole point: this vault predates device.enc.
         fs::remove_file(dir.join(DEVICE_FILE)).unwrap();
@@ -5688,7 +6181,10 @@ mod tests {
             account.contacts().is_empty() || account.contacts()[0].queue_id != old_queue_id,
             "nothing may keep pointing at the abandoned inbox"
         );
-        assert!(dir.join(DEVICE_FILE).exists(), "migration must write device.enc");
+        assert!(
+            dir.join(DEVICE_FILE).exists(),
+            "migration must write device.enc"
+        );
         assert!(
             !dir.join(LEGACY_DEVICE_FILE).exists(),
             "the legacy key file holds the identity private key and must not linger"
@@ -5801,11 +6297,7 @@ mod tests {
             "inbound_ready": true,
         }]);
         let bytes = serde_json::to_vec(&state).unwrap();
-        fs::write(
-            dir.join("account.enc"),
-            encrypt(&master, &bytes).unwrap(),
-        )
-        .unwrap();
+        fs::write(dir.join("account.enc"), encrypt(&master, &bytes).unwrap()).unwrap();
 
         let account = Account::open(&dir, "pw").await.unwrap();
         let contact = &account.contacts()[0];
@@ -5926,11 +6418,7 @@ mod tests {
         let account = Account::create(&dir, "pw", "http://127.0.0.1:1")
             .await
             .unwrap();
-        let original = account
-            .device
-            .identity_public()
-            .await
-            .unwrap();
+        let original = account.device.identity_public().await.unwrap();
         let archive = export_vault(&dir).unwrap();
         drop(account);
 
@@ -5994,11 +6482,7 @@ mod tests {
     fn seed_mesh_conclave(account: &mut Account, me: &str) -> String {
         let master = *account.vault.master_key();
         account.state.protocol_name = me.to_string();
-        let members = [
-            ("sam", SAM),
-            ("friend", FRIEND),
-            ("stranger", STRANGER),
-        ];
+        let members = [("sam", SAM), ("friend", FRIEND), ("stranger", STRANGER)];
         let trustees: Vec<ConclaveTrustee> = members
             .iter()
             .map(|(nick, id)| ConclaveTrustee {
@@ -6030,6 +6514,7 @@ mod tests {
             reach: TrusteeReach::Full,
             peer_reach: TrusteeReach::Full,
             place_of: None,
+            signals: SignalPolicy::Allow,
         });
     }
 
@@ -6215,10 +6700,7 @@ mod tests {
         assert_eq!(friend.pending_intro_requests().len(), 1);
 
         // Dismissing it clears the record without sending anything.
-        friend
-            .dismiss_intro_request(&cid, SAM)
-            .await
-            .unwrap();
+        friend.dismiss_intro_request(&cid, SAM).await.unwrap();
         assert!(friend.pending_intro_requests().is_empty());
     }
 
@@ -6231,7 +6713,14 @@ mod tests {
         // dropped: the invite is only valid in its owner's name.
         let dirty = sam
             .receive_intro(
-                &cid, "mesh", STRANGER, "stranger", SAM, "not-a-real-invite", FRIEND, false,
+                &cid,
+                "mesh",
+                STRANGER,
+                "stranger",
+                SAM,
+                "not-a-real-invite",
+                FRIEND,
+                false,
             )
             .await
             .unwrap();
@@ -6245,7 +6734,9 @@ mod tests {
             friend_vault.invite().await.unwrap()
         };
         let dirty = sam
-            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &swapped, FRIEND, false)
+            .receive_intro(
+                &cid, "mesh", STRANGER, "stranger", SAM, &swapped, FRIEND, false,
+            )
             .await
             .unwrap();
         assert!(!dirty, "an invite naming someone else must be dropped");
@@ -6257,7 +6748,9 @@ mod tests {
             stranger.fresh_invite().await.unwrap()
         };
         let dirty = sam
-            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false)
+            .receive_intro(
+                &cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false,
+            )
             .await
             .unwrap();
         assert!(dirty);
@@ -6274,11 +6767,19 @@ mod tests {
         assert_eq!(contact.nickname, "stranger");
 
         // A late duplicate has nothing to add.
-        sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false)
-            .await
-            .unwrap();
+        sam.receive_intro(
+            &cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false,
+        )
+        .await
+        .unwrap();
         assert!(sam.pending_intros().is_empty());
-        assert_eq!(sam.contacts().iter().filter(|c| c.account_id == STRANGER).count(), 1);
+        assert_eq!(
+            sam.contacts()
+                .iter()
+                .filter(|c| c.account_id == STRANGER)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6291,9 +6792,11 @@ mod tests {
             stranger.state.protocol_name = STRANGER.to_string();
             stranger.fresh_invite().await.unwrap()
         };
-        sam.receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false)
-            .await
-            .unwrap();
+        sam.receive_intro(
+            &cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, false,
+        )
+        .await
+        .unwrap();
 
         assert!(sam.accept_intro(&cid, STRANGER, "taken").await.is_err());
         // The pending record survives a rejected nickname: the caller picks
@@ -6314,7 +6817,9 @@ mod tests {
             stranger.fresh_invite().await.unwrap()
         };
         let dirty = sam
-            .receive_intro(&cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, true)
+            .receive_intro(
+                &cid, "mesh", STRANGER, "stranger", SAM, &invite, FRIEND, true,
+            )
             .await
             .unwrap();
         assert!(dirty);
@@ -6355,13 +6860,18 @@ mod tests {
         for payload in [req, intro] {
             let decoded = MessagePayload::decode(&payload.encode().unwrap()).unwrap();
             match (payload, decoded) {
-                (MessagePayload::ConclaveIntroReq { seeker, .. }, MessagePayload::ConclaveIntroReq { seeker: s, .. })
-                | (MessagePayload::ConclaveIntro { seeker, .. }, MessagePayload::ConclaveIntro { seeker: s, .. }) => {
+                (
+                    MessagePayload::ConclaveIntroReq { seeker, .. },
+                    MessagePayload::ConclaveIntroReq { seeker: s, .. },
+                )
+                | (
+                    MessagePayload::ConclaveIntro { seeker, .. },
+                    MessagePayload::ConclaveIntro { seeker: s, .. },
+                ) => {
                     assert_eq!(seeker, s);
                 }
                 _ => panic!("intro payload did not round trip"),
             }
         }
     }
-
 }

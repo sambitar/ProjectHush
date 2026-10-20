@@ -539,6 +539,21 @@ pub enum MessagePayload {
         /// Suggested label stamped at adopt time ("phone", …).
         label: String,
     },
+    /// The adopted Place confirming the vouch.
+    ///
+    /// Sent back by the vault that received [`Self::PlaceAdopt`], carrying the
+    /// same chain with that vault's counter-signature on the hop naming it. The
+    /// minter cannot produce this signature, so it is the evidence that the
+    /// adopted vault agreed to the relationship rather than merely being named
+    /// in it. Until it arrives the minter's hop is a claim, and a peer badge
+    /// requires an accepted chain — see `VouchChain::verify_accepted`.
+    ///
+    /// Sent by the Place that received the adopt, so the recipient here is the
+    /// minter. No further reply: the exchange ends at two signatures.
+    PlaceAdoptAck {
+        /// The chain back, with the sender's counter-signature on the last hop.
+        chain: crate::place::VouchChain,
+    },
     /// Opt-in introduction of one of the sender's Places to a contact.
     ///
     /// The recipient verifies the chain against contacts they already trust,
@@ -548,6 +563,38 @@ pub enum MessagePayload {
         invite: String,
         chain: crate::place::VouchChain,
         label: String,
+    },
+    /// A typed, non-chat message between two trustees.
+    ///
+    /// Signals are the sideband: they ride the same encrypted 1:1 session and
+    /// the same store-and-forward queue as chat and mail, but they are never
+    /// rendered as either. The envelope owns delivery concerns — identity,
+    /// expiry, duplicate suppression and acknowledgement — while `body` names
+    /// what the signal means. A build that does not know a kind decodes it as
+    /// `SignalBody::Unknown` and ignores it.
+    Signal {
+        /// Random id chosen by the sender: dedupe key and ack correlation.
+        id: String,
+        /// When the sender produced it, Unix ms. Advisory only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_ms: Option<u64>,
+        /// When the signal stops being meaningful, Unix ms. A receiver drops
+        /// it after this instant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_ms: Option<u64>,
+        /// Ask the receiver for a `SignalAck`.
+        #[serde(default)]
+        ack: bool,
+        body: crate::signals::SignalBody,
+    },
+    /// One acknowledgement of a [`MessagePayload::Signal`].
+    ///
+    /// A control payload: it is consumed by `recv` and never surfaced as an
+    /// inbox item.
+    SignalAck {
+        /// The `id` of the signal being acknowledged.
+        id: String,
+        status: crate::signals::SignalStatus,
     },
     /// A payload whose tag this build does not know.
     ///

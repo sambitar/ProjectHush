@@ -4,6 +4,8 @@
 
 **Progress (2026-10-19):** Core vouch + adopt/detach/introduce + daemon routes + Settings → Places UI + contact badges landed on `feature/places-desktop`. PlaceAdopt still needs the adopted vault to add the minter's invite before decrypt (documented). Not committed until you ask.
 
+**Counter-signature (2026-10-20).** The vouch shipped one-sided: the minter signed, the adopted vault did not, so anyone holding a vault's invite could mint a hop naming it and earn a "place of …" badge in front of every peer who trusted the minter — a claim about someone who never agreed. Closed by requiring the adopted vault's own signature. A hop is now a **claim** until it carries a `hush-place-accept-v1` counter-signature from the account it names, and `VouchChain::verify_accepted` — which both `introduce_place` and `apply_place_introduce` run — refuses any chain where a hop is unconfirmed. `apply_place_adopt` counter-signs the hop naming it and returns the chain in a new `place_adopt_ack` payload; `apply_place_adopt_ack` stores it. Because that reply can be lost to a relay that was down, re-running adopt on a place we already minted is now a **repair** path rather than `PlaceExists`, and Settings → Places shows "waiting for them to confirm" with Introduce disabled until it lands. Chains stored before this change read as unconfirmed, so an old vouch loses its badge until the pair re-adopts — the safe direction.
+
 **Architecture:** Each Place is a normal Hush account. The minting Place signs a vouch hop (XEd25519 over identity key, same primitive as queue grants). Hops chain up to 2. Adoption: existing Place scans the new vault's invite, adds it as a contact, signs the hop, stores a local Place record, and sends `PlaceAdopt` so the new vault auto-adds the minter and records "minted me". Introduce: opt-in `PlaceIntroduce` carries invite + chain to a chosen contact. Peers verify the chain against contacts they already trust and show a flat contact + badge.
 
 **Tech Stack:** Rust (`hush-core`, `hush-daemon`), libsignal XEd25519, existing `MessagePayload` / chat recv path, Tauri UI (`app.ts`).
@@ -16,7 +18,8 @@
 - No shared vault master key; no multi-device / device-list resurrection.
 - Chain cap = 2 hops. Detach is local only (D12). Badges refresh on a newer introduce (D14).
 - Vouch signing uses the minting Place's identity key (same as queue-grant signing).
-- Invite format: vouch travels as a **sidecar on the wire messages** (`PlaceAdopt` / `PlaceIntroduce`), not inside the `hush1…` pointer body (keeps QR short). Optional: later bake into invite if needed for in-person badge without a message.
+- Invite format: vouch travels as a **sidecar on the wire messages** (`PlaceAdopt` / `PlaceAdoptAck` / `PlaceIntroduce`), not inside the `hush1…` pointer body (keeps QR short). Optional: later bake into invite if needed for in-person badge without a message.
+- A vouch is **two signatures**: the minter's, and the counter-signature of the account the hop names. Only a chain where every hop carries both is `verify_accepted`, and only an accepted chain may be introduced or badged.
 - No bare `cargo fmt`. Prefer TDD at listed seams.
 - Commit only when the user asks.
 
@@ -26,10 +29,10 @@
 |---|---|
 | `crates/hush-core/src/place.rs` *(new)* | `PlaceHop`, `SignedHop`, `VouchChain` sign/verify; chain continuity; trusted-anchor lookup |
 | `crates/hush-core/src/error.rs` | `PlaceNotFound`, `InvalidPlace`, `PlaceChainTooLong`, `PlaceExists` |
-| `crates/hush-core/src/payload.rs` | `PlaceAdopt`, `PlaceIntroduce` variants |
+| `crates/hush-core/src/payload.rs` | `PlaceAdopt`, `PlaceAdoptAck`, `PlaceIntroduce` variants |
 | `crates/hush-core/src/account.rs` | `PlaceRecord` in account state; `adopt_place`, `detach_place`, `introduce_place`, `places`; recv handlers |
 | `crates/hush-core/src/lib.rs` | Export place types |
-| `crates/hush-core/tests/places.rs` *(new)* | End-to-end adopt / introduce / badge / detach |
+| `crates/hush-core/tests/places.rs` *(new)* | End-to-end adopt / confirm / introduce / badge / detach |
 | `crates/hush-daemon/src/account_worker.rs` | Work variants + methods |
 | `crates/hush-daemon/src/main.rs` | `/api/places` routes |
 | `apps/hush-tauri/src/lib/api/types.ts` | DTOs |
@@ -142,12 +145,17 @@ Simpler v1 for D14: each PlaceIntroduce from contact C about place P sets `Conta
 ## Acceptance
 
 - [ ] Two desktop vaults: adopt → both see My places; auto-contacts
+- [ ] The adopted vault confirms, and the minter's chain reads confirmed
 - [ ] Introduce to a third vault → third sees contact + badge
+- [ ] An unconfirmed place cannot be introduced (`PlaceNotAccepted`)
 - [ ] Detach removes from My places only
 - [ ] `cargo test -p hush-core --test places` passes
+- [ ] `scripts/smoke-places.sh` passes — the same handshake through the daemon HTTP layer, which is where the `confirmed` field the UI reads is computed
 - [ ] UI typechecks
 
 ## Self-review
 
 - Vouch not in `hush1` body: intentional for QR size; in-person badge without a message needs a later invite flag — call out in PROTOCOL.
 - D14 full "introduce omits place" replace-set deferred to a follow-up; sticky badge after introduce is the v1 behavior unless Task 3 lands the replace-set.
+- The peer-side refusal paths (`apply_place_introduce` and `apply_place_adopt_ack` rejecting an unconfirmed chain) are defense in depth against a client that does not follow the handshake. No public API can send a crafted payload, so only the local guard is reachable from an integration test; the semantics are covered by `place.rs` unit tests, and the daemon routes are covered end to end by `scripts/smoke-places.sh`. See the 2026-10-20 entries in `DEEPSEEKPROBLEMS.MD`.
+- The Settings → Places row's new "waiting for them to confirm" text and disabled Introduce button are not covered by a test: the pane is DOM code and this environment has no DOM (the same gap recorded for the other panes). Verified by `tsc` and the existing UI suite only.

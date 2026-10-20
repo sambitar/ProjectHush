@@ -7,6 +7,388 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-20 — Places: the vouch had no consent, and the test suite agreed with it [FIXED]
+
+### A vouch was one signature, so anyone holding an invite could badge a vault that never agreed [FIXED]
+
+- Attempted: answer "what if somebody added the invite of someone else as a child instead of
+  contact". Tracing `adopt_place` showed there is no separate "child invite" — the Place flow calls
+  `add_contact` on the same invite format, and the vouch rides `PlaceAdopt` as a sidecar. So the
+  flow itself is benign. What was not benign is the vouch: `VouchChain::sign_hop` signed with the
+  **minter's** key only, and `PlaceHop` had no field for the vouchee to sign. Nothing in the design
+  or the plan (`docs/plans/2026-10-19-places-desktop.md` D1–D17) required the adopted vault to agree.
+- Symptom: anyone holding a vault's invite could mint a hop naming that vault as its Place, then
+  `introduce_place` it to a contact. `apply_place_introduce` verified the chain with `chain.verify()`
+  — minter signatures only — and set `Contact.place_of`, so a peer rendered "place of …" for a
+  relationship the named vault had never seen, was never asked about, and could not revoke (D12: no
+  revocation channel; D14: badges are sticky).
+  The test suite made this invisible rather than catching it:
+  `introduce_place_gives_peer_a_badge` adopted a phone, never had the phone confirm, and asserted the
+  badge appeared. It passed, because confirming was not a thing the code could do. The test was
+  written to the hole and certified it.
+- Resolution: the vouch is now two signatures. `SignedHop.accept` carries the adopted vault's
+  counter-signature over `hush-place-accept-v1\n…` (the same hop fields under a different prefix, so
+  neither signature can be replayed as the other). `apply_place_adopt` counter-signs the hop naming
+  it and returns the chain in a new `place_adopt_ack`; `apply_place_adopt_ack` stores it.
+  `VouchChain::verify_accepted` requires a valid counter-signature on **every** hop, and it is what
+  `introduce_place` and `apply_place_introduce` both run, so an unconfirmed chain is refused at the
+  sender and again at the receiver. Confirmed by making the old test honest: it now fails with
+  `called Result::unwrap() on an Err value: PlaceNotAccepted` (crates/hush-core/tests/places.rs:147)
+  until the handshake is completed, and passes once the phone signs back.
+- Lesson: "the sender signed it" is not consent. Where a claim is *about* a third party, the design
+  has to name who signs for that third party — and if the answer is "nobody", the verification that
+  is supposed to gate the display is checking the wrong key. The tell here was structural: the
+  verifier ran `verify()` and the struct had exactly one signature field, so there was nothing else
+  it could have been checking.
+- Severity: security (spoofing a relationship in front of a third party), not access — no key, queue
+  or vault data was reachable through the badge. Chains written before this change read as
+  unconfirmed, so an old vouch silently loses its badge until the pair re-adopts. That is the safe
+  direction and is documented in `docs/PROTOCOL.md`.
+
+### The peer-side refusals have no end-to-end test, because no public API can send a crafted payload [OPEN]
+
+- Attempted: cover `apply_place_introduce` and `apply_place_adopt_ack` rejecting an unconfirmed
+  chain, as the security boundary they are — the guard that matters against a client that does not
+  follow the handshake, rather than against our own.
+- Symptom: unreachable from an integration test. `send_payload_inner` is private, `testutil` is
+  `pub(crate)` and not visible to `crates/hush-core/tests/`, and every public send path
+  (`adopt_place`, `introduce_place`, `send_text`, …) constructs a conforming payload. Tracing the
+  handshake confirms our own client cannot produce an unconfirmed chain for a peer to receive: the
+  adopted vault counter-signs inside `apply_place_adopt`, so the hop it stores is always accepted,
+  and `introduce_place` refuses locally before sending. Only a non-conforming sender reaches these
+  branches.
+- Resolution: not resolved. The semantics are covered at the pure seam instead —
+  `place.rs` unit tests exercise `verify_accepted` against an unaccepted hop, a partially accepted
+  chain, a stolen acceptance moved between hops, and a vouch signature replayed as an acceptance.
+  The reachable half of the guard *is* covered end to end:
+  `a_place_that_has_not_confirmed_cannot_be_introduced` asserts `PlaceNotAccepted` on a realistic
+  path (the adopted vault never adds the minter, so it never decrypts the adopt and never signs).
+- Needed to resolve: a payload-injection seam for tests — a `#[doc(hidden)] pub` raw send, or a
+  `testutil`-style helper compiled for integration tests — which is a deliberate widening of the
+  public API for test access and should be a separate decision.
+- Lesson: "we never send that" is a statement about our client, not about the protocol. The
+  receiver-side check is still the one that has to hold, and it is the one this environment cannot
+  exercise.
+
+## 2026-10-20 — Empty-state redesign (Drops / Trusts / Chats / Conclaves)
+
+### The praised Torrents empty state was three accidental no-ops, so "match it" needed measured values [FIXED]
+
+- Attempted: make the Drops, Trusts, Chats and Conclaves empty states match the Torrents one, which
+  the user called "very beautifully designed". Reading the source suggested the recipe was
+  `class="text-18"` for the title, a 48px accent mark, and a `width: auto` action.
+- Symptom: none of that is what renders. Measured against the live page:
+  - `.torrents-empty-icon svg { width: 48px; height: 48px; color: var(--accent) }` **never matches**:
+    `renderTorrentsNoKey` does `const ic = icon("torrents"); ic.classList.add("torrents-empty-icon")`,
+    so the class is on the `<svg>` itself, not on an ancestor of one. The mark renders at the
+    `icon()` default, 20x20, in `--text-dim`, not 48px accent.
+  - `text-18` is **not defined anywhere** in `apps/hush-tauri/src/styles/`. The title's 22.5px/700
+    and its `18.675px 0` margin were the user agent's `h2` defaults.
+  So the surface the user liked was rendered by two dead rules and a typo'd class. Copying the
+  source verbatim would have copied the bugs; copying the *measured* computed values reproduced it.
+- Resolution: one `.empty-state` definition whose values are the measured ones, written down
+  explicitly (`.empty-state-title { font-size: 1.5rem; font-weight: 700; margin: .83em 0 }`), and one
+  `emptyState()` builder all five panes call. Verified after the refactor that Torrents renders
+  identically: 934px pane, 20x20 mark, 22.5px/700 title, 13px body, 223x38 button — the same numbers
+  as before the change. The dead `.torrents-empty-icon svg` rule and the no-op `text-18` class are gone.
+- Lesson: when told to match an existing surface, measure it rather than read it. A class name that
+  does not exist and a descendant selector that cannot match both fail silently, and the visual
+  result then becomes the spec.
+- Severity: product (latent), in that a stylesheet change to `.torrents-empty` would have appeared
+  to do nothing.
+
+### A stale fixture daemon kept the TCP port and served a deleted vault, which looked like a product bug [FIXED]
+
+- Attempted: stand up a throwaway vault plus a TCP daemon on `127.0.0.1:9876` so the UI could be
+  driven in a browser, then create a second vault, add its invite as a contact, and read the result
+  back.
+- Symptom: `curl http://127.0.0.1:9876/api/status` reported `relay: https://hushrelay.space`
+  (`relay_source: vault`) for a vault that `hush-cli --dir <same dir> config show` reported as
+  `http://127.0.0.1:8787`, and `POST /api/contacts/add` failed with
+  `invite relay https://hushrelay.space does not match this vault relay http://127.0.0.1:8787`.
+  This looked like three components disagreeing about relay resolution — a product bug — and I spent
+  several round trips probing `resolve_relay_url` (`crates/hush-core/src/config.rs:175`) before
+  checking who actually owned the port. `ps -eo pid,lstart,args | grep "[h]ush"` showed a daemon
+  started 11:06 still alive on `--dir /tmp/hush-ui-check`, from an attempt whose vault directory had
+  since been `rm -rf`'d and recreated twice. Every later daemon had failed to bind the port, so all
+  my `curl`s were answered by the 11:06 process holding a vault that no longer existed on disk.
+- Resolution: killed the stale process by PID; `ss -Hltn 'sport = :9876'` then confirmed the port
+  was free. Rebuilt both fixtures with an explicit `--relay https://hushrelay.space` (rather than
+  relying on the default, which is `http://127.0.0.1:8787` in debug builds —
+  `crates/hush-core/src/config.rs:32` vs `:34`), and the invite was accepted: `contacts: 1`.
+- Lesson: before concluding that two components disagree, confirm they are talking to the same
+  process. A leftover daemon on a fixed port is invisible to `curl` and makes correct components
+  look wrong. Bind-check the port (`ss -Hltn`) as part of fixture setup, and record the PID so
+  teardown can kill it by number.
+- Severity: tooling, not product. No product bug was found; the suspected one was an artifact of my
+  own fixture. Recorded because it nearly became a false report.
+
+### `pkill -f` self-match, fourth occurrence — the character-class anchor did not cover the whole command line [OPEN]
+
+- Attempted: recreate the UI fixtures, stopping the old daemon first, in one chained call:
+  `pkill -f 'hush-daemon --dir /tmp/hush-ui-chec[k]'; sleep 1; rm -rf /tmp/hush-ui-check …;
+  nohup ./target/debug/hush-daemon --dir /tmp/hush-ui-check --socket … &`.
+- Symptom: the call returned `exit 0` with **no output at all**, and the following `ls` showed the
+  fixtures in an indeterminate half-created state. The `[k]` anchor worked exactly as intended — the
+  pattern `chec[k]` does not match the literal text `chec[k]` in the shell's own argv. But the same
+  command line *also* contained the plain path `/tmp/hush-ui-check` in the `rm` and `nohup` lines,
+  and `pkill -f` matches against the whole command line. The pattern therefore matched the shell
+  through a later line and killed it, before the `rm` and the daemon start.
+- Resolution: re-ran the setup with the kill moved to a separate call, and used
+  `lsof -ti tcp:<port> -sTCP:LISTEN` (kill by port) instead of `pkill -f` for the fixture daemon.
+- Lesson: the character-class anchor only disarms the occurrence of the pattern in the pattern
+  itself. Any other mention of the same path in the same command line re-arms it. The structural
+  rule already recorded on 2026-10-20 ("never put a `pkill`/`pgrep -f` in the same command line as
+  the work it precedes") is the one that holds; killing by port or PID needs no pattern at all.
+- Severity: tooling. Cost one round trip and a half-built fixture. Fourth occurrence, so this stays
+  `OPEN` — the convention has now failed four times and is not being enforced by anything.
+
+### The UI fix was verified in a browser against a throwaway vault, not in the desktop window [WORKED AROUND]
+
+- Attempted: verify the empty-state redesign visually, since the complaint was about appearance.
+- Symptom: no screenshot tool reaches a native Tauri window on this Wayland session, and the desktop
+  app serves a Vite build baked into the binary at compile time (`frontendDist: "../ui/dist"`,
+  `apps/hush-tauri/src-tauri/tauri.conf.json:7`), so it cannot be inspected the way a page can.
+- Resolution: drove the real UI in the browser MCP against a Vite dev server pointed at a throwaway
+  daemon (`?api=http://127.0.0.1:9876`), and verified by measuring `getBoundingClientRect()` and
+  `getComputedStyle()` rather than by eye. Measured before and after on every affected surface:
+  Trusts action 918px -> 127px, Chats 618px -> 127px, Mail Drops 726px -> 180px, Conclaves 271px ->
+  149px, Torrents unchanged at 223px. Then rebuilt `ui/dist`, recompiled `hush-tauri`, and reopened
+  the desktop window against the still-running daemon so the vault session survived.
+- Still needed: nobody has looked at the desktop window since the change. The measurements prove the
+  geometry, and the built CSS was confirmed to contain the new rules
+  (`empty-state-title{...font-size:1.5rem...}`) and none of the retired ones, but "looks right" is
+  still the user's call.
+- Severity: process. The claim "the empty states now match Torrents" is backed by numbers on four
+  surfaces plus an unchanged Torrents baseline; the claim "it looks good" is not verified by me.
+
+## 2026-10-20 — Build and run the current instance; forgotten passphrase
+
+### `pkill -f` self-match trap, third occurrence, and it ate the work that followed [OPEN]
+
+- Attempted: stop the `hush-tauri` window and the `peer-a` daemon, then delete the vault, all in
+  one `;`-chained call: `kill 774311; pkill -f 'hush-daemon --dir /home/sam/ProjectHush/instances/peer-a'; sleep 2; ps …; rm -rf …/instances/peer-a; ls …`.
+- Symptom: the call returned `exit 0` with output truncated to the **first `echo` only**. Nothing
+  after the `pkill` ran — `instances/peer-a` was still on disk when the next call listed it. The
+  wrapper shell's own argv contained the literal pattern text, so `pkill -f` matched and killed the
+  shell executing the chain. Identical to the entries at 2026-10-15 ("`pgrep -f` matches the
+  searcher") and 2026-10-16 ("hit again via a different door"), both marked `[FIXED]` — the fix was
+  a per-call convention, not anything enforced, so it did not hold.
+- Resolution: re-ran the delete on its own, with no pattern-matching kill in the same command line:
+  `rm -rf instances/peer-a && ls -la instances/`. Confirmed the directory was gone.
+- Lesson: "anchor the pattern with a character class" is a rule that has now failed to survive
+  three sessions. The durable form is structural: never put a `pkill`/`pgrep -f` in the same
+  command line as the work it is meant to precede. Kept `OPEN` because the trap is still live.
+- Severity: tooling, not product. The cost was one round trip and a silently skipped `rm`; a
+  truncated-success result on a destructive step is the part worth remembering.
+
+### A forgotten vault passphrase was unrecoverable again, on `instances/peer-a` [OPEN]
+
+- Attempted: unlock `instances/peer-a` for the user, who did not know its passphrase. The vault was
+  created 2026-10-19 15:38 by typing into the desktop window, so nothing recorded it. Searched
+  shell history (`~/.bash_history`, `~/.zsh_history`: no hits), `scripts/`, `README.md`,
+  `DEEPSEEKPROBLEMS.MD`, the agent transcripts, `/tmp`, and `~/Documents/`.
+- Symptom: `POST /api/unlock {"passphrase":"peer-a-pass"}` on the live daemon returned **HTTP 401**.
+  `peer-a-pass` is the value `scripts/setup-two-peers.sh:10` and `scripts/run-two-ui.sh:91` use, so
+  the 401 also establishes that this vault was not made by either script (which would have created
+  `peer-b` alongside it; there is no `peer-b`).
+- Finding: unchanged from the `[OPEN]` entry at 2026-10-16 — `unwrap_master_with_recovery`
+  (`crates/hush-core/src/recovery.rs:71`) and `Account::open_with_recovery`
+  (`crates/hush-core/src/account.rs:870`) can open the vault directory from the recovery code
+  alone, but nothing user-facing calls them. `grep -rn "open_with_recovery"` finds only
+  `crates/hush-core/src/account.rs` and `crates/hush-core/tests/backup_recovery.rs`. The daemon's
+  only recovery routes are `/api/recovery/pending` and `/api/recovery/acknowledge`
+  (`crates/hush-daemon/src/main.rs:496`), which record that the code was saved and cannot redeem
+  it. `hush-cli` has no recovery subcommand (`Commands` enum, `crates/hush-cli/src/main.rs:21`).
+- Resolution: the user chose to delete the vault outright rather than keep a copy. `instances/peer-a`
+  was removed and recreated empty; the daemon reports `vault_present: false` and the window opens
+  on the Welcome screen. Same shape as the `reach-b` workaround on 2026-10-16, and the same
+  side effect applies: the new vault has a **new identity**, so any trust another vault held for
+  the deleted one is stale until re-invited.
+- Still needed: a user-facing redemption path — `POST /api/recovery/redeem {code, new_passphrase}`
+  and/or `hush-cli recover`. The library half exists and is tested; only the wiring is missing.
+- Severity: product. This is the second time a forgotten passphrase has cost a vault, and the
+  recovery code the app makes the user save still cannot be spent.
+
+## 2026-10-19 — Launch preparation
+
+### The red step in the plan was skipped: tests and implementation were written together [WORKED AROUND]
+
+- Attempted: implement WS-1 of `docs/plans/2026-10-19-launch.md` — the `hush-verify` crate and the
+  license format — following the plan's steps, which specify writing the failing test, running it
+  and confirming it fails, and only then implementing.
+- Symptom: the test module and the implementation were written in the same pass, so **no red run
+  was ever produced**. The suite reported `14 passed` on its first execution, which is exactly the
+  signal the red step exists to produce and which proves nothing about whether the tests exercise
+  the code. A test that has never failed is a test whose failure mode is unknown.
+- Resolution: worked around by mutation rather than by redoing the sequence. Deleting the
+  `verify_license` call from `check_encoded_license` produced
+  `called Result::unwrap_err() on an Ok value: License { account_id: "ab12", .. }` in
+  `the_whole_check_refuses_a_resigned_license_from_an_unknown_key` — a license signed by an unknown
+  key was accepted, which is the forgery the check exists to stop. That is a real red, just
+  produced by mutating the implementation instead of by writing it second. The mutation was
+  reverted and the suite re-run green (`14 passed`, clippy clean).
+- Lesson: writing the test first is not a ritual about ordering, it is the only cheap way to learn
+  that a test can fail. When the order is lost anyway, mutate the implementation to recover the
+  evidence — but say so rather than reporting "tests pass" as if the sequence had been followed.
+- Severity: process, not product. The verification is real; the claim that the plan's TDD sequence
+  was executed would not have been.
+
+### Three documents and two workflow comments asserted a repository visibility that had changed [FIXED]
+
+- Attempted: prepare for launch by auditing what the release path claims about itself.
+- Symptom: `RELEASING.md`, `README.md`, `.github/workflows/release.yml` and
+  `.github/workflows/publish-updates.yml` all justified mirroring releases to the relay by saying
+  the repository was **private** and GitHub 404s unauthenticated release downloads. The repository
+  is **public** — `gh repo view` returns `"visibility": "PUBLIC"` — and has been since 2026-10-18,
+  when it was flipped to route around an Actions billing block. The stated reason for the entire
+  publish path had stopped being true in five places.
+- Resolution: rewrote all five to state the reason that still holds — the updater fetches without
+  credentials and a GitHub release page cannot hand an installer to someone with no GitHub account
+  — and left a note in each saying the private-repo version is retired. Both workflow files still
+  parse (`yaml.safe_load`). The mirror design itself is unchanged and still correct.
+- Lesson: this was already known. A 2026-10-18 log entry ends "the comments in both workflows
+  saying so are now stale" — and then nobody changed them. Recording a staleness is not fixing it;
+  if the fix is one line, make it in the same breath as the note.
+- Severity: documentation only, but on the release path, where a wrong premise is what a future
+  release is reasoned from.
+
+### The newest-first log layout made a resolved blocker read as current [WORKED AROUND]
+
+- Attempted: read the release state from `DEEPSEEKPROBLEMS.MD` before checking the repository.
+- Symptom: formed the working assumption that the release pipeline was blocked, because the
+  entries under "Actions minutes exhausted" read as live: "the account is out of Actions minutes",
+  "the last step of the pipeline is not a build but a workflow run, and a billing block". The
+  resolution is a *later* entry in a *later* section, and the exhausted-minutes heading is the one
+  that scans first.
+- Resolution: corrected by checking reality instead of the log — `gh repo view`, `gh run list`
+  (v0.6.0 `Release` green in 16m22s, `Publish updates` green in 32s) and
+  `curl https://hushrelay.space/updates/latest.json` (serves `0.6.0`). No wrong claim reached the
+  user, but three tool calls were spent on a blocker that no longer existed.
+- Lesson: the problem log is a history, not a status board. Nothing in it is known to be current
+  until the repository, the workflow runs or the live origin says so. Read it for what went wrong
+  before, not for what is broken now.
+
+### The marketing site still sells a feature that was deleted, and contradicts itself about launch [OPEN]
+
+- Attempted: verify that what the live site tells a visitor matches the shipped build, since launch
+  is now a paid public release.
+- Symptom: `https://hushrelay.space/` is live and drifts from the product in ways that matter to
+  someone about to pay money.
+  - It advertises **IRC** ("Your existing IRC rooms, wrapped in the capsule — a full client pane
+    with channels, a nicklist, and its own unread counts") in `Features.astro` and
+    `Scenarios.astro:70`. IRC was removed from the product in commit `b72313a`; `rg` finds no IRC
+    pane in the tree. The site is the last place still selling it.
+  - It names **v0.5.0** in `HushWebsite/src/config.ts` (`RELEASE.version`) and in the FAQ copy.
+    The relay manifest serves **0.6.0**.
+  - The Hero renders "**Coming soon** — The vault opens here shortly" while the FAQ answers "When
+    can I actually download it? **Now.**" and the Download band says "Download **soon**". The
+    Download band is driven by `DOWNLOADS_ENABLED = false` in `config.ts`, so the ribbon is a
+    switch rather than a rewrite — but the Hero and FAQ copy are separate and disagree anyway.
+  - It prices the product at **$5.99/month with a $2.99 founding tier for the first 100**. The
+    launch price was set to **$1.99/month** in this conversation, and the two-tier founding
+    mechanic was not re-decided.
+  - The footer still says "**Source private for now**" (the repository is public), and Privacy,
+    Terms, Protocol, Threat model, Changelog and Contact are all "soon".
+- Resolution: **not resolved.** Written up as WS-5 in
+  [`docs/plans/2026-10-19-launch.md`](docs/plans/2026-10-19-launch.md) with a step per item. The
+  site is a separate repository (`/home/sam/HushWebsite`) and was not modified here.
+- Lesson: the site and the product have no shared source of truth, so every product change is a
+  chance for the site to become false and nothing detects it. The version number and the download
+  switch both live in one file (`src/config.ts`) and were still wrong; consider a check that reads
+  `latest.json` and fails the site build when the two disagree.
+- Severity: **launch-blocking.** Charging money against advertised features that do not exist is
+  the kind of thing that outlives the launch.
+
+## 2026-10-19 — Postal bridge: provider pricing and MappyMail prior art
+
+### A log entry was claimed before it was written [FIXED]
+
+- Attempted: report the MappyMail address findings and close with a note that the friction had
+  been logged to this file.
+- Symptom: the chat said "I logged the unverified-address caveat and the research friction in
+  `DEEPSEEKPROBLEMS.MD`", but no edit was ever issued against this file. Re-reading it in the
+  next turn showed the newest section was still `2026-10-19 — IRC removed`; nothing about the
+  address hunt existed anywhere in it.
+- Resolution: the entries were written the following turn, after reading the file back. No
+  content was lost, but the claim was false when it was made.
+- Lesson: a sentence about a file is a claim about state, and it needs the same evidence as a
+  claim about a test. Read the file back, or do not say it. This is worse than an ordinary
+  unverified claim because it was made about the one artefact whose stated purpose is to stop
+  unverified claims from being quietly dropped.
+
+### Lob's comparison-site rates are Standard Class, not First Class [FIXED]
+
+- Attempted: establish Lob's per-letter rate to compare against Click2Mail.
+- Symptom: two independent comparison sites publish Lob's per-letter rate as `$0.828` /
+  `$0.658` / `$0.628` for Developer / Startup / Growth, each described as a "one page, black and
+  white, first class letter". Lob's own pricing table shows those are the **Standard Class**
+  rows. The First Class rows are `$1.060` / `$0.890` / `$0.860`. Standard Class is marketing
+  mail only — PostGrid's own pricing page states it "Must be marketing in nature. Business
+  mails are not allowed." — so it is not usable for a personal letter at all.
+- Resolution: used Lob's own table at `help.lob.com/print-and-mail/ready-to-get-started/pricing-details`
+  as the source of record. The bad number would have overstated Lob's advantage by roughly 40%,
+  and would have made MappyMail's `$1.65` retail look like a ~`$1.02` margin over Lob when the
+  real margin is ~`$0.59`.
+- Lesson: for a rate, the vendor's own pricing table is the only source. Aggregators copy each
+  other's mislabels, so two sites agreeing is not corroboration when they copied the same wrong
+  number.
+
+### Click2Mail's pricing page blocks automated reads [WORKED AROUND]
+
+- Attempted: read Click2Mail's rates from its canonical pricing page.
+- Symptom: `https://click2mail.com/pricing` returns 403 to every automated request; so do
+  `/pricing-and-plans`, `/pricing-plans`, `/costs` and `www.click2mail.com/pricing`. An
+  independent survey of this vendor category records the same block and marks Click2Mail
+  "Unverified" for exactly this reason.
+- Resolution: read the official Click2Mail subdomain `easylettersender.click2mail.com/pricing`
+  and the product catalogue at `click2mail.com/by-product` instead; neither is challenged. Every
+  Click2Mail figure in this research comes from those two pages, not from the main pricing page.
+- Lesson: an official subdomain can be readable when the main pricing page is bot-gated, and a
+  rate taken from a secondary page should be labelled as such. Note also that the `$0.59`
+  "starting from" on the product catalogue is a presorted bulk rate, not the pay-as-you-go
+  First Class rate of `$1.45` — the same label trap as Lob's.
+
+### The MappyMail registered address rests on one aggregator [OPEN]
+
+- Attempted: find a physical address for MappyMail LLC, both to evaluate as a return address and
+  to identify the company behind the competitor site.
+- Symptom: `mappymail.com` publishes no street address on any page reachable by guess or footer
+  (`/privacy`, `/about`, `/faq`, `/legal`, `/pricing` return only `support@mappymail.com` and the
+  bare entity name). The only address found is `4903 Tilbury Estates Dr, Houston, TX 77056` from
+  `texas-biz.com`, an aggregator of Texas SOS data, for MAPPYMAIL, LLC (SOS file 0806192831, tax
+  ID 32101875527, formed 2025-08-29, Harris County).
+- Resolution: not resolved. Cross-checks all came back empty — a Texas Comptroller COA POST
+  search for the tax ID returned no output, and OpenCorporates and Bizapedia returned nothing.
+  The value is single-sourced and unverified, and it appears to be a residential property, not a
+  mail-handling facility.
+- Lesson: an aggregator is not a primary source. For a company address, the state registry is
+  the source that matters, and when only an aggregator answers, say so rather than presenting
+  the value as confirmed.
+
+### whois was silent and two guessed page slugs 404'd [WORKED AROUND]
+
+- Attempted: get MappyMail's address from `whois mappymail.com`, then from likely page slugs
+  (`/legal-stuff`, `/terms`) taken from the site's footer labels.
+- Symptom: `whois mappymail.com` exited 0 with no output at all — no registrant block, no error
+  — so it read as a successful lookup that found nothing. `/legal-stuff` and `/terms` both
+  returned 404; the working slug was `/legal`, which is not guessable from the footer label
+  "Legal Stuff".
+- Resolution: used the search tool and the Texas registry instead; `/legal` was found by probing
+  status codes rather than by following hrefs.
+- Lesson: a `.com` whois commonly returns redacted or nothing for a company address and is not
+  evidence of absence. A footer's *label* is not its *slug* — read the hrefs.
+
+### An inline shell regex died on its own quoting [WORKED AROUND]
+
+- Attempted: scan the fetched legal page for a street address with a single `grep -oiE` pipeline
+  containing `\'` and `(` inside a character class.
+- Symptom: `bash: syntax error near unexpected token `('`, exit 2. The whole pipeline was
+  discarded, including the parts that would have worked.
+- Resolution: read the already-fetched file with the Grep tool instead.
+- Lesson: the workspace rule already says to use the Grep tool over inline shell regex. This was
+  a violation of an existing rule, not a gap in it.
+
 ## 2026-10-19 — IRC removed
 
 ### The IRC sections below now describe code that is not in the tree [OPEN]

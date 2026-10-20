@@ -9,13 +9,18 @@ Three properties of that design drive everything below:
 - The updater only trusts an artifact whose signature matches the public key
   compiled into the app. That key is a one-time decision: change it and no
   already-installed copy will accept anything you publish again.
-- The update origin is the relay, not GitHub. This repository is private, and
-  GitHub answers 404 for unauthenticated release downloads on a private repo —
-  which is exactly what the updater makes. `.github/workflows/publish-updates.yml`
+- The update origin is the relay, not GitHub. The updater fetches `latest.json`
+  and the bundles it names without credentials, and a GitHub release page cannot
+  hand an installer to someone who has no GitHub account.
+  `.github/workflows/publish-updates.yml`
   mirrors the manifest and every bundle it names to the relay after a release is
   published. The same directory is what makes the installers publicly
-  downloadable; the GitHub release page cannot serve them to anyone without a
-  GitHub account and a token.
+  downloadable.
+
+  > This section used to justify the mirror by saying the repository was private
+  > and GitHub 404s unauthenticated release downloads. The repository became
+  > **public on 2026-10-18**, so that reason is gone; the reason above is the one
+  > that still holds. Do not repeat the private-repo version.
 - The build creates a **draft** release, and nothing is mirrored until that draft
   is published. Publishing is the single gate, so a half-built release cannot
   reach an installed copy.
@@ -37,7 +42,7 @@ command below is written from the repository root unless it says otherwise.
 
 Already set for this deployment. It has to be a public origin that can serve
 `latest.json` and the bundles it names without credentials — see the note above
-about private repositories. A fork needs its own relay, or any HTTPS host holding
+about why the origin has to be credential-free. A fork needs its own relay, or any HTTPS host holding
 that directory.
 
 Change it before the first release, not after: the endpoint is compiled into the

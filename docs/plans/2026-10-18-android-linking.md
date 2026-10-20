@@ -140,12 +140,12 @@ everything text-shaped it *receives* is fully local, there is no fetching the de
 
 | # | Decision |
 |---|---|
-| D1 | Vouch shape: **parent-signed claim baked into (or beside) the child's invite** — anyone who already trusts the parent can verify the place. Invite format version bump required; parent must be unlocked once to mint. |
+| D1 | Vouch shape: **parent-signed claim carried beside the child's invite** — anyone who already trusts the parent can verify the place. Amended 2026-10-20: the vouch is **two signatures**, the parent's and the child's counter-signature, and only a chain where every hop has both earns a badge. Carried as a sidecar on `PlaceAdopt` / `PlaceAdoptAck` / `PlaceIntroduce`, not baked into the invite body. Parent must be unlocked once to mint. |
 | D2 | Continuity: **two places = two contacts = two threads.** No merge, no mirror. |
 | D3 | Conclaves: **admin re-invites**; double membership accepted as rare (user is on one place at a time). |
 | D4 | Backup/loss: **each place stands alone.** No parent backup of the child's vault. |
 | D5 | UI name: **Places** (Settings → My places). "Child" stays implementation jargon only. |
-| D6 | On adoption, parent and place **auto-add each other as contacts.** |
+| D6 | On adoption, parent and place **auto-add each other as contacts**, and the child **counter-signs the hop naming it** and returns it; until that lands the parent's record reads "waiting for them to confirm" and cannot be introduced. |
 | D7 | **Any Place can adopt another** — no special root; places are equals. |
 | D8 | Existing contacts learn a new Place via **opt-in introduce** (pick who gets the signed vouch/invite). |
 | D9 | Peer contact list: **flat + badge** — two ordinary contacts; a "place of …" chip when the vouch verifies. |

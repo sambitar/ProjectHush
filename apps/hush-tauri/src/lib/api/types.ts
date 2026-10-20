@@ -54,6 +54,56 @@ export interface RelayConfigResponse {
  */
 export type TrusteeReach = "mail_only" | "full";
 
+/**
+ * Whether a trustee relationship carries signals.
+ *
+ * Signals are the non-chat sideband: typed control payloads that never appear
+ * in the chat or mail stream. `allow` is the default for a trustee; `deny`
+ * turns the sideband off in both directions.
+ */
+export type SignalPolicy = "allow" | "deny";
+
+/** One kind of signal body on the wire. */
+export interface SignalBodyDto {
+  /** `ping` is the reference kind; future kinds add their own fields. */
+  kind: string;
+  note?: string | null;
+  [key: string]: unknown;
+}
+
+/** One accepted signal in a trustee's audit log. */
+export interface SignalRecordDto {
+  id: string;
+  from_account: string;
+  from_nick: string;
+  kind: string;
+  received_ms: number;
+  expires_ms?: number | null;
+  supported: boolean;
+}
+
+/** A signal handed to the shell by `/api/recv`. */
+export interface ReceivedSignalDto {
+  from_account: string;
+  from_nick: string;
+  id: string;
+  sent_ms?: number | null;
+  expires_ms?: number | null;
+  body: SignalBodyDto;
+}
+
+/** One acknowledgement of a signal this vault sent. */
+export interface ReceivedSignalAckDto {
+  from_account: string;
+  from_nick: string;
+  id: string;
+  status: string;
+}
+
+export interface SendSignalResponse {
+  id: string;
+}
+
 export interface ContactDto {
   nickname: string;
   protocol_name: string;
@@ -73,6 +123,8 @@ export interface ContactDto {
   my_reach: TrusteeReach;
   /** Account id this contact was vouched under ("place of …"), when set. */
   place_of?: string | null;
+  /** Whether this relationship carries trustee signals. */
+  signals: SignalPolicy;
 }
 
 /** One row of Settings → My places. */
@@ -81,6 +133,12 @@ export interface PlaceDto {
   nickname: string;
   label: string;
   role: "minted_by_me" | "minted_me" | string;
+  /**
+   * Whether the vouch is counter-signed by the place it names. A place we
+   * minted is unconfirmed until its confirmation message arrives, and cannot
+   * be introduced to a contact until then.
+   */
+  confirmed: boolean;
   added_unix: number;
 }
 
@@ -294,6 +352,10 @@ export interface DropsDrainDto {
 
 export interface RecvResponse {
   messages: ReceivedDto[];
+  /** Accepted trustee signals, out of band. Never chat rows. */
+  signals: ReceivedSignalDto[];
+  /** Acknowledgements for signals this vault sent. */
+  signal_acks: ReceivedSignalAckDto[];
   warnings: string[];
 }
 

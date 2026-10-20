@@ -312,6 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | MessagePayload::ZineGrant { .. }
                     | MessagePayload::Reach { .. }
                     | MessagePayload::PlaceAdopt { .. }
+                    | MessagePayload::PlaceAdoptAck { .. }
                     | MessagePayload::PlaceIntroduce { .. }
                     | MessagePayload::ConclaveInvite { .. }
                     | MessagePayload::ConclaveAccept { .. }
@@ -320,7 +321,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | MessagePayload::ConclaveUpdate { .. }
                     | MessagePayload::ConclaveEnd { .. }
                     | MessagePayload::ConclaveIntroReq { .. }
-                    | MessagePayload::ConclaveIntro { .. } => {}
+                    | MessagePayload::ConclaveIntro { .. }
+                    | MessagePayload::Signal { .. }
+                    | MessagePayload::SignalAck { .. } => {}
                     // Paper payloads are routed to the paper store, and an
                     // unknown tag has nothing to print, so neither is an inbox
                     // item.

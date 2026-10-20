@@ -32,6 +32,20 @@ pub struct InboxResult {
     /// is not a chat message. The manager is in-memory — a voice session is
     /// live-only — so these are applied and then gone.
     pub voices: Vec<ReceivedVoice>,
+    /// Trustee signals accepted during this poll, newest last.
+    ///
+    /// Kept out of `messages` for the same reason as `papers`, `voices` and
+    /// `zine_grants`: a signal is not a chat message and must never render as
+    /// one. The envelope has already been policy-checked, expired signals have
+    /// been dropped, duplicates have been suppressed and the audit log has been
+    /// written; the caller owns what the body *means*.
+    pub signals: Vec<crate::signals::ReceivedSignal>,
+    /// Acknowledgements of signals this vault sent during this poll.
+    ///
+    /// Carried separately from `signals` because an ack is not a signal kind:
+    /// it belongs to the envelope, and the caller uses it to settle whatever
+    /// pending state the original send created.
+    pub signal_acks: Vec<crate::signals::ReceivedSignalAck>,
     /// Conclave ids that gained a joined trustee during this poll.
     ///
     /// The paper hub needs this: a trustee that joined after the paper existed

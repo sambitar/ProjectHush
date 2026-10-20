@@ -4550,6 +4550,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hush-verify"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "hush-wallet"
 version = "0.1.0"
 dependencies = [

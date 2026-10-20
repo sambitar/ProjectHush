@@ -8,9 +8,12 @@
 # The release is created as a draft on purpose. Nothing reaches an installed
 # copy until the draft is published, and publishing is what triggers
 # publish-updates.yml, which mirrors the release to the relay that installed
-# copies actually read: https://hushrelay.space/updates/latest.json. This
-# repository is private, and GitHub 404s unauthenticated release downloads on a
-# private repo, so the updater can never be pointed here.
+# copies actually read: https://hushrelay.space/updates/latest.json. The relay
+# is the update origin, not this repository: the Tauri updater fetches with no
+# credentials, and a GitHub release page cannot hand an installer to someone who
+# has no GitHub account. (This comment used to say the repository was private
+# and GitHub 404s unauthenticated downloads. The repository became public on
+# 2026-10-18; that reason is gone, the one above is not.)
 name: Release
 
 on:

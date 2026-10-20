@@ -1,0 +1,58 @@
+# The ubuntu-22.04 leg of .github/workflows/release.yml, as an image.
+#
+# Why a container rather than the host: the AppImage links the system glibc, and
+# this workstation runs Ubuntu 24.04 (glibc 2.39). An AppImage built against that
+# refuses to start on 22.04 or Debian 12 — "GLIBC_2.39 not found" — so a locally
+# built bundle would be narrower than the one CI ships. Matching the runner's
+# distro is the whole point of the image.
+#
+# It also supplies patchelf and libevent-2.1.so.7, which linuxdeploy needs to
+# resolve the bundled Tor. Neither is installed on the host, and installing them
+# there needs a sudo password; in here they are just part of the image.
+#
+# The apt list is copied from the workflow's "install Linux dependencies" step.
+# See that file for why each entry is there — libappindicator3-dev is absent on
+# purpose, and libevent-2.1-7 is for the bundler rather than the app.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libwebkit2gtk-4.1-dev \
+      librsvg2-dev \
+      patchelf \
+      build-essential \
+      curl \
+      wget \
+      file \
+      libxdo-dev \
+      libssl-dev \
+      libayatana-appindicator3-dev \
+      libasound2-dev \
+      libdbus-1-dev \
+      libevent-2.1-7 \
+      protobuf-compiler \
+      ca-certificates \
+      git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node, matching `node-version: lts/*` on the runner.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust stable, matching dtolnay/rust-toolchain@stable. There is no rust-toolchain
+# file in the repository, so `stable` is what both this and the workflow resolve.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+    && rustc --version \
+    && cargo --version
+
+# linuxdeploy is itself an AppImage and the bundler runs it. A container has no
+# FUSE, so it has to unpack itself and run rather than mount.
+ENV APPIMAGE_EXTRACT_AND_RUN=1
+
+WORKDIR /src

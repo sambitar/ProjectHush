@@ -653,15 +653,52 @@
   box-shadow: var(--shadow-1);
 }
 
+/* Empty states: one shape for every "nothing here yet" surface — a small mark,
+   a title, a line of explanation, and at most one action.
+   `.torrents-empty` was the original and the only one that got the action right;
+   the rest are folded in here, so a new empty state cannot invent its own type
+   scale. The action stays a pill: the base `.btn-primary` is `width: 100%` for
+   the stacked forms, and inheriting that is what stretched one button across a
+   whole pane (918px of the 982px Trusts pane, for a two-word label). */
 .empty-state {
   flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: var(--space-6);
+  gap: var(--space-3);
+  padding: var(--space-7) var(--space-5);
   text-align: center;
-  gap: var(--space-4);
+  color: var(--text-dim);
+}
+
+/* Pinned rather than left to the user agent's h2 defaults, which is what the
+   Torrents pane was silently rendering: a class the stylesheet never defined
+   meant the size, weight and margin came from the browser. Same values, now
+   written down once. */
+.empty-state-title {
+  color: var(--text);
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0.83em 0;
+}
+
+/* The mark above the title: the `icon()` default size, inheriting the dim body
+   colour rather than a tint of its own. */
+.empty-state-icon {
+  flex-shrink: 0;
+}
+
+.empty-state .btn-primary,
+.empty-state .btn-secondary {
+  width: auto;
+}
+
+/* The `display: flex` above would otherwise beat the `hidden` attribute. The
+   Mail list's note is the one empty state the app hides and shows in place —
+   `narrowDropList` toggles it as the search narrows the rows. */
+.empty-state[hidden] {
+  display: none;
 }
 
 .avatar {
@@ -1210,7 +1247,10 @@
   color: var(--warning-text);
 }
 
-.mail-empty {
+/* The Mail list's plain "nothing here" note — no key to offer, no mark: a line
+   of text in the list's own gutter. The keyless form is a real empty state and
+   draws through `.empty-state`, which brings its own padding. */
+.mail-empty:not(.empty-state) {
   padding: var(--space-6) var(--space-5);
 }
 
@@ -2255,10 +2295,6 @@
   padding: 0 var(--space-4) var(--space-4);
 }
 
-.conclaves-empty {
-  flex: 1;
-}
-
 .conclaves-detail {
   flex: 1;
   display: flex;
@@ -3299,32 +3335,8 @@
   width: auto;
 }
 
-/* Empty state: no API key yet. */
-.torrents-empty {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  gap: var(--space-3);
-  color: var(--text-dim);
-  padding: var(--space-7) var(--space-5);
-}
-
-.torrents-empty-icon svg {
-  width: 48px;
-  height: 48px;
-  color: var(--accent);
-}
-
-.torrents-empty h2 {
-  color: var(--text);
-}
-
-.torrents-empty .btn-primary {
-  width: auto;
-}
+/* The Torrents empty state draws through `.empty-state` like every other pane;
+   its own block was the template for that one. */
 
 /* Add bar */
 .torrents-add {

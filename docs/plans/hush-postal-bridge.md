@@ -1,6 +1,12 @@
 # Hush Postal Bridge — Project Context for Cursor
 
 > **Status:** Future plan / standing context — **not** current scope. Added 2026-10-18.
+> **Deferred past production (2026-10-19):** the whole bridge, Mode 1 included, waits until after
+> **Phase J — Ship** in [`2026-10-04-v1-milestones.md`](2026-10-04-v1-milestones.md). Mode 1 is the
+> only mode with no phone in it, but it still needs a gateway, a print provider, a service return
+> address, payments and abuse controls, so it is production infrastructure rather than a dogfood
+> feature. The provider research done on 2026-10-19 is recorded in Section 6 and Section 11 so it
+> does not have to be redone when the work starts.
 > Standing context for every task that touches postal mail, QR payloads, or the Android
 > scanner; surfaced to Cursor via [`.cursor/rules/hush-postal-bridge.mdc`](../../.cursor/rules/hush-postal-bridge.mdc).
 > If a task conflicts with this file, stop and ask before proceeding.
@@ -66,7 +72,37 @@ Yes, this is feasible and routine. Requirements:
 ## 6. Providers and map/address layer
 
 - Print/mail fulfillment: Lob, PostGrid, or Click2Mail (all offer APIs; compare per-letter price, certified mail support, minimums). Lob's docs confirm `from` is required and `name` or `company` is required on addresses.
-- Address validation, autocomplete, and reverse geocoding: Lob's Address Verification API includes Reverse Geocode Lookup and autocomplete; alternatives are Smarty, Google, Mapbox, or the USPS Addresses API.
+- **Primary candidate: Lob** (researched 2026-10-19, from Lob's own table at
+  `help.lob.com/print-and-mail/ready-to-get-started/pricing-details`). Rates are all-in per piece —
+  print, postage and envelope. First Class B&W letter: **$1.060** on Developer ($0/month, capped at
+  500 mailings/month), $0.890 on Startup ($260/month), $0.860 on Growth ($550/month). Each extra
+  page $0.10. Certified $6.950 all-in, or $9.860 with Electronic Return Receipt. Return envelope
+  $0.04, custom return envelope $0.05. Over 6 sheets adds $2.495. Rates rise slightly on
+  2026-11-01 ($1.060 → $1.066 on Developer); certified is unchanged. Developer's break-even against
+  Startup is ~1,529 letters/month, so the $0 tier holds for a long time.
+- **PostGrid is the credible second source**: Starter $0/month, B&W First Class letter $1.059, extra
+  page $0.10, Certified $6.94, Certified + eRR $9.85. Near-identical to Lob on price, which is what
+  makes the swappable adapter below worth having rather than aspirational.
+- **Click2Mail is the certified-mail fallback only**: no subscription and no minimum, First Class
+  letter $1.45 for one sheet (2 pages) plus **$0.75 per additional sheet**, Certified from $6.66.
+  Its multi-page pricing is punitive (a 4-page letter is $2.20 against Lob's $1.36) and its catalogue
+  is bulk/marketing mail — lists, mail merge, EDDM, presorted rates — which Section 8 rules out.
+- **Do not trust aggregator comparison sites for Lob's rate.** frontdeskreview.com and
+  customerexperience.io both publish Lob at $0.628–$0.828 labelled "first class". Those are Lob's
+  **Standard Class** rows, and Standard Class is marketing mail only — PostGrid's own page says it
+  "Must be marketing in nature. Business mails are not allowed." The First Class rate is $1.060.
+  Using the wrong number overstates Lob's margin story by roughly 40%.
+- **Prior art: MappyMail (mappymail.com) already ships this feature.** Built on **Lob** for print
+  and mail production and **Stripe** for payment, from **$1.65** retail per letter — so ~$0.59 gross
+  margin over Lob's Developer rate before card fees. It prints its own service return address and
+  states the honest-limits line almost verbatim. Its deletion pipeline is a working reference for
+  Section 2: content, mailing addresses and PDF artifacts queued for deletion once the print
+  provider confirms acceptance; immediate when no confirmation email was requested; 14 days
+  otherwise; a 7-day manual-review window when the provider response is uncertain; retries on failed
+  cleanup; orphaned uploads deleted at ~24h. It uses a windowed envelope, so a PDF upload gets a
+  generated first page carrying the addresses. Its marketing says "anonymous letter", which
+  Section 9 forbids; its own terms concede the point.
+- Address validation, autocomplete, and reverse geocoding: Lob's Address Verification API includes Reverse Geocode Lookup and autocomplete; alternatives are Smarty, Google, Mapbox, or the USPS Addresses API. Lob's verification rate was **not** verified on 2026-10-19 — it is a separate metered product from the per-piece table.
 - Keep provider calls behind a thin adapter interface so the vendor can be swapped.
 - Secret provider keys live on the gateway server only. Browser/app code may use only publishable verification keys.
 
@@ -98,14 +134,17 @@ Anonymous physical mail to a street address is the most abusable feature in the 
 - Ask before starting any task that would change the trust boundary, add stored data to the gateway, or add a third-party service.
 - When a task touches the QR format, update Section 4 and note a format version bump.
 - Keep Mode 1, 2, and 3 as separate modules sharing a common provider adapter and QR codec.
-- Prefer small, reviewable steps. Suggested order: QR codec + tests → Mode 3 (invite/drop letter) → Android scan/decrypt prototype → Mode 1 gateway with deletion pipeline → Mode 2 sealed letters.
+- Prefer small, reviewable steps. Suggested order, **once Phase J has shipped**: QR codec + tests → Mode 3 (invite/drop letter) → Android scan/decrypt prototype → Mode 1 gateway with deletion pipeline → Mode 2 sealed letters. Two caveats on that order, found 2026-10-19: Modes 2 and 3 both end with the recipient scanning on the Android app, which does not exist yet (`apps/` holds only `hush-tauri`; `WORKSPACE.md` says Android is later), so they cannot be demoed end-to-end until it does. Mode 1 is the only mode with no phone in it, and it does not use the QR codec at all.
 - Write tests for: payload parsing (malformed, oversized, wrong version), tamper detection, buffer zeroing, and the deletion pipeline.
 - Add every new data field or third party to a running threat-model note in the same PR.
 
 ## 11. Open decisions
 
 - Final QR payload layout and ECC level.
-- Which provider is primary (compare Lob, PostGrid, Click2Mail on price and certified mail).
-- Service return address type (PO box vs registered agent).
+- ~~Which provider is primary~~ — **Lob**, researched 2026-10-19 (numbers in Section 6). PostGrid
+  stays behind the adapter as the swap target; Click2Mail is the certified-mail fallback.
+- Service return address type (PO box vs registered agent). Note the constraint found in research:
+  undeliverable mail returns to the `from` address, so this must be an address Hush controls and can
+  receive returns at — not a borrowed one.
 - Whether Mode 2 uses key-in-QR, recipient public key, or passphrase split by default.
 - Wallet payment flow for per-letter orders and how the gateway verifies payment without learning identity.

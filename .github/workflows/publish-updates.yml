@@ -1,11 +1,14 @@
 # Mirror a published release to the relay, so installed copies can update.
 #
-# Why not GitHub: this repository is private, and GitHub answers 404 for every
-# unauthenticated /releases/latest/download/... request on a private repo. The
-# Tauri updater fetches latest.json with no credentials, so a private repo cannot
-# serve its own updates. The manifest and the bundles it names are mirrored to
+# Why not GitHub: the Tauri updater fetches latest.json with no credentials, and
+# a GitHub release page cannot hand an installer to someone who has no GitHub
+# account. The manifest and the bundles it names are mirrored to
 # https://hushrelay.space/updates/ instead, which also makes the installers
 # publicly downloadable.
+#
+# (This comment used to say the repository was private and GitHub answers 404 for
+# unauthenticated /releases/latest/download/... requests. The repository became
+# public on 2026-10-18, so that reason no longer applies; the one above does.)
 #
 # Trigger: publishing a release. The build job in release.yml creates the release
 # as a draft and attaches the bundles to it; nothing is mirrored until someone

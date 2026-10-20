@@ -98,8 +98,16 @@ pub enum Error {
     InvalidPlace,
     #[error("place vouch chain is too long")]
     PlaceChainTooLong,
+    #[error("that place has not confirmed the vouch yet")]
+    PlaceNotAccepted,
     #[error("that place is already on file")]
     PlaceExists,
+    #[error("signals are off for this trustee")]
+    SignalsDisabled,
+    #[error("invalid signal")]
+    InvalidSignal,
+    #[error("signal too large (max {0} bytes)")]
+    SignalTooLarge(usize),
 }
 
 impl From<argon2::Error> for Error {

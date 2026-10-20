@@ -1,8 +1,8 @@
-//! Places: adopt, detach, introduce, peer badge.
+//! Places: adopt, confirm, detach, introduce, peer badge.
 
 mod presence_helper;
 
-use hush_core::{Account, PlaceRole};
+use hush_core::{Account, Error, PlaceRole};
 use presence_helper::recipient_online;
 use hush_relay::{router, RelayConfig};
 use tempfile::TempDir;
@@ -22,6 +22,68 @@ async fn spawn_relay() -> (String, TempDir) {
     (base, dir)
 }
 
+/// Drive an adoption all the way to a confirmed vouch.
+///
+/// `minter` scans `place`'s invite; `place` adds the minter so the adopt is
+/// decryptable, counter-signs the hop naming it, and the minter applies the
+/// confirmation. Returns once the minter's chain is accepted, which is the
+/// state `introduce_place` requires.
+async fn confirm_adoption(minter: &mut Account, place: &mut Account, label: &str) {
+    let place_invite = place.invite().await.unwrap();
+    minter.adopt_place(label, &place_invite, label).await.unwrap();
+    assert!(
+        minter.places()[0].chain.verify_accepted().is_err(),
+        "the hop is a claim until the other vault signs back"
+    );
+
+    // The adopted vault must add the minter before PlaceAdopt is decryptable
+    // (inbox blobs carry no sender id).
+    let minter_invite = minter.invite().await.unwrap();
+    place.add_contact("minter", &minter_invite).await.unwrap();
+
+    recipient_online(place).await;
+    for _ in 0..5 {
+        place.recv().await.unwrap();
+        if place
+            .places()
+            .iter()
+            .any(|p| matches!(p.role, PlaceRole::MintedMe))
+        {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        place
+            .places()
+            .iter()
+            .any(|p| matches!(p.role, PlaceRole::MintedMe)),
+        "the adopted vault should record MintedMe: places={:?}",
+        place.places(),
+    );
+
+    recipient_online(minter).await;
+    for _ in 0..5 {
+        minter.recv().await.unwrap();
+        if minter
+            .places()
+            .iter()
+            .all(|p| p.chain.verify_accepted().is_ok())
+        {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        minter
+            .places()
+            .iter()
+            .all(|p| p.chain.verify_accepted().is_ok()),
+        "the minter should hold a counter-signed chain: places={:?}",
+        minter.places(),
+    );
+}
+
 #[tokio::test]
 async fn adopt_place_records_both_sides_and_auto_contacts() {
     let (relay, _relay_dir) = spawn_relay().await;
@@ -35,48 +97,66 @@ async fn adopt_place_records_both_sides_and_auto_contacts() {
         .await
         .unwrap();
 
+    confirm_adoption(&mut desktop, &mut phone, "phone").await;
+
+    assert_eq!(desktop.places().len(), 1);
+    assert!(matches!(desktop.places()[0].role, PlaceRole::MintedByMe));
+    assert_eq!(desktop.places()[0].label, "phone");
+    // Both ends signed: the minter's hop and the adopted vault's acceptance.
+    desktop.places()[0].chain.verify_accepted().unwrap();
+    assert!(desktop.places()[0].chain.hops[0].accepted());
+
+    let phone_place = &phone.places()[0];
+    assert!(matches!(phone_place.role, PlaceRole::MintedMe));
+    phone_place.chain.verify_accepted().unwrap();
+
+    assert!(
+        desktop
+            .contacts()
+            .iter()
+            .any(|c| c.account_id == phone.protocol_name()),
+        "adopting must leave the vault as an ordinary contact too"
+    );
+}
+
+/// The badge is the whole point of the counter-signature: a hop the adopted
+/// vault has not signed is the minter's claim alone, and must not travel.
+#[tokio::test]
+async fn a_place_that_has_not_confirmed_cannot_be_introduced() {
+    let (relay, _relay_dir) = spawn_relay().await;
+    let desktop_dir = TempDir::new().unwrap();
+    let phone_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+
+    let mut desktop = Account::create(desktop_dir.path(), "desk-pass", &relay)
+        .await
+        .unwrap();
+    let mut phone = Account::create(phone_dir.path(), "phone-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+
+    // A mutual contact, so the contact check is not what refuses this.
+    let desk_invite = desktop.invite().await.unwrap();
+    let bob_invite = bob.invite().await.unwrap();
+    bob.add_contact("sam", &desk_invite).await.unwrap();
+    desktop.add_contact("bob", &bob_invite).await.unwrap();
+
+    // Adopt, and stop: the phone never adds the desktop, so it never decrypts
+    // the adopt and never counter-signs.
     let phone_invite = phone.invite().await.unwrap();
     desktop
         .adopt_place("phone", &phone_invite, "phone")
         .await
         .unwrap();
+    let phone_id = desktop.places()[0].account_id.clone();
 
-    assert_eq!(desktop.places().len(), 1);
-    assert!(matches!(desktop.places()[0].role, PlaceRole::MintedByMe));
-    assert_eq!(desktop.places()[0].label, "phone");
-    desktop.places()[0].chain.verify().unwrap();
-
-    // Phone must add the desktop before PlaceAdopt becomes decryptable (inbox
-    // blobs have no sender id). The desktop invite is what the UI shows after adopt.
-    let desk_invite = desktop.invite().await.unwrap();
-    phone
-        .add_contact("desktop", &desk_invite)
-        .await
-        .unwrap();
-
-    recipient_online(&phone).await;
-    let mut saw_minted = false;
-    for _ in 0..5 {
-        let inbox = phone.recv().await.unwrap();
-        if !inbox.warnings.is_empty() {
-            eprintln!("phone recv warnings: {:?}", inbox.warnings);
-        }
-        if phone
-            .places()
-            .iter()
-            .any(|p| matches!(p.role, PlaceRole::MintedMe))
-        {
-            saw_minted = true;
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-
+    let err = desktop.introduce_place(&phone_id, "bob").await.unwrap_err();
     assert!(
-        saw_minted,
-        "phone should record MintedMe after PlaceAdopt: places={:?} contacts={:?}",
-        phone.places(),
-        phone.contacts().iter().map(|c| &c.nickname).collect::<Vec<_>>()
+        matches!(err, Error::PlaceNotAccepted),
+        "an unconfirmed vouch must not be handed to a contact, got {err:?}"
     );
 }
 
@@ -93,11 +173,7 @@ async fn detach_removes_place_but_keeps_contact() {
         .await
         .unwrap();
 
-    let phone_invite = phone.invite().await.unwrap();
-    desktop
-        .adopt_place("phone", &phone_invite, "phone")
-        .await
-        .unwrap();
+    confirm_adoption(&mut desktop, &mut phone, "phone").await;
     let phone_id = desktop.places()[0].account_id.clone();
 
     desktop.detach_place(&phone_id).await.unwrap();
@@ -133,11 +209,7 @@ async fn introduce_place_gives_peer_a_badge() {
     bob.add_contact("sam", &desk_invite).await.unwrap();
     desktop.add_contact("bob", &bob_invite).await.unwrap();
 
-    let phone_invite = phone.invite().await.unwrap();
-    desktop
-        .adopt_place("phone", &phone_invite, "phone")
-        .await
-        .unwrap();
+    confirm_adoption(&mut desktop, &mut phone, "phone").await;
     let phone_id = desktop.places()[0].account_id.clone();
 
     recipient_online(&bob).await;

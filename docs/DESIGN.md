@@ -87,9 +87,11 @@ Living record. Reasons and rejected alternatives. Not a marketing doc.
 ### Payments
 
 - **Decision:** Subscription via a normal card processor (Stripe or similar) as the default.
-- **What they pay for:** First-party relay, easy updates, optional first-party storage. Not the right to open their own files.
-- **Unpaid / lapsed:** Vault, history, and local encryption still work. QR add and direct/online paths still work. You may cut *your* relay, *your* storage tier, and official auto-update. Do not brick the capsule.
-- **Anonymous payment:** Later optional extra, not v1. Default payment **will** link money to a name/email; do not market the product as anonymous.
+- **Price:** **$1.99/month, flat** — no founding tier, no first-100 mechanic (decided 2026-10-19).
+- **What they pay for:** First-party relay and official auto-update. Not the right to open their own files. **No first-party storage tier** (removed 2026-10-19) — the bring-your-own cloud replica over WebDAV/S3 (still Task **8**) is the user's own storage and is unaffected.
+- **Licensing:** an offline-verifiable **signed license**, bound to the vault's `account_id`, verified against a public key compiled into the app and configured on the relay. Validation does not phone home. The relay verifies it statelessly and keeps no list of payers. See [`plans/2026-10-19-launch.md`](plans/2026-10-19-launch.md), WS-1..WS-4.
+- **Unpaid / lapsed:** Vault, history, and local encryption still work. QR add and direct/online paths still work. You may cut *your* relay and official auto-update. Do not brick the capsule. Because verification is offline, a cancelled subscription keeps working until its license expires — the accepted cost of not phoning home.
+- **Anonymous payment:** Later optional extra, not v1. Default payment **will** link money to a name/email; do not market the product as anonymous. The license service is the one place a payment identity and an `account_id` are held together; the relay holds neither.
 - **Rejected:** Lifetime license as the business (B); free-core as the plan (C); crypto as the default (D).
 
 ### Safety and moderation

@@ -4,7 +4,7 @@ use std::thread;
 use hush_core::{
   Account, ChatRecord, ChatRetention, ConclaveRecord, InboxResult, MessagePayload,
   PaperDescriptor, PendingInvite, PendingIntroRequest, PlaceRecord, PlaceRole, QueueMap,
-  TrusteeReach, VoiceDescriptor,
+  SignalBody, SignalPolicy, SignalRecord, TrusteeReach, VoiceDescriptor,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -152,6 +152,22 @@ enum Work {
     SetContactReach {
         nickname: String,
         reach: TrusteeReach,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SetContactSignals {
+        nickname: String,
+        policy: SignalPolicy,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SendSignal {
+        to: String,
+        body: SignalBody,
+        expires_ms: Option<u64>,
+        ack: bool,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    ContactSignals {
+        nickname: String,
         reply: oneshot::Sender<WorkResult>,
     },
     RemoveContact {
@@ -662,6 +678,8 @@ pub struct ContactDto {
     /// Account id this contact was vouched under ("place of …"), when set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub place_of: Option<String>,
+    /// Whether this relationship carries trustee signals.
+    pub signals: SignalPolicy,
 }
 
 /// One row of Settings → My places.
@@ -672,6 +690,12 @@ pub struct PlaceDto {
     pub label: String,
     /// `minted_by_me` or `minted_me`.
     pub role: String,
+    /// Whether the vouch is counter-signed by the Place it names.
+    ///
+    /// A place we minted stays unconfirmed until its confirmation lands, and
+    /// cannot be introduced to a contact until then. A place that minted us is
+    /// always confirmed, because confirming is what recorded it.
+    pub confirmed: bool,
     pub added_unix: u64,
 }
 
@@ -685,6 +709,7 @@ impl From<&PlaceRecord> for PlaceDto {
                 PlaceRole::MintedByMe => "minted_by_me".into(),
                 PlaceRole::MintedMe => "minted_me".into(),
             },
+            confirmed: p.chain.verify_accepted().is_ok(),
             added_unix: p.added_unix,
         }
     }
@@ -747,6 +772,10 @@ pub enum WorkResult {
     Exists,
     Invite(String),
     Contacts(Vec<ContactDto>),
+    /// The id of a signal that was sent, for correlating its ack.
+    SignalId(String),
+    /// One trustee's signal audit log, newest first.
+    Signals(Vec<SignalRecord>),
     Places(Vec<PlaceDto>),
     /// The relay queues this vault drains and delivers into, for diagnosis.
     Queues(QueueMap),
@@ -1031,6 +1060,7 @@ impl AccountWorker {
                                             reach: c.reach.narrow(c.peer_reach),
                                             my_reach: c.reach,
                                             place_of: c.place_of.clone(),
+                                            signals: c.signals,
                                         });
                                     }
                                     WorkResult::Contacts(list)
@@ -1143,6 +1173,46 @@ impl AccountWorker {
                                 None => WorkResult::Err("locked".into()),
                                 Some(a) => match a.set_contact_reach(&nickname, reach).await {
                                     Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SetContactSignals {
+                            nickname,
+                            policy,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.set_contact_signals(&nickname, policy).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendSignal {
+                            to,
+                            body,
+                            expires_ms,
+                            ack,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.send_signal(&to, body, expires_ms, ack).await {
+                                    Ok(id) => WorkResult::SignalId(id),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::ContactSignals { nickname, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.signals_for(&nickname) {
+                                    Ok(list) => WorkResult::Signals(list),
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
@@ -2410,6 +2480,43 @@ impl AccountWorker {
         self.call(|reply| Work::SetContactReach {
             nickname: nickname.to_string(),
             reach,
+            reply,
+        })
+        .await
+    }
+
+    /// Turn the trustee sideband on or off for one contact.
+    pub async fn set_contact_signals(&self, nickname: &str, policy: SignalPolicy) -> WorkResult {
+        self.call(|reply| Work::SetContactSignals {
+            nickname: nickname.to_string(),
+            policy,
+            reply,
+        })
+        .await
+    }
+
+    /// Send one typed signal. Store-and-forward, so no presence check.
+    pub async fn send_signal(
+        &self,
+        to: &str,
+        body: SignalBody,
+        expires_ms: Option<u64>,
+        ack: bool,
+    ) -> WorkResult {
+        self.call(|reply| Work::SendSignal {
+            to: to.to_string(),
+            body,
+            expires_ms,
+            ack,
+            reply,
+        })
+        .await
+    }
+
+    /// One trustee's signal audit log, newest first.
+    pub async fn contact_signals(&self, nickname: &str) -> WorkResult {
+        self.call(|reply| Work::ContactSignals {
+            nickname: nickname.to_string(),
             reply,
         })
         .await

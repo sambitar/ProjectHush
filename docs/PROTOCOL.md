@@ -57,6 +57,35 @@ exists, and neither do the endpoints.
 An account's identity key is its **account id**: `account_id = hex(identity_public_key)`. That is what
 a peer addresses it by and what the relay checks a prekey record against.
 
+### Places — vouched sibling accounts (2026-10-19, counter-signature 2026-10-20)
+
+A **Place** is a second vault someone runs as their own account: own identity, own queue, own
+threads. It is not a device on the first vault and shares no key material — peers see two ordinary
+contacts. What makes them a Place is a **vouch**: a signed claim that one account minted another.
+
+- A hop is `{minter_account_id, place_account_id, label, signed_unix}` plus the minter's XEd25519
+  signature over `hush-place-vouch-v1\n{minter}\n{place}\n{label}\n{unix}` — the same primitive
+  queue grants use, no new key material.
+- A hop is a **claim** until the account it names signs back. The adopted vault counter-signs over
+  `hush-place-accept-v1\n…` (the same fields under a different prefix, so neither signature can be
+  replayed as the other) and returns the chain in a `place_adopt_ack`. A hop is an **agreement**
+  only when that counter-signature is present and valid.
+- **A badge requires an agreement.** `verify_accepted` demands a valid counter-signature on *every*
+  hop in the chain, and both the introduce sender and the badge receiver enforce it, so no peer
+  renders "place of …" for a relationship the named vault never signed. This is what stops a holder
+  of a vault's invite from unilaterally minting a vouch over it.
+- Chains are ordered (`hops[i].place == hops[i+1].minter`) and **capped at 2 hops**; longer or
+  discontinuous chains are rejected. A verifier badges the **earliest hop whose minter is already a
+  contact** — the anchor — so a vouch is only ever worth the trust the verifier already places in
+  the minter.
+- The vouch rides the wire as a sidecar on `place_adopt` / `place_adopt_ack` / `place_introduce`,
+  never inside the `hush1…` pointer body, which stays short. A Place invite is therefore
+  indistinguishable from a contact invite on the wire — the relationship is local state plus these
+  messages.
+- Adoption adds the other vault as an ordinary contact (both directions, D6). Detach removes the
+  local record only; the contact and every history stay. There is no vouch revocation channel, and a
+  badge is sticky until a newer introduce from the same introducer.
+
 ## Queues
 
 Each **account** owns one **inbox** and mints one **per-contact queue** for every contact it
@@ -240,6 +269,33 @@ conclaves). Mail is the floor and is never gated.
   member would be worse.
 
 Design and decisions: [`tasks/trustee-reach.md`](tasks/trustee-reach.md) (Task **24**).
+
+### Trustee signals — the non-chat sideband (2026-10-20)
+
+A **signal** is a typed payload between two trustees that is never rendered as a chat line or a
+mail message. It is the transport for sideband features — wallet addresses, torrent handoffs,
+contact-card refreshes — so each new feature does not invent its own control payload.
+
+- **Wire payload:** `MessagePayload::Signal { id, sent_ms?, expires_ms?, ack, body }`, where `body`
+  is internally tagged by `kind`. A build that does not know the kind decodes it as
+  `SignalBody::Unknown` and applies nothing. `MessagePayload::SignalAck { id, status }` answers a
+  signal whose `ack` flag was set. Both are **control** payloads: consumed in `recv`, listed in the
+  `to_dto` ignore arms, and never filed as inbox items.
+- **Store-and-forward:** signals ride the mail path, so an away trustee receives them on their next
+  drain. They are **not** gated by trustee reach: a mail-only relationship still has a sideband.
+- **Policy:** every contact has `signals` (`allow` by default, `deny` on request). Deny refuses
+  outbound sends and drops inbound signals silently, without an ack, so the peer cannot probe the
+  preference. The choice is local and unannounced.
+- **Expiry and dedupe:** `expires_ms` is an absolute Unix-millisecond deadline; an expired signal is
+  dropped and a requested ack says `expired`. A repeated `(sender, id)` is not applied twice, and a
+  requested ack is re-sent. The dedupe window is a bounded audit log, not a permanent ledger.
+- **Audit:** every accepted signal records `{ id, sender, kind, received_ms, expires_ms, supported }`
+  in the vault, capped at 256 and readable per contact. Bodies are deliberately not stored.
+- **No second signature.** The 1:1 session is the authentication: the sender is a contact whose
+  identity key was pinned in their invite. Unlike `QueueGrant`, a signal confers no authority, so
+  there is nothing for a signature to protect.
+
+Design and decisions: [`tasks/trustee-signals.md`](tasks/trustee-signals.md) (Task **26**).
 
 ### Paper
 

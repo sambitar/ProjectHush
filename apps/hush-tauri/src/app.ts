@@ -4,6 +4,7 @@ import { api, AppError, getApiBase } from "./lib/api/daemon";
 import type {
   ContactDto,
   DropsKeyDto,
+  SignalPolicy,
   StatusResponse,
   TrusteeReach,
   ReadsCommentDto,
@@ -586,6 +587,61 @@ function busyNote(text: string): HTMLElement {
   label.textContent = text;
   note.appendChild(label);
   return note;
+}
+
+/**
+ * The pane-level empty state: a small mark, a title, one line of explanation,
+ * and at most one action.
+ *
+ * One builder, because the shape is the product decision and every pane had
+ * assembled its own. They had drifted apart in three ways: two title sizes, a
+ * body at 15px where this one wants 13px, and — the visible one — an action
+ * button that inherited `.btn-primary`'s `width: 100%` and stretched across the
+ * whole pane (918px of the 982px Trusts pane, for a two-word label). The
+ * Torrents pane was the one that got all of it right; this is that shape, and
+ * `.empty-state` in the stylesheet is now the single definition of it.
+ *
+ * `className` lets a caller keep a class the rest of the app looks for — the
+ * Mail list finds its note again by `.mail-empty` — without that caller
+ * re-deciding any of the styling.
+ */
+function emptyState(opts: {
+  icon?: IconName;
+  title: string;
+  body: string;
+  /**
+   * The handler receives its own button, so a caller whose action must not run
+   * twice can disable it on the way in — the keyless Drops note starts a
+   * `dropsKeyCreate` that a second click would otherwise start again.
+   */
+  action?: { label: string; onClick: (btn: HTMLButtonElement) => void };
+  className?: string;
+}): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = opts.className ? `empty-state ${opts.className}` : "empty-state";
+  if (opts.icon) {
+    const mark = icon(opts.icon);
+    mark.classList.add("empty-state-icon");
+    wrap.appendChild(mark);
+  }
+  const title = document.createElement("h2");
+  // Deliberately classless: `.empty-state-title` pins the size, weight and
+  // margin, so the title does not come from the user agent's h2 defaults.
+  title.className = "empty-state-title";
+  title.textContent = opts.title;
+  const body = document.createElement("p");
+  body.className = "muted text-13";
+  body.textContent = opts.body;
+  wrap.append(title, body);
+  if (opts.action) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-primary pressable";
+    btn.textContent = opts.action.label;
+    btn.onclick = () => opts.action?.onClick(btn);
+    wrap.appendChild(btn);
+  }
+  return wrap;
 }
 
 /**
@@ -4197,31 +4253,32 @@ export class App {
     const nick = this.selectedNick;
     const contact = nick ? this.contacts.find((c) => c.nickname === nick) : undefined;
     if (!contact || !nick) {
-      const empty = document.createElement("div");
-      empty.className = "empty-state";
-      empty.innerHTML = `<svg width="120" height="80" viewBox="0 0 120 80" aria-hidden="true"><ellipse cx="60" cy="50" rx="40" ry="20" fill="var(--accent-soft)"/><circle cx="60" cy="35" r="18" fill="var(--accent)" opacity="0.3"/></svg>`;
-      const t = document.createElement("h2");
-      t.className = "text-22";
-      t.textContent = "Quiet in here";
-      const p = document.createElement("p");
-      p.className = "muted";
       // Three different nothings: no trusts at all, trusts that are all mail
       // only, and chats that exist but are not open — a selection dropped when
-      // its reach narrowed, or a trust that was just deleted.
-      p.textContent = !this.contacts.length
+      // its reach narrowed, or a trust that was just deleted. Only the first has
+      // anything to offer, so only the first carries the action; offering "Add a
+      // trust" to someone who has five of them says the app is not listening.
+      const body = !this.contacts.length
         ? "Invite someone to start your first chat"
         : this.chatContacts().length
           ? "Pick a conversation on the left, or start a new one."
           : "Everyone you know is mail only. Chat needs a full trust.";
-      const b = document.createElement("button");
-      b.className = "btn-primary pressable";
-      b.textContent = "Add a trust";
-      b.onclick = () => {
-        this.addFriendOpen = true;
-        this.scheduleRender();
-      };
-      empty.append(t, p, b);
-      pane.appendChild(empty);
+      pane.appendChild(
+        emptyState({
+          icon: "chats",
+          title: "Quiet in here",
+          body,
+          action: this.contacts.length
+            ? undefined
+            : {
+                label: "Add a trust",
+                onClick: () => {
+                  this.addFriendOpen = true;
+                  this.scheduleRender();
+                },
+              },
+        }),
+      );
       return pane;
     }
     this.syncChatPane(pane, nick, contact);
@@ -5118,17 +5175,14 @@ export class App {
     });
 
     if (drops.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "empty-state";
-      const t = document.createElement("h2");
-      t.className = "text-22";
-      t.textContent = "No verified Drops yet";
-      const p = document.createElement("p");
-      p.className = "muted";
-      p.textContent =
-        "Verified SecureDrop destinations appear here once their onion address is confirmed against a trusted source.";
-      empty.append(t, p);
-      pane.append(empty, this.dropsFootnote());
+      pane.append(
+        emptyState({
+          icon: "drop",
+          title: "No verified Drops yet",
+          body: "Verified SecureDrop destinations appear here once their onion address is confirmed against a trusted source.",
+        }),
+        this.dropsFootnote(),
+      );
       return pane;
     }
 
@@ -5337,23 +5391,20 @@ export class App {
     filter.append(icon("search"), filterInput);
 
     if (!this.contacts.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty-state";
-      const t = document.createElement("h2");
-      t.className = "text-22";
-      t.textContent = "No contacts yet";
-      const p = document.createElement("p");
-      p.className = "muted";
-      p.textContent = "Add someone to start a chat or send mail.";
-      const b = document.createElement("button");
-      b.className = "btn-primary pressable";
-      b.textContent = "Add a trust";
-      b.onclick = () => {
-        this.addFriendOpen = true;
-        this.scheduleRender();
-      };
-      empty.append(t, p, b);
-      pane.appendChild(empty);
+      pane.appendChild(
+        emptyState({
+          icon: "trusts",
+          title: "No contacts yet",
+          body: "Add someone to start a chat or send mail.",
+          action: {
+            label: "Add a trust",
+            onClick: () => {
+              this.addFriendOpen = true;
+              this.scheduleRender();
+            },
+          },
+        }),
+      );
       return pane;
     }
 
@@ -5525,6 +5576,19 @@ export class App {
           ),
       },
       {
+        // The sideband is part of the trust by default; this is how a user
+        // narrows it. Both directions are imperatives naming the click.
+        id: "signals",
+        label:
+          c.signals === "deny" ? "Allow signals" : "Turn off signals",
+        icon: c.signals === "deny" ? "bell" : "bellOff",
+        onSelect: () =>
+          void this.setTrustSignals(
+            c,
+            c.signals === "deny" ? "allow" : "deny",
+          ),
+      },
+      {
         id: "rename",
         label: "Change nickname",
         icon: "pencil",
@@ -5608,6 +5672,34 @@ export class App {
       this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't change how you reach them.", {
+        kind: "error",
+      });
+    }
+  }
+
+  /**
+   * Turn the trustee sideband on or off for one contact.
+   *
+   * Local and unannounced: `deny` stops both directions silently, so the peer
+   * cannot use the setting as a probe. The contact list is re-read so the menu
+   * and the daemon's view cannot disagree.
+   */
+  private async setTrustSignals(
+    c: ContactDto,
+    policy: SignalPolicy,
+  ): Promise<void> {
+    try {
+      await api.setContactSignals(c.nickname, policy);
+      this.contacts = (await api.contacts()) ?? [];
+      setKnownContacts(this.contacts.map((x) => x.nickname));
+      this.announce(
+        policy === "deny"
+          ? `Signals are off for ${displayNick(c.nickname)}.`
+          : `Signals are on for ${displayNick(c.nickname)}.`,
+      );
+      this.scheduleRender();
+    } catch (e) {
+      showToast(e instanceof AppError ? e.message : "Couldn't change signals.", {
         kind: "error",
       });
     }
@@ -5734,25 +5826,21 @@ export class App {
     const conclaves = listConclaves();
     const invites = listPendingInvites();
     if (conclaveListShape(conclaves.length, invites.length) === "empty") {
-      const empty = document.createElement("div");
-      empty.className = "empty-state conclaves-empty";
-      const t = document.createElement("h2");
-      t.className = "text-22";
-      t.textContent = "No conclaves yet";
-      const p = document.createElement("p");
-      p.className = "muted";
-      p.textContent = this.contacts.length
-        ? "Start a conclave and bring a few people in."
-        : "Add a trust, then you can meet with them.";
-      empty.append(t, p);
-      if (this.contacts.length) {
-        const b = document.createElement("button");
-        b.className = "btn-primary pressable";
-        b.textContent = "New conclave";
-        b.onclick = () => this.openConclaveCreate();
-        empty.appendChild(b);
-      }
-      col.appendChild(empty);
+      col.appendChild(
+        emptyState({
+          icon: "conclaves",
+          title: "No conclaves yet",
+          body: this.contacts.length
+            ? "Start a conclave and bring a few people in."
+            : "Add a trust, then you can meet with them.",
+          // With no contacts there is no conclave to make, so the pane offers
+          // nothing rather than a button that cannot be used; the header's own
+          // "New conclave" is disabled and says why.
+          action: this.contacts.length
+            ? { label: "New conclave", onClick: () => this.openConclaveCreate() }
+            : undefined,
+        }),
+      );
       return col;
     }
 
@@ -5993,16 +6081,13 @@ export class App {
     pane.className = "conclaves-detail";
     const conclave = this.conclaveId ? conclaveById(this.conclaveId) : undefined;
     if (!conclave) {
-      const empty = document.createElement("div");
-      empty.className = "empty-state";
-      const t = document.createElement("h2");
-      t.className = "text-22";
-      t.textContent = "Pick a conclave";
-      const p = document.createElement("p");
-      p.className = "muted";
-      p.textContent = "Choose a conclave on the left, or start a new one.";
-      empty.append(t, p);
-      pane.appendChild(empty);
+      pane.appendChild(
+        emptyState({
+          icon: "conclaves",
+          title: "Pick a conclave",
+          body: "Choose a conclave on the left, or start a new one.",
+        }),
+      );
       return pane;
     }
 
@@ -13430,37 +13515,42 @@ export class App {
 
   /** The note under the rows: the offer of a key, or the two kinds of nothing. */
   private dropEmpty(kind: "no-key" | "plain"): HTMLElement {
+    if (kind === "no-key") {
+      // The one thing a fresh vault needs is the key — offer it here rather
+      // than sending the user hunting through Settings first. The class the
+      // list patch looks the note up by is kept, but the styling is the shared
+      // empty state's, not this pane's.
+      const empty = emptyState({
+        icon: "drop",
+        title: "No drop key yet",
+        body: "Generate one, publish it anywhere, and drops sealed to it land here.",
+        action: {
+          label: "Generate drop key",
+          onClick: (btn) => {
+            btn.disabled = true;
+            void api
+              .dropsKeyCreate()
+              .then((k) => {
+                this.dropInboxKey = k;
+                this.scheduleRender();
+              })
+              .catch((e) => {
+                showToast(
+                  e instanceof AppError ? e.message : "Could not generate the drop key.",
+                  { kind: "error" },
+                );
+                this.scheduleRender();
+              });
+          },
+        },
+        className: "mail-empty",
+      });
+      empty.dataset.emptyKind = kind;
+      return empty;
+    }
     const empty = document.createElement("div");
     empty.className = "mail-empty";
     empty.dataset.emptyKind = kind;
-    if (kind === "no-key") {
-      // The one thing a fresh vault needs is the key — offer it here rather
-      // than sending the user hunting through Settings first.
-      empty.textContent =
-        "No drop key yet — generate one, publish it anywhere, and drops sealed to it land here.";
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "btn-primary pressable";
-      btn.textContent = "Generate drop key";
-      btn.onclick = () => {
-        btn.disabled = true;
-        void api
-          .dropsKeyCreate()
-          .then((k) => {
-            this.dropInboxKey = k;
-            this.scheduleRender();
-          })
-          .catch((e) => {
-            showToast(
-              e instanceof AppError ? e.message : "Could not generate the drop key.",
-              { kind: "error" },
-            );
-            this.scheduleRender();
-          });
-      };
-      empty.appendChild(btn);
-      return empty;
-    }
     empty.textContent = MAIL_EMPTY.drops;
     return empty;
   }
@@ -15508,28 +15598,21 @@ export class App {
 
 
   private renderTorrentsNoKey(): HTMLElement {
-    const wrap = document.createElement("div");
-    wrap.className = "torrents-empty";
-    const ic = icon("torrents");
-    ic.classList.add("torrents-empty-icon");
-    const h = document.createElement("h2");
-    h.className = "text-18";
-    h.textContent = "Connect TorBox to start";
-    const p = document.createElement("p");
-    p.className = "muted text-13";
-    p.textContent =
-      "Torrents are fetched in the cloud by TorBox, then downloaded straight into your vault. Paste your TorBox API key once to turn it on.";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "btn-primary pressable";
-    btn.textContent = "Open Settings → TorBox";
-    btn.onclick = () => {
-      this.rail = "settings";
-      this.settingsSection = "torbox";
-      this.scheduleRender();
-    };
-    wrap.append(ic, h, p, btn);
-    return wrap;
+    // This pane was the template for `emptyState`; it now draws through it, so
+    // the shape the rest of the app copies cannot drift from this one.
+    return emptyState({
+      icon: "torrents",
+      title: "Connect TorBox to start",
+      body: "Torrents are fetched in the cloud by TorBox, then downloaded straight into your vault. Paste your TorBox API key once to turn it on.",
+      action: {
+        label: "Open Settings → TorBox",
+        onClick: () => {
+          this.rail = "settings";
+          this.settingsSection = "torbox";
+          this.scheduleRender();
+        },
+      },
+    });
   }
 
   private renderTorrentsAddBar(): HTMLElement {
@@ -17720,7 +17803,7 @@ export class App {
   private renderPlacesSettings(): HTMLElement {
     const wrap = document.createElement("div");
     wrap.innerHTML = `<h2 class="text-22">Places</h2>
-      <p class="muted text-13">Each Place is its own vault and its own threads. Peers see them as separate contacts. After you adopt a Place, show them your invite so they can add you back — then their next sync records the relationship.</p>`;
+      <p class="muted text-13">Each Place is its own vault and its own threads. Peers see them as separate contacts. After you adopt a Place, show them your invite so they can add you back — then their next sync records the relationship and signs the vouch back. Only a Place that has confirmed can be introduced to a contact.</p>`;
 
     const listHost = document.createElement("div");
     listHost.style.marginTop = "var(--space-4)";
@@ -17750,11 +17833,23 @@ export class App {
           p.role === "minted_by_me" ? "you minted" : "minted you";
         label.textContent = `${p.nickname}${p.label ? ` (${p.label})` : ""} — ${role}`;
         row.appendChild(label);
+        if (!p.confirmed) {
+          // The vouch is one-sided until they sign back, so say so rather than
+          // offering an Introduce that would be refused.
+          const pending = document.createElement("span");
+          pending.className = "text-12 muted";
+          pending.textContent = "waiting for them to confirm";
+          row.appendChild(pending);
+        }
         if (p.role === "minted_by_me") {
           const intro = document.createElement("button");
           intro.type = "button";
           intro.className = "btn-secondary pressable";
           intro.textContent = "Introduce…";
+          intro.disabled = !p.confirmed;
+          intro.title = p.confirmed
+            ? "Show this Place to a contact"
+            : "They have not confirmed this Place yet";
           intro.onclick = async () => {
             const nick = window.prompt(
               "Introduce this Place to which contact nickname?",

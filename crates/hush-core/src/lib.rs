@@ -11,12 +11,13 @@ mod invite;
 mod lockfile;
 mod mail;
 mod message;
+mod signals;
 mod payload;
 mod place;
 pub mod prekey;
 mod recovery;
 mod relay_client;
-mod signal;
+mod signal_protocol;
 mod signal_persist;
 #[cfg(test)]
 mod testutil;
@@ -57,6 +58,10 @@ pub use mail::{
 };
 pub use message::{
     InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper, ReceivedZineGrant,
+};
+pub use signals::{
+    ReceivedSignal, ReceivedSignalAck, SignalBody, SignalPolicy, SignalRecord, SignalStatus,
+    MAX_PING_NOTE_BYTES, MAX_SIGNAL_BYTES, MAX_SIGNAL_LOG,
 };
 pub use payload::{
     ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeReach,

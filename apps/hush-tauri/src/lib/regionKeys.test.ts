@@ -274,7 +274,10 @@ test("the empty pane has a key of its own", () => {
 });
 
 test("a trusts row's shape is both reaches and the mail address", () => {
-  assert.equal(trustRowShape({ reach: "full", my_reach: "full" }), "full\nfull\n\n");
+  assert.equal(
+    trustRowShape({ reach: "full", my_reach: "full" }),
+    "full\nfull\n\n\n",
+  );
   assert.equal(
     trustRowShape({
       reach: "mail_only",
@@ -282,7 +285,7 @@ test("a trusts row's shape is both reaches and the mail address", () => {
       mail_handle: "ana@example.org",
       mail_vault: "vault-1",
     }),
-    "mail_only\nfull\nana@example.org\nvault-1",
+    "mail_only\nfull\nana@example.org\nvault-1\n",
   );
 });
 
@@ -297,6 +300,14 @@ test("a reach moving on either side moves a trusts row's shape", () => {
   assert.notEqual(
     trustRowShape(base),
     trustRowShape({ ...base, my_reach: "mail_only" }),
+  );
+});
+
+test("a signal policy moving moves a trusts row's shape", () => {
+  const base = { reach: "full", my_reach: "full" } as const;
+  assert.notEqual(
+    trustRowShape(base),
+    trustRowShape({ ...base, signals: "deny" }),
   );
 });
 
@@ -321,7 +332,7 @@ test("the trusts key pairs each shown name with its row's shape", () => {
   // shows, each carrying the shape its own row and menu were drawn from.
   assert.equal(
     trustsKey([{ name: "Ana", shape: trustRowShape({ reach: "full", my_reach: "full" }) }]),
-    "Ana\nfull\nfull\n\n",
+    "Ana\nfull\nfull\n\n\n",
   );
 });
 

@@ -25,7 +25,7 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **G — Articles** | Reshaped 2026-10-14 | **11** pen names → **public publish only** | **Reshaped** — native long-form is **zines** (Task **21** / Phase **O**); the public surface is now an **AT Protocol / Standard.site** publish |
 | **H — Knowledge layer** | After 11 dogfood | **12–15** (see [`knowledge-layer-roadmap.md`](knowledge-layer-roadmap.md)) | Backlog |
 | **I — Confidential** | Heavy; spec early, code late | **10** TPM + lease rail | Planning only |
-| **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages | Partly started — **updater + release workflow landed 2026-10-11** (branch `feature/auto-update`); `hush-verify` extraction, `rust-toolchain.toml`, `cargo deny`/`audit` still open |
+| **J — Ship** | When feature-complete | **7** signed builds, CI audit, packages; **paid launch** ([`2026-10-19-launch.md`](2026-10-19-launch.md)) | Partly started — **updater + release workflow landed 2026-10-11**, `v0.6.0` published and mirrored. Launch scope set 2026-10-19: **public, paid ($1.99/month), Linux + macOS**, Stripe live. Open: licensing (WS-1..4), site truth pass + legal (WS-5), macOS notarization (WS-6), `hush-verify` / `rust-toolchain.toml` / `cargo deny`+`audit` (WS-7) |
 | **K — Member calls** | After **C** stabilizes | **17** P2P audio/video between contacts | Planning only |
 | **L — Shared surface** | After **17** Phase 4 (video) | **18** live screen share / co-browse in a conclave | Planning only |
 | **M — Conclave Paper** | Before **17** (voice/video postponed; data-only WebRTC) | **19** collaborative paper ("Etherpad-like") in a conclave | ✅ **All eight tasks landed and dogfooded 2026-10-12** |
@@ -34,7 +34,8 @@ Task IDs are stable for cross-links; **implement in this sequence** (not the sec
 | **P — The public lane** | After **21** (front page) | **22** public long-form over **AT Protocol / Standard.site**, badged on the zines front page behind a control | ✅ **Implemented 2026-10-14** (replaces the 2026-10-13 Nostr spec) |
 | **Q — Conclave voice** | After **C** stabilizes (same gate as **17**); engine spike shared with **17** Phase 2 | **23** group voice inside a conclave | Forks resolved 2026-10-13 — decisions **delegated to agent judgment, user review pending**; planning only, Phase 1 not approved |
 | **R — Trustee reach** | After **D** (mail) lands; independent of the media tasks | **24** per-trustee surface scope — **mail only** or **mail + chat + conclave** | ✅ **Built 2026-10-15** |
-| **—** | Do not start | **8** (Stripe, Android, groups, Flathub, OS image, …) | Later |
+| **S — Postal bridge** | After **J** (Ship) | Physical mail: plain, sealed and invite/drop letters ([`hush-postal-bridge.md`](hush-postal-bridge.md)) | **Deferred past production 2026-10-19** — needs a gateway, a print provider, a service return address, payments and abuse controls. Provider researched: **Lob** primary, PostGrid as swap target |
+| **—** | Do not start | **8** (Android, groups, Flathub, OS image, …) — **Stripe pulled forward to J** | Later |
 
 **Rationale (short):** Finish **private 1:1** (B) before **mail** (D) and **outsiders** (E). **Notes** (F) are vault-local and smaller than **Articles** (G). **Knowledge** (H) needs pen names and encrypted store. **Confidential** (I) is a separate trust domain — after messaging at-rest is boring. **Ship** (J) only when you are ready to produce. **Reading room** (N) is a data feature like Paper — it shares a position, not pixels — so it does not wait on the postponed media plane. **Zines** (O) is the members-only long-form commons: also a data feature, reusing **19**'s spine, and it is the one task that adds a relay ability (a broadcast bulletin) — also independent of the media plane. It reshapes **Articles** (G) from a native build into an optional publish. **The public lane** (P) is the counterpart to zines: it publishes a zine to the **open social web** and reads other people's documents back onto the same page, badged and behind a control. It uses the member's **own AT Protocol account** — no key minted, no separate identity, no second network to curate — which is what replaced the Nostr lane (relays, `npub`, a per-vault public identity, NIP-23/NIP-22) on 2026-10-14. **Trustee reach** (R) is a small contact-policy change on top of **mail** (D): when you add a trustee you choose whether they may reach you by **mail only** or by **mail + chat + conclave**, so a member can add someone they only want to correspond with by mail.
 
@@ -805,9 +806,34 @@ serializer crate is the only runtime-dep question.
 
 ---
 
+### Task 26: Trustee signals — the non-chat sideband (built 2026-10-20)
+
+**Status:** built **2026-10-20**, infrastructure only. `Ping` is the reference kind; feature kinds
+are added as `SignalBody` variants.
+
+**Goal:** one typed, policy-controlled sideband between trustees for traffic that is not a
+conversation — wallet addresses, torrent handoffs, contact-card refreshes — instead of a new control
+payload per feature. The envelope owns delivery (store-and-forward, expiry, dedupe, acks) and the
+audit log; a feature owns only what its body means. Notes are visible per contact, and a contact can
+turn the sideband off without telling the peer.
+
+→ **[`docs/tasks/trustee-signals.md`](../tasks/trustee-signals.md)**
+
+**Key constraints:** no new relay, queue or encryption; unknown kinds are ignored rather than
+fatal; the layer carries data, never a command, so a state-changing kind must ask the user by its
+own rules.
+
+**Depends on:** Task **5** (daemon), **5c** (encrypted store). **Independent of** reach, conclaves
+and the media plane.
+
+---
+
 ### Task 8: Deliberately later (do not start)
 
-- Stripe
+> **Stripe is no longer in this list** — launch is a paid public v1, so billing moved onto the
+> critical path on 2026-10-19. See [`2026-10-19-launch.md`](2026-10-19-launch.md), WS-1..WS-4.
+> The rest of this task stands.
+
 - WebDAV/S3 live providers
 - Android
 - Groups; **messaging** follow-model (Zines Task **21** deliberately has **no** follows — it is a pull-only newspaper; Articles Task **11** is now only a **publish** to the public lane)
