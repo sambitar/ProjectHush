@@ -20,13 +20,14 @@
 use std::str::FromStr;
 
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 
+use crate::chain::TransferCheck;
 use crate::error::{Result, WalletError};
 use crate::net::{socks_addr_from_proxy, NetworkMode};
 use crate::seed;
@@ -34,7 +35,7 @@ use crate::seed;
 /// Default RPC endpoints. Overridable per-config so a user can point at their
 /// own node, or at a different provider entirely.
 pub const DEFAULT_RPC_MAINNET: &str = "https://ethereum-rpc.publicnode.com";
-pub const DEFAULT_RPC_SEPOLIA: &str = "https://ethereum-sepolia-rpc.publicnode.com";
+pub const DEFAULT_RPC_SEPOLIA: &str = "https://sepolia.rpc.thirdweb.com";
 
 // The ERC-20 calls this wallet makes. Declared here rather than pulled from a
 // contract crate: four calls are the whole surface, and a hand-rolled ABI
@@ -319,6 +320,69 @@ impl EthereumWallet {
             .to(token)
             .input(call.abi_encode().into());
         self.broadcast(tx).await
+    }
+
+    /// Confirm that `txid` is a mined, successful transfer of `amount` of
+    /// `token` to `expected_to`.
+    ///
+    /// The signal is only a pointer; this is what makes a "received" line
+    /// evidence rather than a peer's claim. A transport failure is `Err` and
+    /// the caller may retry; [`TransferCheck::Refused`] is a definite answer.
+    pub async fn verify_token_transfer(
+        &self,
+        txid: &str,
+        token: &str,
+        expected_to: &str,
+        amount: u128,
+    ) -> Result<TransferCheck> {
+        let hash = B256::from_str(txid.trim())
+            .map_err(|e| WalletError::Ethereum(format!("not a transaction hash: {e}")))?;
+        let token = parse_address(token)?;
+        let expected_to = parse_address(expected_to)?;
+        let Some(receipt) = self
+            .provider
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(|e| WalletError::Ethereum(e.to_string()))?
+        else {
+            return Ok(TransferCheck::Pending);
+        };
+        if !receipt.status() {
+            return Ok(TransferCheck::Refused(
+                "the payment transaction failed on chain".into(),
+            ));
+        }
+        // `Transfer(address indexed from, address indexed to, uint256 value)`:
+        // topic 0 is the signature, 1 the sender, 2 the recipient, and the
+        // amount is the only word of data. Decoded by hand so this does not
+        // depend on a generated binding staying in step with the contract.
+        let transfer_topic = keccak256(b"Transfer(address,address,uint256)");
+        let mut total = 0u128;
+        let mut from: Option<Address> = None;
+        for log in receipt.logs() {
+            if log.address() != token {
+                continue;
+            }
+            let topics = log.data().topics();
+            if topics.len() != 3 || topics[0] != transfer_topic {
+                continue;
+            }
+            let to = Address::from_slice(&topics[2][12..]);
+            if to != expected_to || log.data().data.len() < 32 {
+                continue;
+            }
+            let value = U256::from_be_slice(&log.data().data[..32]);
+            total = total.saturating_add(to_u128(value));
+            from = Some(Address::from_slice(&topics[1][12..]));
+        }
+        if total < amount {
+            return Ok(TransferCheck::Refused(format!(
+                "the transaction carries {total} of the token to this wallet, not {amount}"
+            )));
+        }
+        Ok(TransferCheck::Confirmed {
+            from: from.map(|a| a.to_checksum(None)).unwrap_or_default(),
+        })
     }
 
     /// A read-only call, as a call to the token contract.

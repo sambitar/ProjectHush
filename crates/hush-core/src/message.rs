@@ -19,6 +19,13 @@ pub struct ReceivedMessage {
 #[derive(Debug, Clone, Default)]
 pub struct InboxResult {
     pub messages: Vec<ReceivedMessage>,
+    /// Live chat lines that expire, from contacts.
+    ///
+    /// Kept out of `messages` for the same reason as `papers`, `voices` and
+    /// `signals`: these are not filed in the chat log. The caller owns the
+    /// in-memory copy and must drop it at `expires_ms`; a restart or a missed
+    /// poll loses it, which is the promise the feature makes.
+    pub ephemeral: Vec<ReceivedEphemeral>,
     /// Paper payloads from peers, for the caller to apply to its paper store.
     ///
     /// Kept out of `messages` deliberately: a paper payload is not a chat
@@ -46,6 +53,16 @@ pub struct InboxResult {
     /// it belongs to the envelope, and the caller uses it to settle whatever
     /// pending state the original send created.
     pub signal_acks: Vec<crate::signals::ReceivedSignalAck>,
+    /// Contacts this vault should (re)announce its wallet addresses to because
+    /// the handshake just moved: their address was newly stored, or they just
+    /// allowed payments.
+    ///
+    /// The address exchange is otherwise one-shot — whoever enables first
+    /// announces, and the other side has nothing to answer with — so a peer can
+    /// allow payments and still never receive ours. The daemon answers this list
+    /// with an announcement to exactly those contacts, which also makes a lost
+    /// announcement self-healing.
+    pub wallet_announce_to: Vec<String>,
     /// Conclave ids that gained a joined trustee during this poll.
     ///
     /// The paper hub needs this: a trustee that joined after the paper existed
@@ -100,6 +117,22 @@ pub struct ReceivedPaper {
     /// The sender's nickname, for diagnostics.
     pub from_nick: String,
     pub payload: crate::payload::MessagePayload,
+}
+
+/// An expiring chat line received from a contact.
+///
+/// The payload was consumed at the relay, validated, and deliberately **not**
+/// written to the chat log. The daemon hands it to the UI once; if the UI is not
+/// there to take it, it is gone.
+#[derive(Debug, Clone)]
+pub struct ReceivedEphemeral {
+    pub from_account: String,
+    pub from_nick: String,
+    /// The sender's message id, used to key the line on both sides.
+    pub id: String,
+    pub sent_ms: u64,
+    pub expires_ms: u64,
+    pub body: String,
 }
 
 /// A voice payload received from a conclave trustee (Task 23).

@@ -69,6 +69,20 @@ pub struct TokenView {
     pub balance: String,
 }
 
+/// The outcome of checking a claimed payment against the chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferCheck {
+    /// The transaction is not in a block yet. Retrying is the right answer.
+    Pending,
+    /// Mined, successful, and the claimed transfer is really there.
+    Confirmed {
+        /// The sender as the chain recorded it, EIP-55 checksummed.
+        from: String,
+    },
+    /// Mined, but not the transfer that was claimed. Never retry this one.
+    Refused(String),
+}
+
 /// A request to send value, as it arrives from the UI.
 #[derive(Clone, Debug, Deserialize)]
 pub struct SendRequest {

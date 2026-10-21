@@ -323,7 +323,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | MessagePayload::ConclaveIntroReq { .. }
                     | MessagePayload::ConclaveIntro { .. }
                     | MessagePayload::Signal { .. }
-                    | MessagePayload::SignalAck { .. } => {}
+                    | MessagePayload::SignalAck { .. }
+                    // Expiring chat lines arrive out of band in
+                    // `inbox.ephemeral`, never as filed inbox items.
+                    | MessagePayload::ExpireText { .. } => {}
                     // Paper payloads are routed to the paper store, and an
                     // unknown tag has nothing to print, so neither is an inbox
                     // item.
@@ -343,6 +346,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | MessagePayload::VoiceLeave { .. }
                     | MessagePayload::Unknown => {}
                 }
+            }
+            for line in inbox.ephemeral {
+                println!("{}: {} (expiring)", line.from_nick, line.body);
             }
         }
         Commands::DropKeyShow => {

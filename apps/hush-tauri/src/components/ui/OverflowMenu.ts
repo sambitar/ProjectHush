@@ -39,6 +39,10 @@ export interface OverflowMenuOptions {
   items: OverflowMenuItem[];
   /** Accessible name for the trigger, e.g. "Options for Ada". */
   label: string;
+  /** The trigger's icon. Defaults to the three-dot menu. */
+  icon?: IconName;
+  /** Extra class on the trigger, for a caller that styles its own control. */
+  triggerClass?: string;
   /**
    * A container whose presses count as inside the menu: a row whose whole
    * click is the menu. Without it, the close-on-mousedown would fire before
@@ -86,12 +90,13 @@ export class OverflowMenu {
     this.trigger = document.createElement("button");
     this.trigger.type = "button";
     this.trigger.className = "btn-icon-round pressable overflow-trigger";
+    if (opts.triggerClass) this.trigger.classList.add(opts.triggerClass);
     this.trigger.setAttribute("aria-label", opts.label);
     this.trigger.title = opts.label;
     this.trigger.setAttribute("aria-haspopup", "menu");
     this.trigger.setAttribute("aria-expanded", "false");
     this.trigger.setAttribute("aria-controls", this.menuId);
-    this.trigger.appendChild(icon("more"));
+    this.trigger.appendChild(icon(opts.icon ?? "more"));
     this.trigger.addEventListener("click", (e) => {
       e.stopPropagation();
       this.toggle();

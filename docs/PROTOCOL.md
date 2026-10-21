@@ -183,6 +183,47 @@ Mail is a payload **kind** on the same Signal session and the same queue — not
 
 Relay view of a mail message is unchanged from any other message: an opaque ciphertext blob. Subject, body, and attachment names are inside the Signal envelope and never appear in relay storage.
 
+### Expiring messages (2026-10-21)
+
+An **expiring message** is a 1:1 chat line that both sides delete at a deadline. It is a chat
+payload, not a trustee signal: it renders in the conversation, uses the same reach and presence
+gates as `Text`, and carries no sideband policy.
+
+- **Wire payload:** `MessagePayload::ExpireText { id, sent_ms, expires_ms, body }`. `id` is the
+  sender's random key, so both sides and a retried delivery name the same line. `expires_ms` is an
+  absolute Unix-millisecond deadline.
+- **Live-only:** the send path is `send_payload` (the same one `Text` uses), so the peer must be
+  online and the relationship must allow live chat. Nothing is parked on the relay for an away
+  recipient, which is what makes the deadline honest.
+- **Never filed:** `send_expire_text` writes no `chat.enc` row, and `recv` hands the inbound line
+  out of band (`InboxResult::ephemeral`) instead of appending it. The daemon passes it to the UI
+  once; a restart, a lock, or a missed poll loses it. This is the promise the feature makes, not
+  an implementation detail.
+- **Deletion:** both UI copies are in memory and are dropped at `expires_ms`. The sender arms the
+  timer from the daemon's returned deadline, the receiver from the payload's, so the two sides
+  disappear at the same instant modulo clock skew.
+- **UI:** `/expire <message>` in the 1:1 composer opens a lifetime dialog (5 seconds to 24 hours,
+  default 30 seconds) before sending. A bare `/expire` is refused with a prompt for the body.
+- **Limits:** body 16 KiB; protocol lifetime 1 second to 24 hours. The UI's 5-second floor keeps a
+  line alive across at least one receiver poll.
+- **Relay view:** unchanged — an opaque ciphertext blob until the recipient's drain consumes it.
+  Because the send is refused when the recipient is offline, the relay does not hold a copy that
+  could be delivered after its deadline.
+
+### Chat links (2026-10-21)
+
+- **Wire:** a link is an ordinary `MessagePayload::Text` body. There is no link payload, no preview
+  fetch, and no new relay ability. `/link <url>` in the 1:1 composer validates an absolute `http(s)`
+  URL and sends it as the body; conclave chat accepts the same command.
+- **Rendering:** the shell builds the body from text nodes and turns `http(s)` runs into anchors. A
+  trailing sentence mark stays outside the anchor; a balanced `)` stays inside. `javascript:`,
+  `data:`, relative, and credential-bearing URLs stay inert. The text is never injected as HTML.
+- **Opening:** every click goes through the external-link confirmation, which names the host, and
+  then `hush_open_url`. The webview never navigates to a peer-supplied address. The site sees the
+  user's normal browser identity, not Hush's.
+- **Limit:** `/link` accepts up to 4,096 characters; a longer URL is refused in the composer. The
+  relay sees only the ordinary encrypted text blob.
+
 ### Conclaves
 
 A conclave is **not** a relay-side room and there is no group object in the protocol. Group chat is
@@ -294,6 +335,47 @@ contact-card refreshes — so each new feature does not invent its own control p
 - **No second signature.** The 1:1 session is the authentication: the sender is a contact whose
   identity key was pinned in their invite. Unlike `QueueGrant`, a signal confers no authority, so
   there is nothing for a signature to protect.
+- **First durable kind: `wallet_address`.** `SignalBody::WalletAddress { bitcoin?, ethereum? }`
+  writes the sender's receive addresses onto the contact record (`wallet_bitcoin`,
+  `wallet_ethereum`, `wallet_updated_ms`). It is announced after wallet create/restore and on
+  demand from `POST /api/wallet/announce`; the send card offers the trustee as a destination and
+  warns that the address must be confirmed. USDC is an ordinary ERC-20 the wallet already tracks
+  and sends, so no Circle (or other custodian) integration is involved.
+- **Payment consent (`payments`, 2026-10-20).** A second per-contact choice, **deny by default**,
+  gates the whole money surface: wallet-address announcements skip denied contacts, an inbound
+  `WalletAddress` is audited but not stored, and `POST /api/wallet/pay-trustee` refuses. Turning it
+  off clears the stored address. The chat composer's `+` offers **Send USDC** only when it is on, and
+  typing `/pay` or `/pay <amount>` in the composer opens the same dialog; the route resolves the
+  contact's announced Ethereum address and the network's USDC contract (mainnet or Sepolia), so the
+  UI never supplies a destination.
+- **Payment notices (`payment`, 2026-10-20).** After a broadcast, the sender writes a
+  `ChatRecordPayload::Payment` line to its own log and sends `SignalBody::Payment { txid, amount,
+  symbol }` over the sideband. The core never applies the notice: the **recipient's daemon**
+  verifies the transaction receipt (mined, successful), the token contract (the network's canonical
+  USDC), the recipient address, and the transferred amount before it writes a `payment` record with
+  `outgoing: false`. A transaction that is not mined yet is retried with backoff for 15 minutes; a
+  refusal is logged and dropped. The chain, not the signal, remains the account of the money.
+- **Payment chat lines.** A `payment` record is drawn as a centered system line ("You sent 1 USDC
+  to Alice" / "You received 1 USDC from Alice") with the transaction hash beneath it, never as a
+  chat bubble. It survives reloads because it is a chat record, and `recv` reports
+  `chat_appended` so the UI re-reads its history rather than guessing at the record id.
+- **Two-step send.** The chat dialog asks for an amount, then restates the amount, recipient
+  address and network on a confirmation screen. A payment is irreversible once mined.
+- **Torrent offers (`torrent_offer`, 2026-10-21).** A third per-contact choice, **deny by default
+  on both sides**, gates torrent sharing: `TorrentConsent` announces it, `/torrent` in the 1:1
+  composer (and **Share a torrent** in the trust's menu) opens a picker over the vault's Torrents
+  state, and `POST /api/torrents/share` resolves the name, info hash and size from the daemon's own
+  state before sending `TorrentOffer { offer_id, name, hash, size }`. The recipient's daemon files
+  the body in `torrents-state.enc` (the signal audit log is metadata-only), shows a confirmation,
+  and `POST /api/torrents/offers/{id}/accept` builds
+  `magnet:?xt=urn:btih:<hash>&dn=<name>` and queues it as an ordinary TorBox item. `TorrentResponse`
+  tells the sender accepted or declined. Only the hash and display name cross the sideband; no file
+  bytes and no tracker list are carried, and the receiver re-checks both contacts' choices before
+  accepting.
+- **Torrent limit.** Library entries retain the info hash, not the original magnet. A hash-only
+  magnet works for public swarms that TorBox can resolve (DHT/cache); a private-tracker torrent
+  whose tracker list was not retained may not be downloadable this way. The recipient sees the name
+  and size before accepting.
 
 Design and decisions: [`tasks/trustee-signals.md`](tasks/trustee-signals.md) (Task **26**).
 

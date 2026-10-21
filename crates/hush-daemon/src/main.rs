@@ -34,10 +34,11 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
+use hush_wallet::chain::TransferCheck;
 use hush_core::{
     ChatRecord, ConclaveRecord, Error, MessagePayload, PaperDescriptor, PendingInvite,
-    QueueMap, ReceivedMessage, SignalBody, SignalPolicy, TrusteeReach, VoiceEffect, VoiceManager,
-    VoiceSession,
+    PaymentPolicy, QueueMap, ReceivedMessage, SignalBody, SignalPolicy, TorrentPolicy,
+    TrusteeReach, VoiceEffect, VoiceManager, VoiceSession,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -125,8 +126,32 @@ struct App {
     /// something real to read between calls. Runtime-only; a watchdog drops
     /// it after the panel stops asking (a mic left hot with no panel is a
     /// lie the user can see in their hardware).
+    /// Settings-side device probe (see [`DeviceProbe`]).
     device_probe: Mutex<Option<DeviceProbe>>,
+    /// Payment notices waiting for their transaction to be mined, keyed by
+    /// transaction hash. Runtime-only: a restart loses the retry, never the
+    /// money — the recipient's balance sync still shows the transfer.
+    pending_payments: Mutex<HashMap<String, PendingPayment>>,
 }
+
+/// A payment notice from a trustee whose transaction is not mined yet.
+#[derive(Clone)]
+struct PendingPayment {
+    nick: String,
+    /// In the token's smallest unit.
+    amount: u128,
+    symbol: String,
+    first_seen: Instant,
+    /// Checks already made, which sets the next backoff step.
+    attempts: u32,
+    next_try: Instant,
+}
+
+/// How long a payment notice waits for its transaction to be mined.
+const PAYMENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// The first retry interval, doubled per pending check and capped below.
+const PAYMENT_RETRY_MIN: Duration = Duration::from_secs(2);
+const PAYMENT_RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// The Settings-side device probe and its last-use stamp. The watchdog takes
 /// the whole entry when the panel has not touched it for a minute.
@@ -222,6 +247,28 @@ struct SetContactSignalsRequest {
 }
 
 #[derive(Deserialize)]
+struct SetContactPaymentsRequest {
+    nickname: String,
+    policy: PaymentPolicy,
+}
+
+#[derive(Deserialize)]
+struct SetContactTorrentsRequest {
+    nickname: String,
+    policy: TorrentPolicy,
+}
+
+#[derive(Deserialize)]
+struct PayTrusteeRequest {
+    nickname: String,
+    /// Amount in USDC's smallest unit (6 decimals).
+    amount: String,
+    /// Optional ERC-20 contract; absent means the network's USDC.
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SendSignalRequest {
     nickname: String,
     body: SignalBody,
@@ -269,6 +316,21 @@ struct SendTextRequest {
 }
 
 #[derive(Deserialize)]
+struct SendExpireRequest {
+    to: String,
+    text: String,
+    /// How long both sides keep the line, in milliseconds.
+    ttl_ms: u64,
+}
+
+#[derive(Serialize)]
+struct SendExpireResponse {
+    id: String,
+    /// Absolute Unix-millisecond deadline the UI counts down to.
+    expires_ms: u64,
+}
+
+#[derive(Deserialize)]
 struct SendFileRequest {
     to: String,
     path: String,
@@ -311,6 +373,16 @@ struct ReceivedDto {
     conclave_name: Option<String>,
     /// Conclave only: the sender's trustee nicknames, for rendering on first sight.
     conclave_trustees: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ExpireDto {
+    from: String,
+    /// The sender's message id, used to key the line on both sides.
+    id: String,
+    text: String,
+    sent_ms: u64,
+    expires_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -462,6 +534,9 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/torrents/retry", post(torrents_retry))
         .route("/api/torrents/remove", post(torrents_remove))
         .route("/api/torrents/concurrency", post(torrents_concurrency))
+        .route("/api/torrents/share", post(torrents_share))
+        .route("/api/torrents/offers/{id}/accept", post(torrents_accept_offer))
+        .route("/api/torrents/offers/{id}/decline", post(torrents_decline_offer))
         .route("/api/torrents/library/{id}", delete(torrents_delete_library))
         .route("/api/conclaves", get(conclaves).post(create_conclave))
         .route("/api/queues", get(queue_map))
@@ -501,6 +576,8 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/contacts/remove", post(remove_contact))
         .route("/api/contacts/reach", post(set_contact_reach))
         .route("/api/contacts/signals", post(set_contact_signals))
+        .route("/api/contacts/payments", post(set_contact_payments))
+        .route("/api/contacts/torrents", post(set_contact_torrents))
         .route("/api/contacts/{nickname}/signals", get(contact_signals))
         .route("/api/signals/send", post(send_signal))
         .route("/api/places", get(places))
@@ -509,6 +586,7 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/places/introduce", post(introduce_place))
         .route("/api/outbox/retry", post(outbox_retry))
         .route("/api/send", post(send_text))
+        .route("/api/send-expire", post(send_expire_text))
         .route("/api/send-file", post(send_file))
         .route("/api/send-file-data", post(send_file_data))
         .route("/api/presence/heartbeat", post(presence_heartbeat))
@@ -539,10 +617,12 @@ fn api_router(state: Arc<App>) -> Router {
             .route("/api/wallet/address", post(wallet_address))
             .route("/api/wallet/sync", post(wallet_sync))
             .route("/api/wallet/send", post(wallet_send))
+            .route("/api/wallet/pay-trustee", post(wallet_pay_trustee))
             .route("/api/wallet/mode", post(wallet_mode))
             .route("/api/wallet/proxy", post(wallet_proxy))
             .route("/api/wallet/token", post(wallet_token_add))
             .route("/api/wallet/token/remove", post(wallet_token_remove))
+            .route("/api/wallet/announce", post(wallet_announce))
             .route("/api/wallet/wipe", post(wallet_wipe));
     }
 
@@ -668,6 +748,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         voice_planes: Mutex::new(HashMap::new()),
         voice_rings: Mutex::new(HashMap::new()),
         device_probe: Mutex::new(None),
+        pending_payments: Mutex::new(HashMap::new()),
     };
     let state = Arc::new(app);
 
@@ -1063,6 +1144,13 @@ async fn unlock(
             *state.unlocked.lock().await = true;
             touch(&state).await;
             apply_relay_prefs(&state).await;
+            // Re-announce on unlock: the address handshake used to be one-shot,
+            // so a lost announcement left one side unable to pay even though
+            // both allowed it. Best effort and off the response path.
+            let announce_state = state.clone();
+            tokio::spawn(async move {
+                let _ = announce_wallet_addresses(&announce_state).await;
+            });
             Ok(StatusCode::NO_CONTENT)
         }
         _ => Err(StatusCode::UNAUTHORIZED),
@@ -2017,6 +2105,36 @@ async fn set_contact_signals(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Turn payments on or off for one contact.
+async fn set_contact_payments(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SetContactPaymentsRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .set_contact_payments(&body.nickname, body.policy)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Turn torrent sharing on or off for one contact.
+async fn set_contact_torrents(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SetContactTorrentsRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .set_contact_torrents(&body.nickname, body.policy)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Send a typed sideband signal; returns the id for correlating its ack.
 async fn send_signal(
     State(state): State<Arc<App>>,
@@ -2147,6 +2265,34 @@ async fn send_text(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Send a live chat line that both sides forget at the returned deadline.
+///
+/// Nothing is written to the chat log on either side; the response carries the
+/// deadline the sender's UI arms its own timer with.
+async fn send_expire_text(
+    State(state): State<Arc<App>>,
+    Json(body): Json<SendExpireRequest>,
+) -> Result<Json<SendExpireResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(
+        state
+            .worker
+            .send_expire_text(&body.to, &body.text, body.ttl_ms)
+            .await,
+    )?;
+    match result {
+        WorkResult::ExpireSent { id, expires_ms } => {
+            Ok(Json(SendExpireResponse { id, expires_ms }))
+        }
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
 async fn send_file(
     State(state): State<Arc<App>>,
     Json(body): Json<SendFileRequest>,
@@ -2199,11 +2345,167 @@ async fn send_file_data(
 #[derive(Serialize)]
 struct RecvResponse {
     messages: Vec<ReceivedDto>,
+    /// Live chat lines that expire. Never written to the chat log on either
+    /// side; the caller holds them only until `expires_ms`.
+    expire_messages: Vec<ExpireDto>,
     /// Accepted trustee signals, out of band. Never chat rows.
     signals: Vec<hush_core::ReceivedSignal>,
     /// Acknowledgements for signals this vault sent.
     signal_acks: Vec<hush_core::ReceivedSignalAck>,
     warnings: Vec<String>,
+    /// True when this poll wrote a chat record that is not in `messages` —
+    /// today only a verified incoming payment. The UI re-reads its history so
+    /// the line appears without the pane guessing at a record id.
+    chat_appended: bool,
+}
+
+/// Apply the payment notices in an inbox batch.
+///
+/// A notice is only a pointer to evidence. The chat gets "You received …"
+/// only after the chain shows a mined transfer of at least the claimed amount,
+/// in the network's USDC contract, to this wallet. A transaction that is not
+/// mined yet is retried with backoff for a quarter of an hour; a refusal is
+/// logged and dropped, and a contact whose payments are off is never applied.
+///
+async fn apply_payment_notices(
+    state: &Arc<App>,
+    signals: &[hush_core::ReceivedSignal],
+) -> bool {
+    {
+        let now = Instant::now();
+        let mut pending = state.pending_payments.lock().await;
+        for signal in signals {
+            let SignalBody::Payment {
+                txid,
+                amount,
+                symbol,
+            } = &signal.body
+            else {
+                continue;
+            };
+            // The chat offers one token. Verifying anything else would be a
+            // guess at a contract, and a guess is how a fake credit gets in.
+            if symbol != "USDC" {
+                eprintln!(
+                    "hush-daemon: payment notice from {} names an unsupported token ({symbol}); ignored",
+                    signal.from_nick
+                );
+                continue;
+            }
+            let Ok(amount) = amount.parse::<u128>() else {
+                continue;
+            };
+            if amount == 0 {
+                continue;
+            }
+            pending.entry(txid.clone()).or_insert(PendingPayment {
+                nick: signal.from_nick.clone(),
+                amount,
+                symbol: symbol.clone(),
+                first_seen: now,
+                attempts: 0,
+                next_try: now,
+            });
+        }
+    }
+
+    let due: Vec<(String, PendingPayment)> = {
+        let pending = state.pending_payments.lock().await;
+        if pending.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        pending
+            .iter()
+            .filter(|(_, p)| now >= p.next_try)
+            .map(|(txid, p)| (txid.clone(), p.clone()))
+            .collect()
+    };
+    if due.is_empty() {
+        return false;
+    }
+
+    let public = match state.wallet.public_state(relay_is_tor(state)).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hush-daemon: payment check deferred: {e}");
+            return false;
+        }
+    };
+    if !public.exists {
+        return false;
+    }
+    let Some(token) = usdc_contract(&public.ethereum_network) else {
+        return false;
+    };
+    let contacts = match state.worker.contacts().await {
+        WorkResult::Contacts(list) => list,
+        _ => Vec::new(),
+    };
+
+    let mut wrote = false;
+    for (txid, p) in due {
+        let allowed = contacts
+            .iter()
+            .find(|c| c.nickname == p.nick)
+            .map(|c| c.payments.allows())
+            .unwrap_or(false);
+        if !allowed {
+            // The user narrowed this relationship after the signal arrived, or
+            // the contact is gone. Nothing is written, and the notice is done.
+            state.pending_payments.lock().await.remove(&txid);
+            continue;
+        }
+        let retry = match state
+            .wallet
+            .verify_incoming_token(&txid, token, p.amount)
+            .await
+        {
+            Ok(TransferCheck::Confirmed { .. }) => {
+                let recorded = matches!(
+                    state
+                        .worker
+                        .record_payment(&p.nick, false, &p.amount.to_string(), &p.symbol, &txid)
+                        .await,
+                    WorkResult::PaymentRecorded(true)
+                );
+                wrote |= recorded;
+                state.pending_payments.lock().await.remove(&txid);
+                false
+            }
+            Ok(TransferCheck::Pending) => true,
+            Ok(TransferCheck::Refused(reason)) => {
+                eprintln!(
+                    "hush-daemon: payment notice from {} refused: {reason}",
+                    p.nick
+                );
+                state.pending_payments.lock().await.remove(&txid);
+                false
+            }
+            Err(e) => {
+                eprintln!("hush-daemon: payment check for {txid} failed: {e}");
+                true
+            }
+        };
+        if retry {
+            let mut pending = state.pending_payments.lock().await;
+            let expired = pending
+                .get(&txid)
+                .map(|e| e.first_seen.elapsed() > PAYMENT_VERIFY_TIMEOUT)
+                .unwrap_or(false);
+            if expired {
+                pending.remove(&txid);
+                eprintln!(
+                    "hush-daemon: payment {txid} was not confirmed in time; no chat line written"
+                );
+            } else if let Some(entry) = pending.get_mut(&txid) {
+                entry.attempts += 1;
+                let step = PAYMENT_RETRY_MIN * (1u32 << entry.attempts.min(4));
+                entry.next_try = Instant::now() + step.min(PAYMENT_RETRY_MAX);
+            }
+        }
+    }
+    wrote
 }
 
 async fn recv(
@@ -2222,6 +2524,53 @@ async fn recv(
             ))
         }
     };
+    // Payment notices are the one signal kind that writes into the chat, and
+    // only after the chain proves the transfer. Done before the response is
+    // built so the UI is told whether to re-read its history.
+    let chat_appended = apply_payment_notices(&state, &inbox.signals).await;
+    // Torrent offers are durable: the signal audit log stores only metadata, so
+    // the body is filed in the torrents sidecar here. A failure is logged and
+    // swallowed; the rest of the poll has already landed.
+    for signal in &inbox.signals {
+        if let SignalBody::TorrentOffer {
+            offer_id,
+            name,
+            hash,
+            size,
+        } = &signal.body
+        {
+            let offer = crate::torrents_store::TorrentOffer {
+                offer_id: offer_id.clone(),
+                from_nick: signal.from_nick.clone(),
+                from_account: signal.from_account.clone(),
+                name: name.clone(),
+                hash: hash.to_ascii_lowercase(),
+                size: *size,
+                received_at: crate::torrents_store::now_secs(),
+                status: crate::torrents_store::OfferStatus::Pending,
+                item_id: None,
+            };
+            if let Err(e) = state.torrents.add_offer(offer).await {
+                eprintln!(
+                    "hush-daemon: torrent offer from {} could not be stored: {e}",
+                    signal.from_nick
+                );
+            }
+        }
+    }
+    // A handshake move needs an answer: the peer's address was just stored, or
+    // they just allowed payments. Without this, whoever enabled payments second
+    // would send its address and never receive one back.
+    if !inbox.wallet_announce_to.is_empty() {
+        if let Err((_, Json(err))) =
+            announce_wallet_addresses_to(&state, Some(&inbox.wallet_announce_to)).await
+        {
+            eprintln!(
+                "hush-daemon: wallet announcement after a handshake failed: {}",
+                err.error
+            );
+        }
+    }
     // Paper payloads are not chat messages: they belong in the papers sidecar,
     // not the inbox. A payload this vault cannot use is logged rather than
     // failing the poll — the messages in the same batch have already landed,
@@ -2507,9 +2856,21 @@ async fn recv(
     }
     Ok(Json(RecvResponse {
         messages: inbox.messages.into_iter().filter_map(to_dto).collect(),
+        expire_messages: inbox
+            .ephemeral
+            .into_iter()
+            .map(|m| ExpireDto {
+                from: m.from_nick,
+                id: m.id,
+                text: m.body,
+                sent_ms: m.sent_ms,
+                expires_ms: m.expires_ms,
+            })
+            .collect(),
         signals: inbox.signals,
         signal_acks: inbox.signal_acks,
         warnings: inbox.warnings,
+        chat_appended,
     }))
 }
 /// `None` for an own-copy envelope: `recv` files those into the chat log itself
@@ -2610,7 +2971,8 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         | MessagePayload::ConclaveIntroReq { .. }
         | MessagePayload::ConclaveIntro { .. }
         | MessagePayload::Signal { .. }
-        | MessagePayload::SignalAck { .. } => None,
+        | MessagePayload::SignalAck { .. }
+        | MessagePayload::ExpireText { .. } => None,
         // A paper payload is not a chat message either: it is routed into the
         // paper store, never the inbox. A voice payload (Task 23) likewise
         // never renders in the inbox — its state surfaces through /api/voice/*.
@@ -7226,12 +7588,19 @@ async fn wallet_create(
 ) -> Result<Json<wallet::CreateResult>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let tor = relay_is_tor(&state);
-    state
+    let result = state
         .wallet
         .create(&body.network, &body.ethereum_network, body.mode, tor)
         .await
-        .map(Json)
-        .map_err(wallet_err)
+        .map_err(wallet_err)?;
+    // Discovery is part of creating a wallet: a trustee cannot pay an address
+    // they have never been told. Run it in the background so a slow relay does
+    // not hold the create response; the announce route can re-drive it.
+    let announce_state = state.clone();
+    tokio::spawn(async move {
+        let _ = announce_wallet_addresses(&announce_state).await;
+    });
+    Ok(Json(result))
 }
 
 async fn wallet_restore(
@@ -7240,7 +7609,7 @@ async fn wallet_restore(
 ) -> Result<Json<wallet::PublicState>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let tor = relay_is_tor(&state);
-    state
+    let result = state
         .wallet
         .restore(
             &body.mnemonic,
@@ -7250,8 +7619,248 @@ async fn wallet_restore(
             tor,
         )
         .await
-        .map(Json)
-        .map_err(wallet_err)
+        .map_err(wallet_err)?;
+    // A restored wallet has the same addresses as the one it replaces; telling
+    // trustees again is cheap and repairs an announcement that was lost. In the
+    // background for the same reason as create.
+    let announce_state = state.clone();
+    tokio::spawn(async move {
+        let _ = announce_wallet_addresses(&announce_state).await;
+    });
+    Ok(Json(result))
+}
+
+/// How many trustees a wallet announcement reached, and how many did not.
+#[derive(Serialize)]
+struct WalletAnnounceResult {
+    sent: usize,
+    failed: usize,
+}
+
+/// Tell every trustee this wallet's receive addresses.
+///
+/// The wallet owns the addresses; the signal is only discovery. Best effort per
+/// contact: one unreachable trustee must not fail the wallet operation that
+/// triggered the announcement. Contacts that denied signals are skipped.
+async fn announce_wallet_addresses(
+    state: &Arc<App>,
+) -> Result<(usize, usize), (StatusCode, Json<ApiError>)> {
+    announce_wallet_addresses_to(state, None).await
+}
+
+/// The same announcement, optionally limited to named trustees.
+///
+/// `None` is the wallet's "Share with trustees" action, which tells everyone
+/// who has payments on. `Some` is the answer to a handshake move from `recv`:
+/// announce only to the contacts that just shared an address or allowed
+/// payments, so one arrival does not fan out to the whole trust list.
+async fn announce_wallet_addresses_to(
+    state: &Arc<App>,
+    targets: Option<&[String]>,
+) -> Result<(usize, usize), (StatusCode, Json<ApiError>)> {
+    let tor = relay_is_tor(state);
+    let public = state.wallet.public_state(tor).await.map_err(wallet_err)?;
+    if !public.exists {
+        return Ok((0, 0));
+    }
+    let bitcoin = public
+        .chains
+        .iter()
+        .find(|c| c.chain == hush_wallet::chain::ChainId::Bitcoin)
+        .and_then(|c| c.address.clone());
+    let ethereum = public
+        .chains
+        .iter()
+        .find(|c| c.chain == hush_wallet::chain::ChainId::Ethereum)
+        .and_then(|c| c.address.clone());
+    if bitcoin.is_none() && ethereum.is_none() {
+        return Ok((0, 0));
+    }
+
+    let contacts = match map_err(state.worker.contacts().await)? {
+        WorkResult::Contacts(list) => list,
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "unexpected worker response".into(),
+                }),
+            ))
+        }
+    };
+    let body = SignalBody::WalletAddress { bitcoin, ethereum };
+    let (mut sent, mut failed) = (0usize, 0usize);
+    for contact in contacts {
+        if let Some(names) = targets {
+            if !names.iter().any(|n| n == &contact.nickname) {
+                continue;
+            }
+        }
+        if contact.signals == SignalPolicy::Deny
+            || !contact.payments.allows()
+            || !contact.peer_payments.allows()
+        {
+            continue;
+        }
+        match state
+            .worker
+            .send_signal(&contact.nickname, body.clone(), None, false)
+            .await
+        {
+            WorkResult::SignalId(_) => sent += 1,
+            _ => failed += 1,
+        }
+    }
+    Ok((sent, failed))
+}
+
+/// Re-announce this wallet's receive addresses to every trustee.
+async fn wallet_announce(
+    State(state): State<Arc<App>>,
+) -> Result<Json<WalletAnnounceResult>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let (sent, failed) = announce_wallet_addresses(&state).await?;
+    Ok(Json(WalletAnnounceResult { sent, failed }))
+}
+
+/// The canonical USDC contract for an Ethereum network.
+fn usdc_contract(network: &str) -> Option<&'static str> {
+    match network {
+        "mainnet" | "ethereum" => Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        "sepolia" | "testnet" => Some("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"),
+        _ => None,
+    }
+}
+
+/// Pay a trustee in USDC, using the address they announced.
+///
+/// The payment consent is enforced here, not only in the UI: a contact whose
+/// payments are off cannot be paid through this route, and one who has never
+/// announced an address has nowhere for the money to go.
+async fn wallet_pay_trustee(
+    State(state): State<Arc<App>>,
+    Json(body): Json<PayTrusteeRequest>,
+) -> Result<Json<wallet::SendResult>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let tor = relay_is_tor(&state);
+    let contacts = match map_err(state.worker.contacts().await)? {
+        WorkResult::Contacts(list) => list,
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "unexpected worker response".into(),
+                }),
+            ))
+        }
+    };
+    let contact = contacts
+        .into_iter()
+        .find(|c| c.nickname == body.nickname)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "contact not found".into(),
+                }),
+            )
+        })?;
+    if !contact.payments.allows() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "payments are off for this trustee".into(),
+            }),
+        ));
+    }
+    if !contact.signals.allows() {
+        // Wallet addresses and payment notices ride the sideband. Paying with
+        // the sideband off would move money the recipient cannot verify and
+        // would never see a chat line for, so it is refused rather than done
+        // silently.
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "signals are off for this trustee; payments need the trustee sideband"
+                    .into(),
+            }),
+        ));
+    }
+    if !contact.peer_payments.allows() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "this trustee is not accepting payments".into(),
+            }),
+        ));
+    }
+    let to = contact.wallet_ethereum.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "this trustee has not shared an Ethereum address".into(),
+            }),
+        )
+    })?;
+    let public = state.wallet.public_state(tor).await.map_err(wallet_err)?;
+    if !public.exists {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "create a wallet first".into(),
+            }),
+        ));
+    }
+    let token = match body.token {
+        Some(token) => token,
+        None => usdc_contract(&public.ethereum_network)
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError {
+                        error: "no default USDC contract for this Ethereum network".into(),
+                    }),
+                )
+            })?
+            .to_string(),
+    };
+    let amount_base = body.amount;
+    let request = hush_wallet::chain::SendRequest {
+        chain: hush_wallet::chain::ChainId::Ethereum,
+        to,
+        amount: amount_base.clone(),
+        fee_rate: None,
+        token: Some(token),
+    };
+    let result = state.wallet.send(request).await.map_err(wallet_err)?;
+
+    // The sender's line is written whether or not the peer is reachable: the
+    // money has already moved. The notice is best effort and carries only the
+    // evidence pointer; the recipient verifies it against the chain.
+    let symbol = "USDC".to_string();
+    if let WorkResult::Err(e) = state
+        .worker
+        .record_payment(&body.nickname, true, &amount_base, &symbol, &result.txid)
+        .await
+    {
+        eprintln!("hush-daemon: could not record the payment in chat: {e}");
+    }
+    let notice = SignalBody::Payment {
+        txid: result.txid.clone(),
+        amount: amount_base,
+        symbol,
+    };
+    if let WorkResult::Err(e) = state
+        .worker
+        .send_signal(&body.nickname, notice, None, false)
+        .await
+    {
+        eprintln!(
+            "hush-daemon: payment notice to {} could not be sent: {e}",
+            body.nickname
+        );
+    }
+    Ok(Json(result))
 }
 
 async fn wallet_address(
@@ -7392,6 +8001,22 @@ struct TorrentsIdRequest {
 }
 
 #[derive(Deserialize)]
+struct TorrentsShareRequest {
+    nickname: String,
+    /// An item in Active & Queue or an entry in the Library; the daemon looks
+    /// up its name and hash, so the UI never supplies the pointer itself.
+    id: String,
+}
+
+#[derive(Serialize)]
+struct TorrentsShareResponse {
+    offer_id: String,
+    /// The envelope id, so a later acknowledgement can be correlated.
+    signal_id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct TorrentsConcurrencyRequest {
     max: u32,
 }
@@ -7473,6 +8098,213 @@ async fn torrents_add_file(
         .await
         .map(Json)
         .map_err(torrents_err)
+}
+
+/// A trustee by local nickname, for the share route.
+async fn torrent_contact_by_nick(
+    state: &Arc<App>,
+    nickname: &str,
+) -> Result<ContactDto, (StatusCode, Json<ApiError>)> {
+    let list = match state.worker.contacts().await {
+        WorkResult::Contacts(list) => list,
+        WorkResult::Err(msg) => {
+            return Err((StatusCode::BAD_REQUEST, Json(ApiError { error: msg })))
+        }
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "unexpected worker response".into(),
+                }),
+            ))
+        }
+    };
+    list.into_iter().find(|c| c.nickname == nickname).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "no such trustee".into(),
+            }),
+        )
+    })
+}
+
+/// A trustee by account id, for an offer whose nickname may have changed.
+async fn torrent_contact_by_account(
+    state: &Arc<App>,
+    account_id: &str,
+) -> Result<ContactDto, (StatusCode, Json<ApiError>)> {
+    let list = match state.worker.contacts().await {
+        WorkResult::Contacts(list) => list,
+        WorkResult::Err(msg) => {
+            return Err((StatusCode::BAD_REQUEST, Json(ApiError { error: msg })))
+        }
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "unexpected worker response".into(),
+                }),
+            ))
+        }
+    };
+    list.into_iter()
+        .find(|c| c.protocol_name == account_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "that trustee is no longer in your trusts".into(),
+                }),
+            )
+        })
+}
+
+/// Offer one locally held torrent to a trustee. The daemon resolves the name
+/// and hash from its own state, so the UI cannot invent a destination.
+async fn torrents_share(
+    State(state): State<Arc<App>>,
+    Json(body): Json<TorrentsShareRequest>,
+) -> Result<Json<TorrentsShareResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let contact = torrent_contact_by_nick(&state, &body.nickname).await?;
+    if !contact.signals.allows() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "signals are off for this trustee; torrent sharing needs the sideband"
+                    .into(),
+            }),
+        ));
+    }
+    if !contact.torrents.allows() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "torrent sharing is off for this trustee".into(),
+            }),
+        ));
+    }
+    if !contact.peer_torrents.allows() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "this trustee is not accepting torrent shares".into(),
+            }),
+        ));
+    }
+    let (name, hash, size) = state
+        .torrents
+        .shareable(&body.id)
+        .await
+        .map_err(torrents_err)?;
+    let offer_id = uuid::Uuid::new_v4().to_string();
+    let signal = SignalBody::TorrentOffer {
+        offer_id: offer_id.clone(),
+        name: name.clone(),
+        hash,
+        size,
+    };
+    match state
+        .worker
+        .send_signal(&body.nickname, signal, None, false)
+        .await
+    {
+        WorkResult::SignalId(signal_id) => Ok(Json(TorrentsShareResponse {
+            offer_id,
+            signal_id,
+            name,
+        })),
+        WorkResult::Err(msg) => Err((StatusCode::BAD_REQUEST, Json(ApiError { error: msg }))),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "unexpected worker response".into(),
+            }),
+        )),
+    }
+}
+
+/// Accept an offer, queue the torrent, and tell the sender.
+async fn torrents_accept_offer(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let offer = state
+        .torrents
+        .offer(&id)
+        .await
+        .map_err(torrents_err)?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "no such torrent offer".into(),
+                }),
+            )
+        })?;
+    if offer.status != crate::torrents_store::OfferStatus::Pending {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "that offer has already been answered".into(),
+            }),
+        ));
+    }
+    let contact = torrent_contact_by_account(&state, &offer.from_account).await?;
+    if !contact.torrents.allows() || !contact.peer_torrents.allows() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "torrent sharing is off for this trustee".into(),
+            }),
+        ));
+    }
+    let (offer, public) = state
+        .torrents
+        .accept_offer(&id)
+        .await
+        .map_err(torrents_err)?;
+    let body = SignalBody::TorrentResponse {
+        offer_id: offer.offer_id.clone(),
+        accepted: true,
+    };
+    if let WorkResult::Err(e) = state
+        .worker
+        .send_signal(&contact.nickname, body, None, false)
+        .await
+    {
+        eprintln!("hush-daemon: torrent acceptance response failed: {e}");
+    }
+    Ok(Json(public))
+}
+
+/// Decline an offer and tell the sender, if they are still a contact.
+async fn torrents_decline_offer(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let (offer, public) = state
+        .torrents
+        .decline_offer(&id)
+        .await
+        .map_err(torrents_err)?;
+    if let Ok(contact) = torrent_contact_by_account(&state, &offer.from_account).await {
+        let body = SignalBody::TorrentResponse {
+            offer_id: offer.offer_id.clone(),
+            accepted: false,
+        };
+        if let WorkResult::Err(e) = state
+            .worker
+            .send_signal(&contact.nickname, body, None, false)
+            .await
+        {
+            eprintln!("hush-daemon: torrent decline response failed: {e}");
+        }
+    }
+    Ok(Json(public))
 }
 
 async fn torrents_pause(
@@ -7604,6 +8436,7 @@ mod drops_api_tests {
             voice_planes: Mutex::new(HashMap::new()),
             voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
+            pending_payments: Mutex::new(HashMap::new()),
         })
     }
 
@@ -7886,6 +8719,7 @@ mod wallet_api_tests {
             voice_planes: Mutex::new(HashMap::new()),
             voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
+            pending_payments: Mutex::new(HashMap::new()),
         });
         app.wallet
             .apply_relay(false, Some(TEST_SOCKS.to_string()))
@@ -8410,6 +9244,7 @@ mod notes_api_tests {
             voice_planes: Mutex::new(HashMap::new()),
             voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
+            pending_payments: Mutex::new(HashMap::new()),
         })
     }
 
@@ -10279,6 +11114,59 @@ mod contacts_api_tests {
             assert_eq!(
                 list[0]["inbound_ready"], true,
                 "{who} must read ready after draining the peer's grant: {list}"
+            );
+        }
+    }
+}
+
+/// Expiring chat lines over the daemon API: the route the composer calls, the
+/// out-of-band field the poll returns, and the absence of a history row on
+/// either side.
+#[cfg(test)]
+mod expire_api_tests {
+    use super::api_test_harness::pair;
+    use super::*;
+
+    #[tokio::test]
+    async fn an_expiring_line_crosses_the_api_and_leaves_no_history() {
+        let (_relay, _db, a, b) = pair().await;
+        // Drain the queue grants, then make the recipient present: chat is live
+        // only, and the send route says so instead of queueing for later.
+        a.poll().await;
+        b.poll().await;
+        let (status, view) = b.post("/api/presence/heartbeat", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{view}");
+
+        let body = serde_json::json!({
+            "to": "bo",
+            "text": "burn after reading",
+            "ttl_ms": 30_000,
+        })
+        .to_string();
+        let (status, sent) = a.post("/api/send-expire", Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        let id = sent["id"].as_str().unwrap().to_string();
+        let expires_ms = sent["expires_ms"].as_u64().unwrap();
+        assert!(expires_ms > 0);
+
+        let inbox = b.poll().await;
+        let lines = inbox["expire_messages"].as_array().unwrap();
+        assert_eq!(lines.len(), 1, "{inbox}");
+        assert_eq!(lines[0]["from"], "ada");
+        assert_eq!(lines[0]["id"], id);
+        assert_eq!(lines[0]["text"], "burn after reading");
+        assert_eq!(lines[0]["expires_ms"], expires_ms);
+        assert!(
+            inbox["messages"].as_array().unwrap().is_empty(),
+            "an expiring line is not a filed chat record: {inbox}"
+        );
+
+        for (who, member) in [("ada", &a), ("bo", &b)] {
+            let (status, history) = member.get("/api/messages").await;
+            assert_eq!(status, StatusCode::OK, "{history}");
+            assert!(
+                history.as_array().unwrap().is_empty(),
+                "{who} must have no chat row for it: {history}"
             );
         }
     }

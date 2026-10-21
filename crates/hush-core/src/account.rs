@@ -18,12 +18,13 @@ use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
 use crate::error::Error;
 use crate::invite::{InvitePayload, ShortInvite};
 use crate::message::{
-    InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper, ReceivedVoice,
+    InboxResult, ReceivedAttachment, ReceivedEphemeral, ReceivedMessage, ReceivedPaper,
+    ReceivedVoice,
 };
 use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeReach, TrusteeState};
 use crate::payload::{
-    MailAttachment, MessagePayload, PaperDescriptor, VoiceDescriptor, MAX_INLINE_FILE_BYTES,
-    MAX_MAIL_ATTACHMENTS,
+    MailAttachment, MessagePayload, PaperDescriptor, VoiceDescriptor, MAX_EXPIRE_TEXT_BYTES,
+    MAX_EXPIRE_TTL_MS, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS, MIN_EXPIRE_TTL_MS,
 };
 use crate::prekey::PreKeyRecord;
 use crate::recovery::{
@@ -40,8 +41,8 @@ use crate::signal_protocol::{
     verify_queue_grant,
 };
 use crate::signals::{
-    prune_signal_log, ReceivedSignal, ReceivedSignalAck, SignalBody, SignalPolicy, SignalRecord,
-    SignalStatus, MAX_SIGNAL_BYTES,
+    prune_signal_log, PaymentPolicy, ReceivedSignal, ReceivedSignalAck, SignalBody, SignalPolicy,
+    SignalRecord, SignalStatus, TorrentPolicy, MAX_SIGNAL_BYTES,
 };
 use crate::vault::{BlobId, DropDrainKey, Vault};
 use crate::wire::{decode_relay_blob, encode_relay_blob};
@@ -141,6 +142,15 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The peer's payment choice before they have announced one.
+///
+/// Optimistic, unlike our own switch (`PaymentPolicy::Deny`): a peer on an
+/// older build never sends `PaymentConsent`, and their announced address is
+/// already evidence they allowed payments. An explicit `deny` overrides this.
+fn peer_payments_default() -> PaymentPolicy {
+    PaymentPolicy::Allow
+}
+
 /// A contact: one account, one device.
 ///
 /// The routing details the send path needs live here directly. Before
@@ -225,6 +235,46 @@ pub struct Contact {
     /// acknowledgement so a denied relationship produces no extra traffic.
     #[serde(default)]
     pub signals: SignalPolicy,
+    /// Whether this relationship may carry payments.
+    ///
+    /// Off by default: money is opt-in on both sides. When allowed,
+    /// wallet-address signals are accepted and the chat offers a payment
+    /// action; when denied, addresses are neither sent nor stored and no
+    /// payment route will run.
+    #[serde(default)]
+    pub payments: PaymentPolicy,
+    /// The peer's payment choice, as they last announced it.
+    ///
+    /// Optimistic until told otherwise: a peer that predates consent signals
+    /// never sends one, and their announced address is already evidence they
+    /// allowed payments at the time. An explicit `deny` is what turns it off,
+    /// and it also clears the stored address so this side cannot pay either.
+    #[serde(default = "peer_payments_default")]
+    pub peer_payments: PaymentPolicy,
+    /// Whether this relationship may carry torrent offers.
+    ///
+    /// Off by default on both sides: a torrent offer sends a pointer that makes
+    /// the recipient's vault fetch the content, so it is opt-in exactly like
+    /// payments. The local switch gates sending; the peer's announced choice
+    /// gates accepting, and both must allow it.
+    #[serde(default)]
+    pub torrents: TorrentPolicy,
+    /// The peer's torrent-sharing choice, as they last announced it.
+    ///
+    /// Deny until they say otherwise: unlike payments, there is no older-build
+    /// relationship to preserve. A peer that never sends `TorrentConsent` has
+    /// not opted in.
+    #[serde(default)]
+    pub peer_torrents: TorrentPolicy,
+    /// The Bitcoin receive address this contact announced, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_bitcoin: Option<String>,
+    /// The Ethereum receive address this contact announced, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet_ethereum: Option<String>,
+    /// When the contact last announced a wallet address, Unix ms. 0 = never.
+    #[serde(default)]
+    pub wallet_updated_ms: u64,
 }
 
 impl<'de> Deserialize<'de> for Contact {
@@ -279,6 +329,20 @@ impl<'de> Deserialize<'de> for Contact {
                 place_of: Option<String>,
                 #[serde(default)]
                 signals: SignalPolicy,
+                #[serde(default)]
+                payments: PaymentPolicy,
+                #[serde(default = "peer_payments_default")]
+                peer_payments: PaymentPolicy,
+                #[serde(default)]
+                torrents: TorrentPolicy,
+                #[serde(default)]
+                peer_torrents: TorrentPolicy,
+                #[serde(default)]
+                wallet_bitcoin: Option<String>,
+                #[serde(default)]
+                wallet_ethereum: Option<String>,
+                #[serde(default)]
+                wallet_updated_ms: u64,
             },
             Devices {
                 nickname: String,
@@ -319,6 +383,13 @@ impl<'de> Deserialize<'de> for Contact {
                 peer_reach,
                 place_of,
                 signals,
+                payments,
+                peer_payments,
+                torrents,
+                peer_torrents,
+                wallet_bitcoin,
+                wallet_ethereum,
+                wallet_updated_ms,
             } => Contact {
                 nickname,
                 account_id,
@@ -334,6 +405,13 @@ impl<'de> Deserialize<'de> for Contact {
                 peer_reach,
                 place_of,
                 signals,
+                payments,
+                peer_payments,
+                torrents,
+                peer_torrents,
+                wallet_bitcoin,
+                wallet_ethereum,
+                wallet_updated_ms,
             },
             Repr::Devices {
                 nickname,
@@ -364,6 +442,13 @@ impl<'de> Deserialize<'de> for Contact {
                     peer_reach: TrusteeReach::Full,
                     place_of: None,
                     signals: SignalPolicy::Allow,
+                    payments: PaymentPolicy::Deny,
+                    peer_payments: PaymentPolicy::Allow,
+                    torrents: TorrentPolicy::Deny,
+                    peer_torrents: TorrentPolicy::Deny,
+                    wallet_bitcoin: None,
+                    wallet_ethereum: None,
+                    wallet_updated_ms: 0,
                 }
             }
             Repr::Legacy {
@@ -390,6 +475,13 @@ impl<'de> Deserialize<'de> for Contact {
                     peer_reach: TrusteeReach::Full,
                     place_of: None,
                     signals: SignalPolicy::Allow,
+                    payments: PaymentPolicy::Deny,
+                    peer_payments: PaymentPolicy::Allow,
+                    torrents: TorrentPolicy::Deny,
+                    peer_torrents: TorrentPolicy::Deny,
+                    wallet_bitcoin: None,
+                    wallet_ethereum: None,
+                    wallet_updated_ms: 0,
                 }
             }
         })
@@ -1901,6 +1993,13 @@ impl Account {
             peer_reach: TrusteeReach::Full,
             place_of: None,
             signals: SignalPolicy::Allow,
+            payments: PaymentPolicy::Deny,
+            peer_payments: PaymentPolicy::Allow,
+            torrents: TorrentPolicy::Deny,
+            peer_torrents: TorrentPolicy::Deny,
+            wallet_bitcoin: None,
+            wallet_ethereum: None,
+            wallet_updated_ms: 0,
         });
         // Adding a contact clears any revocation left from a previous delete, so
         // a re-added contact is granted a queue again instead of being treated
@@ -2069,6 +2168,91 @@ impl Account {
         Ok(())
     }
 
+    /// Turn payments on or off for one trustee.
+    ///
+    /// Off by default, and a two-sided agreement: the choice is announced to
+    /// the peer, whose copy of this consent gates its own send route and
+    /// clears the address on a denial. When off locally, an inbound wallet
+    /// address is audited but not stored, and the daemon refuses to pay this
+    /// contact. When on, the chat offers the payment action.
+    pub async fn set_contact_payments(
+        &mut self,
+        nickname: &str,
+        policy: PaymentPolicy,
+    ) -> Result<(), Error> {
+        let changed = {
+            let contact = self
+                .state
+                .contacts
+                .iter_mut()
+                .find(|c| c.nickname == nickname)
+                .ok_or(Error::ContactNotFound)?;
+            if contact.payments == policy {
+                false
+            } else {
+                contact.payments = policy;
+                // Turning money off also forgets the address it would have
+                // used: a disabled relationship should not keep a payment
+                // destination on file.
+                if policy == PaymentPolicy::Deny {
+                    contact.wallet_bitcoin = None;
+                    contact.wallet_ethereum = None;
+                    contact.wallet_updated_ms = 0;
+                }
+                true
+            }
+        };
+        if changed {
+            self.save().await?;
+        }
+        // Announce even when the value did not change: a call after enabling
+        // signals is how a choice made while the sideband was off reaches the
+        // peer. Best effort — the local state has already applied, and a peer
+        // that is offline gets it from the store-and-forward queue.
+        let body = SignalBody::PaymentConsent {
+            allow: policy.allows(),
+        };
+        let _ = self.send_signal(nickname, body, None, false).await;
+        Ok(())
+    }
+
+    /// Turn torrent sharing on or off for one trustee.
+    ///
+    /// Off by default on both sides. The local switch gates sending; the
+    /// announced choice lets the peer know whether an offer may be accepted.
+    /// Nothing is stored on the contact beyond the two choices: a torrent offer
+    /// is a pointer to content the recipient fetches independently.
+    pub async fn set_contact_torrents(
+        &mut self,
+        nickname: &str,
+        policy: TorrentPolicy,
+    ) -> Result<(), Error> {
+        let changed = {
+            let contact = self
+                .state
+                .contacts
+                .iter_mut()
+                .find(|c| c.nickname == nickname)
+                .ok_or(Error::ContactNotFound)?;
+            if contact.torrents == policy {
+                false
+            } else {
+                contact.torrents = policy;
+                true
+            }
+        };
+        if changed {
+            self.save().await?;
+        }
+        // Announce even when unchanged, for the same reason as payments: a
+        // toggle made while signals were off has to be able to cross later.
+        let body = SignalBody::TorrentConsent {
+            allow: policy.allows(),
+        };
+        let _ = self.send_signal(nickname, body, None, false).await;
+        Ok(())
+    }
+
     /// The audit log for one trustee, newest first.
     ///
     /// Ids and kinds only, never the bodies: this is the "show me what the
@@ -2202,6 +2386,68 @@ impl Account {
         self.chat_log.append_text(&master, nickname, true, text)?;
         self.enforce_chat_retention();
         Ok(())
+    }
+
+    /// Send a chat line that both sides delete after `ttl_ms`.
+    ///
+    /// Live-only, like [`Account::send_text`], and deliberately not filed on
+    /// either side: no chat row is written here and `recv` hands the inbound
+    /// copy to the caller out of band. The daemon owns the in-memory copy until
+    /// the deadline, and a restart loses it — which is the point.
+    ///
+    /// Returns the message id and the absolute Unix-millisecond deadline, so
+    /// the UI can arm the same timer the receiver will use.
+    pub async fn send_expire_text(
+        &mut self,
+        nickname: &str,
+        text: &str,
+        ttl_ms: u64,
+    ) -> Result<(String, u64), Error> {
+        if text.trim().is_empty() {
+            return Err(Error::InvalidExpire);
+        }
+        if text.len() > MAX_EXPIRE_TEXT_BYTES {
+            return Err(Error::ExpireTooLarge(MAX_EXPIRE_TEXT_BYTES));
+        }
+        if !(MIN_EXPIRE_TTL_MS..=MAX_EXPIRE_TTL_MS).contains(&ttl_ms) {
+            return Err(Error::InvalidExpire);
+        }
+        let sent_ms = now_ms();
+        let expires_ms = sent_ms.saturating_add(ttl_ms);
+        let id = Uuid::new_v4().to_string();
+        self.send_payload(
+            nickname,
+            MessagePayload::ExpireText {
+                id: id.clone(),
+                sent_ms,
+                expires_ms,
+                body: text.to_string(),
+            },
+        )
+        .await?;
+        Ok((id, expires_ms))
+    }
+
+    /// Record a token payment in the 1:1 log, without sending anything.
+    ///
+    /// The sender records after the transaction is broadcast; the daemon
+    /// records a received payment only after the chain confirms the transfer.
+    /// Returns false when this contact already has a record for `txid`, so a
+    /// retried notice cannot draw a second line in the chat.
+    pub fn record_payment(
+        &mut self,
+        nickname: &str,
+        outgoing: bool,
+        amount: &str,
+        symbol: &str,
+        txid: &str,
+    ) -> Result<bool, Error> {
+        let master = *self.vault.master_key();
+        let added = self
+            .chat_log
+            .append_payment(&master, nickname, outgoing, amount, symbol, txid)?;
+        self.enforce_chat_retention();
+        Ok(added)
     }
 
     pub async fn send_file(&mut self, nickname: &str, path: &Path) -> Result<(), Error> {
@@ -4984,11 +5230,15 @@ impl Account {
         }
 
         let mut out = Vec::new();
+        let mut ephemeral = Vec::new();
         let mut papers = Vec::new();
         let mut voices = Vec::new();
         let mut zine_grants = Vec::new();
         let mut signals = Vec::new();
         let mut signal_acks = Vec::new();
+        // Contacts whose handshake moved in a way that needs our address:
+        // their address was just stored, or they just allowed payments.
+        let mut wallet_announce_to = Vec::new();
         let mut warnings = Vec::new();
         let mut dirty = false;
         // Who was joined before this poll, so a trustee that joins during it can
@@ -5196,6 +5446,71 @@ impl Account {
                         continue;
                     }
 
+                    // An expiring chat line. It is live chat, so the same reach
+                    // gate as `Text`/`File` applies, but it is never filed: the
+                    // line goes out of band and the UI forgets it at the
+                    // deadline. An expired one is consumed silently — warning
+                    // about a message the user was never meant to see is noise.
+                    if let MessagePayload::ExpireText {
+                        id,
+                        sent_ms,
+                        expires_ms,
+                        body,
+                    } = &payload
+                    {
+                        if !self
+                            .effective_reach_for_account(&from_account)
+                            .allows_live()
+                        {
+                            warnings.push(format!(
+                                "An expiring message from {nick} was refused — this is a mail-only relationship."
+                            ));
+                            consume!(blob_id);
+                            dirty = true;
+                            continue;
+                        }
+                        if id.is_empty() || id.len() > 128 {
+                            warnings.push(format!(
+                                "An expiring message from {nick} had an invalid id and was dropped."
+                            ));
+                            consume!(blob_id);
+                            continue;
+                        }
+                        if body.trim().is_empty() || body.len() > MAX_EXPIRE_TEXT_BYTES {
+                            warnings.push(format!(
+                                "An expiring message from {nick} was malformed and was dropped."
+                            ));
+                            consume!(blob_id);
+                            continue;
+                        }
+                        let now = now_ms();
+                        if *expires_ms <= now {
+                            // Expired in flight: consume it silently.
+                            consume!(blob_id);
+                            continue;
+                        }
+                        // A peer must not be able to pin a line in memory for
+                        // longer than the feature allows. The sender checks its
+                        // own clock; this checks the deadline it actually sent.
+                        if expires_ms.saturating_sub(now) > MAX_EXPIRE_TTL_MS {
+                            warnings.push(format!(
+                                "An expiring message from {nick} had too long a deadline and was dropped."
+                            ));
+                            consume!(blob_id);
+                            continue;
+                        }
+                        ephemeral.push(ReceivedEphemeral {
+                            from_account: from_account.clone(),
+                            from_nick: nick.clone(),
+                            id: id.clone(),
+                            sent_ms: *sent_ms,
+                            expires_ms: *expires_ms,
+                            body: body.clone(),
+                        });
+                        consume!(blob_id);
+                        continue;
+                    }
+
                     // A trustee signal: a typed sideband payload. It is consumed
                     // here and never rendered as a chat message; the daemon gets
                     // the decoded body and decides what the kind means.
@@ -5239,6 +5554,16 @@ impl Account {
                         if id.is_empty() || id.len() > 128 {
                             warnings.push(format!(
                                 "A signal from {nick} had an invalid id and was dropped."
+                            ));
+                            consume!(blob_id);
+                            continue;
+                        }
+                        // A known kind is validated on arrival too: the sender's
+                        // check is not a guarantee, and a wallet address is
+                        // written to the contact record.
+                        if body.is_supported() && body.validate().is_err() {
+                            warnings.push(format!(
+                                "A signal from {nick} was malformed and was dropped."
                             ));
                             consume!(blob_id);
                             continue;
@@ -5317,15 +5642,124 @@ impl Account {
                         // An unknown kind is audited and acknowledged but never
                         // handed to a feature: there is nothing here that could
                         // apply it.
-                        if supported {
-                            signals.push(ReceivedSignal {
-                                from_account: from_account.clone(),
-                                from_nick: nick.clone(),
-                                id: id.clone(),
-                                sent_ms: *sent_ms,
-                                expires_ms: *expires_ms,
-                                body: body.clone(),
-                            });
+                        match body {
+                            // A core-applied kind: the contact record is the
+                            // destination, so the daemon does not need to see
+                            // it. An address change is recorded with its time,
+                            // which is what the send card warns on.
+                            SignalBody::WalletAddress { bitcoin, ethereum } => {
+                                if let Some(c) = self
+                                    .state
+                                    .contacts
+                                    .iter_mut()
+                                    .find(|c| c.account_id == from_account)
+                                {
+                                    // Payments are opt-in on both sides: an
+                                    // address from a contact whose payments are
+                                    // off is audited and acknowledged, but not
+                                    // stored where a send could use it.
+                                    if c.payments.allows() && c.peer_payments.allows() {
+                                        let mut changed = false;
+                                        if c.wallet_bitcoin != *bitcoin {
+                                            c.wallet_bitcoin = bitcoin.clone();
+                                            changed = true;
+                                        }
+                                        if c.wallet_ethereum != *ethereum {
+                                            c.wallet_ethereum = ethereum.clone();
+                                            changed = true;
+                                        }
+                                        if changed {
+                                            c.wallet_updated_ms = now_ms();
+                                            wallet_announce_to.push(nick.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            // A peer announcing its own payment choice. Turning
+                            // it off also clears the address this vault would
+                            // have paid, so one side's decision stops both.
+                            SignalBody::PaymentConsent { allow } => {
+                                let policy = if *allow {
+                                    PaymentPolicy::Allow
+                                } else {
+                                    PaymentPolicy::Deny
+                                };
+                                if let Some(c) = self
+                                    .state
+                                    .contacts
+                                    .iter_mut()
+                                    .find(|c| c.account_id == from_account)
+                                {
+                                    if c.peer_payments != policy {
+                                        c.peer_payments = policy;
+                                        if policy == PaymentPolicy::Allow {
+                                            // They just opened the relationship;
+                                            // answer with our address so they can
+                                            // pay, not only be paid.
+                                            wallet_announce_to.push(nick.clone());
+                                        }
+                                        if policy == PaymentPolicy::Deny {
+                                            c.wallet_bitcoin = None;
+                                            c.wallet_ethereum = None;
+                                            c.wallet_updated_ms = 0;
+                                        }
+                                    }
+                                }
+                            }
+                            // The peer's torrent-sharing choice. Unlike
+                            // payments there is no address handshake to re-run;
+                            // the local switch and this one are the whole gate.
+                            SignalBody::TorrentConsent { allow } => {
+                                let policy = if *allow {
+                                    TorrentPolicy::Allow
+                                } else {
+                                    TorrentPolicy::Deny
+                                };
+                                if let Some(c) = self
+                                    .state
+                                    .contacts
+                                    .iter_mut()
+                                    .find(|c| c.account_id == from_account)
+                                {
+                                    c.peer_torrents = policy;
+                                }
+                            }
+                            // A torrent offer is data for the torrents feature,
+                            // and only when both sides have opted in. With the
+                            // receiver's switch off it is audited, acknowledged
+                            // and dropped rather than parked on disk.
+                            SignalBody::TorrentOffer { .. } => {
+                                let allowed = self
+                                    .state
+                                    .contacts
+                                    .iter()
+                                    .find(|c| c.account_id == from_account)
+                                    .map(|c| c.torrents.allows() && c.peer_torrents.allows())
+                                    .unwrap_or(false);
+                                if allowed && body.validate().is_ok() {
+                                    signals.push(ReceivedSignal {
+                                        from_account: from_account.clone(),
+                                        from_nick: nick.clone(),
+                                        id: id.clone(),
+                                        sent_ms: *sent_ms,
+                                        expires_ms: *expires_ms,
+                                        body: body.clone(),
+                                    });
+                                }
+                            }
+                            // A daemon-owned kind: hand the body over and let
+                            // the feature apply it.
+                            _ if supported => {
+                                signals.push(ReceivedSignal {
+                                    from_account: from_account.clone(),
+                                    from_nick: nick.clone(),
+                                    id: id.clone(),
+                                    sent_ms: *sent_ms,
+                                    expires_ms: *expires_ms,
+                                    body: body.clone(),
+                                });
+                            }
+                            _ => {}
                         }
                         consume!(blob_id);
                         dirty = true;
@@ -5677,7 +6111,8 @@ impl Account {
                     | MessagePayload::PlaceAdoptAck { .. }
                     | MessagePayload::PlaceIntroduce { .. }
                     | MessagePayload::Signal { .. }
-                    | MessagePayload::SignalAck { .. } => {
+                    | MessagePayload::SignalAck { .. }
+                    | MessagePayload::ExpireText { .. } => {
                         unreachable!("control payload handled above")
                     }
                     // A paper payload is not a chat message, so it must not
@@ -5866,10 +6301,12 @@ impl Account {
             .collect();
         Ok(InboxResult {
             messages: out,
+            ephemeral,
             papers,
             voices,
             signals,
             signal_acks,
+            wallet_announce_to,
             joined,
             departed,
             zine_grants,
@@ -6515,6 +6952,13 @@ mod tests {
             peer_reach: TrusteeReach::Full,
             place_of: None,
             signals: SignalPolicy::Allow,
+            payments: PaymentPolicy::Deny,
+            peer_payments: PaymentPolicy::Allow,
+            torrents: TorrentPolicy::Deny,
+            peer_torrents: TorrentPolicy::Deny,
+            wallet_bitcoin: None,
+            wallet_ethereum: None,
+            wallet_updated_ms: 0,
         });
     }
 

@@ -89,6 +89,14 @@ test("our own message after a trustee's starts a new run", () => {
   assert.equal(plan.continuesRun, false);
 });
 
+test("a payment line never joins the run around it", () => {
+  const payment = { ...msg("p", false), kind: "payment" };
+  const thread = [msg("a", false), payment, msg("b", false)];
+  // Neither the bubble before it nor the one after may absorb the system line.
+  assert.equal(planAppend(["a"], thread)?.continuesRun, false);
+  assert.equal(planAppend(["a", "p"], thread)?.continuesRun, false);
+});
+
 // --- Several arrivals at once ---
 
 test("a burst is planned as one append, in order", () => {

@@ -7,6 +7,229 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-21 — Torrent sharing (`/torrent`) [FIXED / OPEN]
+
+### Consent made while signals were off was lost [FIXED]
+
+- Attempted: add a torrent-sharing choice that is announced to the peer, like payments.
+- Symptom: enabling torrents while the sideband was off saved the local choice but the
+  `TorrentConsent` send was refused, and turning signals on later only re-announced wallet
+  addresses. The peer stayed at `peer_torrents = deny` until the user toggled torrents again. The
+  same gap existed for payments.
+- Resolution: `set_contact_payments` and `set_contact_torrents` now announce the current choice even
+  when the stored value did not change; the trust menu's signals toggle re-sends payment and torrent
+  consent before announcing the wallet address. `torrent_consent_travels_both_ways` and the payment
+  tests still pass.
+- Lesson: an announced choice made while the transport is off is not delivered later by the store;
+  the re-enable path has to replay it.
+
+### The invalid-offer test could not reach the inbound path [FIXED]
+
+- Attempted: pin the receiver-side validation of a forged `TorrentOffer` by sending one with an
+  `&` in its hash and expecting `recv` to drop it.
+- Symptom: the test failed at `send_signal(...).unwrap()` with `InvalidSignal` before any relay
+  traffic; outbound validation refuses to put the body on the wire.
+- Resolution: changed the test to assert the outbound refusal (`an_invalid_torrent_offer_cannot_be_sent`).
+  The inbound `body.validate()` branch is covered by the unit validation tests and remains in the
+  receive path, but an end-to-end forged-body test would need a lower-level delivery helper.
+- Lesson: `send_signal` is a validated boundary; a test that needs an invalid body on the wire has
+  to bypass it deliberately, and should say so.
+
+### A 64-character v2 info hash may not resolve from a `btih` magnet [OPEN]
+
+- Attempted: accept the hash shapes TorBox can return (32-64 alphanumeric) and build a hash-only
+  magnet on the recipient.
+- Symptom: not observed yet. A 64-character hash is a v2 multihash and normally needs
+  `xt=urn:btmh:1220…`; `magnet_for` always writes `btih`. TorBox's handling of a 64-char `btih`
+  was not verified (no live key in this environment).
+- Resolution: none yet. The common v1 32/40-character hashes are covered. Either reject 64-character
+  hashes in `valid_offer_hash` and the picker, or add the `btmh` form after testing against TorBox.
+- Lesson: accepting a broad hash shape in validation is not the same as supporting the magnet form
+  it implies.
+
+### The unknown-kind test used `torrent_offer` as its fake future kind [FIXED]
+
+- Attempted: add `SignalBody::TorrentOffer` to the sideband and run the core signal tests.
+- Symptom: `signals::tests::an_unknown_kind_decodes_to_unknown_instead_of_failing` failed with
+  `Error("missing field `offer_id`", line: 0, column: 0)`. The fixture had used
+  `{"kind":"torrent_offer",...}` as a hypothetical kind that no build knew.
+- Resolution: changed the fixture to `{"kind":"something_new",...}`; the behaviour under test is
+  unknown-tag tolerance, not that specific name.
+- Lesson: using a plausible future name as an "unknown" fixture turns a harmless test into a
+  collision the day the feature lands. Use a name that cannot become real.
+
+## 2026-10-21 — Expiring chat messages (`/expire`) [FIXED / OPEN]
+
+### `icon("clock")` was not a key the icon map exports [FIXED]
+
+- Attempted: draw a small clock beside the "Ephemeral · not saved" mark in a bubble.
+- Symptom: `npx tsc --noEmit` failed with `Argument of type '"clock"' is not assignable to
+  parameter of type ...`; the map had `outbox: Clock` but no `clock` key.
+- Resolution: added `clock: Clock` to `ICONS` in `apps/hush-tauri/src/lib/icons.ts`, leaving the
+  existing `outbox` alias alone.
+- Lesson: the icon helper is keyed by the map, so a semantic name has to be added even when the
+  same component is already imported under another key.
+
+### The expiry listener was typed with one argument and called with two [FIXED]
+
+- Attempted: let the chat store tell the shell which message reached its deadline, so the bubble
+  could be removed without a full thread redraw.
+- Symptom: `npx tsc --noEmit` reported `Target signature provides too few arguments. Expected 2 or
+  more, but got 1` at the `onEphemeralExpired` registration.
+- Resolution: changed `ExpiryListener` to `(nick, id)` and passed `msg.id` through the timer. No
+  runtime behaviour changed beyond the listener receiving the id it was always going to need.
+- Lesson: the component that removes a bubble needs the id, not only the contact; type the callback
+  at the point where the event is emitted, not at the registration site.
+
+### The new wire variant broke `hush-cli`'s exhaustive match [FIXED]
+
+- Attempted: check the whole workspace after adding `MessagePayload::ExpireText`.
+- Symptom: `cargo check --workspace --all-targets` failed with
+  `error[E0004]: non-exhaustive patterns: MessagePayload::ExpireText { .. } not covered` at
+  `crates/hush-cli/src/main.rs:255`.
+- Resolution: added the variant to the control-payload arm with a comment that it arrives through
+  `inbox.ephemeral`, and made the CLI's `recv` print those lines with an `(expiring)` marker. The
+  arm is unreachable for filed messages by construction, but the compiler is right to demand it.
+- Lesson: `cargo check -p hush-core -p hush-daemon` is not enough for a new `MessagePayload`
+  variant; the CLI has its own exhaustive match and only the workspace check sees it.
+
+### `cargo fmt --all -- --check` fails on files this slice did not touch [WORKED AROUND]
+
+- Attempted: check formatting across the workspace after the Rust changes.
+- Symptom: the check reports diffs in `crates/voice-spike/src/lib.rs`, `crates/voice-spike/src/main.rs`,
+  `crates/hush-daemon/src/zine_store.rs` and existing tests in `payload.rs`. Those files are not
+  part of this slice and are already unformatted on disk.
+- Resolution: fixed the one formatting issue in the new `tests/expire_messages.rs` by hand and left
+  the pre-existing files alone, rather than sweeping a large unrelated diff into this change.
+- Lesson: the workspace is not rustfmt-clean; `cargo fmt --all` is not a safe pre-commit check here
+  until the baseline is fixed separately.
+
+### The `/expire` dialog has not been exercised in a running Tauri window [OPEN]
+
+- Attempted: verify the slash command, the lifetime dialog and the bubble deletion visually.
+- Symptom: this environment has no running desktop shell; verification was limited to `npx tsc`,
+  `npm test`, `npm run build` and the relay-backed core tests.
+- Resolution needed: run the app against two unlocked test vaults, send `/expire hello`, confirm the
+  dialog accepts 5–86400 seconds, and watch both threads drop the bubble at the deadline. The
+  daemon API and the pure command parser are covered; the DOM timer path is not.
+- Update 2026-10-21: the two-peer stack was started with
+  `HUSH_PROFILE=debug ./scripts/run-two-ui.sh` (PIDs in `/run/user/1000/hush-two-peers`). Both daemons unlocked, both
+  contacts online. A live `/api/send-expire` delivered out of band to Bob and wrote no history row;
+  a later 10-minute line was consumed by Bob's UI poll (the next manual `/api/recv` returned an
+  empty `expire_messages`, and `/api/messages` stayed at 10 rows). That proves the UI poll path ran,
+  not that the bubble was drawn.
+- Still missing: GNOME's screenshot D-Bus rejected `org.gnome.Shell.Screenshot.Screenshot` with
+  `AccessDenied`, so the bubble, the dialog, and the removal were not captured. Visual confirmation
+  is with the user in the running windows, not with this agent.
+- Lesson: a store-level test cannot prove the bubble-removal patch kept the reader's scroll, which
+  is the one claim the hand-removal code makes.
+
+## 2026-10-21 — The test chain died and took its balances with it [WORKED AROUND]
+
+### Ganache was gone, so the wallet could not reach 127.0.0.1:8545 [FIXED]
+
+- Attempted: sync the test wallet before a payment run.
+- Symptom: `POST /api/wallet/sync` returned
+  `{"error":"ethereum: error sending request for url (http://127.0.0.1:8545/)"}`. `pgrep ganache`
+  was empty and `/tmp/hush-test-chain/ganache.log` ended with `Received shutdown signal: SIGTERM`.
+- Cause: the chain had been started from a terminal session that later ended. The dev chain is
+  in-memory, so SIGTERM took the contract, the balances and every transaction with it, while the
+  vaults (and their cached balances and payment chat records) survived.
+- Resolution: restarted it detached (`setsid nohup … --chain.chainId 11155111`), redeployed
+  `MockUSDC` from `/tmp/hush-test-chain/build/`, called `evm_setAccountCode` at the canonical
+  Sepolia USDC address, minted 100 USDC to each peer, and sent 10 ETH from a Ganache account for
+  gas. Bob's sync then read 100 USDC / 10 ETH.
+- Follow-on: `evm_setBalance` is not available in this Ganache build (`-32700 The method
+  evm_setBalance does not exist/is not available`); `eth_sendTransaction` from an unlocked
+  Ganache account is the portable way to fund an address.
+- Follow-on: after a chain reset a vault's cached balance is stale until an explicit Sync. The
+  send route does not read that cache, so payments still work, but the dialog's balance line can
+  read 0 until the wallet pane is synced.
+- Lesson: an ephemeral test chain has to be started detached and reseeded after every restart;
+  the vault survives a chain reset, the money does not.
+
+## 2026-10-20 — "Turn off payments" looked inert [FIXED]
+
+### A trust row's shape did not carry `payments` [FIXED]
+
+- Attempted: turn payments off for a trustee from the trust row's menu.
+- Symptom: the daemon applied it — `POST /api/contacts/payments` returned 204, `/api/contacts`
+  showed `payments: "deny"` and the wallet address cleared — but the row kept the "Payments
+  allowed" badge and the menu kept "Turn off payments". The open chat's `+` menu also kept
+  offering Send USDC.
+- Cause: `trustRowShape` in `apps/hush-tauri/src/lib/regionKeys.ts` listed reach, my_reach, the
+  mail fields and `signals`, but not `payments`. The Trusts region key therefore did not change,
+  `patchTrustRows` accepted the old row as current, and the badge and menu — drawn once and never
+  patched — were never redrawn. The `chatComposer` key had the same omission, so the composer's
+  structure (whether `+` offers Send USDC) stayed as first drawn.
+- Resolution: `payments` is part of `trustRowShape` and of the `chatComposer` key, with tests for
+  the shape and for the key's composition. Verified `POST` deny → 204, contacts shows `deny` and no
+  address, then allow → 204.
+- Lesson: any value a region's first paint reads and no patch rewrites must be in its key. The
+  payments choice was wired into the row and the composer but not into either key, so every other
+  surface updated while the two that mattered did not.
+
+## 2026-10-20 — Peer payment confirmation and verified chat lines [FIXED / OPEN]
+
+### alloy's rpc `Log` exposes `address` and `data` as methods [FIXED]
+
+- Attempted: decode the ERC-20 `Transfer` event by hand from `receipt.logs()` in
+  `crates/hush-wallet/src/ethereum.rs`, reading `log.address`, `log.data.topics()` and
+  `log.data.data`.
+- Symptom: `error[E0615]: attempted to take value of method 'address' on type
+  '&alloy::rpc::alloy_rpc_types::Log'` (and the same for `data`).
+- Resolution: call the accessors — `log.address()` and `log.data()`, then `.topics()` and `.data`.
+  Nothing else in the decoding changed.
+- Lesson: alloy 2.x's rpc `Log` wraps `LogData` and hides the fields behind methods, unlike
+  `alloy_primitives::Log`, whose fields are public. Check which type the receipt hands back before
+  writing the field accesses.
+
+### The recipient's verified line has not been observed end to end [OPEN]
+
+- Attempted: after rebuilding the stack, sent 1 USDC Bob → Alice with
+  `POST /api/wallet/pay-trustee` (txid `0x35b2b995e6b248f6db92351a643018a793bbe138ce88faafea59b8c73f085cf8`).
+- Verified: Bob's own `payment` record was written (`amount 1000000`, `symbol USDC`), and the
+  Ganache receipt is `status 0x1` with a `Transfer` of `1000000` to Alice's address
+  (`0x989C…5755`). Bob's daemon logged no notice failure.
+- Verified separately with a temporary probe against the live mock chain (deleted after the run):
+  `EthereumWallet::verify_token_transfer` returned `Confirmed { from: 0x756F…16b2 }` for the real
+  txid and amount, `Refused` for an over-claim, the wrong recipient and the wrong contract, and
+  `Pending` for an unknown txid. The decoding and the four checks are therefore exercised.
+- Not verified: Alice's daemon has not processed the notice end to end. Her vault is locked and its
+  passphrase is not available in this environment, so `apply_payment_notices` has not run on the
+  receiving side — that is the queue, policy, record-write and UI-reload path after the verifier.
+  The signal is store-and-forward and should still be waiting at the relay.
+- Also unverified after the reciprocal-consent change: `cargo test -p hush-daemon` was rerun with
+  the live two-peer stack up and the tool killed it at the 10-minute cap (the earlier run took 56s).
+  The suite passed 227 before that change; the later daemon edits are the DTO field, one refusal
+  check and one announcement filter, and `cargo check` is clean. Rerun it with the stack stopped
+  before treating 227 as current.
+- To close: unlock Alice's window, make sure **Trusts → Bob → Allow payments** is on, then watch
+  `/run/user/1000/hush-two-peers/logs/alice.log` and the chat for the "You received 1 USDC from
+  Bob" line. If nothing appears, the pending retry window is 15 minutes from the first recv after
+  unlock; the relay queue is the next place to look.
+- Severity: unverified end-to-end path, not a known defect.
+
+## 2026-10-20 — Cursor → Zed migration had to write outside the project root [WORKED AROUND]
+
+### Bulk migration used a script because file tools are workspace-scoped [WORKED AROUND]
+
+- Attempted: migrate the global Cursor rules/skills plus project `.cursor/rules` in sibling repos to
+  Zed's `~/.config/zed/AGENTS.md`, `~/.agents/skills/`, and per-project `AGENTS.md` /
+  `.agents/skills/`.
+- Symptom: `write_file` and `edit_file` can only write inside `/home/sam/ProjectHush` and
+  `~/.agents/skills`. The global `~/.config/zed/AGENTS.md` and sibling repos (`mobiletrustless`,
+  `kalshi`, `ironlink-project`, `visalization`, `ironcount`) are outside that scope. A `touch` test
+  confirmed terminal writes were permitted, but per-file tool calls could not reach those paths.
+- Resolution: staged the global file under `.zed-migration/`, copied it to
+  `~/.config/zed/AGENTS.md`, and generated sibling-project files from the existing `.mdc` bodies
+  with a temporary script using `cp`/`sed`/`awk`. Verified the generated files, then removed the
+  staging directory.
+- Lesson: for a migration that spans paths outside the workspace, plan a reviewable scripted write
+  path up front instead of attempting per-file file-tool calls that will fail. Keep shell writes in
+  a temporary script and delete it after validation.
+- Severity: tooling limitation, not a repo defect.
+
 ## 2026-10-20 — Places: the vouch had no consent, and the test suite agreed with it [FIXED]
 
 ### A vouch was one signature, so anyone holding an invite could badge a vault that never agreed [FIXED]

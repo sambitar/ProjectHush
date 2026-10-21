@@ -45,7 +45,9 @@ MessagePayload::Signal {
 
 MessagePayload::SignalAck { id: String, status: SignalStatus }
 
-SignalBody = { "kind": "ping", "note"?: "…" } | <unknown kind>
+SignalBody = { "kind": "ping", "note"?: "…" }
+           | { "kind": "wallet_address", "bitcoin"?: "…", "ethereum"?: "…" }
+           | <unknown kind>
 SignalStatus = delivered | unsupported | expired | denied | failed | unknown
 ```
 
@@ -106,34 +108,113 @@ whose signature names a queue the recipient will deliver into).
 
 ---
 
-## 5. What landed
+## 5. Wallet addresses — the first durable kind
 
-- `crates/hush-core/src/signals.rs` — `SignalPolicy`, `SignalStatus`, `SignalBody`, `SignalRecord`,
-  `ReceivedSignal`, `ReceivedSignalAck`, caps and `prune_signal_log`.
+`SignalBody::WalletAddress { bitcoin, ethereum }` carries the sender's receive addresses. It is the
+first **core-applied** kind: `recv` writes it onto the contact record rather than handing it to the
+daemon, because the contact record is the destination.
+
+- **Stored on the contact:** `wallet_bitcoin`, `wallet_ethereum`, and `wallet_updated_ms`. A later
+  announcement replaces the previous one; an absent chain clears that chain rather than keeping a
+  stale address.
+- **Announced:** automatically after wallet create/restore (in the background, so a slow relay does
+  not hold the response), and on demand from the wallet's "Share with trustees" action
+  (`POST /api/wallet/announce`). Contacts that denied signals are skipped.
+- **Change warning:** the send card shows who shared the address and when, and tells the user to
+  confirm it. The transfer is irreversible, so the UI must never make a changed address look like
+  the old one.
+- **USDC is already supported.** It is an ERC-20 token the wallet tracks and sends through the
+  existing token path; this signal supplies the destination address. No Circle integration, no
+  custodian, no third-party key.
+
+**Payment consent.** Wallet addresses are useful only for money, so they are gated by a second
+per-contact choice: `Contact.payments` (`PaymentPolicy`, **deny by default**). Enabling it is the
+only way the wallet's "Share with trustees" announcement includes that contact, the only way an
+inbound `WalletAddress` is stored, and the only way `/api/wallet/pay-trustee` will run. Turning it
+off clears the stored address. Both sides must enable it for an address to cross.
+
+**The chat action.** When payments are on, the composer's `+` offers **Send USDC** beside **Attach
+file**, and `/pay` or `/pay <amount>` in the composer opens the same dialog. The payment uses the
+contact's announced Ethereum address and the network's canonical USDC contract (mainnet or Sepolia);
+other assets stay in the wallet pane. The daemon resolves the address and contract, so the UI never
+invents a destination. The dialog is **two steps**: amount, then a confirmation that restates the
+amount, recipient address and network.
+
+**The chat line.** A completed payment is a `ChatRecordPayload::Payment` record, drawn as a centered
+system line with its transaction hash ("You sent 1 USDC to Alice" / "You received 1 USDC from
+Alice"). The sender records its own line after broadcast. The recipient's line is written only
+after its daemon verifies the chain (`SignalBody::Payment` carries the txid and amount): mined and
+successful, the network's USDC contract, the recipient's own address, and at least the claimed
+amount. Pending transactions retry with backoff for 15 minutes; a refusal is logged and dropped.
+`RecvResponse.chat_appended` tells the UI to re-read its history, because the line is not one of
+`recv`'s messages.
+
+## 5a. Torrent sharing — the second durable kind
+
+`SignalBody::TorrentOffer { offer_id, name, hash, size }` offers one torrent from the sender's
+Torrents library. The content is never sent: the recipient's own TorBox account fetches it. The
+recipient's daemon stores the body in `torrents-state.enc` (the signal audit log is metadata-only),
+shows a confirmation, and only on accept builds `magnet:?xt=urn:btih:<hash>&dn=<name>` and queues an
+ordinary TorBox item. `TorrentResponse { offer_id, accepted }` tells the sender.
+
+- **Two-sided, deny by default.** `Contact.torrents` is the local switch and `peer_torrents` is the
+  announced one; `TorrentConsent { allow }` carries a change. Both must allow before
+  `POST /api/torrents/share` or an accept route will run. Unlike payments there is no optimistic
+  default: a peer that never sent consent has not opted in.
+- **No auto-download.** The signal is data, not a command. The recipient sees the name and size and
+  chooses; a missing TorBox key leaves the offer pending and the Download button disabled.
+- **No trackers from a peer.** The daemon builds a hash-only magnet, so a peer cannot smuggle a
+  tracker list or a different source into the offer. A private-tracker torrent may not resolve,
+  because the library retained only the hash; the UI states that limit.
+- **The UI.** `/torrent` and the trust menu's **Share a torrent** open the picker; the `+` menu
+  offers it when both sides allow. Incoming offers open a modal and are also stored, so one that
+  arrived while the app was away reappears on the next unlock.
+
+## 6. What landed
+
+- `crates/hush-core/src/signals.rs` — `SignalPolicy`, `SignalStatus`, `SignalBody` (`Ping`,
+  `WalletAddress`, `Unknown`), `SignalRecord`, `ReceivedSignal`, `ReceivedSignalAck`, caps and
+  `prune_signal_log`.
 - `crates/hush-core/src/payload.rs` — `MessagePayload::Signal` and `SignalAck`.
-- `crates/hush-core/src/account.rs` — `Contact.signals`, `AccountState.signal_log`,
-  `send_signal`, `send_signal_ack`, `set_contact_signals`, `signals_for`, the receive branches,
-  dedupe/expiry/policy handling, and audit pruning on removal.
+- `crates/hush-core/src/signals.rs` also carries `PaymentPolicy` (allow/deny, deny by default).
+- `crates/hush-core/src/account.rs` — `Contact.signals` and `Contact.payments`,
+  `Contact.wallet_bitcoin` / `.wallet_ethereum` / `.wallet_updated_ms`, `AccountState.signal_log`,
+  `send_signal`, `send_signal_ack`, `set_contact_signals`, `set_contact_payments`, `signals_for`,
+  the receive branches, dedupe/expiry/policy handling, the core application of `WalletAddress`,
+  clearing addresses when payments are turned off, and audit pruning on removal.
 - `crates/hush-core/src/message.rs` — `InboxResult.signals` and `.signal_acks`.
 - `crates/hush-core/src/error.rs` — `SignalsDisabled`, `InvalidSignal`, `SignalTooLarge`.
 - `crates/hush-core/src/signal.rs` → `signal_protocol.rs` — renamed so "signal" names the feature,
   not the libsignal wrapper.
-- `crates/hush-daemon` — `ContactDto.signals`, `Work::{SendSignal, SetContactSignals,
-  ContactSignals}`, `POST /api/signals/send`, `POST /api/contacts/signals`,
-  `GET /api/contacts/{nickname}/signals`, and signals/acks on `RecvResponse`.
-- `apps/hush-tauri` — `SignalPolicy`, `SignalBodyDto`, `SignalRecordDto`, `ReceivedSignalDto`,
-  `ReceivedSignalAckDto`, the API methods, the trust-menu toggle, and `signals` in
-  `trustRowShape`.
+- `crates/hush-daemon` — `ContactDto.signals`, `.payments` and the wallet-address fields,
+  `Work::{SendSignal, SetContactSignals, ContactSignals, SetContactPayments}`,
+  `POST /api/signals/send`, `POST /api/contacts/signals`, `POST /api/contacts/payments`,
+  `GET /api/contacts/{nickname}/signals`, `POST /api/wallet/announce`,
+  `POST /api/wallet/pay-trustee` (records the sender's line and sends the notice),
+  `Work::RecordPayment`, `RecvResponse.chat_appended`, the pending-notice verifier with backoff,
+  automatic announcement after create/restore (payment-enabled trustees only),
+  `PublicState.ethereum_network`, and signals/acks on `RecvResponse`.
+- `apps/hush-tauri` — `SignalPolicy` / `PaymentPolicy`, the signal DTOs, the API methods, the trust
+  menu's signals and payments toggles plus the "Payments allowed" badge, the chat composer's `+`
+  menu (Send USDC / Attach file), the `/pay` and `/pay <amount>` composer command, the two-step
+  payment dialog, the payment system line and its styles, the trustee picker in the wallet send
+  card, and the "Share with trustees" action.
+- **Torrent sharing (2026-10-21).** `SignalBody::TorrentOffer`, `TorrentResponse` and
+  `TorrentConsent`; `TorrentPolicy` on contacts (deny by default both ways); `set_contact_torrents`;
+  the torrents sidecar's offer list; `POST /api/torrents/share`, `/offers/{id}/accept` and
+  `/decline`; the `/torrent` command, picker, offer modal, trust-menu toggle and badge.
 
-**Verification:** `crates/hush-core/tests/signals.rs` (7 end-to-end tests: out-of-band delivery +
-ack, optional ack, expiry, deny, mail-only, reopen, unknown refuses locally), the `signals.rs` unit
-tests (round-trip, unknown kind, policy/status fallbacks, caps, pruning), `cargo test -p hush-core
---lib` (164), `cargo check -p hush-daemon`, `npx tsc --noEmit`, and `npm test` in
-`apps/hush-tauri` (281).
+**Verification:** `crates/hush-core/tests/signals.rs` (9 end-to-end tests: out-of-band delivery +
+ack, optional ack, expiry, deny, mail-only, reopen, unknown refuses locally, wallet-address
+replacement, and an address dropped when payments are off), the `signals.rs` unit tests
+(round-trip, unknown kind, policy/status fallbacks, caps, pruning, wallet-address cap, payment
+validation), `chat_log.rs` payment dedupe, `cargo test -p hush-core` (167 lib), `cargo test -p
+hush-daemon` (227), `cargo check --workspace`, `npx tsc --noEmit`, and `npm test` in
+`apps/hush-tauri` (282).
 
 ---
 
-## 6. Decisions
+## 7. Decisions
 
 - **On by default.** Signals are part of the trustee relationship, not a separate opt-in. The menu
   narrows rather than grants.
@@ -151,12 +232,12 @@ tests (round-trip, unknown kind, policy/status fallbacks, caps, pruning), `cargo
 
 ---
 
-## 7. Kinds to build next
+## 8. Kinds to build next
 
 These are deliberately **not** in this task:
 
-1. **Wallet address** — durable, change-warning before the next payment.
-2. **Torrent handoff** — durable offer, ask by default, ack accepted/declined.
+1. ~~**Wallet address** — durable, change-warning before the next payment.~~ **Built 2026-10-20.**
+2. ~~**Torrent handoff** — durable offer, ask by default, ack accepted/declined.~~ **Built 2026-10-21.**
 3. **Payment request / receipt** — chain, fresh address, amount, txid notification.
 4. **Contact card refresh** — mail handle, relay, vault name in place of a new invite.
 5. **Ping UI** — the reference kind is wire-complete but has no user surface yet.
@@ -165,7 +246,7 @@ Each is a `SignalBody` variant plus the feature that applies it. The transport d
 
 ---
 
-## 8. Depends on / independent of
+## 9. Depends on / independent of
 
 **Depends on:** Task **5** (daemon), **5c** (encrypted store), **5h** (presence, only for future
 ephemeral kinds). **Independent of** reach, conclaves and the media plane: a signal is one more

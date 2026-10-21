@@ -37,17 +37,28 @@ export interface AppendableMessage {
    * the 1:1 thread, which has only two sides.
    */
   from?: string;
+  /**
+   * The row's kind, when it is not a bubble. A payment line is its own block,
+   * so it must never join the run above it.
+   */
+  kind?: string;
 }
 
 /** What makes two messages one run: direction, sender, and day. */
 interface RunKey {
   outgoing: boolean;
   from: string;
+  kind: string;
   day: string;
 }
 
 function runKey(m: AppendableMessage): RunKey {
-  return { outgoing: m.outgoing, from: m.from ?? "", day: dayLabel(m.createdAt) };
+  return {
+    outgoing: m.outgoing,
+    from: m.from ?? "",
+    kind: m.kind === "payment" ? "payment" : "",
+    day: dayLabel(m.createdAt),
+  };
 }
 
 /** What the caller has to do to bring a pane up to date. */
@@ -113,6 +124,7 @@ export function planAppend<T extends AppendableMessage>(
       last !== null &&
       last.outgoing === first.outgoing &&
       last.from === first.from &&
+      last.kind === first.kind &&
       last.day === first.day,
     daySep: last !== null && last.day === first.day ? null : first.day,
   };

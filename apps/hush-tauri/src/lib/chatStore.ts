@@ -1,13 +1,80 @@
 import type {
   ChatMessage,
   ChatRecordDto,
+  ExpireMessageDto,
   ReceivedDto,
 } from "./api/types";
+import { formatUnits } from "./walletStore.ts";
 
 const threads = new Map<string, ChatMessage[]>();
 /** Unread messages per contact nickname. */
 const unread = new Map<string, number>();
 let idSeq = 0;
+
+/**
+ * Live timers for expiring messages, keyed by contact and message id.
+ *
+ * A message is never written to the vault, so this timer is the only thing that
+ * can delete it. `clearChatStore` clears them with the threads; `loadHistory`
+ * keeps the live ones, because a history refresh must not make an unexpired
+ * message disappear early.
+ */
+const expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+type ExpiryListener = (nick: string, id: string) => void;
+const expiryListeners = new Set<ExpiryListener>();
+
+function expiryKey(nick: string, id: string): string {
+  return `${nick}\u0000${id}`;
+}
+
+function scheduleExpiry(nick: string, msg: ChatMessage): void {
+  if (msg.expiresAt === undefined) return;
+  const key = expiryKey(nick, msg.id);
+  const previous = expiryTimers.get(key);
+  if (previous !== undefined) clearTimeout(previous);
+  const delay = Math.max(0, msg.expiresAt - Date.now());
+  const timer = setTimeout(() => {
+    expiryTimers.delete(key);
+    if (removeEphemeral(nick, msg.id)) {
+      for (const listener of expiryListeners) listener(nick, msg.id);
+    }
+  }, delay);
+  expiryTimers.set(key, timer);
+}
+
+/**
+ * Subscribe to a message reaching its deadline.
+ *
+ * The store owns the deletion; the caller only needs to repaint. Returns an
+ * unsubscribe function, which the app does not need today but keeps the
+ * listener set from becoming impossible to clean up.
+ */
+export function onEphemeralExpired(listener: ExpiryListener): () => void {
+  expiryListeners.add(listener);
+  return () => expiryListeners.delete(listener);
+}
+
+/** Remove one expiring message. Returns false when it was already gone. */
+export function removeEphemeral(nick: string, id: string): boolean {
+  const list = threads.get(nick);
+  if (!list) return false;
+  const at = list.findIndex((m) => m.id === id && m.expiresAt !== undefined);
+  if (at < 0) return false;
+  const [msg] = list.splice(at, 1);
+  const timer = expiryTimers.get(expiryKey(nick, id));
+  if (timer !== undefined) clearTimeout(timer);
+  expiryTimers.delete(expiryKey(nick, id));
+  // An unread badge must not outlive the message that earned it. A contact
+  // whose badge was cleared by opening the chat has no entry here, so this
+  // cannot underflow.
+  if (!msg.outgoing && unread.has(nick)) {
+    const left = (unread.get(nick) ?? 1) - 1;
+    if (left > 0) unread.set(nick, left);
+    else unread.delete(nick);
+  }
+  return true;
+}
 
 function nextId(): string {
   idSeq += 1;
@@ -15,12 +82,21 @@ function nextId(): string {
 }
 
 export function clearChatStore(): void {
+  for (const timer of expiryTimers.values()) clearTimeout(timer);
+  expiryTimers.clear();
   threads.clear();
   unread.clear();
   idSeq = 0;
 }
 
 export function loadHistory(records: ChatRecordDto[]): void {
+  // A history reload is a read of the vault, and expiring messages are not in
+  // it. The live ones are kept in memory and re-armed, so a payment notice (or
+  // any other refresh) cannot delete a message before its deadline.
+  const now = Date.now();
+  const live = [...threads.values()]
+    .flat()
+    .filter((m) => m.expiresAt !== undefined && m.expiresAt > now);
   clearChatStore();
   for (const r of records) {
     const base = {
@@ -40,13 +116,37 @@ export function loadHistory(records: ChatRecordDto[]): void {
         fileSize: r.payload.size,
         blobId: r.payload.blob_id_hex.toLowerCase(),
       });
+    } else if (r.payload.t === "payment") {
+      push(r.contact_nick, {
+        ...base,
+        kind: "payment",
+        amount: r.payload.amount,
+        symbol: r.payload.symbol,
+        txid: r.payload.txid,
+      });
     }
     // Mail records belong to the Mail rail; the chat store ignores them.
+  }
+  for (const m of live) {
+    const list = threads.get(m.contactNick) ?? [];
+    if (list.some((x) => x.id === m.id)) continue;
+    const at = list.findIndex((x) => x.createdAt > m.createdAt);
+    if (at < 0) list.push(m);
+    else list.splice(at, 0, m);
+    threads.set(m.contactNick, list);
+    scheduleExpiry(m.contactNick, m);
   }
 }
 
 export function getThread(nick: string): ChatMessage[] {
-  return threads.get(nick) ?? [];
+  const list = threads.get(nick) ?? [];
+  const now = Date.now();
+  // The timer is the deleter, but a backgrounded window can throttle it. A
+  // message past its deadline must not be drawn again while the timer waits.
+  if (!list.some((m) => m.expiresAt !== undefined && m.expiresAt <= now)) {
+    return list;
+  }
+  return list.filter((m) => m.expiresAt === undefined || m.expiresAt > now);
 }
 
 export function getAllThreads(): Map<string, ChatMessage[]> {
@@ -69,13 +169,18 @@ export function unreadTotal(): number {
 }
 
 export function lastPreview(nick: string): { text: string; time: number } | null {
-  const t = threads.get(nick);
+  const t = getThread(nick);
   if (!t?.length) return null;
   const m = t[t.length - 1];
   const text =
     m.kind === "text"
       ? m.text ?? ""
-      : `File: ${m.fileName ?? "attachment"}`;
+      : m.kind === "payment"
+        ? `${m.outgoing ? "Sent" : "Received"} ${formatUnits(
+            m.amount ?? "0",
+            6,
+          )} ${m.symbol ?? "USDC"}`
+        : `File: ${m.fileName ?? "attachment"}`;
   return { text, time: m.createdAt };
 }
 
@@ -161,6 +266,57 @@ export function ingestIncoming(from: string, dto: ReceivedDto): ChatMessage {
   };
   push(from, msg);
   unread.set(from, (unread.get(from) ?? 0) + 1);
+  return msg;
+}
+
+/**
+ * Add an expiring line the daemon just reported.
+ *
+ * The payload is already out of the vault, so this is the only copy. A retried
+ * delivery carries the same sender id and is ignored rather than drawn twice.
+ */
+export function ingestEphemeral(
+  from: string,
+  dto: ExpireMessageDto,
+): ChatMessage | null {
+  if (dto.expires_ms <= Date.now()) return null;
+  if (!dto.text) return null;
+  if (getThread(from).some((m) => m.id === dto.id)) return null;
+  const msg: ChatMessage = {
+    id: dto.id,
+    contactNick: from,
+    outgoing: false,
+    kind: "text",
+    text: dto.text,
+    createdAt: Date.now(),
+    expiresAt: dto.expires_ms,
+    reactions: [],
+  };
+  push(from, msg);
+  unread.set(from, (unread.get(from) ?? 0) + 1);
+  scheduleExpiry(from, msg);
+  return msg;
+}
+
+/** Add the sender's own expiring line, after the daemon has accepted it. */
+export function addOutgoingEphemeral(
+  nick: string,
+  id: string,
+  text: string,
+  expiresAt: number,
+): ChatMessage {
+  const msg: ChatMessage = {
+    id,
+    contactNick: nick,
+    outgoing: true,
+    kind: "text",
+    text,
+    createdAt: Date.now(),
+    expiresAt,
+    reactions: [],
+  };
+  push(nick, msg);
+  scheduleExpiry(nick, msg);
   return msg;
 }
 

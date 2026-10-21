@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "${ROOT}/scripts/lib/hush.sh"
 hush_require_protoc || exit 1
-RELAY_URL="${HUSH_RELAY_URL:-http://127.0.0.1:8787}"
+RELAY_URL="${HUSH_RELAY_URL:-https://hushrelay.space}"
 PEER_A="${ROOT}/instances/peer-a"
 PEER_B="${ROOT}/instances/peer-b"
 PASS_A="${HUSH_PEER_A_PASS:-peer-a-pass}"

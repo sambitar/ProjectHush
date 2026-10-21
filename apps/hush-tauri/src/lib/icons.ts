@@ -109,6 +109,7 @@ const ICONS = {
   sun: Sun,
   monitor: Monitor,
   inbox: Inbox,
+  clock: Clock,
   outbox: Clock,
   drafts: FileText,
   star: Star,

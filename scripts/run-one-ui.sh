@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One Hush desktop window: one vault, one daemon, one local relay when needed.
+# One Hush desktop window: one vault, one daemon, the production relay.
 #
 # The single-instance counterpart of run-two-ui.sh. Safe to re-run: a relay or
 # daemon that is already up is reused, and a fresh dist is embedded into the
@@ -17,7 +17,7 @@
 #   ./scripts/run-one-ui.sh --relay http://host:8790   # relay a new vault is created against
 #   ./scripts/run-one-ui.sh --vault instances/me # somewhere else to keep the vault
 #   VAULT_DIR=instances/peer-b ./scripts/run-one-ui.sh
-#   ./scripts/run-one-ui.sh --no-relay           # never start a local relay
+#   ./scripts/run-one-ui.sh --no-relay           # accepted; local relays are never started
 #
 # An existing vault keeps the relay stored inside it: that is the one the daemon
 # dials, and --relay only warns when the two disagree. For a vault that does not
@@ -101,9 +101,8 @@ if [[ -x "$TOR_DIR/tor" ]]; then
 fi
 
 # The relay for a vault that does not exist yet: --relay, then HUSH_RELAY_URL, then
-# the shared relay. A teammate's first run has no vault and no local relay worth
-# starting (it would only talk to itself), and the point of the shared one is that
-# two machines can reach each other through it.
+# the production relay. There is no local-relay path: two machines reach each
+# other through the production host, and a local one would only talk to itself.
 NEW_VAULT=0
 if hush_vault_present "$VAULT_DIR"; then
   VAULT_RELAY="$(hush_vault_relay "$VAULT_DIR")"
@@ -128,6 +127,13 @@ else
   VAULT_RELAY="${RELAY_ARG:-${HUSH_RELAY_URL:-$HUSH_CLOUD_RELAY_URL}}"
   NEW_VAULT=1
 fi
+
+case "${VAULT_RELAY#*://}" in
+  127.0.0.1* | localhost* | \[::1\]*)
+    echo "This vault is on a local relay ($VAULT_RELAY). Local relays are disabled in this project; move it to https://hushrelay.space first." >&2
+    exit 2
+    ;;
+esac
 
 # A release daemon refuses plain HTTP to a relay that is not loopback or a v3
 # onion (hush-core HttpPolicy::LoopbackOnly), so a plain-HTTP relay on a public
@@ -157,7 +163,7 @@ hush_ensure_node_modules "$ROOT/apps/hush-tauri"
 # and refuses to compile the app without it, so the daemon is staged first — in
 # the profile this run already builds, so the copy costs no extra build.
 "$ROOT/scripts/stage-daemon-sidecar.sh" --profile "$DAEMON_PROFILE"
-cargo build -p hush-relay -p hush-tauri -p hush-cli
+cargo build -p hush-tauri -p hush-cli
 # The daemon runs in release. Its vault store encrypts multi-GB torrent files
 # chunk by chunk, and AEAD is ~40x slower in a debug build (measured 1.7 MiB/s
 # debug vs 73 MiB/s release), which made large downloads look stalled at 100%
@@ -171,50 +177,23 @@ daemon_ready() {
   curl -sf -o /dev/null --unix-socket "$1" http://localhost/api/status 2>/dev/null
 }
 
-# Which relay does this vault talk to? The one stored in the vault — never a
-# local one unless you ask for it (peer vaults created against the loopback
-# relay by setup-two-peers.sh): WITH_LOCAL_RELAY=1.
-WITH_LOCAL_RELAY="${WITH_LOCAL_RELAY:-0}"
+# The relay is always the production relay, or the one stored in the vault.
+# Local relays are not used in this project outside automated tests.
+if [[ "${WITH_LOCAL_RELAY:-0}" -eq 1 ]]; then
+  echo "Local relays are disabled in this project; use https://hushrelay.space." >&2
+  exit 2
+fi
 
 RELAY_PID=""
-if [[ "$NO_RELAY" -eq 1 ]]; then
-  echo "Skipping the local relay (--no-relay)."
-elif [[ "$WITH_LOCAL_RELAY" -eq 1 ]]; then
-  RELAY_URL="${HUSH_RELAY_URL:-http://127.0.0.1:8787}"
-  relay_host="${RELAY_URL#*://}"; relay_host="${relay_host%%:*}"
-  case "$relay_host" in
-    127.0.0.1|localhost|::1)
-      if curl -sf -o /dev/null --connect-timeout 1 "${RELAY_URL%/}/health"; then
-        echo "Local relay already up at $RELAY_URL"
-      else
-        echo "Starting local relay at $RELAY_URL …"
-        HUSH_RELAY_DB="$ROOT/instances/relay/relay.db" \
-          HUSH_RELAY_ADDR="${RELAY_URL#*://}" \
-          "$ROOT/target/debug/hush-relay" >"$LOG_DIR/relay.log" 2>&1 &
-        RELAY_PID=$!
-        for _ in $(seq 1 100); do
-          curl -sf -o /dev/null --connect-timeout 1 "${RELAY_URL%/}/health" && break
-          sleep 0.1
-        done
-        curl -sf -o /dev/null --connect-timeout 1 "${RELAY_URL%/}/health" \
-          || { echo "Relay did not come up:" >&2; tail -n 20 "$LOG_DIR/relay.log" >&2; exit 1; }
-      fi
-      ;;
-    *)
-      echo "Using relay at $RELAY_URL (no local relay started)."
-      ;;
-  esac
+if [[ "$NEW_VAULT" -eq 1 ]]; then
+  echo "Relay for the new vault: $VAULT_RELAY"
 else
-  if [[ "$NEW_VAULT" -eq 1 ]]; then
-    echo "Relay for the new vault: $VAULT_RELAY (no local relay started; WITH_LOCAL_RELAY=1 to run one)."
-  else
-    echo "Using the relay stored in the vault${VAULT_RELAY:+ ($VAULT_RELAY)} (no local relay started; WITH_LOCAL_RELAY=1 to run one)."
-  fi
-  # Worth saying out loud before the window opens: with the shared relay down, a
-  # new user's first invite has nowhere to go and every failure looks local.
-  if [[ -n "$VAULT_RELAY" ]] && ! curl -sf -o /dev/null --connect-timeout 5 "${VAULT_RELAY%/}/health"; then
-    echo "warning: ${VAULT_RELAY%/}/health did not answer — sends will queue until the relay is back." >&2
-  fi
+  echo "Using the relay stored in the vault${VAULT_RELAY:+ ($VAULT_RELAY)}"
+fi
+# Worth saying out loud before the window opens: with the production relay
+# down, a new user's first invite has nowhere to go and every failure looks local.
+if [[ -n "$VAULT_RELAY" ]] && ! curl -sf -o /dev/null --connect-timeout 5 "${VAULT_RELAY%/}/health"; then
+  echo "warning: ${VAULT_RELAY%/}/health did not answer — sends will queue until the relay is back." >&2
 fi
 
 # The daemon is RESTARTED on every run, never reused: it serves the API the UI

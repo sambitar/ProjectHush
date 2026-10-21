@@ -92,6 +92,26 @@ A locked vault answers **401** on every state route, matching the Reads contract
 
 ---
 
+## Sharing with a trustee (2026-10-21)
+
+A trustee can offer one torrent instead of sending a multi-gigabyte file. The offer is a pointer:
+name, info hash and size cross the sideband; the recipient's own TorBox account fetches the content
+and stores it as ordinary vault blobs.
+
+- **Permission:** `torrents` and `peer_torrents` on the contact, both deny by default, announced by
+  `TorrentConsent`. Both sides must allow it; the trust menu has the toggle and a badge.
+- **Entry points:** `/torrent` in the 1:1 composer, **Share a torrent** in the trust menu, and the
+  composer's `+` menu when both sides allow it.
+- **Source:** the picker lists Active & Queue and Library entries with a hash. The daemon resolves
+  the name/hash/size itself; the UI never supplies a magnet.
+- **Accept:** the recipient's daemon builds `magnet:?xt=urn:btih:<hash>&dn=<name>` and queues a
+  normal item. A missing TorBox key leaves the offer pending; the modal says so.
+- **Limit:** library entries retain the hash, not the original magnet or tracker list. A
+  private-tracker torrent may not resolve from a hash-only magnet. The UI states this.
+
+Routes: `POST /api/torrents/share`, `POST /api/torrents/offers/{id}/accept`,
+`POST /api/torrents/offers/{id}/decline`; offers are returned in `GET /api/torrents/state`.
+
 ## Known limitations (honest)
 
 1. **Open / Save as… streams, with a plaintext temp file.** Both legs are now memory-bounded:

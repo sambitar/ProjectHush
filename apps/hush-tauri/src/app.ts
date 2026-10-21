@@ -4,6 +4,7 @@ import { api, AppError, getApiBase } from "./lib/api/daemon";
 import type {
   ContactDto,
   DropsKeyDto,
+  PaymentPolicy,
   SignalPolicy,
   StatusResponse,
   TrusteeReach,
@@ -15,6 +16,8 @@ import type {
   TorrentFileDto,
   TorrentItemDto,
   TorrentLibraryEntryDto,
+  TorrentOfferDto,
+  TorrentPolicy,
   TorrentsStateDto,
   NoteDto,
   NotesStateDto,
@@ -64,9 +67,11 @@ import {
   searchNotes,
 } from "./lib/notesStore";
 import {
+  acceptTorrentOffer,
   addTorrent,
   addTorrentFile,
   clearTorrentsStore,
+  declineTorrentOffer,
   deleteLibraryEntry,
   getTorrentsState,
   pauseTorrent,
@@ -76,6 +81,7 @@ import {
   resumeTorrent,
   retryTorrent,
   saveTorboxKey,
+  shareTorrent,
   setTorrentConcurrency,
   setTorrentsHooks,
   setTorrentsPaneOpen,
@@ -114,6 +120,7 @@ import {
   wipeWallet,
 } from "./lib/walletStore";
 import {
+  addOutgoingEphemeral,
   addOutgoingFile,
   addOutgoingText,
   contactsWithFiles,
@@ -123,8 +130,10 @@ import {
   loadHistory,
   getThread,
   hasUnread,
+  ingestEphemeral,
   ingestIncoming,
   lastPreview,
+  onEphemeralExpired,
   markRead,
   removeOutgoingMessage,
   clearSendProgress,
@@ -213,6 +222,17 @@ import {
   composerState,
   type ComposerState,
 } from "./lib/composer";
+import {
+  DEFAULT_EXPIRE_SECONDS,
+  MAX_EXPIRE_SECONDS,
+  MIN_EXPIRE_SECONDS,
+  expireRangeHint,
+  parseExpireCommand,
+  parseExpireSeconds,
+} from "./lib/expireCommand";
+import { parsePayCommand } from "./lib/payCommand";
+import { normalizeExternalLink, parseLinkCommand, splitLinks } from "./lib/links";
+import { parseTorrentCommand } from "./lib/torrentCommand";
 import { isAtBottom, isAtTop, pinToBottom } from "./lib/paneScroll";
 import {
   planModalSync,
@@ -396,14 +416,18 @@ type ModalKey =
   | "profile"
   | "recovery"
   | "trustDelete"
+  | "payTrustee"
+  | "torrentPicker"
+  | "torrentOffer"
   | "conclaveCreate"
   | "conclaveInvite"
   | "conclaveEnd"
   | "conclaveDelete"
-  | "readsConfirm"
+  | "externalConfirm"
   | "torrentsDelete"
   | "noteView"
   | "chatHistory"
+  | "expireMessage"
   | "identity"
   | "introPicker"
   | "introConsent"
@@ -804,6 +828,15 @@ export class App {
   private profileNick: string | null = null;
   /** The contact whose Chat history dialog is open, if any. */
   private chatHistoryNick: string | null = null;
+  /**
+   * The `/expire` dialog, while it is open: who the line is for and what it
+   * says. The seconds field is a draft held apart so typing never rebuilds the
+   * field (see `modalShape`).
+   */
+  private expireMessage: { nick: string; body: string } | null = null;
+  private expireMessageSeconds = String(DEFAULT_EXPIRE_SECONDS);
+  private expireMessageError: string | null = null;
+  private expireMessageBusy = false;
   /** The trustee whose identity dialog is open, if any. */
   private identityTarget: { nick: string; accountId: string } | null = null;
   /** "Introduce to…" picker: which member the chosen contact is offered to. */
@@ -850,8 +883,8 @@ export class App {
   private readsReaderLoading = false;
   private readsReaderError: string | null = null;
   private readsCollapsed = new Set<string>();
-  /** Set while the open-original confirm modal is up. */
-  private readsConfirmUrl: string | null = null;
+  /** Set while the external-link confirm modal is up, for any surface. */
+  private externalConfirmUrl: string | null = null;
   // --- Notes (private sticky-paper board, reached from the Vault pane) ---
   /** True while the Vault pane is showing the board instead of the bento. */
   private notesOpen = false;
@@ -1241,6 +1274,23 @@ export class App {
   private walletRestoreInput = "";
   /** Send form fields. `walletSendAmount` is in the unit named by the field. */
   private walletSendTo = "";
+  /** The trustee whose announced address filled the send field, when one did. */
+  private walletSendContact: string | null = null;
+  /** The chat payment dialog: who it is for, the draft, and its state. */
+  private payTrusteeNick: string | null = null;
+  private payTrusteeAmount = "";
+  /** Whether the dialog is on its second screen, the confirmation. */
+  private payTrusteeConfirm = false;
+  private payTrusteeError: string | null = null;
+  private payTrusteeBusy = false;
+  /** The torrent picker: who it is for, and the share in flight. */
+  private torrentPickerNick: string | null = null;
+  private torrentPickerBusyId: string | null = null;
+  private torrentPickerError: string | null = null;
+  /** The incoming torrent-offer modal: which offer, and its own state. */
+  private torrentOfferId: string | null = null;
+  private torrentOfferBusy = false;
+  private torrentOfferError: string | null = null;
   private walletSendAmount = "";
   private walletSendFee = String(DEFAULT_FEE_RATE);
   /**
@@ -1300,6 +1350,13 @@ export class App {
 
   constructor(root: HTMLElement) {
     this.root = root;
+    // An expiring line deletes itself in the store; the shell only has to
+    // repaint. Registered here, not in start(), which runs again after every
+    // unlock and would accumulate listeners.
+    onEphemeralExpired((nick, id) => {
+      this.removeExpiredBubble(nick, id);
+      this.scheduleBackgroundRender();
+    });
     // Registered once, here — startPoll runs again after every unlock cycle,
     // and a listener registered there would accumulate. Hidden: the shell has
     // no reader, so the interval timers stop and the CPU sleeps while the
@@ -1426,6 +1483,7 @@ export class App {
         this.readsAddError = null;
         this.profileNick = null;
         this.closeTrustDelete();
+        if (!this.expireMessageBusy) this.closeExpireMessage();
         this.conclaveCreateOpen = false;
         this.conclaveInviteOpen = false;
         this.closeConclaveEnd();
@@ -1704,6 +1762,9 @@ export class App {
   private startPoll(): void {
     if (this.pollTimer) return;
     this.pollTimer = window.setInterval(() => this.pollRecv(), RECV_POLL_MS);
+    // An offer received while the app was closed or locked is still pending in
+    // the torrents sidecar; show the oldest one as soon as the vault is open.
+    void this.resumeTorrentOffers();
   }
 
   /** Pull the whole mailbox: messages and drafts arrive together so the two
@@ -1815,7 +1876,14 @@ export class App {
       // sounds, and stops the moment it is answered, dismissed, or expired.
       const [r, fresh, voiceChanged] = await Promise.all([
         api.recv(),
-        api.contacts().then((c) => c ?? []),
+        // The contact list is a delta, but `recv` consumes the inbox. A
+        // contacts read that fails must not reject the group and throw away a
+        // response that has already been acked daemon-side — that is merely a
+        // stale list, but for an expiring line it is the only copy there is.
+        api
+          .contacts()
+          .then((c) => c ?? [])
+          .catch(() => this.contacts),
         this.refreshVoiceRooms(),
       ]);
       await beat;
@@ -1832,27 +1900,66 @@ export class App {
       const prevReach = new Map(
         this.contacts.map((c) => [c.nickname, c.reach]),
       );
+      // Both halves of each feature agreement are drawn (badge, menu, `+`), so
+      // a move on either side is a render, like a reach move. The daemon answers
+      // a payment move with an announcement to that contact, so the address
+      // handshake completes without a UI action of its own.
+      const prevPolicies = new Map(
+        this.contacts.map((c) => [
+          c.nickname,
+          `${c.payments}/${c.peer_payments}/${c.torrents}/${c.peer_torrents}`,
+        ]),
+      );
       const presenceChanged =
         contactsMoved || fresh.some((c) => prevOnline.get(c.nickname) !== c.online);
       const reachChanged =
         contactsMoved || fresh.some((c) => prevReach.get(c.nickname) !== c.reach);
+      const policiesChanged =
+        contactsMoved ||
+        fresh.some(
+          (c) =>
+            prevPolicies.get(c.nickname) !==
+            `${c.payments}/${c.peer_payments}/${c.torrents}/${c.peer_torrents}`,
+        );
+      // A peer switching payments back on is answered by the daemon with an
+      // address announcement; this side only has to repaint.
       this.contacts = fresh;
       setKnownContacts(fresh.map((c) => c.nickname));
       if (!r) {
         // The recv read failed, but presence and the rings were read anyway.
         // The patch covers the presence flip — the one delta that arrives
         // without a message — and a ring still needs the shell, because its
-        // prompt mounts above it. A reach that moved needs the shell too: the
-        // menus it changes are drawn, not patched.
-        if (presenceChanged && !reachChanged && !voiceChanged && this.patchBackground())
+        // prompt mounts above it. A reach or payments move needs the shell too:
+        // the menus and badges it changes are drawn, not patched.
+        if (
+          presenceChanged &&
+          !reachChanged &&
+          !policiesChanged &&
+          !voiceChanged &&
+          this.patchBackground()
+        )
           return;
-        if (presenceChanged || reachChanged || voiceChanged)
+        if (presenceChanged || reachChanged || policiesChanged || voiceChanged)
           this.scheduleBackgroundRender();
         return;
       }
       for (const w of r.warnings) this.announce(w);
       let mailArrived = false;
       let conclaveArrived = false;
+      let expireArrived = false;
+      // Expiring lines are not in the chat log, so they arrive on their own
+      // channel and never trigger a history re-read. The store keys them by the
+      // sender's id and arms their deadline; a duplicate delivery is ignored.
+      for (const m of r.expire_messages ?? []) {
+        if (!ingestEphemeral(m.from, m)) continue;
+        expireArrived = true;
+        this.announce(`New message from ${m.from}`);
+        if (this.rail === "chats" && this.selectedNick === m.from) {
+          markRead(m.from);
+        } else if (chatSoundEnabled() && !isChatSoundMuted(m.from)) {
+          playChatSound();
+        }
+      }
       for (const m of r.messages) {
         if (m.kind === "mail") {
           // Reloaded from the daemon rather than appended here, so the message
@@ -1884,6 +1991,30 @@ export class App {
       // mailbox so the list is never stale. The mailbox and the conclave list
       // are separate stores, so when both are due they are read together
       // rather than one after the other.
+      if (r.chat_appended) {
+        // A verified incoming payment wrote a record the recv path does not
+        // carry, so the thread is re-read rather than guessed at. The system
+        // line then arrives with the daemon's record id.
+        await this.refreshChatHistory();
+      }
+      // Torrent offers are durable on the daemon, but the popup is worth showing
+      // now: re-read the sidecar and open the oldest pending offer. A response
+      // to one this vault sent is only a notice, so a toast is enough.
+      for (const signal of r.signals ?? []) {
+        if (signal.body.kind === "torrent_offer") {
+          void refreshTorrents().then(() => this.showNextTorrentOffer());
+        } else if (signal.body.kind === "torrent_response") {
+          const accepted = signal.body.accepted;
+          if (typeof accepted === "boolean") {
+            showToast(
+              accepted
+                ? `${displayNick(signal.from_nick)} accepted your torrent offer.`
+                : `${displayNick(signal.from_nick)} declined your torrent offer.`,
+              { kind: accepted ? "success" : "info" },
+            );
+          }
+        }
+      }
       const [mailboxChanged, conclavesLoad] = await Promise.all([
         mailArrived || this.rail === "mail" ? this.reloadMailbox() : false,
         conclaveArrived || this.rail === "conclaves"
@@ -1904,11 +2035,15 @@ export class App {
         this.readsAddOpen ||
         this.profileNick !== null ||
         this.trustDeleteNick !== null ||
+        this.expireMessage !== null ||
         (this.conclaveTab === "paper" && paperHasFocus()) ||
         (this.rail === "zines" && (this.zinesEditing || zineEditorHasFocus()));
       const changed =
         r.messages.length > 0 ||
+        expireArrived ||
+        r.chat_appended === true ||
         presenceChanged ||
+        policiesChanged ||
         reachChanged ||
         mailboxChanged ||
         conclavesLoad.changed ||
@@ -1927,6 +2062,7 @@ export class App {
       // user the surface they are using.
       const shellNeeded =
         reachChanged ||
+        policiesChanged ||
         (mailboxChanged && !this.patchMailReload()) ||
         voiceChanged ||
         (conclavesLoad.changed && !conclavesLoad.grewOnly);
@@ -2203,6 +2339,7 @@ export class App {
     this.walletLastTx = null;
     this.walletError = null;
     this.walletSendTo = "";
+    this.walletSendContact = null;
     this.walletSendAmount = "";
     this.walletRestoreInput = "";
     this.walletWipeConfirm = "";
@@ -2214,7 +2351,13 @@ export class App {
     this.readsOpenId = null;
     this.readsDetail = null;
     this.readsReaderHtml = null;
-    this.readsConfirmUrl = null;
+    this.externalConfirmUrl = null;
+    this.torrentPickerNick = null;
+    this.torrentPickerBusyId = null;
+    this.torrentPickerError = null;
+    this.torrentOfferId = null;
+    this.torrentOfferBusy = false;
+    this.torrentOfferError = null;
     this.notesOpen = false;
     this.notesEditorOpen = false;
     this.notesEditingId = null;
@@ -2583,6 +2726,15 @@ export class App {
     if (this.profileNick) add("profile", () => this.renderProfile());
     if (this.recoveryModalCode) add("recovery", () => this.renderRecoveryModal());
     if (this.trustDeleteNick) add("trustDelete", () => this.renderTrustDeleteModal());
+    if (this.payTrusteeNick) {
+      add("payTrustee", () => this.renderPayTrusteeModal());
+    }
+    if (this.torrentPickerNick) {
+      add("torrentPicker", () => this.renderTorrentPickerModal());
+    }
+    if (this.torrentOfferId) {
+      add("torrentOffer", () => this.renderTorrentOfferModal());
+    }
     if (this.conclaveCreateOpen) {
       add("conclaveCreate", () => this.renderConclaveCreateModal());
     }
@@ -2593,12 +2745,15 @@ export class App {
     if (this.conclaveDeleteId) {
       add("conclaveDelete", () => this.renderConclaveDeleteModal());
     }
-    if (this.readsConfirmUrl) add("readsConfirm", () => this.renderReadsConfirm());
+    if (this.externalConfirmUrl) {
+      add("externalConfirm", () => this.renderExternalConfirm());
+    }
     if (this.torrentsDeleteId) {
       add("torrentsDelete", () => this.renderTorrentsDeleteModal());
     }
     if (this.notesViewingId) add("noteView", () => this.renderNoteViewModal());
     if (this.chatHistoryNick) add("chatHistory", () => this.renderChatHistoryModal());
+    if (this.expireMessage) add("expireMessage", () => this.renderExpireMessageModal());
     if (this.identityTarget) add("identity", () => this.renderIdentityModal());
     if (this.introPicker) add("introPicker", () => this.renderIntroPicker());
     if (this.pendingIntroConsent()) add("introConsent", () => this.renderIntroConsent());
@@ -2670,6 +2825,75 @@ export class App {
         return [this.trustDeleteNick ?? "", displayNick(this.trustDeleteNick ?? "")].join(
           "\n",
         );
+      // What the dialog says and its own busy/error state. The seconds field is
+      // the user's draft and is deliberately absent: typing must not rebuild
+      // the input, and its value is read back from state on a rebuild anyway.
+      case "expireMessage":
+        return [
+          this.expireMessage?.nick ?? "",
+          this.expireMessage?.body ?? "",
+          this.expireMessageBusy ? "busy" : "idle",
+          this.expireMessageError ?? "",
+        ].join("\n");
+      // Who the payment is for, whether they can take it, and the dialog's own
+      // busy/error state. The amount is the field's draft and is deliberately
+      // absent: typing must not rebuild the input.
+      case "payTrustee": {
+        const contact = this.contacts.find(
+          (x) => x.nickname === this.payTrusteeNick,
+        );
+        return [
+          this.payTrusteeNick ?? "",
+          contact?.payments ?? "",
+          contact?.peer_payments ?? "",
+          contact?.signals ?? "",
+          contact?.wallet_ethereum ?? "",
+          this.payTrusteeConfirm ? "confirm" : "amount",
+          this.payTrusteeBusy ? "busy" : "idle",
+          this.payTrusteeError ?? "",
+          getWalletState().ethereum_network,
+        ].join("\n");
+      }
+      // Who the offer is for, both sides' torrent choices, and every shareable
+      // entry. The hash is part of the shape because it is what the offer sends.
+      case "torrentPicker": {
+        const contact = this.contacts.find(
+          (x) => x.nickname === this.torrentPickerNick,
+        );
+        const state = getTorrentsState();
+        return [
+          this.torrentPickerNick ?? "",
+          contact?.signals ?? "",
+          contact?.torrents ?? "",
+          contact?.peer_torrents ?? "",
+          ...state.items
+            .filter((i) => i.hash)
+            .map((i) => `${i.id}\n${i.hash}\n${i.name}\n${i.size}`),
+          ...state.library
+            .filter((e) => e.hash)
+            .map((e) => `${e.id}\n${e.hash}\n${e.name}\n${e.size}`),
+          state.has_key ? "key" : "no-key",
+          this.torrentPickerBusyId ?? "",
+          this.torrentPickerError ?? "",
+        ].join("\n\n");
+      }
+      case "torrentOffer": {
+        const state = getTorrentsState();
+        const offer = state.offers.find(
+          (o) => o.offer_id === this.torrentOfferId,
+        );
+        return [
+          this.torrentOfferId ?? "",
+          offer?.from_nick ?? "",
+          offer?.name ?? "",
+          offer?.hash ?? "",
+          String(offer?.size ?? 0),
+          offer?.status ?? "",
+          state.has_key ? "key" : "no-key",
+          this.torrentOfferBusy ? "busy" : "idle",
+          this.torrentOfferError ?? "",
+        ].join("\n");
+      }
       // The picker's items, and whether there is anyone at all to offer — the
       // two decide its empty message as well as its rows. The name field and the
       // chosen trustees are drafts.
@@ -2702,9 +2926,9 @@ export class App {
           : undefined;
         return [this.conclaveDeleteId ?? "", conclave?.name ?? ""].join("\n");
       }
-      case "readsConfirm": {
-        const url = this.readsConfirmUrl ?? "";
-        return [url, this.readsHostOf(url)].join("\n");
+      case "externalConfirm": {
+        const url = this.externalConfirmUrl ?? "";
+        return [url, this.hostOf(url)].join("\n");
       }
       // The name and the file count the sentence is built from.
       case "torrentsDelete": {
@@ -4354,13 +4578,13 @@ export class App {
         update: (el) => this.patchChatMessages(el, nick),
       },
       {
-        // Keyed by the conversation and the reach, which are the two facts its
-        // *structure* is drawn from: a mail-only trust has the reason instead of
-        // a box. Presence is deliberately not here — it changes a hint, a
-        // placeholder and three flags inside a box that stays, and
-        // `updateComposer` writes those in place. A peer going offline must not
-        // detach a box the user is typing in.
-        key: `chatComposer:${nick}:${contact.reach}`,
+        // Keyed by the conversation, the reach and the two feature choices: the
+        // first two decide whether a box exists at all, and the choices decide
+        // what the `+` menu offers. Presence is deliberately not here — it
+        // changes a hint, a placeholder and three flags inside a box that stays,
+        // and `updateComposer` writes those in place. A peer going offline must
+        // not detach a box the user is typing in.
+        key: `chatComposer:${nick}:${contact.reach}:${contact.signals}:${contact.payments}:${contact.peer_payments}:${contact.torrents}:${contact.peer_torrents}`,
         build: () => this.renderComposer(nick, contact.online, contact.reach === "full"),
         update: (el) => this.updateComposer(el, nick, contact),
       },
@@ -4485,6 +4709,48 @@ export class App {
    * when the pane has drifted from the store — a reload, a prune — and then the
    * list is redrawn rather than patched into looking current.
    */
+  /**
+   * Take one expired bubble out of the open thread.
+   *
+   * The store has already removed it. Doing this by hand rather than letting
+   * the patch rediscover the difference is what keeps the reader's place: a
+   * message expiring below someone reading history must not redraw the pane
+   * and pull them to the bottom. An empty run is removed, and the run that is
+   * left becomes the tail so the bubble shapes still match a fresh paint.
+   */
+  private removeExpiredBubble(nick: string, id: string): boolean {
+    if (this.rail !== "chats" || this.selectedNick !== nick) return false;
+    const scroll = this.root.querySelector<HTMLElement>(".chat-messages");
+    if (!scroll) return false;
+    const el = scroll.querySelector<HTMLElement>(
+      `[data-msg-id="${CSS.escape(id)}"]`,
+    );
+    if (!el) return false;
+    const group = el.parentElement;
+    el.remove();
+    if (group && group.classList.contains("bubble-group")) {
+      if (group.children.length === 0) {
+        // A day heading belongs to the first run under it, so it goes too when
+        // that run was the last thing on the board.
+        const previous = group.previousElementSibling;
+        group.remove();
+        if (previous && previous.classList.contains("day-sep")) {
+          // The next element is either nothing (the heading is now orphaned)
+          // or another day's heading (this one has no run left to introduce).
+          // A run on the same day would have no heading of its own, so keeping
+          // this one is only right when the next sibling is that run.
+          const next = previous.nextElementSibling;
+          if (next === null || next.classList.contains("day-sep")) {
+            previous.remove();
+          }
+        }
+      } else {
+        group.lastElementChild?.classList.add("tail");
+      }
+    }
+    return true;
+  }
+
   private patchChatMessages(scroll: HTMLElement, nick: string): void {
     // Returning to the window is a fresh read: the newest message wins even
     // over a reader who had scrolled away.
@@ -4507,14 +4773,32 @@ export class App {
    * lets the append find the pane's place without guessing.
    */
   private chatBubble(m: ChatMessage, tail: boolean): HTMLElement {
+    if (m.kind === "payment") return this.paymentLine(m);
     const b = document.createElement("div");
     b.className = `bubble ${m.outgoing ? "out" : "in"}${tail ? " tail" : ""}`;
     b.dataset.msgId = m.id;
-    if (m.kind === "text") b.textContent = m.text ?? "";
+    if (m.kind === "text") this.appendChatText(b, m.text ?? "");
     else {
       const fc = document.createElement("div");
       fc.className = "file-card";
-      fc.innerHTML = `<div class="text-15" style="font-weight:500">${m.fileName}</div><div class="text-13 muted">${formatBytes(m.fileSize ?? 0)}</div><div class="text-12" style="color:var(--success-text);background:var(--success-soft);display:inline-block;padding:2px 8px;border-radius:var(--radius-pill);margin-top:8px">Sealed on your device</div>`;
+      // Node by node, never `innerHTML`: a file name comes from the peer.
+      const nameEl = document.createElement("div");
+      nameEl.className = "text-15";
+      nameEl.style.fontWeight = "500";
+      nameEl.textContent = m.fileName ?? "";
+      const sizeEl = document.createElement("div");
+      sizeEl.className = "text-13 muted";
+      sizeEl.textContent = formatBytes(m.fileSize ?? 0);
+      const sealEl = document.createElement("div");
+      sealEl.className = "text-12";
+      sealEl.style.color = "var(--success-text)";
+      sealEl.style.background = "var(--success-soft)";
+      sealEl.style.display = "inline-block";
+      sealEl.style.padding = "2px 8px";
+      sealEl.style.borderRadius = "var(--radius-pill)";
+      sealEl.style.marginTop = "8px";
+      sealEl.textContent = "Sealed on your device";
+      fc.append(nameEl, sizeEl, sealEl);
       if (m.sendProgress !== undefined) {
         const bar = document.createElement("div");
         bar.style.height = "3px";
@@ -4546,6 +4830,15 @@ export class App {
       }
       b.appendChild(fc);
     }
+    // An expiring line says so in the bubble. The countdown itself is not drawn:
+    // the message is removed at the deadline, and a number that only changes on
+    // the next repaint would be a lie between repaints.
+    if (m.expiresAt !== undefined) {
+      const tag = document.createElement("div");
+      tag.className = "chat-expire-badge";
+      tag.append(icon("clock"), document.createTextNode("Ephemeral · not saved"));
+      b.appendChild(tag);
+    }
     if (m.reactions.length) {
       const pills = document.createElement("div");
       pills.style.display = "flex";
@@ -4570,6 +4863,67 @@ export class App {
       this.scheduleRender();
     };
     return b;
+  }
+
+  /**
+   * Draw a text body with `http(s)` links as clickable anchors.
+   *
+   * Node by node, never `innerHTML`: the text comes from a peer, so it is
+   * untrusted. Every click goes through the external-open confirmation, so the
+   * webview never follows a link by itself.
+   */
+  private appendChatText(b: HTMLElement, text: string): void {
+    for (const part of splitLinks(text)) {
+      if (part.kind === "text") {
+        b.appendChild(document.createTextNode(part.text));
+        continue;
+      }
+      const a = document.createElement("a");
+      a.className = "chat-link";
+      a.href = part.href;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = part.text;
+      a.onclick = (e) => {
+        e.preventDefault();
+        this.confirmExternalOpen(part.href);
+      };
+      // Middle-click must not bypass the confirmation either.
+      a.onauxclick = (e) => {
+        if (e.button === 1) e.preventDefault();
+      };
+      b.appendChild(a);
+    }
+  }
+
+  /**
+   * A payment line in the thread: a system note, not a bubble.
+   *
+   * The received form is written by the daemon only after the transaction is
+   * mined and the transfer to this wallet is confirmed, so the line reports
+   * evidence rather than a peer's claim. The hash is the reference to check it.
+   */
+  private paymentLine(m: ChatMessage): HTMLElement {
+    const row = document.createElement("div");
+    row.className = `chat-payment ${m.outgoing ? "out" : "in"}`;
+    row.dataset.msgId = m.id;
+    const amount = formatUnits(m.amount ?? "0", 6);
+    const symbol = m.symbol ?? "USDC";
+    const who = displayNick(m.contactNick);
+    const text = document.createElement("div");
+    text.className = "chat-payment-text";
+    text.textContent = m.outgoing
+      ? `You sent ${amount} ${symbol} to ${who}`
+      : `You received ${amount} ${symbol} from ${who}`;
+    row.appendChild(text);
+    if (m.txid) {
+      const tx = document.createElement("div");
+      tx.className = "chat-payment-tx";
+      tx.textContent = `${m.txid.slice(0, 10)}…${m.txid.slice(-6)}`;
+      tx.title = m.txid;
+      row.appendChild(tx);
+    }
+    return row;
   }
 
   private renderComposer(
@@ -4604,19 +4958,59 @@ export class App {
     const inner = document.createElement("div");
     inner.className = "composer-inner";
     if (!contactOnline) inner.classList.add("composer-disabled");
-    const attach = document.createElement("button");
-    // Named so `updateComposer` can find it without counting children.
-    attach.className = "composer-attach pressable";
-    attach.appendChild(icon("attach"));
+    const contact = this.contacts.find((c) => c.nickname === nick);
     const fileIn = document.createElement("input");
     fileIn.type = "file";
     fileIn.hidden = true;
-    attach.onclick = () => fileIn.click();
     fileIn.onchange = async () => {
       const f = fileIn.files?.[0];
       if (f) await this.sendFile(nick, f);
       fileIn.value = "";
     };
+    // The "+" menu: money or an attachment, the way a chat app offers both.
+    // The money entry exists only when the sideband and both payment choices
+    // allow it: the address exchange and the received notice both ride signals.
+    const addItems: OverflowMenuItem[] = [];
+    if (
+      contact?.signals === "allow" &&
+      contact.payments === "allow" &&
+      contact.peer_payments === "allow"
+    ) {
+      addItems.push({
+        id: "pay",
+        label: "Send USDC",
+        icon: "wallet",
+        onSelect: () => this.openPayTrustee(nick),
+      });
+    }
+    if (
+      contact?.signals === "allow" &&
+      contact.torrents === "allow" &&
+      contact.peer_torrents === "allow"
+    ) {
+      addItems.push({
+        id: "torrent",
+        label: "Share torrent",
+        icon: "magnet",
+        onSelect: () => this.openTorrentPicker(nick),
+      });
+    }
+    addItems.push({
+      id: "attach",
+      label: "Attach file",
+      icon: "attach",
+      onSelect: () => fileIn.click(),
+    });
+    const add = new OverflowMenu({
+      label: `Add to the message to ${displayNick(nick)}`,
+      icon: "plus",
+      triggerClass: "composer-attach",
+      items: addItems,
+    });
+    const addTrigger = add.element.querySelector<HTMLButtonElement>(
+      ".composer-attach",
+    );
+    if (addTrigger) addTrigger.disabled = !contactOnline;
     const ta = document.createElement("textarea");
     ta.rows = 1;
     ta.placeholder = composerPlaceholder(state);
@@ -4640,8 +5034,7 @@ export class App {
     };
     send.disabled = !contactOnline;
     send.onclick = () => void this.sendText(nick, ta.value.trim(), ta, send);
-    attach.disabled = !contactOnline;
-    inner.append(attach, fileIn, ta, send);
+    inner.append(add.element, fileIn, ta, send);
     wrap.appendChild(inner);
     syncSend();
     return wrap;
@@ -4661,17 +5054,235 @@ export class App {
       showToast(`${displayNick(nick)} is offline. Chat needs you both online — send Mail instead.`, { kind: "error" });
       return;
     }
-    const msg = addOutgoingText(nick, text);
+    // `/pay [amount]` opens the USDC dialog without sending the line. The
+    // amount is validated here so a malformed command is corrected in the box
+    // rather than carried into the dialog; the dialog still owns the two-step
+    // confirmation and every refusal state.
+    const pay = parsePayCommand(text);
+    if (pay) {
+      if (pay.amount) {
+        const base = parseUnits(pay.amount, 6);
+        if (base === null || base === "0") {
+          showToast("Use /pay or /pay <amount> in USDC.", { kind: "error" });
+          return;
+        }
+      }
+      ta.value = "";
+      ta.style.height = "auto";
+      send.classList.remove("ready");
+      this.openPayTrustee(nick, pay.amount);
+      return;
+    }
+    // `/expire <body>` opens the lifetime dialog instead of sending the line.
+    // A bare `/expire` asks for the body rather than sending the word itself.
+    const command = parseExpireCommand(text);
+    if (command) {
+      if (!command.body) {
+        showToast("Add a message after /expire.", { kind: "error" });
+        return;
+      }
+      ta.value = "";
+      ta.style.height = "auto";
+      send.classList.remove("ready");
+      this.openExpireMessage(nick, command.body);
+      return;
+    }
+    // `/torrent` opens the picker. The refusal states live in the dialog, the
+    // same way `/pay` explains why payments are off instead of only toasting.
+    if (parseTorrentCommand(text)) {
+      ta.value = "";
+      ta.style.height = "auto";
+      send.classList.remove("ready");
+      this.openTorrentPicker(nick);
+      return;
+    }
+    // `/link <url>` is the deliberate way to send a link. It is validated
+    // here and then sent as ordinary text, so the receiver renders the same
+    // body and an older build still shows it as text.
+    let outgoing = text;
+    const link = parseLinkCommand(text);
+    if (link) {
+      if (!link.url) {
+        showToast("Add a link after /link.", { kind: "error" });
+        return;
+      }
+      const normalized = normalizeExternalLink(link.url);
+      if (!normalized) {
+        showToast("Use /link with an http:// or https:// address.", {
+          kind: "error",
+        });
+        return;
+      }
+      outgoing = normalized;
+    }
+    const msg = addOutgoingText(nick, outgoing);
     ta.value = "";
     send.classList.remove("ready");
     this.scheduleRender();
     try {
-      await api.sendText(nick, text);
+      await api.sendText(nick, outgoing);
     } catch (e) {
       removeOutgoingMessage(nick, msg.id);
       showToast(e instanceof AppError ? e.message : "Couldn't send. Try again.", {
         kind: "error",
       });
+      this.scheduleRender();
+    }
+  }
+
+  /**
+   * Open the `/expire` dialog with the body the composer carried.
+   *
+   * The command text is consumed on purpose: the dialog owns the body, and a
+   * second render must not put the slash line back in the composer.
+   */
+  private openExpireMessage(nick: string, body: string): void {
+    this.expireMessage = { nick, body };
+    this.expireMessageSeconds = String(DEFAULT_EXPIRE_SECONDS);
+    this.expireMessageError = null;
+    this.expireMessageBusy = false;
+    this.scheduleRender();
+  }
+
+  private closeExpireMessage(): void {
+    this.expireMessage = null;
+    this.expireMessageSeconds = String(DEFAULT_EXPIRE_SECONDS);
+    this.expireMessageError = null;
+    this.expireMessageBusy = false;
+  }
+
+  private renderExpireMessageModal(): HTMLElement {
+    const pending = this.expireMessage!;
+    const who = displayNick(pending.nick);
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal expire-message-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `Expire a message to ${who}`);
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Expire message";
+    const meta = document.createElement("p");
+    meta.className = "muted text-13";
+    meta.style.marginTop = "var(--space-3)";
+    meta.textContent = `This message to ${who} is deleted from both sides when the timer ends. It is never written to either vault.`;
+
+    // The irreversible facts, restated as the message itself rather than a
+    // sentence about it: what the peer will read and what will disappear.
+    const preview = document.createElement("div");
+    preview.className = "expire-message-preview text-15";
+    preview.textContent = pending.body;
+
+    const label = document.createElement("label");
+    label.className = "expire-message-field";
+    const labelText = document.createElement("span");
+    labelText.className = "text-13";
+    labelText.textContent = "Delete after (seconds)";
+    const input = document.createElement("input");
+    input.type = "number";
+    input.className = "input-field";
+    input.min = String(MIN_EXPIRE_SECONDS);
+    input.max = String(MAX_EXPIRE_SECONDS);
+    input.step = "1";
+    input.inputMode = "numeric";
+    input.value = this.expireMessageSeconds;
+    const hint = document.createElement("span");
+    hint.className = "text-12 faint";
+    hint.textContent = expireRangeHint();
+    label.append(labelText, input, hint);
+
+    const error = document.createElement("p");
+    error.className = "expire-message-error text-13";
+    error.hidden = this.expireMessageError === null;
+    error.textContent = this.expireMessageError ?? "";
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.disabled = this.expireMessageBusy;
+    cancel.onclick = () => {
+      this.closeExpireMessage();
+      this.scheduleRender();
+    };
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "btn-primary pressable";
+    send.textContent = this.expireMessageBusy ? "Sending…" : "Send";
+    send.disabled =
+      this.expireMessageBusy ||
+      parseExpireSeconds(this.expireMessageSeconds) === null;
+    const submit = () => {
+      this.expireMessageSeconds = input.value;
+      const seconds = parseExpireSeconds(input.value);
+      if (seconds === null) {
+        this.expireMessageError = `Choose between ${MIN_EXPIRE_SECONDS} seconds and ${MAX_EXPIRE_SECONDS / 3600} hours.`;
+        this.scheduleRender();
+        return;
+      }
+      this.expireMessageError = null;
+      void this.sendExpireNow();
+    };
+    input.oninput = () => {
+      this.expireMessageSeconds = input.value;
+      send.disabled =
+        this.expireMessageBusy || parseExpireSeconds(input.value) === null;
+    };
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submit();
+      }
+    };
+    send.onclick = submit;
+    actions.append(cancel, send);
+
+    modal.append(h, meta, preview, label, error, actions);
+    back.appendChild(modal);
+    back.onclick = (e) => {
+      if (e.target === back && !this.expireMessageBusy) {
+        this.closeExpireMessage();
+        this.scheduleRender();
+      }
+    };
+    queueMicrotask(() => {
+      input.focus();
+      input.select();
+    });
+    return back;
+  }
+
+  private async sendExpireNow(): Promise<void> {
+    const pending = this.expireMessage;
+    if (!pending || this.expireMessageBusy) return;
+    const seconds = parseExpireSeconds(this.expireMessageSeconds);
+    if (seconds === null) {
+      this.expireMessageError = `Choose between ${MIN_EXPIRE_SECONDS} seconds and ${MAX_EXPIRE_SECONDS / 3600} hours.`;
+      this.scheduleRender();
+      return;
+    }
+    this.expireMessageBusy = true;
+    this.expireMessageError = null;
+    this.scheduleRender();
+    try {
+      const sent = await api.sendExpire(
+        pending.nick,
+        pending.body,
+        seconds * 1000,
+      );
+      if (!sent) throw new AppError("The daemon sent no message id.");
+      addOutgoingEphemeral(pending.nick, sent.id, pending.body, sent.expires_ms);
+      this.closeExpireMessage();
+      this.scheduleRender();
+    } catch (e) {
+      this.expireMessageBusy = false;
+      this.expireMessageError =
+        e instanceof AppError ? e.message : "Couldn't send the message.";
       this.scheduleRender();
     }
   }
@@ -5517,6 +6128,63 @@ export class App {
         : "Not available for live chat.";
       titleRow.appendChild(badge);
     }
+    if (
+      c.signals === "allow" &&
+      c.payments === "allow" &&
+      c.peer_payments === "allow"
+    ) {
+      const badge = document.createElement("span");
+      badge.className = "trust-reach-badge";
+      badge.textContent = "Payments allowed";
+      badge.title = "Both of you allow USDC payments with this trustee.";
+      titleRow.appendChild(badge);
+    } else if (c.payments === "allow" && c.signals === "deny") {
+      // The local sideband switch is the actionable one: payments cannot
+      // exchange an address or deliver a notice without it.
+      const badge = document.createElement("span");
+      badge.className = "trust-reach-badge";
+      badge.textContent = "Payments need signals";
+      badge.title =
+        "Signals are off for this trustee. Allow signals to exchange wallet addresses and payment notices.";
+      titleRow.appendChild(badge);
+    } else if (c.payments === "allow" && c.peer_payments === "deny") {
+      // The peer's own switch, not ours. Shown because it is the reason this
+      // side cannot pay, and the wording names them rather than implying our
+      // setting is off.
+      const badge = document.createElement("span");
+      badge.className = "trust-reach-badge";
+      badge.textContent = "Not accepting payments";
+      badge.title = `${displayNick(
+        c.nickname,
+      )} turned payments off. Neither side can pay until they allow them again.`;
+      titleRow.appendChild(badge);
+    }
+    if (
+      c.signals === "allow" &&
+      c.torrents === "allow" &&
+      c.peer_torrents === "allow"
+    ) {
+      const badge = document.createElement("span");
+      badge.className = "trust-reach-badge";
+      badge.textContent = "Torrents allowed";
+      badge.title = "Both of you allow torrent sharing with this trustee.";
+      titleRow.appendChild(badge);
+    } else if (c.torrents === "allow" && c.signals === "deny") {
+      const badge = document.createElement("span");
+      badge.className = "trust-reach-badge";
+      badge.textContent = "Torrents need signals";
+      badge.title =
+        "Signals are off for this trustee. Allow signals to send or receive torrent offers.";
+      titleRow.appendChild(badge);
+    } else if (c.torrents === "allow" && c.peer_torrents === "deny") {
+      const badge = document.createElement("span");
+      badge.className = "trust-reach-badge";
+      badge.textContent = "Not accepting torrents";
+      badge.title = `${displayNick(
+        c.nickname,
+      )} turned torrent sharing off. Neither side can share until they allow it again.`;
+      titleRow.appendChild(badge);
+    }
     main.appendChild(titleRow);
     if (c.mail_handle) {
       const mail = document.createElement("div");
@@ -5576,6 +6244,34 @@ export class App {
           ),
       },
       {
+        // Money is opt-in on both sides. The label is the action; the row's
+        // badge says when it is on.
+        id: "payments",
+        label:
+          c.payments === "allow" ? "Turn off payments" : "Allow payments",
+        icon: "wallet",
+        onSelect: () =>
+          void this.setTrustPayments(
+            c,
+            c.payments === "allow" ? "deny" : "allow",
+          ),
+      },
+      {
+        // Torrent sharing is opt-in on both sides, like payments. The row's
+        // badge says when both halves are on.
+        id: "torrents",
+        label:
+          c.torrents === "allow"
+            ? "Turn off torrent sharing"
+            : "Allow torrent sharing",
+        icon: "magnet",
+        onSelect: () =>
+          void this.setTrustTorrents(
+            c,
+            c.torrents === "allow" ? "deny" : "allow",
+          ),
+      },
+      {
         // The sideband is part of the trust by default; this is how a user
         // narrows it. Both directions are imperatives naming the click.
         id: "signals",
@@ -5606,6 +6302,21 @@ export class App {
         onSelect: () => this.openTrustDelete(c.nickname),
       },
     );
+
+    // Sharing is a trust-level action, not only a chat one: a mail-only trust
+    // still has the sideband, so the same offer works without a composer.
+    if (
+      c.signals === "allow" &&
+      c.torrents === "allow" &&
+      c.peer_torrents === "allow"
+    ) {
+      items.unshift({
+        id: "shareTorrent",
+        label: "Share a torrent",
+        icon: "magnet",
+        onSelect: () => this.openTorrentPicker(c.nickname),
+      });
+    }
 
     const menu = new OverflowMenu({
       label: `Contact options for ${displayNick(c.nickname)}`,
@@ -5692,17 +6403,734 @@ export class App {
       await api.setContactSignals(c.nickname, policy);
       this.contacts = (await api.contacts()) ?? [];
       setKnownContacts(this.contacts.map((x) => x.nickname));
-      this.announce(
-        policy === "deny"
-          ? `Signals are off for ${displayNick(c.nickname)}.`
-          : `Signals are on for ${displayNick(c.nickname)}.`,
-      );
+      if (policy === "allow") {
+        // Re-announce the choices that were made while the sideband was off.
+        // Payments first (its consent gates address storage), then torrents,
+        // then the wallet address itself. The daemon answers a payment consent
+        // with this side's address, so the handshake repairs itself either way.
+        if (c.payments === "allow") {
+          await api.setContactPayments(c.nickname, "allow").catch(() => {});
+        }
+        if (c.torrents === "allow") {
+          await api.setContactTorrents(c.nickname, "allow").catch(() => {});
+        }
+        await api.walletAnnounce().catch(() => {});
+        this.announce(`Signals are on for ${displayNick(c.nickname)}.`);
+      } else {
+        this.announce(`Signals are off for ${displayNick(c.nickname)}.`);
+      }
       this.scheduleRender();
     } catch (e) {
       showToast(e instanceof AppError ? e.message : "Couldn't change signals.", {
         kind: "error",
       });
     }
+  }
+
+  /**
+   * Turn payments on or off for one contact.
+   *
+   * Enabling also announces this wallet's addresses to payment-enabled
+   * trustees, so the other side can pay without a separate address swap. Both
+   * sides must allow payments for an address to be accepted.
+   */
+  private async setTrustPayments(
+    c: ContactDto,
+    policy: PaymentPolicy,
+  ): Promise<void> {
+    try {
+      await api.setContactPayments(c.nickname, policy);
+      this.contacts = (await api.contacts()) ?? [];
+      setKnownContacts(this.contacts.map((x) => x.nickname));
+      if (policy === "allow") {
+        await api.walletAnnounce().catch(() => {});
+        this.announce(
+          `Payments are on for ${displayNick(
+            c.nickname,
+          )}. Both sides must allow them.`,
+        );
+      } else {
+        this.announce(`Payments are off for ${displayNick(c.nickname)}.`);
+      }
+      this.scheduleRender();
+    } catch (e) {
+      showToast(e instanceof AppError ? e.message : "Couldn't change payments.", {
+        kind: "error",
+      });
+    }
+  }
+
+  /** Turn torrent sharing on or off for one contact. */
+  private async setTrustTorrents(
+    c: ContactDto,
+    policy: TorrentPolicy,
+  ): Promise<void> {
+    try {
+      await api.setContactTorrents(c.nickname, policy);
+      this.contacts = (await api.contacts()) ?? [];
+      setKnownContacts(this.contacts.map((x) => x.nickname));
+      this.announce(
+        policy === "allow"
+          ? `Torrent sharing is on for ${displayNick(c.nickname)}. Both sides must allow it.`
+          : `Torrent sharing is off for ${displayNick(c.nickname)}.`,
+      );
+      this.scheduleRender();
+    } catch (e) {
+      showToast(
+        e instanceof AppError ? e.message : "Couldn't change torrent sharing.",
+        { kind: "error" },
+      );
+    }
+  }
+
+  private openPayTrustee(nick: string, amount = ""): void {
+    this.payTrusteeNick = nick;
+    this.payTrusteeAmount = amount;
+    this.payTrusteeConfirm = false;
+    this.payTrusteeError = null;
+    this.payTrusteeBusy = false;
+    void refreshWallet()
+      .then(() => this.scheduleRender())
+      .catch(() => {});
+    this.scheduleRender();
+  }
+
+  private closePayTrustee(): void {
+    this.payTrusteeNick = null;
+    this.payTrusteeAmount = "";
+    this.payTrusteeConfirm = false;
+    this.payTrusteeError = null;
+    this.payTrusteeBusy = false;
+  }
+
+  /**
+   * The chat payment dialog. USDC is the default and only unit here: the
+   * wallet remains the place for ETH, BTC and other tokens.
+   */
+  private renderPayTrusteeModal(): HTMLElement {
+    const nick = this.payTrusteeNick!;
+    const contact = this.contacts.find((c) => c.nickname === nick);
+    const wallet = getWalletState();
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal pay-trustee-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `Send USDC to ${displayNick(nick)}`);
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = this.payTrusteeConfirm ? "Confirm payment" : "Send USDC";
+    modal.appendChild(h);
+
+    const close = () => {
+      this.closePayTrustee();
+      this.scheduleRender();
+    };
+    /** The step's own right-aligned actions, or null for the refusal states. */
+    let stepActions: HTMLElement | null = null;
+
+    if (!contact) {
+      const p = document.createElement("p");
+      p.className = "muted text-13";
+      p.textContent = "This trustee is no longer in your trusts.";
+      modal.appendChild(p);
+    } else if (contact.signals === "deny") {
+      // The sideband is what carries the address and the receipt. Saying so
+      // here is the only place a user can connect the two switches.
+      const p = document.createElement("p");
+      p.className = "muted text-13";
+      p.textContent = `Signals are off for ${displayNick(
+        nick,
+      )}. Payments need the trustee sideband to exchange addresses, so allow signals for this trustee first.`;
+      modal.appendChild(p);
+    } else if (contact.peer_payments === "deny") {
+      // The peer's own switch. Shown before the local one so the reason this
+      // side cannot pay is never mistaken for a setting the user can change
+      // here.
+      const p = document.createElement("p");
+      p.className = "muted text-13";
+      p.textContent = `${displayNick(
+        nick,
+      )} is not accepting payments. They turned them off for this trust; payments work only when both sides allow them.`;
+      modal.appendChild(p);
+    } else if (contact.payments !== "allow") {
+      const p = document.createElement("p");
+      p.className = "muted text-13";
+      p.textContent = `Payments are off for ${displayNick(
+        nick,
+      )}. Turn them on from the trust's menu first.`;
+      modal.appendChild(p);
+    } else if (!contact.wallet_ethereum) {
+      const p = document.createElement("p");
+      p.className = "muted text-13";
+      p.textContent = `${displayNick(
+        nick,
+      )} has not shared an Ethereum address yet. Both sides need payments and signals enabled; the address is exchanged automatically once they are.`;
+      modal.appendChild(p);
+    } else if (!wallet.exists) {
+      const p = document.createElement("p");
+      p.className = "muted text-13";
+      p.textContent = "Create a wallet first: Vault → Wallet.";
+      modal.appendChild(p);
+    } else {
+      const network =
+        wallet.ethereum_network === "sepolia" ? "Sepolia" : "mainnet";
+      const toAddress = contact.wallet_ethereum;
+      const shortAddress = `${toAddress.slice(0, 6)}…${toAddress.slice(-4)}`;
+      const usdc = wallet.tokens.find(
+        (t) => t.symbol.toUpperCase() === "USDC",
+      );
+
+      if (this.payTrusteeConfirm) {
+        // The second screen: an irreversible send gets an explicit yes, and
+        // the amount, address and network are restated in one block.
+        const amount = formatUnits(
+          parseUnits(this.payTrusteeAmount, 6) ?? "0",
+          6,
+        );
+        const summary = document.createElement("div");
+        summary.className = "pay-trustee-summary";
+        const amountEl = document.createElement("div");
+        amountEl.className = "pay-trustee-amount";
+        amountEl.textContent = `${amount} USDC`;
+        const toEl = document.createElement("div");
+        toEl.className = "text-13";
+        toEl.textContent = `to ${displayNick(nick)}`;
+        const addrEl = document.createElement("div");
+        addrEl.className = "faint text-12";
+        addrEl.textContent = `${shortAddress} · Ethereum ${network}`;
+        summary.append(amountEl, toEl, addrEl);
+        const note = document.createElement("p");
+        note.className = "faint text-12 pay-trustee-note";
+        note.textContent =
+          "A payment cannot be undone once it is mined.";
+
+        const actions = document.createElement("div");
+        actions.className = "modal-actions";
+        const back = document.createElement("button");
+        back.type = "button";
+        back.className = "btn-secondary pressable";
+        back.textContent = "Back";
+        back.disabled = this.payTrusteeBusy;
+        back.onclick = () => {
+          this.payTrusteeConfirm = false;
+          this.payTrusteeError = null;
+          this.scheduleRender();
+        };
+        const confirm = document.createElement("button");
+        confirm.type = "button";
+        confirm.className = "btn-primary pressable";
+        confirm.textContent = this.payTrusteeBusy
+          ? "Sending…"
+          : "Confirm payment";
+        confirm.disabled = this.payTrusteeBusy;
+        confirm.onclick = () => void this.payTrusteeNow(nick);
+        actions.append(back, confirm);
+        modal.append(summary, note);
+        stepActions = actions;
+      } else {
+        const meta = document.createElement("p");
+        meta.className = "muted text-13 pay-trustee-meta";
+        meta.textContent = `to ${displayNick(
+          nick,
+        )} · ${shortAddress} · Ethereum ${network}`;
+        modal.appendChild(meta);
+        if (usdc) {
+          const bal = document.createElement("p");
+          bal.className = "faint text-12";
+          bal.style.marginTop = "var(--space-1)";
+          bal.textContent = `Balance: ${formatUnits(
+            usdc.balance,
+            usdc.decimals,
+          )} USDC.`;
+          modal.appendChild(bal);
+        }
+
+        // One labelled field, the same shape the delete dialog uses, rather
+        // than a full-width box and a full-width button.
+        const field = document.createElement("label");
+        field.className = "pay-trustee-field";
+        const fieldLabel = document.createElement("span");
+        fieldLabel.className = "text-13";
+        fieldLabel.textContent = "Amount (USDC)";
+        const input = document.createElement("input");
+        input.className = "input-field";
+        input.type = "text";
+        input.placeholder = "0.00";
+        input.inputMode = "decimal";
+        input.value = this.payTrusteeAmount;
+        field.append(fieldLabel, input);
+        modal.appendChild(field);
+
+        const actions = document.createElement("div");
+        actions.className = "modal-actions";
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "btn-secondary pressable";
+        cancel.textContent = "Cancel";
+        cancel.onclick = close;
+        const next = document.createElement("button");
+        next.type = "button";
+        next.className = "btn-primary pressable";
+        next.textContent = "Continue";
+        const sync = () => {
+          const base = parseUnits(this.payTrusteeAmount, 6);
+          next.disabled = base === null || base === "0";
+        };
+        input.oninput = () => {
+          this.payTrusteeAmount = input.value;
+          sync();
+        };
+        sync();
+        next.onclick = () => {
+          const base = parseUnits(this.payTrusteeAmount, 6);
+          if (base === null || base === "0") {
+            this.payTrusteeError = "Enter an amount greater than zero.";
+            this.scheduleRender();
+            return;
+          }
+          this.payTrusteeConfirm = true;
+          this.payTrusteeError = null;
+          this.scheduleRender();
+        };
+        actions.append(cancel, next);
+        stepActions = actions;
+      }
+    }
+
+    if (this.payTrusteeError) {
+      const err = document.createElement("p");
+      err.className = "text-13 pay-trustee-error";
+      err.style.color = "var(--danger)";
+      err.textContent = this.payTrusteeError;
+      modal.appendChild(err);
+    }
+
+    if (stepActions) {
+      modal.appendChild(stepActions);
+    } else {
+      const row = document.createElement("div");
+      row.className = "modal-actions";
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "btn-secondary pressable";
+      cancel.textContent = "Close";
+      cancel.onclick = close;
+      row.appendChild(cancel);
+      modal.appendChild(row);
+    }
+    back.appendChild(modal);
+    return back;
+  }
+
+  private async payTrusteeNow(nick: string): Promise<void> {
+    const base = parseUnits(this.payTrusteeAmount, 6);
+    if (base === null || base === "0") {
+      this.payTrusteeError = "Enter an amount greater than zero.";
+      this.scheduleRender();
+      return;
+    }
+    const amount = this.payTrusteeAmount.trim();
+    this.payTrusteeBusy = true;
+    this.payTrusteeError = null;
+    this.scheduleRender();
+    try {
+      const result = await api.payTrustee(nick, base);
+      if (!result) throw new AppError("The daemon sent no transaction id.");
+      this.payTrusteeBusy = false;
+      this.closePayTrustee();
+      showToast(`Sent ${amount} USDC. Tx ${result.txid.slice(0, 10)}…`, {
+        kind: "success",
+      });
+      // The daemon wrote the payment line into the thread before answering, so
+      // the confirmation lives in the conversation rather than only in a toast.
+      await this.refreshChatHistory();
+    } catch (e) {
+      this.payTrusteeBusy = false;
+      this.payTrusteeError =
+        e instanceof AppError
+          ? e.message
+          : "The payment could not be sent.";
+      this.scheduleRender();
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Torrent sharing: the `/torrent` picker and incoming offers
+  // ---------------------------------------------------------------------
+
+  private openTorrentPicker(nick: string): void {
+    this.torrentPickerNick = nick;
+    this.torrentPickerBusyId = null;
+    this.torrentPickerError = null;
+    void refreshTorrents().then(() => this.scheduleRender());
+    this.scheduleRender();
+  }
+
+  private closeTorrentPicker(): void {
+    this.torrentPickerNick = null;
+    this.torrentPickerBusyId = null;
+    this.torrentPickerError = null;
+    // An offer that arrived while the picker was up waited for this surface to
+    // close; it is still pending in the daemon's sidecar.
+    this.showNextTorrentOffer();
+  }
+
+  private async shareTorrentEntry(id: string): Promise<void> {
+    const nick = this.torrentPickerNick;
+    if (!nick) return;
+    this.torrentPickerBusyId = id;
+    this.torrentPickerError = null;
+    this.scheduleRender();
+    try {
+      const result = await shareTorrent(nick, id);
+      this.torrentPickerBusyId = null;
+      this.closeTorrentPicker();
+      this.announce(`Torrent offered to ${displayNick(nick)}.`);
+      showToast(`Torrent offered to ${displayNick(nick)}: ${result.name}`, {
+        kind: "success",
+      });
+      this.scheduleRender();
+    } catch (e) {
+      this.torrentPickerBusyId = null;
+      this.torrentPickerError =
+        e instanceof AppError
+          ? e.message
+          : "The torrent could not be offered.";
+      this.scheduleRender();
+    }
+  }
+
+  private renderTorrentPickerModal(): HTMLElement {
+    const nick = this.torrentPickerNick!;
+    const contact = this.contacts.find((c) => c.nickname === nick);
+    const state = getTorrentsState();
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal torrent-picker-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", `Share a torrent with ${displayNick(nick)}`);
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Share a torrent";
+    modal.appendChild(h);
+
+    const close = () => {
+      this.closeTorrentPicker();
+      this.scheduleRender();
+    };
+    const meta = document.createElement("p");
+    meta.className = "muted text-13";
+    meta.style.marginTop = "var(--space-3)";
+    modal.appendChild(meta);
+
+    if (!contact) {
+      meta.textContent = "This trustee is no longer in your trusts.";
+    } else if (contact.signals === "deny") {
+      meta.textContent = `Signals are off for ${displayNick(
+        nick,
+      )}. Torrent sharing needs the trustee sideband, so allow signals for this trustee first.`;
+    } else if (contact.torrents !== "allow") {
+      meta.textContent = `Torrent sharing is off for ${displayNick(
+        nick,
+      )}. Turn it on from the trust's menu first.`;
+    } else if (contact.peer_torrents !== "allow") {
+      meta.textContent = `${displayNick(
+        nick,
+      )} is not accepting torrent shares. Both sides must allow torrent sharing.`;
+    } else {
+      meta.textContent = `Choose a torrent from your Torrents library or queue to offer to ${displayNick(
+        nick,
+      )}. They download it with their own TorBox account; the file does not travel through Hush.`;
+      const entries: Array<{
+        id: string;
+        name: string;
+        size: number;
+        meta: string;
+      }> = [
+        ...state.items
+          .filter((i) => i.hash)
+          .map((i) => ({
+            id: i.id,
+            name: i.name,
+            size: i.size,
+            meta: torrentStatusLabel(i),
+          })),
+        ...state.library
+          .filter((e) => e.hash)
+          .map((e) => ({
+            id: e.id,
+            name: e.name,
+            size: e.size,
+            meta: "In your vault",
+          })),
+      ];
+      if (entries.length === 0) {
+        const empty = document.createElement("p");
+        empty.className = "muted text-13";
+        empty.style.marginTop = "var(--space-4)";
+        empty.textContent =
+          "No torrents with an info hash yet. Finish a download in Torrents first.";
+        modal.appendChild(empty);
+      } else {
+        const list = document.createElement("div");
+        list.className = "torrent-picker-list";
+        for (const entry of entries) {
+          const row = document.createElement("div");
+          row.className = "torrent-picker-row";
+          const info = document.createElement("div");
+          const name = document.createElement("div");
+          name.className = "torrent-picker-name text-15";
+          name.textContent = entry.name;
+          name.title = entry.name;
+          const sub = document.createElement("div");
+          sub.className = "muted text-12";
+          const size =
+            entry.size > 0 ? formatBytes(entry.size) : "Size unknown";
+          sub.textContent = `${size} · ${entry.meta}`;
+          info.append(name, sub);
+          const share = document.createElement("button");
+          share.type = "button";
+          share.className = "btn-secondary pressable";
+          share.textContent =
+            this.torrentPickerBusyId === entry.id ? "Sending…" : "Share";
+          share.disabled = this.torrentPickerBusyId !== null;
+          share.onclick = () => void this.shareTorrentEntry(entry.id);
+          row.append(info, share);
+          list.appendChild(row);
+        }
+        modal.appendChild(list);
+      }
+    }
+
+    if (this.torrentPickerError) {
+      const err = document.createElement("p");
+      err.className = "text-13";
+      err.style.color = "var(--danger)";
+      err.style.marginTop = "var(--space-3)";
+      err.textContent = this.torrentPickerError;
+      modal.appendChild(err);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = close;
+    actions.appendChild(cancel);
+    modal.appendChild(actions);
+    back.appendChild(modal);
+    return back;
+  }
+
+  private currentTorrentOffer(): TorrentOfferDto | undefined {
+    return getTorrentsState().offers.find(
+      (o) => o.offer_id === this.torrentOfferId,
+    );
+  }
+
+  /** The sender's current local nickname, even if it changed after receipt. */
+  private torrentOfferFrom(offer: TorrentOfferDto): string {
+    return (
+      this.contacts.find((c) => c.protocol_name === offer.from_account)
+        ?.nickname ?? offer.from_nick
+    );
+  }
+
+  /** Open the oldest pending offer, if no other torrent surface is up. */
+  private showNextTorrentOffer(): void {
+    if (!this.status || this.status.locked) return;
+    if (this.torrentOfferId || this.torrentPickerNick) return;
+    const offer = getTorrentsState().offers.find((o) => o.status === "pending");
+    if (!offer) return;
+    this.torrentOfferId = offer.offer_id;
+    this.torrentOfferBusy = false;
+    this.torrentOfferError = null;
+    this.scheduleRender();
+  }
+
+  /** Re-read offers after unlock so one that arrived while away is not lost. */
+  private async resumeTorrentOffers(): Promise<void> {
+    await refreshTorrents();
+    this.showNextTorrentOffer();
+  }
+
+  private closeTorrentOffer(): void {
+    this.torrentOfferId = null;
+    this.torrentOfferBusy = false;
+    this.torrentOfferError = null;
+  }
+
+  private async torrentOfferAccept(): Promise<void> {
+    const offer = this.currentTorrentOffer();
+    if (!offer) {
+      this.closeTorrentOffer();
+      this.scheduleRender();
+      return;
+    }
+    this.torrentOfferBusy = true;
+    this.torrentOfferError = null;
+    this.scheduleRender();
+    try {
+      await acceptTorrentOffer(offer.offer_id);
+      this.closeTorrentOffer();
+      this.announce(`Torrent queued: ${offer.name}`);
+      showToast(`Torrent queued: ${offer.name}`, { kind: "success" });
+      this.showNextTorrentOffer();
+      this.scheduleRender();
+    } catch (e) {
+      this.torrentOfferBusy = false;
+      this.torrentOfferError =
+        e instanceof AppError ? e.message : "The torrent could not be queued.";
+      this.scheduleRender();
+    }
+  }
+
+  private async torrentOfferDecline(): Promise<void> {
+    const offer = this.currentTorrentOffer();
+    if (!offer) {
+      this.closeTorrentOffer();
+      this.scheduleRender();
+      return;
+    }
+    this.torrentOfferBusy = true;
+    this.torrentOfferError = null;
+    this.scheduleRender();
+    try {
+      await declineTorrentOffer(offer.offer_id);
+      this.closeTorrentOffer();
+      this.announce(
+        `Declined the torrent offer from ${displayNick(this.torrentOfferFrom(offer))}.`,
+      );
+      this.showNextTorrentOffer();
+      this.scheduleRender();
+    } catch (e) {
+      this.torrentOfferBusy = false;
+      this.torrentOfferError =
+        e instanceof AppError ? e.message : "The offer could not be declined.";
+      this.scheduleRender();
+    }
+  }
+
+  private renderTorrentOfferModal(): HTMLElement {
+    const offer = this.currentTorrentOffer();
+    const state = getTorrentsState();
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal torrent-offer-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Torrent offer");
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Torrent offer";
+    modal.appendChild(h);
+
+    const close = () => {
+      this.closeTorrentOffer();
+      this.scheduleRender();
+    };
+    const meta = document.createElement("p");
+    meta.className = "muted text-13";
+    meta.style.marginTop = "var(--space-3)";
+    modal.appendChild(meta);
+
+    let actions: HTMLElement | null = null;
+    if (!offer) {
+      meta.textContent = "This torrent offer is no longer available.";
+    } else if (offer.status !== "pending") {
+      meta.textContent = "This torrent offer has already been answered.";
+    } else {
+      meta.textContent = `${displayNick(
+        this.torrentOfferFrom(offer),
+      )} wants to share a torrent with you.`;
+      const summary = document.createElement("div");
+      summary.className = "torrent-offer-summary";
+      const name = document.createElement("div");
+      name.className = "torrent-offer-name text-15";
+      name.textContent = offer.name;
+      const size = document.createElement("div");
+      size.className = "muted text-13";
+      size.textContent = `${
+        offer.size > 0 ? formatBytes(offer.size) : "Size unknown"
+      } · fetched by your TorBox account`;
+      summary.append(name, size);
+      modal.appendChild(summary);
+
+      const note = document.createElement("p");
+      note.className = "faint text-12 torrent-offer-note";
+      note.textContent =
+        "Hush is not carrying the file. Your TorBox account downloads it from the torrent network and stores it in this vault.";
+      modal.appendChild(note);
+
+      if (!state.has_key) {
+        const noKey = document.createElement("p");
+        noKey.className = "text-13";
+        noKey.style.marginTop = "var(--space-3)";
+        noKey.style.color = "var(--danger)";
+        noKey.textContent =
+          "Add your TorBox API key in Settings → Torrents first.";
+        modal.appendChild(noKey);
+      }
+
+      actions = document.createElement("div");
+      actions.className = "modal-actions";
+      const later = document.createElement("button");
+      later.type = "button";
+      later.className = "btn-secondary pressable";
+      later.textContent = "Later";
+      later.disabled = this.torrentOfferBusy;
+      later.onclick = () => {
+        close();
+        showToast("Torrent offer kept for later. It will appear again next unlock.", {
+          kind: "info",
+        });
+      };
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "btn-secondary pressable";
+      decline.textContent = "Decline";
+      decline.disabled = this.torrentOfferBusy;
+      decline.onclick = () => void this.torrentOfferDecline();
+      const download = document.createElement("button");
+      download.type = "button";
+      download.className = "btn-primary pressable";
+      download.textContent = this.torrentOfferBusy ? "Adding…" : "Download";
+      download.disabled = this.torrentOfferBusy || !state.has_key;
+      download.onclick = () => void this.torrentOfferAccept();
+      actions.append(later, decline, download);
+    }
+
+    if (this.torrentOfferError) {
+      const err = document.createElement("p");
+      err.className = "text-13";
+      err.style.color = "var(--danger)";
+      err.style.marginTop = "var(--space-3)";
+      err.textContent = this.torrentOfferError;
+      modal.appendChild(err);
+    }
+
+    if (actions) {
+      modal.appendChild(actions);
+    } else {
+      const row = document.createElement("div");
+      row.className = "modal-actions";
+      const closeBtn = document.createElement("button");
+      closeBtn.type = "button";
+      closeBtn.className = "btn-secondary pressable";
+      closeBtn.textContent = "Close";
+      closeBtn.onclick = close;
+      row.appendChild(closeBtn);
+      modal.appendChild(row);
+    }
+    back.appendChild(modal);
+    return back;
   }
 
   // ---------------------------------------------------------------------
@@ -6070,7 +7498,7 @@ export class App {
       );
       b.appendChild(fc);
     } else {
-      b.textContent = msg.body;
+      this.appendChatText(b, msg.body);
     }
     return b;
   }
@@ -7501,8 +8929,24 @@ export class App {
     send: HTMLButtonElement,
   ): Promise<void> {
     if (!text) return;
+    let outgoing = text;
+    const link = parseLinkCommand(text);
+    if (link) {
+      if (!link.url) {
+        showToast("Add a link after /link.", { kind: "error" });
+        return;
+      }
+      const normalized = normalizeExternalLink(link.url);
+      if (!normalized) {
+        showToast("Use /link with an http:// or https:// address.", {
+          kind: "error",
+        });
+        return;
+      }
+      outgoing = normalized;
+    }
     try {
-      await api.sendConclaveMessage(conclaveId, text);
+      await api.sendConclaveMessage(conclaveId, outgoing);
       // Cleared only on success, so a failure leaves the text in the box.
       ta.value = "";
       send.classList.remove("ready");
@@ -8606,11 +10050,11 @@ export class App {
 
   /** Every external link routes through the confirm modal; never auto-open. */
   private confirmExternalOpen(url: string): void {
-    this.readsConfirmUrl = url;
+    this.externalConfirmUrl = url;
     this.scheduleRender();
   }
 
-  private readsHostOf(url: string): string {
+  private hostOf(url: string): string {
     try {
       return new URL(url).host;
     } catch {
@@ -10388,7 +11832,7 @@ export class App {
       const open = document.createElement("button");
       open.type = "button";
       open.className = "btn-secondary pressable atproto-pointer-open";
-      open.textContent = `Read it on ${this.readsHostOf(doc.url)}`;
+      open.textContent = `Read it on ${this.hostOf(doc.url)}`;
       open.title = doc.url;
       // Through the same confirmation every other external link uses: the shell
       // is never handed a URL to open without the member seeing where it goes.
@@ -12371,28 +13815,29 @@ export class App {
     this.scheduleRender();
   }
 
-  private renderReadsConfirm(): HTMLElement {
-    const url = this.readsConfirmUrl!;
+  private renderExternalConfirm(): HTMLElement {
+    const url = this.externalConfirmUrl!;
     const back = document.createElement("div");
     back.className = "modal-backdrop";
     const modal = document.createElement("div");
-    modal.className = "modal";
+    modal.className = "modal external-confirm-modal";
     modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
     modal.setAttribute("aria-label", "Open external link");
     const h = document.createElement("h2");
     h.className = "text-22";
-    h.textContent = "Open outside Hush?";
+    h.textContent = "Open external link?";
     const p = document.createElement("p");
     p.className = "muted text-13";
-    p.textContent = `This leaves the app and opens ${this.readsHostOf(url)} in your browser. The site will see your normal browsing identity, not Hush's.`;
+    p.textContent = `This will open an external link in the browser: ${this.hostOf(url)}. The site will see your normal browsing identity, not Hush's.`;
     const row = document.createElement("div");
-    row.className = "reads-confirm-row";
+    row.className = "modal-actions";
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn-secondary pressable";
-    cancel.textContent = "Stay here";
+    cancel.textContent = "Cancel";
     cancel.onclick = () => {
-      this.readsConfirmUrl = null;
+      this.externalConfirmUrl = null;
       this.scheduleRender();
     };
     const open = document.createElement("button");
@@ -12400,7 +13845,7 @@ export class App {
     open.className = "btn-primary pressable";
     open.textContent = "Open in browser";
     open.onclick = () => {
-      this.readsConfirmUrl = null;
+      this.externalConfirmUrl = null;
       if (isTauriShell()) {
         void invoke("hush_open_url", { url }).catch(() => {
           /* the modal already closed; the failure is visible by nothing happening */
@@ -13840,11 +15285,10 @@ export class App {
   /**
    * Make a rendered rich body's links safe to click.
    *
-   * The sanitizer allows `href` on `http(s)`/`mailto` links, but this app has no
-   * external opener wired up, so a raw click would either do nothing or navigate
-   * the webview away from the app. Intercepting the click and copying the URL
-   * keeps the link useful without handing the shell a navigation it cannot
-   * safely perform.
+   * The sanitizer allows `href` on `http(s)`/`mailto` links, but mail keeps a
+   * copy-on-click behavior: a raw click would navigate the webview away from the
+   * app. Chat text uses `confirmExternalOpen` instead, where the link is part of
+   * the message and the host is confirmed before opening.
    */
   private guardLinks(root: HTMLElement): void {
     root.addEventListener("click", (e) => {
@@ -14812,6 +16256,18 @@ export class App {
     });
     card.appendChild(qr);
 
+    const share = document.createElement("button");
+    share.type = "button";
+    share.className = "btn-secondary text-13 pressable";
+    share.textContent = this.walletBusy
+      ? "Sharing…"
+      : "Share with trustees";
+    share.title =
+      "Send these receive addresses to trustees who allow payments.";
+    share.disabled = this.walletBusy;
+    share.onclick = () => void this.walletAnnounceNow();
+    card.appendChild(share);
+
     if (this.walletChain === "bitcoin") {
       const fresh = document.createElement("button");
       fresh.type = "button";
@@ -14846,6 +16302,75 @@ export class App {
         ? "Bitcoin only, on the wallet's own network. The fee is what the miners take."
         : "Ether, or one of the tokens this wallet tracks. The fee is set by the node's own estimate.";
     card.append(h, p);
+
+    // Address discovery: a trustee who announced a wallet address is a
+    // one-click destination. Manual entry stays available for everyone else.
+    const withAddress = this.contacts.filter(
+      (c) => c.wallet_bitcoin || c.wallet_ethereum,
+    );
+    if (withAddress.length > 0) {
+      const picker = document.createElement("select");
+      picker.className = "input-field wallet-contact-picker";
+      picker.setAttribute("aria-label", "Pay a trustee");
+      const manual = document.createElement("option");
+      manual.value = "";
+      manual.textContent = "Pay someone else (enter an address)";
+      picker.appendChild(manual);
+      for (const c of withAddress) {
+        const opt = document.createElement("option");
+        opt.value = c.nickname;
+        const chain = c.wallet_bitcoin
+          ? c.wallet_ethereum
+            ? "Bitcoin or Ethereum"
+            : "Bitcoin"
+          : "Ethereum";
+        opt.textContent = `${displayNick(c.nickname)} — ${chain}`;
+        picker.appendChild(opt);
+      }
+      picker.value = this.walletSendContact ?? "";
+      picker.onchange = () => {
+        const nick = picker.value || null;
+        this.walletSendContact = nick;
+        if (!nick) {
+          this.scheduleRender();
+          return;
+        }
+        const c = this.contacts.find((x) => x.nickname === nick);
+        if (!c) {
+          this.scheduleRender();
+          return;
+        }
+        const onCurrent =
+          this.walletChain === "bitcoin" ? c.wallet_bitcoin : c.wallet_ethereum;
+        if (onCurrent) {
+          this.walletSendTo = onCurrent;
+        } else if (this.walletChain === "bitcoin" && c.wallet_ethereum) {
+          this.walletChain = "ethereum";
+          this.walletSendTo = c.wallet_ethereum;
+        } else if (this.walletChain === "ethereum" && c.wallet_bitcoin) {
+          this.walletChain = "bitcoin";
+          this.walletSendTo = c.wallet_bitcoin;
+        }
+        this.walletError = null;
+        this.scheduleRender();
+      };
+      card.appendChild(picker);
+
+      const chosen = withAddress.find(
+        (c) => c.nickname === this.walletSendContact,
+      );
+      if (chosen) {
+        const shared = document.createElement("p");
+        shared.className = "faint text-12";
+        const stamp = chosen.wallet_updated_ms
+          ? ` Updated ${new Date(chosen.wallet_updated_ms).toLocaleDateString()}.`
+          : "";
+        shared.textContent = `Address shared by ${displayNick(
+          chosen.nickname,
+        )}.${stamp} Confirm it before sending — a transfer cannot be undone.`;
+        card.appendChild(shared);
+      }
+    }
 
     const to = document.createElement("input");
     to.className = "input-field";
@@ -15192,6 +16717,33 @@ export class App {
     } catch (e) {
       this.walletError =
         e instanceof AppError ? e.message : "A new address could not be made.";
+    } finally {
+      this.walletBusy = false;
+      this.scheduleRender();
+    }
+  }
+
+  private async walletAnnounceNow(): Promise<void> {
+    this.walletBusy = true;
+    this.walletError = null;
+    this.scheduleRender();
+    try {
+      const result = await api.walletAnnounce();
+      if (!result) throw new Error("The daemon sent no answer.");
+      const total = result.sent + result.failed;
+      showToast(
+        total === 0
+          ? "No trustees have payments enabled yet. Turn payments on for a trustee first."
+          : result.failed === 0
+            ? `Addresses shared with ${result.sent} trustee${
+                result.sent === 1 ? "" : "s"
+              }.`
+            : `Shared with ${result.sent}; ${result.failed} could not be reached.`,
+        { kind: result.failed === 0 ? "success" : "error" },
+      );
+    } catch (e) {
+      this.walletError =
+        e instanceof AppError ? e.message : "The addresses could not be shared.";
     } finally {
       this.walletBusy = false;
       this.scheduleRender();
@@ -16616,6 +18168,8 @@ export class App {
         await saveTorboxKey(this.torboxKeyDraft);
         this.torboxKeyDraft = "";
         showToast("TorBox key saved", { kind: "success" });
+        // An offer put aside because there was no key can now be answered.
+        void this.resumeTorrentOffers();
       } catch (e) {
         this.torboxTestError = e instanceof AppError ? e.message : "Could not save that key.";
       } finally {
@@ -17305,6 +18859,13 @@ export class App {
         } else if (r.payload.t === "file") {
           lines.push(
             `${stamp} ${sender}: (file) ${r.payload.name} (${formatBytes(r.payload.size)})`,
+          );
+        } else if (r.payload.t === "payment") {
+          lines.push(
+            `${stamp} ${sender}: (payment) ${formatUnits(
+              r.payload.amount,
+              6,
+            )} ${r.payload.symbol} ${r.payload.txid}`,
           );
         }
       }

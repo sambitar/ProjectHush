@@ -7,6 +7,25 @@ pub const MAX_INLINE_FILE_BYTES: usize = 256 * 1024;
 /// `MAX_INLINE_FILE_BYTES`, shared across all of them.
 pub const MAX_MAIL_ATTACHMENTS: usize = 8;
 
+/// The largest body one expiring chat message may carry.
+///
+/// Expiring messages are live-only and never stored, so the cap is only there
+/// to keep one message from becoming a file transfer. It matches the sideband's
+/// 16 KiB envelope rather than the 1 MiB relay blob cap.
+pub const MAX_EXPIRE_TEXT_BYTES: usize = 16 * 1024;
+
+/// The shortest lifetime an expiring message may be given.
+///
+/// A message with no time to arrive is not a message; the daemon enforces this
+/// so a forged or buggy sender cannot make one expire before the next poll.
+pub const MIN_EXPIRE_TTL_MS: u64 = 1_000;
+
+/// The longest lifetime an expiring message may be given: 24 hours.
+///
+/// Past this the feature stops meaning "expiring" and starts meaning "saved
+/// with a cleanup timer", which is exactly what it promises not to be.
+pub const MAX_EXPIRE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+
 /// One attachment on the wire: a display name and its bytes, base64 in JSON.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MailAttachment {
@@ -219,6 +238,23 @@ fn default_paper_title() -> String {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum MessagePayload {
     Text { body: String },
+    /// A chat line that is deleted from both sides at `expires_ms`.
+    ///
+    /// Unlike [`MessagePayload::Text`], this payload is **never** written to
+    /// either vault: `recv` hands it to the caller out of band and `send`
+    /// records no chat row. It is live-only for the same reason chat is, so an
+    /// away peer never has a copy parked on the relay waiting to be delivered
+    /// after its deadline. The id is the sender's, so both sides and a retried
+    /// delivery can name the same line.
+    ExpireText {
+        /// Random id chosen by the sender: UI key and duplicate suppression.
+        id: String,
+        /// When the sender produced it, Unix ms. Advisory only.
+        sent_ms: u64,
+        /// When both sides delete it, Unix ms.
+        expires_ms: u64,
+        body: String,
+    },
     File {
         name: String,
         #[serde(with = "b64_bytes")]
@@ -656,6 +692,23 @@ impl MessagePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expiring_message_round_trips_with_its_deadline() {
+        let p = MessagePayload::ExpireText {
+            id: "e-1".into(),
+            sent_ms: 1_700_000_000_000,
+            expires_ms: 1_700_000_030_000,
+            body: "burn after reading".into(),
+        };
+        let encoded = p.encode().unwrap();
+        let as_text = String::from_utf8(encoded.clone()).unwrap();
+        assert!(
+            as_text.contains("\"t\":\"expire_text\""),
+            "the wire tag names the variant: {as_text}"
+        );
+        assert_eq!(MessagePayload::decode(&encoded).unwrap(), p);
+    }
 
     #[test]
     fn a_mail_payload_round_trips_with_attachments() {

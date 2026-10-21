@@ -71,28 +71,26 @@ first run a packaged build would have, with nothing pre-seeded.
 ```
 
 ```
-./scripts/run-one-ui.sh --relay http://host:8790      # relay a new vault is created against
 ./scripts/run-one-ui.sh --vault instances/me          # keep the vault somewhere else
-./scripts/run-one-ui.sh --no-relay                    # never start a local relay
 ```
 
 An existing vault is reused as it is, relay included, so the passphrase is asked
 for once and later runs go straight to the window. Add a contact with the invite
 the other person sends you; send yours back with **Copy my invite**.
 
-Two peers on one machine, one local relay, both vaults created for you:
+Two peers on one machine, both on the production relay, both vaults created for you:
 
 ```
 ./scripts/run-two-ui.sh
 ```
 
 It creates `instances/peer-a` and `instances/peer-b` (passphrases `peer-a-pass`
-and `peer-b-pass`), starts a relay on `127.0.0.1:8787`, builds, and opens both
-windows. It is safe to re-run: a relay or daemon that is already up is reused.
+and `peer-b-pass`), builds, and opens both windows on `https://hushrelay.space`.
+It is safe to re-run: a daemon that is already up is reused.
 
 ```
 ./scripts/run-two-ui.sh --dev     # Vite dev server, hot reload, one browser URL per peer
-./scripts/run-two-ui.sh --relay http://relay.example:8787   # use a relay elsewhere; none is started
+./scripts/run-two-ui.sh --relay https://hushrelay.space   # explicit; local relays are refused
 ```
 
 Both scripts install the UI's npm dependencies (`npm ci`) when `node_modules` is
@@ -108,64 +106,44 @@ same thing for automation and for machines without a display:
 
 ```
 cargo build -p hush-cli
-cargo run -p hush-cli -- --dir instances/peer-a init --passphrase peer-a-pass --relay http://127.0.0.1:8787
+cargo run -p hush-cli -- --dir instances/peer-a init --passphrase peer-a-pass --relay https://hushrelay.space
 cargo run -p hush-cli -- --dir instances/peer-a invite
 cargo run -p hush-cli -- --help
 ```
 
 ## Test together, on two machines
 
-Both sides point at the same relay, and the relay carries the mail; the two vaults
-never talk to each other directly. Each side runs one command, and the first run
-creates the vault it needs. The relay URL is printed by the first of these:
+Both sides point at the production relay, `https://hushrelay.space`, and the relay
+carries the mail; the two vaults never talk to each other directly. Each side runs
+one command:
 
 ```
-./scripts/relay-tunnel-url.sh              # prints the HTTPS relay that is live now
+# one side: a new vault on the production relay, then the window
+./scripts/run-one-ui.sh
 
-# one side: a new vault on the shared relay, then the window
-./scripts/run-one-ui.sh --relay https://<tunnel-host>
-
-# the other side: two vaults, both on the same relay
-./scripts/run-two-ui.sh --relay https://<tunnel-host>
+# the other side: Alice and Bob, both on the production relay
+./scripts/run-two-ui.sh --dev
 ```
-
-The second person needs the URL, not the script: `relay-tunnel-url.sh` reaches the
-lab box over SSH, so whoever hands the URL out runs it.
 
 Then exchange invites inside the app: **Copy my invite** on one side, **Add
-contact** on the other. The relay address in the vault is what makes that work, so
-the two runs have to name the same one.
+contact** on the other. The relay address stored in the vault is what makes that
+work, so both vaults must name `https://hushrelay.space`.
 
-The lab VPS relay is reachable two ways, and they are not equivalent:
-
-| Relay URL | Build it needs |
-|---|---|
-| `https://hushrelay.space` — the production relay (Hetzner, ARM, Caddy TLS) | **release** (what a packaged build does) |
-| `http://<tunnel-host>` — Cloudflare quick tunnel on the lab box, changes on restart | debug only |
-| `http://137.184.129.205:8790` — the lab VPS, plain HTTP, no TLS | debug only |
-
-`hush-core`'s `HttpPolicy` refuses a plain-HTTP relay that is not loopback or a v3
-onion in a release build, so the plain-HTTP URLs force the run scripts to build the
-daemon in **debug** and say so. The production relay has a publicly trusted
-certificate, so a release daemon dials it with no client configuration — release
-builds default to it, which is the path to test the way it ships.
-
-The lab box's tunnel hostname is a `trycloudflare.com` name minted when
-`cloudflared-hush-quick.service` on the box last restarted, so it changes and it
-expires. `./scripts/relay-tunnel-url.sh` prints the one that is live now and checks
-it; `--refresh` re-mints it if it has died. The durable alternatives — a Public
-Hostname on the named `hush` tunnel, or TLS on the box — are in
-`docs/ops/relay-lab-vps.md`. A vault stores the relay it was created against, so a
-vault made against a dead hostname has to be repointed. Set `HUSH_CLOUD_RELAY_URL` to
-move the default the scripts fall back to.
+Local relays are not used in this project. The run scripts refuse a loopback
+`--relay` or `HUSH_RELAY_URL`; automated tests start an in-process relay that never
+touches the production host.
 
 ## Relays
 
 The **production relay** is `https://hushrelay.space`, with the onion twin
 `http://qvo7toe6urizihhbj7tp4ibsf2rhkilsrwvnkdk5jlwubjm3e7rnrlad.onion`
-(release builds carry both as defaults; Tor relay mode is a per-vault switch and
+ (every build carries both as defaults; Tor relay mode is a per-vault switch and
 fails closed when either half is missing). Deploy steps, the reboot-test record
 and the onion key backup are in `docs/ops/relay-prod-vps.md`.
+
+**Relay policy:** production only. If the relay needs to change, update
+`hushrelay.space` itself (and its onion twin) rather than pointing a build at a
+local or ad-hoc relay.
 
 The same origin serves the releases: `https://hushrelay.space/updates/` holds the
 installers and the updater manifest (`latest.json`) that installed copies poll.
@@ -174,12 +152,11 @@ someone without a GitHub account, and the updater fetches without credentials. P
 automatic when a release is published, via
 `.github/workflows/publish-updates.yml`; the whole path is in `RELEASING.md`.
 
-Each vault stores the relay it was created against and the daemon dials that one;
-a loopback URL means a relay on this machine, which the run scripts start from
-`crates/hush-relay`. A relay on another host is used as-is:
+Each vault stores the relay it was created against and the daemon dials that one.
+There is no local-relay path in the app or the run scripts:
 
 ```
-HUSH_RELAY_URL=http://relay.example:8787 ./scripts/setup-two-peers.sh
+HUSH_RELAY_URL=https://hushrelay.space ./scripts/setup-two-peers.sh
 ```
 
 An existing vault keeps its stored relay: `--relay` on a run warns when the two

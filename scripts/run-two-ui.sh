@@ -11,18 +11,16 @@
 # can reach a daemon).
 #
 # The relay is named by --relay <url> (falling back to HUSH_RELAY_URL, then
-# http://127.0.0.1:8787). A loopback URL means "start a local relay"; any other
-# host is used as-is and no local relay is started. The daemons read the relay
-# from their vault, never from this script's environment, so --relay only decides
-# whether a local relay is started (and where a brand-new vault is created). Point
-# it at a remote relay to run the stack with no local relay:
-#   ./scripts/run-two-ui.sh --dev --relay http://relay.example:8787
+# https://hushrelay.space). Local relays are refused: this project uses the
+# production relay, and a loopback URL exits before anything starts. The daemons
+# read the relay from their vault, so --relay only decides where a brand-new
+# vault is created:
+#   ./scripts/run-two-ui.sh --dev --relay https://hushrelay.space
 #
-# --dev skips the UI and desktop builds entirely: it starts the relay (only when
-# it is local) and both daemons with a TCP listener plus one Vite dev server, and
-# prints a browser URL per peer. Edits under apps/hush-tauri/src hot reload; only
-# crates/ changes need a rebuild, and then only the daemon (this script does that
-# part).
+# --dev skips the UI and desktop builds entirely: it starts both daemons with a
+# TCP listener plus one Vite dev server, and prints a browser URL per peer. Edits
+# under apps/hush-tauri/src hot reload; only crates/ changes need a rebuild, and
+# then only the daemon (this script does that part).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEV=0
@@ -53,7 +51,7 @@ source "$ROOT/scripts/lib/hush.sh"
 hush_check_prereqs
 PEER_A="${ROOT}/instances/peer-a"
 PEER_B="${ROOT}/instances/peer-b"
-RELAY_URL="${RELAY_ARG:-${HUSH_RELAY_URL:-http://127.0.0.1:8787}}"
+RELAY_URL="${RELAY_ARG:-${HUSH_RELAY_URL:-https://hushrelay.space}}"
 
 # True when the relay URL points at this machine, i.e. a relay this script may
 # start. Anything else is remote and is used where it is.
@@ -70,9 +68,9 @@ relay_is_local() {
     *) return 1 ;;
   esac
 }
-RELAY_IS_LOCAL=0
 if relay_is_local "$RELAY_URL"; then
-  RELAY_IS_LOCAL=1
+  echo "Local relays are disabled in this project; use https://hushrelay.space (or another production relay)." >&2
+  exit 2
 fi
 
 RUN_DIR="${HUSH_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/hush-two-peers}"
@@ -92,7 +90,6 @@ PASS_A="${HUSH_PEER_A_PASS:-peer-a-pass}"
 PASS_B="${HUSH_PEER_B_PASS:-peer-b-pass}"
 
 BIN="${ROOT}/target/debug"
-RELAY_BIN="${BIN}/hush-relay"
 # The daemon runs in release: its vault store encrypts multi-GB torrent files
 # chunk by chunk, and AEAD is ~40x slower in a debug build (see run-one-ui.sh),
 # which made large downloads look stalled at 100%.
@@ -112,20 +109,23 @@ else
   exit 2
 fi
 
-# A loopback RELAY_URL with both vaults already present usually means "the
-# operator did not pass --relay", not "start a relay nobody will use": the
-# daemons read the relay stored in their vault, so a local one would come up and
-# carry no traffic. Follow the vaults instead. This runs before the build because
-# the relay it settles on decides which profile the daemon needs.
-if [[ "$RELAY_IS_LOCAL" == 1 && -z "$RELAY_ARG" && -z "${HUSH_RELAY_URL:-}" ]] \
+# With both vaults already present, follow the relay they are actually on. The
+# vault is the runtime source of truth; --relay only chooses where a new vault is
+# created. This runs before the build because the relay decides which daemon
+# profile is needed.
+if [[ -z "$RELAY_ARG" && -z "${HUSH_RELAY_URL:-}" ]] \
      && [[ -d "$PEER_A" && -d "$PEER_B" ]]; then
   STORED="$(hush_vault_relay "$PEER_A")"
   STORED_B="$(hush_vault_relay "$PEER_B")"
-  if [[ -n "$STORED" && "$STORED" == "$STORED_B" ]] && ! relay_is_local "$STORED"; then
+  if [[ -n "$STORED" && "$STORED" == "$STORED_B" ]]; then
     RELAY_URL="$STORED"
-    RELAY_IS_LOCAL=0
-    echo "Vaults point at $RELAY_URL (from client-config.json); no local relay."
+    echo "Vaults point at $RELAY_URL (from client-config.json)."
   fi
+fi
+
+if relay_is_local "$RELAY_URL"; then
+  echo "Vaults point at a local relay ($RELAY_URL); local relays are disabled in this project. Move them to https://hushrelay.space first." >&2
+  exit 2
 fi
 
 # A release daemon refuses plain HTTP to a relay that is not loopback or a v3
@@ -179,11 +179,6 @@ hush_ensure_node_modules "${ROOT}/apps/hush-tauri"
 # The relay first, before anything that needs one to be up: the vaults are
 # created further down, and setup-two-peers.sh registers the first contacts
 # through the relay, so a fresh clone fails there if this comes later.
-if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
-  echo "Building the relay…"
-  cargo build -p hush-relay
-fi
-
 if [[ "$DEV" == 1 ]]; then
   echo "Dev mode: building the daemon (no UI or desktop build)."
   cargo build "${DAEMON_CARGO_FLAGS[@]}" -p hush-daemon
@@ -202,9 +197,6 @@ else
 fi
 
 REQUIRED_BINS=("$DAEMON_BIN")
-if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
-  REQUIRED_BINS=("$RELAY_BIN" "${REQUIRED_BINS[@]}")
-fi
 [[ "$DEV" == 1 ]] || REQUIRED_BINS+=("$TAURI_BIN")
 for bin in "${REQUIRED_BINS[@]}"; do
   if [[ ! -x "$bin" ]]; then
@@ -242,39 +234,11 @@ relay_health() {
   [[ "$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 "${1%/}/health" 2>/dev/null)" == "200" ]]
 }
 
-if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
-  if relay_ready; then
-    echo "Local relay already up at $RELAY_URL"
-  else
-    RELAY_ADDR="${RELAY_URL#*://}"
-    RELAY_ADDR="${RELAY_ADDR%%/*}"
-    if port_busy "$RELAY_ADDR"; then
-      echo "Port $RELAY_ADDR is in use but the relay did not respond — fix or stop that process." >&2
-      exit 1
-    fi
-    echo "Starting local relay at $RELAY_URL …"
-    HUSH_RELAY_DB="${ROOT}/instances/relay/relay.db" HUSH_RELAY_ADDR="$RELAY_ADDR" \
-      "$RELAY_BIN" >"$LOG_DIR/relay.log" 2>&1 &
-    RELAY_PID=$!
-    PIDS+=("$RELAY_PID")
-    for _ in $(seq 1 100); do
-      if relay_ready; then break; fi
-      kill -0 "$RELAY_PID" 2>/dev/null || break
-      sleep 0.1
-    done
-    if ! relay_ready; then
-      echo "Relay did not come up on $RELAY_URL:" >&2
-      tail -n 20 "$LOG_DIR/relay.log" >&2 || true
-      exit 1
-    fi
-  fi
+echo "Using production relay at $RELAY_URL."
+if relay_health "$RELAY_URL"; then
+  echo "  $RELAY_URL/health is up."
 else
-  echo "Using remote relay at $RELAY_URL (no local relay will be started)."
-  if relay_health "$RELAY_URL"; then
-    echo "  $RELAY_URL/health is up."
-  else
-    echo "  warning: $RELAY_URL/health did not answer 200; daemons will retry and sends will queue." >&2
-  fi
+  echo "  warning: $RELAY_URL/health did not answer 200; daemons will retry and sends will queue." >&2
 fi
 
 # Vaults come last of the setup steps, once the relay they are registered
@@ -310,7 +274,7 @@ start_daemon() { # <name> <vault dir> <socket> [tcp addr]
   rm -f "$sock" 2>/dev/null || true
   # `env -u HUSH_RELAY_URL`: the relay stored in the vault is the runtime source
   # of truth, and an inherited env var would override it while the vault is
-  # locked. --relay only chooses a local relay, never a vault's relay.
+  # locked. --relay only chooses where a new vault is created, never a vault's relay.
   env -u HUSH_RELAY_URL HUSH_RUNTIME_DIR="$RUN_DIR" \
     "$DAEMON_BIN" --dir "$dir" --socket "$sock" ${addr:+--addr "$addr"} \
     >"$LOG_DIR/$name.log" 2>&1 &
@@ -448,16 +412,7 @@ echo "Mail: it is store-and-forward, so Bob can be locked or offline."
 echo "  Alice's mailbox:  curl --unix-socket $SOCK_A http://localhost/api/mail"
 echo "  Bob's mailbox:    curl --unix-socket $SOCK_B http://localhost/api/mail"
 echo "  Drain Bob's queue: curl -X POST --unix-socket $SOCK_B http://localhost/api/recv"
-if [[ "$RELAY_IS_LOCAL" == 1 ]]; then
-  if [[ -n "$RELAY_PID" ]]; then
-    echo "  Kill the relay ($RELAY_PID) to watch sends queue in the Outbox, then restart it"
-    echo "  and the daemon's 30s outbox loop delivers them."
-  else
-    echo "  Kill the local relay process to watch sends queue in the Outbox and go out on retry."
-  fi
-else
-  echo "  The relay is remote ($RELAY_URL); stop it on its host to watch sends queue."
-fi
+echo "  The relay is production ($RELAY_URL); stop it on its host to watch sends queue."
 echo ""
 echo "Logs: $LOG_DIR"
 echo "Press Ctrl+C here to stop the relay, daemons, and UI this run started."

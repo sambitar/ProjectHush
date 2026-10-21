@@ -9,12 +9,15 @@ import type {
   NotesNoteResponse,
   NotesStateDto,
   PaperPresenceDto,
+  PayTrusteeResult,
+  PaymentPolicy,
   PaperViewDto,
   PlaceDto,
   ConclaveDto,
   PendingInviteDto,
   RecvResponse,
   RelayConfigResponse,
+  SendExpireResponse,
   SendSignalResponse,
   SignalBodyDto,
   SignalPolicy,
@@ -27,9 +30,12 @@ import type {
   ReadsStoryDetailDto,
   ReadsStoryDto,
   TorboxUserDto,
+  TorrentPolicy,
+  TorrentShareDto,
   TorrentsStateDto,
   TrusteeReach,
   WalletAddressDto,
+  WalletAnnounceResult,
   WalletChain,
   WalletCreateDto,
   WalletNetworkMode,
@@ -203,6 +209,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ nickname, policy }),
     }),
+  setContactPayments: (nickname: string, policy: PaymentPolicy) =>
+    request<null>("/api/contacts/payments", {
+      method: "POST",
+      body: JSON.stringify({ nickname, policy }),
+    }),
+  setContactTorrents: (nickname: string, policy: TorrentPolicy) =>
+    request<null>("/api/contacts/torrents", {
+      method: "POST",
+      body: JSON.stringify({ nickname, policy }),
+    }),
   contactSignals: (nickname: string) =>
     request<SignalRecordDto[]>(
       `/api/contacts/${encodeURIComponent(nickname)}/signals`,
@@ -246,6 +262,12 @@ export const api = {
     request<null>("/api/send", {
       method: "POST",
       body: JSON.stringify({ to, text }),
+    }),
+  /** Send a live chat line both sides forget after `ttl_ms`. */
+  sendExpire: (to: string, text: string, ttl_ms: number) =>
+    request<SendExpireResponse>("/api/send-expire", {
+      method: "POST",
+      body: JSON.stringify({ to, text, ttl_ms }),
     }),
   sendFileData: (to: string, name: string, data_base64: string) =>
     request<{ blob_id: string }>("/api/send-file-data", {
@@ -640,6 +662,21 @@ export const api = {
       `/api/torrents/library/${encodeURIComponent(id)}`,
       { method: "DELETE" },
     ),
+  torrentsShare: (nickname: string, id: string) =>
+    request<TorrentShareDto>("/api/torrents/share", {
+      method: "POST",
+      body: JSON.stringify({ nickname, id }),
+    }),
+  torrentsAcceptOffer: (id: string) =>
+    request<TorrentsStateDto>(
+      `/api/torrents/offers/${encodeURIComponent(id)}/accept`,
+      { method: "POST" },
+    ),
+  torrentsDeclineOffer: (id: string) =>
+    request<TorrentsStateDto>(
+      `/api/torrents/offers/${encodeURIComponent(id)}/decline`,
+      { method: "POST" },
+    ),
   /**
    * Flip the relay switch. `socks` is the shell Tor's SOCKS port, reported
    * when switching on; the daemon refuses to fall back to clearnet on its
@@ -695,6 +732,13 @@ export const api = {
     request<WalletAddressDto>("/api/wallet/address", {
       method: "POST",
       body: JSON.stringify({ chain }),
+    }),
+  walletAnnounce: () =>
+    request<WalletAnnounceResult>("/api/wallet/announce", { method: "POST" }),
+  payTrustee: (nickname: string, amount: string, token?: string | null) =>
+    request<PayTrusteeResult>("/api/wallet/pay-trustee", {
+      method: "POST",
+      body: JSON.stringify({ nickname, amount, token: token ?? null }),
     }),
   walletSync: (chain: WalletChain) =>
     request<WalletStateDto>("/api/wallet/sync", {

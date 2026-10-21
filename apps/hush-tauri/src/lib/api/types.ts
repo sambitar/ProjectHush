@@ -63,6 +63,22 @@ export type TrusteeReach = "mail_only" | "full";
  */
 export type SignalPolicy = "allow" | "deny";
 
+/**
+ * Whether a trustee relationship may carry payments.
+ *
+ * Off by default and local: when `allow`, wallet addresses are exchanged and
+ * the chat offers a payment action; when `deny`, neither happens.
+ */
+export type PaymentPolicy = "allow" | "deny";
+
+/**
+ * Whether a trustee relationship may carry torrent offers.
+ *
+ * Off by default on both sides. An offer is a pointer, but accepting it makes
+ * the recipient's TorBox fetch the content, so it is opt-in like payments.
+ */
+export type TorrentPolicy = "allow" | "deny";
+
 /** One kind of signal body on the wire. */
 export interface SignalBodyDto {
   /** `ping` is the reference kind; future kinds add their own fields. */
@@ -104,6 +120,12 @@ export interface SendSignalResponse {
   id: string;
 }
 
+/** How many trustees a wallet-address announcement reached. */
+export interface WalletAnnounceResult {
+  sent: number;
+  failed: number;
+}
+
 export interface ContactDto {
   nickname: string;
   protocol_name: string;
@@ -125,6 +147,23 @@ export interface ContactDto {
   place_of?: string | null;
   /** Whether this relationship carries trustee signals. */
   signals: SignalPolicy;
+  /** Whether this relationship may carry payments. */
+  payments: PaymentPolicy;
+  /**
+   * The peer's own payment choice, as last announced. `deny` means they are not
+   * accepting payments; this side cannot pay them and says so.
+   */
+  peer_payments: PaymentPolicy;
+  /** Whether this relationship may carry torrent offers. */
+  torrents: TorrentPolicy;
+  /** The peer's torrent-sharing choice, as last announced. */
+  peer_torrents: TorrentPolicy;
+  /** The Bitcoin receive address this contact announced, if any. */
+  wallet_bitcoin?: string | null;
+  /** The Ethereum receive address this contact announced, if any. */
+  wallet_ethereum?: string | null;
+  /** When the contact last announced a wallet address, Unix ms. 0 = never. */
+  wallet_updated_ms: number;
 }
 
 /** One row of Settings → My places. */
@@ -167,6 +206,22 @@ export interface ReceivedDto {
   conclave_name?: string | null;
   /** Conclave only: the sender's joined trustee nicknames. */
   conclave_trustees?: string[];
+}
+
+/** One expiring chat line. The daemon holds it only for this poll. */
+export interface ExpireMessageDto {
+  from: string;
+  /** The sender's message id, used to key the line on both sides. */
+  id: string;
+  text: string;
+  sent_ms: number;
+  expires_ms: number;
+}
+
+/** `POST /api/send-expire` — the id and deadline of the line just sent. */
+export interface SendExpireResponse {
+  id: string;
+  expires_ms: number;
 }
 
 /** A file shared into a conclave: only the vault blob reference travels. */
@@ -287,6 +342,14 @@ export interface ChatRecordDto {
     | { t: "text"; body: string }
     | { t: "file"; name: string; blob_id_hex: string; size: number }
     | {
+        /** A payment, drawn as a system line rather than a bubble. */
+        t: "payment";
+        /** The transferred amount in the token's smallest unit, decimal. */
+        amount: string;
+        symbol: string;
+        txid: string;
+      }
+    | {
         t: "mail";
         thread_id: string;
         subject?: string | null;
@@ -352,11 +415,21 @@ export interface DropsDrainDto {
 
 export interface RecvResponse {
   messages: ReceivedDto[];
+  /**
+   * Live chat lines that expire. Never written to either vault; the store keeps
+   * them only until `expires_ms`.
+   */
+  expire_messages: ExpireMessageDto[];
   /** Accepted trustee signals, out of band. Never chat rows. */
   signals: ReceivedSignalDto[];
   /** Acknowledgements for signals this vault sent. */
   signal_acks: ReceivedSignalAckDto[];
   warnings: string[];
+  /**
+   * True when the poll wrote a chat record that is not in `messages` (today
+   * only a verified incoming payment), so the UI re-reads its history.
+   */
+  chat_appended?: boolean;
 }
 
 export interface InviteResponse {
@@ -367,8 +440,17 @@ export interface ChatMessage {
   id: string;
   contactNick: string;
   outgoing: boolean;
-  kind: "text" | "file";
+  kind: "text" | "file" | "payment";
+  /**
+   * Unix ms when an ephemeral message must be forgotten. Absent for ordinary
+   * messages, which live in the vault.
+   */
+  expiresAt?: number;
   text?: string;
+  /** Payment lines: base-unit amount, token symbol, and the transaction hash. */
+  amount?: string;
+  symbol?: string;
+  txid?: string;
   fileName?: string;
   fileSize?: number;
   fileData?: Uint8Array;
@@ -711,6 +793,30 @@ export interface TorrentLibraryEntryDto {
   files: TorrentFileDto[];
 }
 
+/** Where an incoming torrent offer stands. */
+export type TorrentOfferStatus = "pending" | "accepted" | "declined";
+
+/** One torrent a trustee has offered. The content is fetched, not carried. */
+export interface TorrentOfferDto {
+  offer_id: string;
+  from_nick: string;
+  from_account: string;
+  name: string;
+  hash: string;
+  size: number;
+  /** Unix seconds. */
+  received_at: number;
+  status: TorrentOfferStatus;
+  item_id: string | null;
+}
+
+/** `POST /api/torrents/share` — what the sender queued on the sideband. */
+export interface TorrentShareDto {
+  offer_id: string;
+  signal_id: string;
+  name: string;
+}
+
 /** `GET /api/torrents/state` — everything the pane renders, minus the API key. */
 export interface TorrentsStateDto {
   has_key: boolean;
@@ -720,6 +826,7 @@ export interface TorrentsStateDto {
   max_concurrent: number;
   items: TorrentItemDto[];
   library: TorrentLibraryEntryDto[];
+  offers: TorrentOfferDto[];
 }
 
 /** `POST /api/torrents/test` — a validated key's account info. */
@@ -777,6 +884,8 @@ export interface WalletStateDto {
   exists: boolean;
   /** The Bitcoin network name (`"mainnet"`, `"testnet"`, …). */
   network: string;
+  /** The Ethereum network name (`"mainnet"`, `"sepolia"`). */
+  ethereum_network: string;
   /** The mode in effect: Tor whenever the relay is on Tor. */
   mode: WalletNetworkMode;
   /** True while the relay pins the wallet to Tor, so the toggle is locked on. */
@@ -793,6 +902,13 @@ export interface WalletStateDto {
 export interface WalletCreateDto {
   state: WalletStateDto;
   mnemonic: string;
+}
+
+/** `POST /api/wallet/pay-trustee` — a USDC payment to a trustee. */
+export interface PayTrusteeResult {
+  chain: WalletChain;
+  txid: string;
+  fee_sat?: number | null;
 }
 
 /** `POST /api/wallet/address` */

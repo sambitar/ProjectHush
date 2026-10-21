@@ -108,6 +108,10 @@ pub enum Error {
     InvalidSignal,
     #[error("signal too large (max {0} bytes)")]
     SignalTooLarge(usize),
+    #[error("an expiring message needs a body and a lifetime between 1 second and 24 hours")]
+    InvalidExpire,
+    #[error("expiring message too large (max {0} bytes)")]
+    ExpireTooLarge(usize),
 }
 
 impl From<argon2::Error> for Error {

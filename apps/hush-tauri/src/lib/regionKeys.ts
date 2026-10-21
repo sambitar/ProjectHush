@@ -116,6 +116,10 @@ export function trustRowShape(c: {
   mail_handle?: string | null;
   mail_vault?: string | null;
   signals?: string;
+  payments?: string;
+  peer_payments?: string;
+  torrents?: string;
+  peer_torrents?: string;
 }): string {
   return [
     c.reach,
@@ -123,6 +127,10 @@ export function trustRowShape(c: {
     c.mail_handle ?? "",
     c.mail_vault ?? "",
     c.signals ?? "",
+    c.payments ?? "",
+    c.peer_payments ?? "",
+    c.torrents ?? "",
+    c.peer_torrents ?? "",
   ].join("\n");
 }
 

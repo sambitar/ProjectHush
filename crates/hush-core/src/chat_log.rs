@@ -29,7 +29,9 @@ pub struct ChatRetention {
 fn is_chat_payload(r: &ChatRecord) -> bool {
     matches!(
         r.payload,
-        ChatRecordPayload::Text { .. } | ChatRecordPayload::File { .. }
+        ChatRecordPayload::Text { .. }
+            | ChatRecordPayload::File { .. }
+            | ChatRecordPayload::Payment { .. }
     )
 }
 
@@ -90,6 +92,17 @@ pub enum ChatRecordPayload {    Text {
         name: String,
         blob_id_hex: String,
         size: u64,
+    },
+    /// A token payment between trustees, drawn as a system line rather than a
+    /// bubble. `outgoing` on the record says which way it went; the chain, not
+    /// this record, is the authoritative account of the money.
+    Payment {
+        /// The transferred amount in the token's smallest unit, decimal.
+        amount: String,
+        /// The token symbol, e.g. `USDC`.
+        symbol: String,
+        /// The transaction hash the line can be checked against.
+        txid: String,
     },
     Mail {
         thread_id: String,
@@ -344,6 +357,51 @@ impl ChatLog {
                 },
             },
         )
+    }
+
+    /// Append a payment line, unless this contact already has one for `txid`.
+    ///
+    /// The dedupe matters on the receiving side: a payment notice is retried
+    /// until its transaction is mined, and the same transaction must never draw
+    /// two "received" lines. Returns whether a record was written.
+    pub fn append_payment(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        contact_nick: &str,
+        outgoing: bool,
+        amount: &str,
+        symbol: &str,
+        txid: &str,
+    ) -> Result<bool, Error> {
+        if self.has_payment(contact_nick, txid) {
+            return Ok(false);
+        }
+        self.push(
+            master,
+            ChatRecord {
+                id: Uuid::new_v4().to_string(),
+                contact_nick: contact_nick.to_string(),
+                outgoing,
+                ts_ms: now_ms(),
+                payload: ChatRecordPayload::Payment {
+                    amount: amount.to_string(),
+                    symbol: symbol.to_string(),
+                    txid: txid.to_string(),
+                },
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Whether this contact already has a payment record for `txid`.
+    pub fn has_payment(&self, contact_nick: &str, txid: &str) -> bool {
+        self.file.messages.iter().any(|r| {
+            r.contact_nick == contact_nick
+                && matches!(
+                    &r.payload,
+                    ChatRecordPayload::Payment { txid: t, .. } if t == txid
+                )
+        })
     }
 
     /// Append an outgoing or incoming mail message, returning its record id.
@@ -962,6 +1020,35 @@ mod tests {
                 state: MailState::Sent,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn a_payment_is_written_once_per_transaction() {
+        let dir = scratch("payment");
+        let master = [7u8; MASTER_KEY_LEN];
+        let txid = format!("0x{}", "ab".repeat(32));
+
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        assert!(log
+            .append_payment(&master, "alice", true, "1000000", "USDC", &txid)
+            .unwrap());
+        // The retry that lands after the first write must not draw a second
+        // line, and the same transaction from another contact is separate.
+        assert!(!log
+            .append_payment(&master, "alice", true, "1000000", "USDC", &txid)
+            .unwrap());
+        assert!(log
+            .append_payment(&master, "carol", true, "1000000", "USDC", &txid)
+            .unwrap());
+
+        let reloaded = ChatLog::load(&dir, &master).unwrap();
+        assert!(reloaded.has_payment("alice", &txid));
+        assert_eq!(reloaded.chat_records().count(), 2);
+        assert!(matches!(
+            &reloaded.chat_records().next().unwrap().payload,
+            ChatRecordPayload::Payment { amount, symbol, .. }
+                if amount == "1000000" && symbol == "USDC"
         ));
     }
 

@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use serde::{Deserialize, Serialize};
 
 use hush_wallet::bitcoin::{network_from_str, BitcoinConfig, BitcoinWallet};
-use hush_wallet::chain::{amount_string, ChainId, ChainView, TokenView};
+use hush_wallet::chain::{amount_string, ChainId, ChainView, TokenView, TransferCheck};
 use hush_wallet::net::NetworkMode;
 use hush_wallet::seed::parse_mnemonic;
 use hush_wallet::store::{decode, BitcoinState, EthereumState, TokenEntry, WalletState};
@@ -52,6 +52,8 @@ pub struct PublicState {
     pub exists: bool,
     /// The Bitcoin network name (`"mainnet"`, `"testnet"`, …).
     pub network: String,
+    /// The Ethereum network name (`"mainnet"`, `"sepolia"`).
+    pub ethereum_network: String,
     /// The mode in effect: Tor whenever the relay is on Tor.
     pub mode: NetworkMode,
     /// True when the relay pins the wallet to Tor, so the toggle is locked on.
@@ -536,6 +538,7 @@ impl WalletManager {
         Ok(PublicState {
             exists: state.has_wallet(),
             network: state.network.clone(),
+            ethereum_network: state.ethereum.network.clone(),
             mode: effective_mode(state.mode, relay_tor),
             mode_locked: relay_tor,
             label: state.label.clone(),
@@ -824,6 +827,37 @@ impl WalletManager {
         _request: hush_wallet::chain::SendRequest,
         _amount: u128,
     ) -> Result<SendResult, String> {
+        Err(self.eth_unavailable())
+    }
+
+    /// Confirm that `txid` moved `amount` of `token` to this wallet's own
+    /// address. `Pending` means it is not mined yet; `Refused` means the chain
+    /// says the claim is false.
+    ///
+    /// Used for incoming payment notices: the recipient's chat says "received"
+    /// only after this confirms, so a contact cannot invent a credit.
+    #[cfg(feature = "ethereum")]
+    pub async fn verify_incoming_token(
+        &self,
+        txid: &str,
+        token: &str,
+        amount: u128,
+    ) -> Result<TransferCheck, String> {
+        self.ensure_loaded().await?;
+        let eth = self.eth_handle().ok_or_else(|| self.eth_unavailable())?;
+        let address = eth.address();
+        eth.verify_token_transfer(txid, token, &address, amount)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[cfg(not(feature = "ethereum"))]
+    pub async fn verify_incoming_token(
+        &self,
+        _txid: &str,
+        _token: &str,
+        _amount: u128,
+    ) -> Result<TransferCheck, String> {
         Err(self.eth_unavailable())
     }
 

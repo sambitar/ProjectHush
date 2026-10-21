@@ -276,7 +276,7 @@ test("the empty pane has a key of its own", () => {
 test("a trusts row's shape is both reaches and the mail address", () => {
   assert.equal(
     trustRowShape({ reach: "full", my_reach: "full" }),
-    "full\nfull\n\n\n",
+    "full\nfull\n\n\n\n\n\n\n",
   );
   assert.equal(
     trustRowShape({
@@ -285,7 +285,7 @@ test("a trusts row's shape is both reaches and the mail address", () => {
       mail_handle: "ana@example.org",
       mail_vault: "vault-1",
     }),
-    "mail_only\nfull\nana@example.org\nvault-1\n",
+    "mail_only\nfull\nana@example.org\nvault-1\n\n\n\n\n",
   );
 });
 
@@ -311,6 +311,41 @@ test("a signal policy moving moves a trusts row's shape", () => {
   );
 });
 
+test("a payment policy moving moves a trusts row's shape", () => {
+  // The badge and the menu label are drawn once, so the row has to be rebuilt
+  // when the choice changes — the same rule signals already follow. The peer's
+  // own choice is drawn too ("not accepting payments"), so it moves the shape.
+  const base = { reach: "full", my_reach: "full" } as const;
+  assert.notEqual(
+    trustRowShape(base),
+    trustRowShape({ ...base, payments: "deny" }),
+  );
+  assert.notEqual(
+    trustRowShape({ ...base, payments: "allow" }),
+    trustRowShape({ ...base, payments: "deny" }),
+  );
+  assert.notEqual(
+    trustRowShape({ ...base, peer_payments: "allow" }),
+    trustRowShape({ ...base, peer_payments: "deny" }),
+  );
+});
+
+test("a torrent policy moving moves a trusts row's shape", () => {
+  const base = { reach: "full", my_reach: "full" } as const;
+  assert.notEqual(
+    trustRowShape(base),
+    trustRowShape({ ...base, torrents: "allow" }),
+  );
+  assert.notEqual(
+    trustRowShape({ ...base, torrents: "allow" }),
+    trustRowShape({ ...base, torrents: "deny" }),
+  );
+  assert.notEqual(
+    trustRowShape({ ...base, peer_torrents: "allow" }),
+    trustRowShape({ ...base, peer_torrents: "deny" }),
+  );
+});
+
 test("a mail address appearing moves a trusts row's shape", () => {
   const base = { reach: "full", my_reach: "full" } as const;
   assert.notEqual(
@@ -332,7 +367,7 @@ test("the trusts key pairs each shown name with its row's shape", () => {
   // shows, each carrying the shape its own row and menu were drawn from.
   assert.equal(
     trustsKey([{ name: "Ana", shape: trustRowShape({ reach: "full", my_reach: "full" }) }]),
-    "Ana\nfull\nfull\n\n\n",
+    "Ana\nfull\nfull\n\n\n\n\n\n\n",
   );
 });
 

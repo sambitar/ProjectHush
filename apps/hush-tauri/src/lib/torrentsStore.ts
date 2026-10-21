@@ -2,6 +2,7 @@ import { api } from "./api/daemon";
 import type {
   TorboxUserDto,
   TorrentItemDto,
+  TorrentShareDto,
   TorrentsStateDto,
 } from "./api/types";
 
@@ -30,6 +31,7 @@ const EMPTY: TorrentsStateDto = {
   max_concurrent: 2,
   items: [],
   library: [],
+  offers: [],
 };
 
 type Listener = (state: TorrentsStateDto) => void;
@@ -227,6 +229,28 @@ export async function deleteLibraryEntry(
   id: string,
 ): Promise<TorrentsStateDto> {
   return apply((await api.torrentsDeleteLibrary(id)) ?? getTorrentsState());
+}
+
+/** Offer one locally held torrent to a trustee. No local state changes. */
+export async function shareTorrent(
+  nickname: string,
+  id: string,
+): Promise<TorrentShareDto> {
+  const result = await api.torrentsShare(nickname, id);
+  if (!result) throw new Error("The daemon did not answer.");
+  return result;
+}
+
+export async function acceptTorrentOffer(
+  id: string,
+): Promise<TorrentsStateDto> {
+  return apply((await api.torrentsAcceptOffer(id)) ?? getTorrentsState());
+}
+
+export async function declineTorrentOffer(
+  id: string,
+): Promise<TorrentsStateDto> {
+  return apply((await api.torrentsDeclineOffer(id)) ?? getTorrentsState());
 }
 
 /** Human wording for a pipeline state. */

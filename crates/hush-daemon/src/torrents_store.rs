@@ -20,6 +20,10 @@ pub const STATE_FILE: &str = "torrents-state.enc";
 pub const DEFAULT_MAX_CONCURRENT: u32 = 2;
 const MAX_CONCURRENT_BOUND: u32 = 8;
 
+/// How many incoming offers the sidecar keeps. Pending offers are kept longest;
+/// a resolved one is the first to go when the cap is reached.
+pub const MAX_TORRENT_OFFERS: usize = 64;
+
 /// Where an item's data comes from. The bytes/magnet/URL are held only until
 /// TorBox accepts the torrent, then dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +203,43 @@ impl TorrentItem {
     }
 }
 
-/// A completed torrent in the Library. Its files are real vault blobs.
+/// Where an incoming torrent offer stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfferStatus {
+    Pending,
+    Accepted,
+    Declined,
+}
+
+impl Default for OfferStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+/// One torrent a trustee has offered. The content is not here: the hash is the
+/// pointer, and accepting adds a normal magnet item to the pipeline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TorrentOffer {
+    pub offer_id: String,
+    pub from_nick: String,
+    /// The sender's account id, so a response survives a local nickname change.
+    pub from_account: String,
+    pub name: String,
+    pub hash: String,
+    #[serde(default)]
+    pub size: u64,
+    /// Unix seconds, like the rest of the torrents sidecar.
+    pub received_at: i64,
+    #[serde(default)]
+    pub status: OfferStatus,
+    /// The queue item created when the offer was accepted.
+    #[serde(default)]
+    pub item_id: Option<String>,
+}
+
+/// One completed torrent in the Library. Its files are real vault blobs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LibraryEntry {
     pub id: String,
@@ -225,6 +265,10 @@ pub struct TorrentsState {
     pub items: Vec<TorrentItem>,
     #[serde(default)]
     pub library: Vec<LibraryEntry>,
+    /// Incoming torrent offers, newest first. Bodies are held here because the
+    /// signal audit log deliberately stores metadata only.
+    #[serde(default)]
+    pub offers: Vec<TorrentOffer>,
 }
 
 impl TorrentsState {
@@ -250,6 +294,35 @@ impl TorrentsState {
 
     pub fn item_mut(&mut self, id: &str) -> Option<&mut TorrentItem> {
         self.items.iter_mut().find(|i| i.id == id)
+    }
+
+    pub fn offer(&self, id: &str) -> Option<&TorrentOffer> {
+        self.offers.iter().find(|o| o.offer_id == id)
+    }
+
+    pub fn offer_mut(&mut self, id: &str) -> Option<&mut TorrentOffer> {
+        self.offers.iter_mut().find(|o| o.offer_id == id)
+    }
+
+    /// Store an offer once. A repeated id is a no-op, like the signal layer's
+    /// duplicate suppression.
+    pub fn add_offer(&mut self, offer: TorrentOffer) -> bool {
+        if self.offer(&offer.offer_id).is_some() {
+            return false;
+        }
+        self.offers.insert(0, offer);
+        while self.offers.len() > MAX_TORRENT_OFFERS {
+            let resolved = self
+                .offers
+                .iter()
+                .rposition(|o| o.status != OfferStatus::Pending);
+            if let Some(i) = resolved {
+                self.offers.remove(i);
+            } else {
+                self.offers.pop();
+            }
+        }
+        true
     }
 
     /// Whether any item still needs the pipeline.
@@ -413,6 +486,57 @@ mod tests {
         // Calling again is a harmless no-op.
         state.move_to_library("a");
         assert_eq!(state.library.len(), 1);
+    }
+
+    fn offer(id: &str, status: OfferStatus) -> TorrentOffer {
+        TorrentOffer {
+            offer_id: id.into(),
+            from_nick: "alice".into(),
+            from_account: "a".into(),
+            name: format!("Torrent {id}"),
+            hash: "ab".repeat(20),
+            size: 100,
+            received_at: 1,
+            status,
+            item_id: None,
+        }
+    }
+
+    #[test]
+    fn offers_roundtrip_and_are_deduped() {
+        let mut state = TorrentsState::default();
+        assert!(state.add_offer(offer("o1", OfferStatus::Pending)));
+        assert!(!state.add_offer(offer("o1", OfferStatus::Declined)));
+        assert_eq!(state.offers.len(), 1);
+        assert_eq!(state.offers[0].status, OfferStatus::Pending);
+        let bytes = state.encode().unwrap();
+        let back = decode(Some(&bytes)).unwrap();
+        assert_eq!(back.offers.len(), 1);
+        assert_eq!(back.offers[0].hash, "ab".repeat(20));
+    }
+
+    #[test]
+    fn the_offer_cap_drops_resolved_before_pending() {
+        let mut state = TorrentsState::default();
+        for i in 0..MAX_TORRENT_OFFERS {
+            state.add_offer(offer(&format!("o{i}"), OfferStatus::Pending));
+        }
+        // The oldest offer is resolved, so it is the one the cap should evict.
+        let oldest = state.offers.last_mut().unwrap();
+        oldest.status = OfferStatus::Declined;
+        let resolved_id = oldest.offer_id.clone();
+        state.add_offer(offer("newest", OfferStatus::Pending));
+        assert_eq!(state.offers.len(), MAX_TORRENT_OFFERS);
+        assert!(state.offer("newest").is_some());
+        assert!(state.offer(&resolved_id).is_none());
+        assert_eq!(
+            state
+                .offers
+                .iter()
+                .filter(|o| o.status == OfferStatus::Pending)
+                .count(),
+            MAX_TORRENT_OFFERS
+        );
     }
 
     #[test]

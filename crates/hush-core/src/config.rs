@@ -20,23 +20,18 @@ use serde::{Deserialize, Serialize};
 use crate::paths::default_runtime_dir;
 use crate::relay_client::normalize_relay_base;
 
-/// Default relay for a fresh local dogfood run.
+/// Default relay for a fresh vault, in every build.
 ///
-/// Split by build type: a debug build defaults to a relay on this machine (the
-/// run scripts start one), while a release build — what a packaged app ships —
-/// defaults to the production relay, which is HTTPS with a publicly trusted
-/// certificate and so passes the release HttpPolicy unchanged. A vault stores
-/// the relay it was created with; this default only decides what a fresh
+/// The project uses the production relay only. There is deliberately no
+/// local-relay default: a debug build and a packaged build must reach the same
+/// host, or an invite minted on one is useless on the other. Automated tests
+/// still start an in-process relay, but no app or run script does. A vault
+/// stores the relay it was created with; this default only decides what a fresh
 /// install dials first. Onion twin: [`DEFAULT_RELAY_ONION_URL`].
-#[cfg(debug_assertions)]
-pub const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:8787";
-#[cfg(not(debug_assertions))]
 pub const DEFAULT_RELAY_URL: &str = "https://hushrelay.space";
-/// The production relay's onion twin, baked into release builds so Tor relay
-/// mode works on a fresh install with no configuration. Debug builds have no
-/// default onion — a local dogfood relay generally has none. Precedence:
+/// The production relay's onion twin, baked into every build so Tor relay mode
+/// works on a fresh install with no configuration. Precedence:
 /// `HUSH_RELAY_ONION_URL` > `client-config.json` > this.
-#[cfg(not(debug_assertions))]
 pub const DEFAULT_RELAY_ONION_URL: &str =
     "http://qvo7toe6urizihhbj7tp4ibsf2rhkilsrwvnkdk5jlwubjm3e7rnrlad.onion";
 /// Default daemon HTTP bind address, used only when TCP is explicitly enabled.

@@ -41,6 +41,7 @@ function emptyChain(chain: WalletChain): WalletChainDto {
 const EMPTY: WalletStateDto = {
   exists: false,
   network: "mainnet",
+  ethereum_network: "mainnet",
   mode: "tor",
   mode_locked: false,
   label: null,

@@ -25,12 +25,17 @@ export function groupMessages(messages: ChatMessage[]): MessageGroup[] {
   for (const m of messages) {
     const day = dayLabel(m.createdAt);
     const last = groups[groups.length - 1];
-    if (
-      last &&
+    const prev = last?.messages[last.messages.length - 1];
+    // A payment is a system line, not a bubble, so it neither joins the run
+    // above it nor lets the next message join one through it.
+    const joins =
+      last !== undefined &&
       last.outgoing === m.outgoing &&
       last.day === day &&
-      last.messages.length > 0
-    ) {
+      prev !== undefined &&
+      prev.kind !== "payment" &&
+      m.kind !== "payment";
+    if (joins) {
       last.messages.push(m);
     } else {
       groups.push({ outgoing: m.outgoing, day, messages: [m] });

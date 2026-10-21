@@ -37,7 +37,6 @@ pub use config::{
     resolve_daemon_socket_with_source, resolve_onion_relay_url, resolve_relay_url,
     resolve_relay_url_with_source,
 };
-#[cfg(not(debug_assertions))]
 pub use config::DEFAULT_RELAY_ONION_URL;
 pub use backup::{export_vault, import_vault, BACKUP_FORMAT_VERSION};
 pub use drop::{
@@ -57,16 +56,17 @@ pub use mail::{
     format_address, normalize_handle, normalize_vault_name, DEFAULT_VAULT_NAME, MAX_HANDLE_LEN,
 };
 pub use message::{
-    InboxResult, ReceivedAttachment, ReceivedMessage, ReceivedPaper, ReceivedZineGrant,
+    InboxResult, ReceivedAttachment, ReceivedEphemeral, ReceivedMessage, ReceivedPaper,
+    ReceivedZineGrant,
 };
 pub use signals::{
-    ReceivedSignal, ReceivedSignalAck, SignalBody, SignalPolicy, SignalRecord, SignalStatus,
-    MAX_PING_NOTE_BYTES, MAX_SIGNAL_BYTES, MAX_SIGNAL_LOG,
+    PaymentPolicy, ReceivedSignal, ReceivedSignalAck, SignalBody, SignalPolicy, SignalRecord,
+    SignalStatus, TorrentPolicy, MAX_PING_NOTE_BYTES, MAX_SIGNAL_BYTES, MAX_SIGNAL_LOG,
 };
 pub use payload::{
     ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeReach,
-    TrusteeState, VoiceDescriptor, MailAttachment, DEFAULT_PAPER_TITLE, MAX_INLINE_FILE_BYTES,
-    MAX_MAIL_ATTACHMENTS,
+    TrusteeState, VoiceDescriptor, MailAttachment, DEFAULT_PAPER_TITLE, MAX_EXPIRE_TEXT_BYTES,
+    MAX_EXPIRE_TTL_MS, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS, MIN_EXPIRE_TTL_MS,
 };
 pub use place::{
     place_now_unix, PlaceHop, SignedHop, VouchChain, MAX_PLACE_CHAIN_HOPS,

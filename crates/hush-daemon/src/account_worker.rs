@@ -3,8 +3,8 @@ use std::thread;
 
 use hush_core::{
   Account, ChatRecord, ChatRetention, ConclaveRecord, InboxResult, MessagePayload,
-  PaperDescriptor, PendingInvite, PendingIntroRequest, PlaceRecord, PlaceRole, QueueMap,
-  SignalBody, SignalPolicy, SignalRecord, TrusteeReach, VoiceDescriptor,
+  PaperDescriptor, PaymentPolicy, PendingInvite, PendingIntroRequest, PlaceRecord, PlaceRole,
+  QueueMap, SignalBody, SignalPolicy, SignalRecord, TorrentPolicy, TrusteeReach, VoiceDescriptor,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -159,6 +159,16 @@ enum Work {
         policy: SignalPolicy,
         reply: oneshot::Sender<WorkResult>,
     },
+    SetContactPayments {
+        nickname: String,
+        policy: PaymentPolicy,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SetContactTorrents {
+        nickname: String,
+        policy: TorrentPolicy,
+        reply: oneshot::Sender<WorkResult>,
+    },
     SendSignal {
         to: String,
         body: SignalBody,
@@ -195,6 +205,24 @@ enum Work {
     SendText {
         to: String,
         text: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// A live chat line that both sides forget after `ttl_ms`.
+    SendExpireText {
+        to: String,
+        text: String,
+        ttl_ms: u64,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Write a payment line into the 1:1 log without sending anything. The
+    /// sender records its own; the daemon records a received one after the
+    /// chain confirms it.
+    RecordPayment {
+        nickname: String,
+        outgoing: bool,
+        amount: String,
+        symbol: String,
+        txid: String,
         reply: oneshot::Sender<WorkResult>,
     },
     SendFile {
@@ -680,6 +708,23 @@ pub struct ContactDto {
     pub place_of: Option<String>,
     /// Whether this relationship carries trustee signals.
     pub signals: SignalPolicy,
+    /// Whether this relationship may carry payments.
+    pub payments: PaymentPolicy,
+    /// The peer's own payment choice, as last announced. `deny` means this
+    /// trustee is not accepting payments; the UI says so and the route refuses.
+    pub peer_payments: PaymentPolicy,
+    /// Whether this relationship may carry torrent offers.
+    pub torrents: TorrentPolicy,
+    /// The peer's torrent-sharing choice, as last announced.
+    pub peer_torrents: TorrentPolicy,
+    /// The Bitcoin receive address this contact announced, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_bitcoin: Option<String>,
+    /// The Ethereum receive address this contact announced, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_ethereum: Option<String>,
+    /// When the contact last announced a wallet address, Unix ms. 0 = never.
+    pub wallet_updated_ms: u64,
 }
 
 /// One row of Settings → My places.
@@ -774,6 +819,11 @@ pub enum WorkResult {
     Contacts(Vec<ContactDto>),
     /// The id of a signal that was sent, for correlating its ack.
     SignalId(String),
+    /// An expiring message was delivered: its id and absolute deadline.
+    ExpireSent { id: String, expires_ms: u64 },
+    /// Whether a payment record was newly written. False means this contact
+    /// already had one for the same transaction.
+    PaymentRecorded(bool),
     /// One trustee's signal audit log, newest first.
     Signals(Vec<SignalRecord>),
     Places(Vec<PlaceDto>),
@@ -1061,6 +1111,13 @@ impl AccountWorker {
                                             my_reach: c.reach,
                                             place_of: c.place_of.clone(),
                                             signals: c.signals,
+                                            payments: c.payments,
+                                            peer_payments: c.peer_payments,
+                                            torrents: c.torrents,
+                                            peer_torrents: c.peer_torrents,
+                                            wallet_bitcoin: c.wallet_bitcoin.clone(),
+                                            wallet_ethereum: c.wallet_ethereum.clone(),
+                                            wallet_updated_ms: c.wallet_updated_ms,
                                         });
                                     }
                                     WorkResult::Contacts(list)
@@ -1192,6 +1249,34 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::SetContactPayments {
+                            nickname,
+                            policy,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.set_contact_payments(&nickname, policy).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::SetContactTorrents {
+                            nickname,
+                            policy,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.set_contact_torrents(&nickname, policy).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
                         Work::SendSignal {
                             to,
                             body,
@@ -1235,6 +1320,46 @@ impl AccountWorker {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendExpireText {
+                            to,
+                            text,
+                            ttl_ms,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.send_expire_text(&to, &text, ttl_ms).await {
+                                    Ok((id, expires_ms)) => {
+                                        WorkResult::ExpireSent { id, expires_ms }
+                                    }
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RecordPayment {
+                            nickname,
+                            outgoing,
+                            amount,
+                            symbol,
+                            txid,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => a
+                                    .record_payment(
+                                        &nickname,
+                                        outgoing,
+                                        &amount,
+                                        &symbol,
+                                        &txid,
+                                    )
+                                    .map(WorkResult::PaymentRecorded)
+                                    .unwrap_or_else(|e| WorkResult::Err(e.to_string())),
                             };
                             (reply, result)
                         }
@@ -2495,6 +2620,30 @@ impl AccountWorker {
         .await
     }
 
+    /// Turn payments on or off for one contact.
+    pub async fn set_contact_payments(&self, nickname: &str, policy: PaymentPolicy) -> WorkResult {
+        self.call(|reply| Work::SetContactPayments {
+            nickname: nickname.to_string(),
+            policy,
+            reply,
+        })
+        .await
+    }
+
+    /// Turn torrent sharing on or off for one contact.
+    pub async fn set_contact_torrents(
+        &self,
+        nickname: &str,
+        policy: TorrentPolicy,
+    ) -> WorkResult {
+        self.call(|reply| Work::SetContactTorrents {
+            nickname: nickname.to_string(),
+            policy,
+            reply,
+        })
+        .await
+    }
+
     /// Send one typed signal. Store-and-forward, so no presence check.
     pub async fn send_signal(
         &self,
@@ -2574,6 +2723,37 @@ impl AccountWorker {
         self.call(|reply| Work::SendText {
             to: to.to_string(),
             text: text.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Send a live chat line that both sides forget after `ttl_ms`.
+    pub async fn send_expire_text(&self, to: &str, text: &str, ttl_ms: u64) -> WorkResult {
+        self.call(|reply| Work::SendExpireText {
+            to: to.to_string(),
+            text: text.to_string(),
+            ttl_ms,
+            reply,
+        })
+        .await
+    }
+
+    /// Write a payment line into the 1:1 log. See [`Work::RecordPayment`].
+    pub async fn record_payment(
+        &self,
+        nickname: &str,
+        outgoing: bool,
+        amount: &str,
+        symbol: &str,
+        txid: &str,
+    ) -> WorkResult {
+        self.call(|reply| Work::RecordPayment {
+            nickname: nickname.to_string(),
+            outgoing,
+            amount: amount.to_string(),
+            symbol: symbol.to_string(),
+            txid: txid.to_string(),
             reply,
         })
         .await

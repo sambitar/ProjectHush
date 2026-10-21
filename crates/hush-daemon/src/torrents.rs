@@ -40,7 +40,8 @@ use tokio::sync::{Mutex, Notify};
 use crate::account_worker::{AccountWorker, WorkResult};
 use crate::torbox::{self, Control, TorboxClient, TorboxError, UserInfo};
 use crate::torrents_store::{
-    decode, now_secs, ItemFile, ItemStatus, LibraryEntry, SourceKind, TorrentItem, TorrentsState,
+    decode, now_secs, ItemFile, ItemStatus, LibraryEntry, OfferStatus, SourceKind, TorrentItem,
+    TorrentOffer, TorrentsState,
 };
 
 /// Why one file's download failed, and whether another attempt could help.
@@ -98,6 +99,8 @@ pub struct PublicState {
     pub max_concurrent: u32,
     pub items: Vec<TorrentItem>,
     pub library: Vec<LibraryEntry>,
+    /// Incoming torrent offers. Bodies live here, not in the signal audit log.
+    pub offers: Vec<TorrentOffer>,
 }
 
 pub struct TorrentsManager {
@@ -186,6 +189,7 @@ impl TorrentsManager {
             max_concurrent: state.concurrency(),
             items: state.items.iter().map(|i| i.public_clone()).collect(),
             library: state.library.clone(),
+            offers: state.offers.clone(),
         })
     }
 
@@ -290,6 +294,118 @@ impl TorrentsManager {
         self.persist().await?;
         self.wake();
         self.public_state().await
+    }
+
+    /// One stored offer, for the route that answers it before mutating state.
+    pub async fn offer(&self, offer_id: &str) -> Result<Option<TorrentOffer>, String> {
+        self.ensure_loaded().await?;
+        let s = self.state.lock().await;
+        Ok(s.offer(offer_id).cloned())
+    }
+
+    /// Store one incoming offer. A repeated id is a no-op.
+    pub async fn add_offer(&self, offer: TorrentOffer) -> Result<bool, String> {
+        self.ensure_loaded().await?;
+        let added = {
+            let mut s = self.state.lock().await;
+            s.add_offer(offer)
+        };
+        if added {
+            self.mark_dirty().await;
+            self.persist().await?;
+        }
+        Ok(added)
+    }
+
+    /// The name, info hash and size of an entry this vault can offer. Looked up
+    /// here rather than supplied by the UI, so a share cannot name content the
+    /// vault does not hold.
+    pub async fn shareable(&self, id: &str) -> Result<(String, String, u64), String> {
+        self.ensure_loaded().await?;
+        let s = self.state.lock().await;
+        let (name, hash, size) = if let Some(item) = s.item(id) {
+            (item.name.clone(), item.hash.clone(), item.size)
+        } else if let Some(entry) = s.library.iter().find(|e| e.id == id) {
+            (entry.name.clone(), entry.hash.clone(), entry.size)
+        } else {
+            return Err("no such torrent".into());
+        };
+        let hash = hash.ok_or("this torrent has no info hash to share")?;
+        if !valid_offer_hash(&hash) {
+            return Err("this torrent's info hash cannot be shared".into());
+        }
+        Ok((name, hash.to_ascii_lowercase(), size))
+    }
+
+    /// Accept an offer: queue the torrent as a normal magnet item. The caller
+    /// sends the response signal after this returns.
+    pub async fn accept_offer(
+        &self,
+        offer_id: &str,
+    ) -> Result<(TorrentOffer, PublicState), String> {
+        self.ensure_loaded().await?;
+        if self.state.lock().await.api_key.is_none() {
+            return Err("Add your TorBox API key in Settings first.".into());
+        }
+        let offer = {
+            let s = self.state.lock().await;
+            s.offer(offer_id)
+                .cloned()
+                .ok_or("no such torrent offer")?
+        };
+        if offer.status != OfferStatus::Pending {
+            return Err("that offer has already been answered".into());
+        }
+        if !valid_offer_hash(&offer.hash) {
+            return Err("that offer has an invalid info hash".into());
+        }
+        let item_id = uuid::Uuid::new_v4().to_string();
+        let mut item = TorrentItem::new(item_id.clone(), offer.name.clone(), SourceKind::Magnet);
+        item.hash = Some(offer.hash.clone());
+        item.size = offer.size;
+        item.source_data = Some(magnet_for(&offer.name, &offer.hash));
+        let updated = {
+            let mut s = self.state.lock().await;
+            let Some(entry) = s.offer_mut(offer_id) else {
+                return Err("no such torrent offer".into());
+            };
+            if entry.status != OfferStatus::Pending {
+                return Err("that offer has already been answered".into());
+            }
+            entry.status = OfferStatus::Accepted;
+            entry.item_id = Some(item_id.clone());
+            let updated = entry.clone();
+            s.items.insert(0, item);
+            updated
+        };
+        self.mark_dirty().await;
+        self.persist().await?;
+        self.wake();
+        let public = self.public_state().await?;
+        Ok((updated, public))
+    }
+
+    /// Decline an offer. Nothing is queued.
+    pub async fn decline_offer(
+        &self,
+        offer_id: &str,
+    ) -> Result<(TorrentOffer, PublicState), String> {
+        self.ensure_loaded().await?;
+        let updated = {
+            let mut s = self.state.lock().await;
+            let Some(entry) = s.offer_mut(offer_id) else {
+                return Err("no such torrent offer".into());
+            };
+            if entry.status != OfferStatus::Pending {
+                return Err("that offer has already been answered".into());
+            }
+            entry.status = OfferStatus::Declined;
+            entry.clone()
+        };
+        self.mark_dirty().await;
+        self.persist().await?;
+        let public = self.public_state().await?;
+        Ok((updated, public))
     }
 
     /// Add a `.torrent` file's bytes.
@@ -1015,6 +1131,21 @@ fn relative_path(f: &torbox::TorrentFile) -> String {
     raw.trim_start_matches(['/', '\\']).to_string()
 }
 
+/// The info-hash shape a torrent offer may carry: hex or base32, never a
+/// string that could inject another magnet parameter.
+fn valid_offer_hash(hash: &str) -> bool {
+    (32..=64).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Turn a stored info hash and display name into the magnet the pipeline adds.
+/// Only the hash and `dn` are carried: no tracker list from a peer is trusted.
+fn magnet_for(name: &str, hash: &str) -> String {
+    let dn: String = url::form_urlencoded::byte_serialize(name.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    format!("magnet:?xt=urn:btih:{hash}&dn={dn}")
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
     STANDARD.encode(bytes)
@@ -1091,6 +1222,26 @@ mod tests {
         assert_eq!(item.path, "S01/E01.mkv");
         assert_eq!(item.size, 123);
         assert!(!item.done);
+    }
+
+    #[test]
+    fn a_magnet_carries_only_the_hash_and_encoded_name() {
+        assert_eq!(
+            magnet_for("A film", &"ab".repeat(20)),
+            format!("magnet:?xt=urn:btih:{}&dn=A%20film", "ab".repeat(20))
+        );
+        assert_eq!(
+            magnet_for("a&b?c", &"cd".repeat(20)),
+            format!("magnet:?xt=urn:btih:{}&dn=a%26b%3Fc", "cd".repeat(20))
+        );
+    }
+
+    #[test]
+    fn offer_hashes_reject_injection_and_wrong_lengths() {
+        assert!(valid_offer_hash(&"ab".repeat(20)));
+        assert!(valid_offer_hash(&"a".repeat(64)));
+        assert!(!valid_offer_hash("short"));
+        assert!(!valid_offer_hash(&"a&b".repeat(20)));
     }
 
     #[test]

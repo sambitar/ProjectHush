@@ -158,6 +158,59 @@ peer connections; Phase 1 (signaling) landed, real audio behind the engine spike
 tone); every joined trustee learns every other joined trustee's IP; the network can correlate media
 timing and size though never content; a locked or offline trustee is not in the session.
 
+## Expiring chat lines (added 2026-10-21)
+
+A 1:1 chat line sent with `/expire`, deleted from both sides at a chosen deadline.
+
+| New surface | What it may see | Rule |
+|---|---|---|
+| Relay | The same ciphertext blob as any chat line, until the recipient's next drain consumes it | **No change.** The send is refused when the recipient is offline, so no copy is parked to be delivered after the deadline |
+| Vault | **Nothing.** No `chat.enc` row is written on either side; there is no export, history or backup copy | The line lives only in the daemon's poll response and in each UI's memory |
+| UI memory | The plaintext until `expires_ms` | A reload, a lock or a crash loses it early; a missed poll loses it entirely |
+| Screen capture | Whatever is on screen | **Not prevented.** A photograph or recording keeps the line; the feature promises deletion from Hush, not from the world |
+
+**Honest limits for user-facing copy:** deletion is timed by the peers' clocks, so a large clock
+skew can shorten or lengthen the visible window; a line that cannot be delivered because the peer
+went away is not queued — the sender is told the chat needs both sides online. The dialog says the
+message is never saved in either vault, which is true; it does not claim the relay never held the
+ciphertext.
+
+## Chat links (added 2026-10-21)
+
+A `/link` message is ordinary text; the relay sees the same opaque ciphertext as any chat line.
+The shell makes only absolute `http(s)` URLs clickable, refuses credentials and non-`http(s)`
+schemes, and routes every click through a confirmation that names the host before handing the URL
+to the system browser.
+
+| New surface | What it may see | Rule |
+|---|---|---|
+| Relay | The same ciphertext blob as any text message | **No change.** No preview fetch, no link metadata, no new payload |
+| Link destination | The user's normal browser identity and IP, once the user confirms | **Accepted and stated** — the confirmation says the site will not see Hush's identity |
+| Vault | The URL as part of the ordinary encrypted chat row | Same retention as any text message |
+| Peer-supplied URL | Whatever the URL points at | **Never auto-opened.** No preview, no fetcher, no automatic navigation; the webview never navigates to it, and a click is confirmed first |
+
+**Honest limits for user-facing copy:** the link text is still user-visible content and can be
+misleading; the confirmation names the host, not the destination's intent. A link is not a
+malware scanner.
+
+## Torrent sharing (added 2026-10-21)
+
+A torrent offer is a pointer between trustees: name, info hash and size. The content is fetched by
+the recipient's own TorBox account, never carried by Hush.
+
+| New surface | What it may see | Rule |
+|---|---|---|
+| Relay | The same ciphertext blob as any signal or text message | **No change.** No file bytes, no tracker list, no new relay ability |
+| Sender | Which torrents it already holds; the recipient's accepted/declined response | The sender chooses the item from its own Torrents state; the daemon resolves the hash |
+| Recipient's TorBox | The torrent hash/name, the recipient's TorBox account, and the swarm traffic | **Accepted and stated** — the offer dialog says the file is fetched by TorBox, not Hush |
+| Recipient's network | Swarm peers and traffic to TorBox | Outside Hush's path; the recipient's TorBox settings and network are their own |
+| Vault | The offer body in `torrents-state.enc`; the downloaded files as ordinary vault blobs | Same encryption as the rest of the torrents sidecar |
+
+**Honest limits for user-facing copy:** a hash-only magnet cannot recover a private tracker list
+that was never retained; a torrent name is not a guarantee of its contents; accepting a share uses
+the recipient's TorBox quota and storage, and the recipient can decline. No torrent starts without
+both sides' permission and the recipient's explicit confirmation.
+
 ## Implications already decided
 
 - No phone/email directory, no global username search.
