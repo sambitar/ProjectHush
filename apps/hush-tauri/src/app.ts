@@ -799,6 +799,16 @@ export class App {
    * the pane — the twin of `renderedNick` for chats. */
   private renderedConclaveId: string | null = null;
   private pollTimer: number | null = null;
+  /**
+   * Whether a recv poll is still waiting on the daemon.
+   *
+   * The poll is an interval, so a daemon that is busy (a large file being
+   * encrypted into the vault, say) would otherwise get a second poll stacked
+   * on the first, then a third. That adds queue depth to the single-threaded
+   * worker and no information: nothing is read out of order, and the next tick
+   * after a poll returns reads everything the skipped ones would have.
+   */
+  private pollInFlight = false;
   /** Pending rAF handle for a coalesced render; null when none is queued. */
   private renderRaf: number | null = null;
   /** Pending trailing timer for a coalesced background render. */
@@ -1855,6 +1865,8 @@ export class App {
 
   private async pollRecv(): Promise<void> {
     if (!this.status || this.status.locked) return;
+    if (this.pollInFlight) return;
+    this.pollInFlight = true;
     try {
       // Appear-offline: skip the heartbeat and let the relay's timestamp go
       // stale, so contacts report offline. The daemon's heartbeat loop is
@@ -2070,6 +2082,8 @@ export class App {
       if (!editing) this.scheduleBackgroundRender();
     } catch {
       /* daemon busy */
+    } finally {
+      this.pollInFlight = false;
     }
   }
 
@@ -6779,7 +6793,9 @@ export class App {
 
   private async shareTorrentEntry(id: string): Promise<void> {
     const nick = this.torrentPickerNick;
-    if (!nick) return;
+    // One share per click: a second request adds a second offer for the same
+    // bytes, and the recipient would answer the same popup twice.
+    if (!nick || this.torrentPickerBusyId) return;
     this.torrentPickerBusyId = id;
     this.torrentPickerError = null;
     this.scheduleRender();
@@ -6967,6 +6983,10 @@ export class App {
   }
 
   private async torrentOfferAccept(): Promise<void> {
+    // One answer per offer. The button is disabled while the request is out,
+    // but a render has not landed yet when the second click arrives, and the
+    // daemon would queue the torrent a second time.
+    if (this.torrentOfferBusy) return;
     const offer = this.currentTorrentOffer();
     if (!offer) {
       this.closeTorrentOffer();
@@ -6992,6 +7012,7 @@ export class App {
   }
 
   private async torrentOfferDecline(): Promise<void> {
+    if (this.torrentOfferBusy) return;
     const offer = this.currentTorrentOffer();
     if (!offer) {
       this.closeTorrentOffer();
@@ -7081,30 +7102,32 @@ export class App {
 
       actions = document.createElement("div");
       actions.className = "modal-actions";
-      const later = document.createElement("button");
-      later.type = "button";
-      later.className = "btn-secondary pressable";
-      later.textContent = "Later";
-      later.disabled = this.torrentOfferBusy;
-      later.onclick = () => {
-        close();
-        showToast("Torrent offer kept for later. It will appear again next unlock.", {
-          kind: "info",
-        });
-      };
       const decline = document.createElement("button");
       decline.type = "button";
       decline.className = "btn-secondary pressable";
       decline.textContent = "Decline";
       decline.disabled = this.torrentOfferBusy;
       decline.onclick = () => void this.torrentOfferDecline();
-      const download = document.createElement("button");
-      download.type = "button";
-      download.className = "btn-primary pressable";
-      download.textContent = this.torrentOfferBusy ? "Adding…" : "Download";
-      download.disabled = this.torrentOfferBusy || !state.has_key;
-      download.onclick = () => void this.torrentOfferAccept();
-      actions.append(later, decline, download);
+      actions.appendChild(decline);
+      if (state.has_key) {
+        const download = document.createElement("button");
+        download.type = "button";
+        download.className = "btn-primary pressable";
+        download.textContent = this.torrentOfferBusy ? "Adding…" : "Download";
+        download.disabled = this.torrentOfferBusy;
+        download.onclick = () => void this.torrentOfferAccept();
+        actions.appendChild(download);
+      } else {
+        // No key means Download cannot be taken. Close rather than trap the
+        // reader away from Settings; the offer stays pending and comes back
+        // when a key is saved.
+        const closeBtn = document.createElement("button");
+        closeBtn.type = "button";
+        closeBtn.className = "btn-primary pressable";
+        closeBtn.textContent = "Close";
+        closeBtn.onclick = close;
+        actions.appendChild(closeBtn);
+      }
     }
 
     if (this.torrentOfferError) {

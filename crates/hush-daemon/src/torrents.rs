@@ -359,24 +359,37 @@ impl TorrentsManager {
         if !valid_offer_hash(&offer.hash) {
             return Err("that offer has an invalid info hash".into());
         }
-        let item_id = uuid::Uuid::new_v4().to_string();
-        let mut item = TorrentItem::new(item_id.clone(), offer.name.clone(), SourceKind::Magnet);
-        item.hash = Some(offer.hash.clone());
-        item.size = offer.size;
-        item.source_data = Some(magnet_for(&offer.name, &offer.hash));
+        // Answering is one transition, made under one lock: a second request
+        // (a double click, a retried signal) sees the offer resolved and is
+        // refused instead of queueing the same bytes again. The hash check
+        // also covers two *different* offers for one torrent, and a torrent
+        // that is already in the Library.
         let updated = {
             let mut s = self.state.lock().await;
+            match s.offer(offer_id) {
+                Some(entry) if entry.status == OfferStatus::Pending => {}
+                Some(_) => return Err("that offer has already been answered".into()),
+                None => return Err("no such torrent offer".into()),
+            }
+            let item_id = match s.id_for_hash(&offer.hash) {
+                Some(id) => id.to_string(),
+                None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let mut item =
+                        TorrentItem::new(id.clone(), offer.name.clone(), SourceKind::Magnet);
+                    item.hash = Some(offer.hash.clone());
+                    item.size = offer.size;
+                    item.source_data = Some(magnet_for(&offer.name, &offer.hash));
+                    s.items.insert(0, item);
+                    id
+                }
+            };
             let Some(entry) = s.offer_mut(offer_id) else {
                 return Err("no such torrent offer".into());
             };
-            if entry.status != OfferStatus::Pending {
-                return Err("that offer has already been answered".into());
-            }
             entry.status = OfferStatus::Accepted;
-            entry.item_id = Some(item_id.clone());
-            let updated = entry.clone();
-            s.items.insert(0, item);
-            updated
+            entry.item_id = Some(item_id);
+            entry.clone()
         };
         self.mark_dirty().await;
         self.persist().await?;

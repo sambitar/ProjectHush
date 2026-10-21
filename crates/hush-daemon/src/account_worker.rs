@@ -931,6 +931,10 @@ impl AccountWorker {
                 .expect("account worker runtime");
             rt.block_on(async move {
                 let mut account: Option<Account> = None;
+                // The last presence answer per contact. Read errors are not
+                // answers, so they fall back to this instead of "offline".
+                let mut last_presence: std::collections::HashMap<String, bool> =
+                    std::collections::HashMap::new();
                 while let Some(work) = rx.recv().await {
                     let (reply, result) = match work {
                         Work::Unlock {
@@ -1075,6 +1079,7 @@ impl AccountWorker {
                         }
                         Work::Lock { reply } => {
                             account = None;
+                            last_presence.clear();
                             (reply, WorkResult::Ok)
                         }
                         Work::Invite { reply } => {
@@ -1096,8 +1101,19 @@ impl AccountWorker {
                                     // there is nothing to refresh here.
                                     let mut list = Vec::new();
                                     for c in a.contacts() {
-                                        let online =
-                                            a.contact_is_online(&c.nickname).await.unwrap_or(false);
+                                        // A relay read that fails says nothing
+                                        // about the peer: a heartbeat that is
+                                        // late is not a peer that is away.
+                                        // Keep the last answer, and let the
+                                        // next successful read correct it.
+                                        let online = match a.contact_is_online(&c.nickname).await {
+                                            Ok(online) => online,
+                                            Err(_) => last_presence
+                                                .get(&c.nickname)
+                                                .copied()
+                                                .unwrap_or(false),
+                                        };
+                                        last_presence.insert(c.nickname.clone(), online);
                                         list.push(ContactDto {
                                             nickname: c.nickname.clone(),
                                             protocol_name: c.account_id.clone(),

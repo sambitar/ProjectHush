@@ -7,6 +7,85 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-21 — Torrent offer answers and presence reads [FIXED / OPEN]
+
+### A second Share click queued the same torrent twice [FIXED]
+
+- Attempted: share one torrent to a trustee and accept it on the other side.
+- Symptom: Bob's sidecar held two offers for one info hash, 24 s apart (`received_at`
+  1792615759 and 1792615783), both accepted, and two 403 MB queue items began downloading. The
+  second popup looked like the first one refusing to close, which is why Download was clicked
+  twice — so the duplicate offer caused the duplicate item, not the other way round.
+- Resolution: `TorrentsState::add_offer` drops a second *pending* offer from the same sender for
+  the same hash; `accept_offer` checks the offer status and resolves the item under one lock, and
+  reuses a queue item or Library entry that already holds the hash (`id_for_hash`) instead of
+  inserting a second one; the UI refuses a second accept or share while one is in flight.
+  Tests: `a_second_pending_offer_for_the_same_hash_is_ignored`,
+  `a_resolved_offer_does_not_block_a_fresh_one`, `id_for_hash_finds_a_queued_or_filed_torrent`.
+- Lesson: an idempotency key that is generated per request (a fresh `offer_id`) cannot deduplicate
+  a repeated user action. Content-addressed data has to be idempotent on the content.
+
+### "Later" was a third answer to a two-answer question [FIXED]
+
+- Attempted: a deferred answer for an incoming torrent offer.
+- Symptom: not a bug, a rejected affordance. The offer modal has to be answered, and Later left a
+  pending row the next unlock would surface anyway.
+- Resolution: removed. Decline and Download; without a TorBox key the dialog shows Close and the
+  offer stays pending (Download is disabled there, so a dialog with only Decline and Download
+  would trap the user away from Settings).
+- Lesson: a dialog that cannot be satisfied should offer the exit its own state implies, not a
+  generic postpone.
+
+### A failed presence read was rendered as "offline" [FIXED, trigger unproven]
+
+- Attempted: explain why Alice's dot flipped to offline mid-conversation. Both daemons were
+  unlocked and responsive, `appear_offline` was false on both, the relay answered `/health` 200 on
+  15/15 probes, and live `GET /api/contacts` sampling showed `online: true` throughout.
+- Symptom: the code could not distinguish two different facts. `RelayClient::contact_presence_online`
+  returned `Ok(false)` for *any* non-2xx response, and `account_worker` read presence with
+  `.unwrap_or(false)`. A 5xx, a proxy error or a transport failure therefore painted a working peer
+  as away for one poll, and the next successful poll painted it back.
+- Resolution: 401/403/404 stay `false` (the queue is gone or the token does not match, which no
+  heartbeat can fix); every other status and every transport error now propagates. The worker keeps
+  the last answer per contact and falls back to it on error. The UI recv poll also refuses to stack
+  when the previous one has not returned.
+- Not proven: which of the two triggers was seen. The old code made the question unanswerable, so
+  the fix removes the false "offline" from read failures; a genuinely stale heartbeat would still
+  show offline, as it should.
+
+### A large vault store blocks every other worker call [OPEN]
+
+- Attempted: explain how a heartbeat could go missing for long enough to reach the relay's 90 s
+  freshness window.
+- Symptom: the account worker is a dedicated thread running a **current-thread** runtime
+  (`account_worker.rs`, `AccountWorker::spawn`), and `Work::BlobStoreFile` calls the synchronous
+  `Account::store_blob_file` -> `Vault::put_blob_stream` inside that loop. Every heartbeat, recv and
+  contacts read queues behind a 403 MB encryption pass. The duplicate-download bug above doubled
+  that work (two 403 MB stores, at most `max_concurrent` in parallel, each one serialized through
+  the actor).
+- Resolution: partial. The false "offline" on a failed read is fixed and polls no longer stack, but
+  the blocking store is still on the actor. Moving it off needs the vault handle to be usable
+  outside the actor (an `Arc`ed vault or a dedicated blocking store task), which is a larger change
+  than this slice.
+- Lesson: a single-threaded actor is only as responsive as its slowest synchronous call, and a
+  background file transfer is the obvious way to make it slow.
+
+## 2026-10-21 — Android Ethereum wallet feasibility (research only) [OPEN]
+
+### The Android build path was not verified [OPEN]
+
+- Attempted: assess whether the desktop Ethereum wallet (`crates/hush-wallet/src/ethereum.rs`)
+  can ship on Android unchanged.
+- Symptom: no Android Rust target is installed — `rustup target list --installed` shows only
+  `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-gnu` — and no
+  cross-build was run. The assessment is from crate structure and dependencies, not from a build.
+  The SDK and NDK exist at `/home/sam/Android/Sdk` and `/home/sam/Android/Sdk/ndk/27.1.12297006`.
+- Resolution: none yet. `rustup target add aarch64-linux-android`, then cross-compile at least
+  `cargo check -p hush-wallet --features ethereum --target aarch64-linux-android` to prove alloy,
+  reqwest/rustls and the always-on BDK tree link for Android.
+- Lesson: "the crate is portable Rust" is a design property, not evidence of a working Android
+  build. Do not report it as one.
+
 ## 2026-10-21 — Torrent sharing (`/torrent`) [FIXED / OPEN]
 
 ### Consent made while signals were off was lost [FIXED]

@@ -105,7 +105,12 @@ and stores it as ordinary vault blobs.
 - **Source:** the picker lists Active & Queue and Library entries with a hash. The daemon resolves
   the name/hash/size itself; the UI never supplies a magnet.
 - **Accept:** the recipient's daemon builds `magnet:?xt=urn:btih:<hash>&dn=<name>` and queues a
-  normal item. A missing TorBox key leaves the offer pending; the modal says so.
+  normal item. A missing TorBox key leaves the offer pending; the modal says so and offers Close,
+  because Download cannot be taken without a key.
+- **One answer per offer:** the modal has Decline and Download only. Answering is one transition
+  under one lock, and an offer whose hash is already queued or in the Library points at that item
+  instead of adding a second copy. A repeated offer for the same pending hash from the same sender
+  is dropped, so a second Share click cannot produce two downloads on the other side.
 - **Limit:** library entries retain the hash, not the original magnet or tracker list. A
   private-tracker torrent may not resolve from a hash-only magnet. The UI states this.
 

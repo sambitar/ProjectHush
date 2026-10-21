@@ -350,7 +350,18 @@ impl RelayClient {
             .await
             .map_err(|e| Error::Relay(e.to_string()))?;
         if !res.status().is_success() {
-            return Ok(false);
+            // A refusal is an answer: 401/403/404 means the queue is gone or
+            // the token no longer matches, so no heartbeat will ever make it
+            // online. Anything else is the relay failing to answer, which is
+            // not the same fact — the caller keeps what it last knew rather
+            // than painting a working peer as offline.
+            return match res.status().as_u16() {
+                401 | 403 | 404 => Ok(false),
+                _ => Err(Error::Relay(format!(
+                    "presence read failed: {}",
+                    res.status()
+                ))),
+            };
         }
         #[derive(serde::Deserialize)]
         struct Body {

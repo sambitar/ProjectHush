@@ -304,10 +304,40 @@ impl TorrentsState {
         self.offers.iter_mut().find(|o| o.offer_id == id)
     }
 
+    /// The queue item or library entry that already holds this torrent.
+    ///
+    /// A torrent is content-addressed: the same info hash is the same bytes.
+    /// Accepting it twice must not download it twice, so this is what makes a
+    /// duplicate offer, or a second answer to the same offer, a no-op.
+    pub fn id_for_hash(&self, hash: &str) -> Option<&str> {
+        let same = |h: Option<&str>| h.is_some_and(|h| h.eq_ignore_ascii_case(hash));
+        self.items
+            .iter()
+            .find(|i| same(i.hash.as_deref()))
+            .map(|i| i.id.as_str())
+            .or_else(|| {
+                self.library
+                    .iter()
+                    .find(|e| same(e.hash.as_deref()))
+                    .map(|e| e.id.as_str())
+            })
+    }
+
     /// Store an offer once. A repeated id is a no-op, like the signal layer's
-    /// duplicate suppression.
+    /// duplicate suppression. So is a second *pending* offer from the same
+    /// sender for the same torrent: sharing the same torrent twice (a second
+    /// click on Share, a retried signal) must not present the recipient with
+    /// two popups for one set of bytes, both of which would download it.
     pub fn add_offer(&mut self, offer: TorrentOffer) -> bool {
         if self.offer(&offer.offer_id).is_some() {
+            return false;
+        }
+        let already_pending = self.offers.iter().any(|o| {
+            o.status == OfferStatus::Pending
+                && o.from_account == offer.from_account
+                && o.hash.eq_ignore_ascii_case(&offer.hash)
+        });
+        if already_pending {
             return false;
         }
         self.offers.insert(0, offer);
@@ -488,13 +518,21 @@ mod tests {
         assert_eq!(state.library.len(), 1);
     }
 
+    /// A distinct info hash per offer id, so fixtures are not collapsed by the
+    /// same-hash pending rule unless a test wants them to be.
+    fn hash_for(id: &str) -> String {
+        let mut hash: String = id.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        hash.truncate(40);
+        format!("{hash:0>40}")
+    }
+
     fn offer(id: &str, status: OfferStatus) -> TorrentOffer {
         TorrentOffer {
             offer_id: id.into(),
             from_nick: "alice".into(),
             from_account: "a".into(),
             name: format!("Torrent {id}"),
-            hash: "ab".repeat(20),
+            hash: hash_for(id),
             size: 100,
             received_at: 1,
             status,
@@ -512,7 +550,61 @@ mod tests {
         let bytes = state.encode().unwrap();
         let back = decode(Some(&bytes)).unwrap();
         assert_eq!(back.offers.len(), 1);
-        assert_eq!(back.offers[0].hash, "ab".repeat(20));
+        assert_eq!(back.offers[0].hash, hash_for("o1"));
+    }
+
+    #[test]
+    fn a_second_pending_offer_for_the_same_hash_is_ignored() {
+        let mut state = TorrentsState::default();
+        assert!(state.add_offer(offer("o1", OfferStatus::Pending)));
+        // Same sender, same bytes, a new offer id: the second Share click.
+        let mut second = offer("o2", OfferStatus::Pending);
+        second.hash = hash_for("o1");
+        assert!(!state.add_offer(second));
+        assert_eq!(state.offers.len(), 1);
+        assert!(state.offer("o2").is_none());
+
+        // A different sender is a different offer, even for the same hash.
+        let mut other = offer("o3", OfferStatus::Pending);
+        other.from_account = "b".into();
+        other.from_nick = "bob".into();
+        other.hash = hash_for("o1");
+        assert!(state.add_offer(other));
+        assert_eq!(state.offers.len(), 2);
+    }
+
+    #[test]
+    fn a_resolved_offer_does_not_block_a_fresh_one() {
+        let mut state = TorrentsState::default();
+        assert!(state.add_offer(offer("o1", OfferStatus::Declined)));
+        // Answering an offer and then sharing again is a new intent.
+        let mut again = offer("o2", OfferStatus::Pending);
+        again.hash = hash_for("o1");
+        assert!(state.add_offer(again));
+        assert_eq!(state.offers.len(), 2);
+    }
+
+    #[test]
+    fn id_for_hash_finds_a_queued_or_filed_torrent() {
+        let hash = "ab".repeat(20);
+        let mut state = TorrentsState::default();
+        assert_eq!(state.id_for_hash(&hash), None);
+
+        let mut item = TorrentItem::new("queued".into(), "One".into(), SourceKind::Magnet);
+        item.hash = Some(hash.clone());
+        state.items.push(item);
+        assert_eq!(state.id_for_hash(&hash.to_ascii_uppercase()), Some("queued"));
+
+        state.library.push(LibraryEntry {
+            id: "filed".into(),
+            name: "Two".into(),
+            hash: Some("cd".repeat(20)),
+            size: 1,
+            added_at: 0,
+            files: Vec::new(),
+        });
+        assert_eq!(state.id_for_hash(&"cd".repeat(20)), Some("filed"));
+        assert_eq!(state.id_for_hash(&"ef".repeat(20)), None);
     }
 
     #[test]
