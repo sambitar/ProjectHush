@@ -90,6 +90,12 @@ pub struct InvitePayload {
     /// Optional so invites minted before vault naming still decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault: Option<String>,
+    /// Whether this build can receive a chunked `FileOffer`.
+    ///
+    /// Optional and defaulted so every invite minted before large-file transfer
+    /// decodes as `false`; the sender then keeps the inline file path.
+    #[serde(default)]
+    pub supports_file_transfer: bool,
 }
 
 /// The v1 wire shape: byte fields as JSON arrays of numbers. Kept only so
@@ -140,6 +146,7 @@ impl From<LegacyInvite> for InvitePayload {
             kyber_pre_key_signature: l.kyber_pre_key_signature,
             handle: l.handle,
             vault: l.vault,
+            supports_file_transfer: false,
         }
     }
 }
@@ -381,6 +388,7 @@ pub fn decode(s: &str) -> Result<Self, Error> {
             kyber_pre_key_signature: record.kyber_pre_key_signature,
             handle: self.handle,
             vault: self.vault,
+            supports_file_transfer: record.supports_file_transfer,
         })
     }
 }
@@ -520,6 +528,7 @@ mod tests {
             kyber_pre_key_signature: vec![7u8; 64],
             handle: Some("sam".into()),
             vault: Some("hush".into()),
+            supports_file_transfer: true,
         }
     }
 
@@ -533,6 +542,24 @@ mod tests {
         assert_eq!(back.identity_key, invite.identity_key);
         assert_eq!(back.kyber_pre_key_public, invite.kyber_pre_key_public);
         assert_eq!(back.handle.as_deref(), Some("sam"));
+        assert!(back.supports_file_transfer);
+    }
+
+    /// A v2 invite minted before large-file transfer must decode as `false` so
+    /// the sender keeps the inline path instead of sending an offer the peer
+    /// cannot read.
+    #[test]
+    fn a_v2_invite_without_the_file_transfer_flag_decodes_as_false() {
+        let invite = sample(INVITE_VERSION);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&invite.encode().unwrap()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("supports_file_transfer");
+        let back =
+            InvitePayload::decode(&serde_json::to_string(&value).unwrap()).unwrap();
+        assert!(!back.supports_file_transfer);
     }
 
     #[test]
@@ -544,6 +571,7 @@ mod tests {
         assert_eq!(back.v, 1);
         assert_eq!(back.identity_key, vec![1, 2, 3]);
         assert_eq!(back.kyber_pre_key_public, vec![12]);
+        assert!(!back.supports_file_transfer);
     }
 
     #[test]

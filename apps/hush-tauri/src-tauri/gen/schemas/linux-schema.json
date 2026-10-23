@@ -195,10 +195,10 @@
           "markdownDescription": "Proxy daemon API calls over the local Unix socket"
         },
         {
-          "description": "Open and save files through the OS: chat attachments and vault blobs",
+          "description": "Open, save and pick files through the OS: chat attachments, vault blobs and the vault's own file library",
           "type": "string",
           "const": "allow-hush-files",
-          "markdownDescription": "Open and save files through the OS: chat attachments and vault blobs"
+          "markdownDescription": "Open, save and pick files through the OS: chat attachments, vault blobs and the vault's own file library"
         },
         {
           "description": "Open external http(s) links in the user's browser",

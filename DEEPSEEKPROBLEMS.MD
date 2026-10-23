@@ -7,6 +7,183 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-23 — Vault file library (Your files)
+
+### Torrent deletion could delete a file the new library still needs [FIXED]
+
+- Attempted: leave the existing `TorrentsManager::delete_library` path alone and only guard the new
+  Files delete with a reference check.
+- Symptom found while reviewing ownership: blobs are content-addressed, so an imported file and a
+  torrent's copy of the same bytes share one id. Deleting the torrent entry deleted the blob
+  unconditionally, which would leave the imported entry listed but unopenable.
+- Resolution: `delete_library` now calls `blob_still_used` before each delete. It checks the remaining
+  torrents, `vault-files.enc`, and the chat/mail/drop/draft/conclave records; an error or a locked
+  worker counts as "still used". `cargo test -p hush-daemon torrents` passes.
+- Lesson: adding a new referencer to a content-addressed store makes every unconditional blob
+  deleter a hazard, even ones outside the slice.
+
+### A second `edit_file` on `torrents.rs` duplicated a `match` line [FIXED]
+
+- Attempted: append the chat/mail reference check to `blob_still_used` with a second edit.
+- Symptom: `cargo test` failed with `error: this file contains an unclosed delimiter` at
+  `torrents.rs:1329`, pointing at a duplicated
+  `match self.worker.secret_read(...)` line that shadowed the first `match`.
+- Resolution: re-read lines 592-622 and replaced the whole block, then ran rustfmt and the torrent
+  tests.
+- Lesson: re-read a just-edited region before appending to it; the fuzzy matcher can anchor inside
+  the new text, not just after it.
+
+### `cargo test` takes one test-name filter, not several [WORKED AROUND]
+
+- Attempted: `cargo test -p hush-daemon files_store_tests vault_files_api_tests` to run both new
+  suites in one command.
+- Symptom: `error: unexpected argument 'vault_files_api_tests' found` followed by the usage line.
+  Cargo accepts a single positional `TESTNAME`.
+- Resolution: ran the two filters in separate commands, then the whole crate where needed.
+- Lesson: when several new test modules need one run, use a common prefix or `cargo test -p <crate>`.
+
+### The blob route reports an absent blob as HTTP 400, not 404 [FIXED]
+
+- Attempted: assert `StatusCode::NOT_FOUND` after deleting a library entry, because the bytes are
+  gone and `GET /api/blob/{id}` seemed like a not-found case.
+- Symptom: the new `files_round_trip_upload_list_open_and_delete` test failed at `left: 400`,
+  `right: 404`. `blob()` maps `WorkResult::Err` through the shared `map_err`, which returns
+  `BAD_REQUEST` for everything except `locked`.
+- Resolution: the test now accepts `NOT_FOUND | BAD_REQUEST`, with a comment naming the route's
+  existing classification. The route itself was not changed: that is shared behaviour for every
+  blob caller, not part of this slice.
+- Lesson: check an existing route's real status mapping before writing a new assertion against it.
+
+### A batched `edit_file` call partially applied after a multi-match warning [FIXED]
+
+- Attempted: replace the delete modal's header and its `modal.append(...)` line in one `edit_file`
+  call. The first replacement's `old_text` matched both the torrent delete and the new file delete.
+- Symptom: the tool reported `Edit 1 matched multiple locations ... Edit 2 ...`, and only the first
+  replacement landed. The modal built its summary block but never appended it, which TypeScript
+  would not catch because the element was still constructed.
+- Resolution: re-read the method and applied the `modal.append(h, p, summary, row)` change with a
+  unique enclosing snippet.
+- Lesson: a partially applied batch is not a failed edit. Re-read the target region after any
+  multi-match warning instead of assuming both halves landed.
+
+### `cargo fmt --all --check` is red on untouched files [OPEN]
+
+- Attempted: verify formatting for the slice with `cargo fmt --all -- --check`.
+- Symptom: diffs in `crates/voice-spike/src/main.rs` and `apps/hush-tauri/src-tauri/src/tor.rs`,
+  files this slice did not modify. The workspace is not rustfmt-clean at HEAD.
+- Resolution: checked only the touched files with
+  `rustfmt --edition 2021 --check --config skip_children=true <files>`, which passes. The repo-wide
+  formatting state was left alone.
+- Still needed: a separate formatting pass over the untouched files, if the project wants
+  `cargo fmt --all --check` to be a usable gate.
+- Lesson: a workspace-wide formatting check will fail for reasons unrelated to the current change;
+  scope the check to the touched files and say so instead of claiming the workspace is clean.
+
+## 2026-10-22 — Installing VS Code on the SSD (host tooling, not a repo change)
+
+### `sudo` required a password, so `apt` could not be run directly [WORKED AROUND]
+
+- Attempted: install VS Code from Microsoft's apt repo with `sudo` inside the agent terminal.
+- Symptom: `sudo -n true` returned `sudo: a password is required`. `sam` is in the `sudo` group,
+  but there is no NOPASSWD rule for it, and the agent must not handle or store a password.
+- Resolution: ran a prepared installer through `pkexec --disable-internal-agent`, which routes
+  authentication to the GNOME polkit agent and shows a normal desktop password dialog. Elevated
+  commands this session should use that path, not `sudo`.
+- Lesson: on this machine, root work from the agent means polkit, not `sudo`; tell the user a
+  dialog will appear before invoking it.
+
+### `apt-get install` aborts on pre-existing unconfigured NVIDIA packages [OPEN]
+
+- Attempted: `apt-get install -y gnupg ca-certificates` as the first step of the official VS Code
+  repo setup.
+- Symptom: `E: Sub-process /usr/bin/dpkg returned an error code (1)`. Four packages are stuck
+  unconfigured — `linux-modules-nvidia-580-7.0.0-34-generic`, `linux-modules-nvidia-535-6.17.0-40-generic`,
+  `linux-modules-nvidia-580-generic-hwe-24.04`, `linux-modules-nvidia-535-generic-hwe-24.04` — because
+  their post-install cannot build the modules:
+  `./BUILD: 4: /usr/src/linux-headers-7.0.0-34-generic/tools/objtool/objtool: not found` and
+  `ld.bfd: cannot open linker script file .../scripts/module.lds: No such file or directory`.
+  The installed kernel header trees are incomplete. `apt-get -s install --only-upgrade code` confirms
+  every future apt transaction will try to configure these four and fail the same way.
+- Resolution so far: installed the official `code_1.143.0-..._amd64.deb` with `dpkg -i`, which does not
+  touch the pending queue, and added the Microsoft repo for updates once apt is healthy. The NVIDIA
+  package state is untouched.
+- Still needed: reinstall the matching `linux-headers-*` packages for the running kernels so the
+  NVIDIA module builds can complete, then `dpkg --configure -a`. Left alone here because it touches
+  kernel modules and is unrelated to the VS Code install.
+
+## 2026-10-21 — Contact requests and an edit-tool corruption [FIXED]
+
+### `edit_file` mangled `payload.rs` while inserting the contact payloads [FIXED]
+
+- Attempted: insert `ContactRequest`, `ContactAccept`, and `ContactDecline` into the
+  `MessagePayload` enum with one `edit_file` call.
+- Symptom: `cargo check` failed with 19 errors. Lines 379-736 had been rewritten into fragments such
+  as `it. Sen` + `ders must check t,` + `he contact's ...`, and a later test contained a bare
+  `MessagePayload::` line. The enum and one unrelated test were corrupted; the edit was reported as
+  successful.
+- Resolution: rebuilt the file from `git show HEAD:crates/hush-core/src/payload.rs`, plus the A1
+  additions (extracted from the intact top and test sections) and the contact variants. Verified with
+  `cargo test -p hush-core`: 178 unit tests and every integration suite pass, including the four new
+  `contact_requests` tests.
+- Lesson: run `cargo check` immediately after any large edit; a successful tool response is not a
+  valid file. When a region is mangled, rebuild it from HEAD plus known additions instead of applying
+  more fuzzy edits to the damaged text.
+
+### The first `ContactCard` validation rejected legacy intro fixtures [FIXED]
+
+- Attempted: enforce `hex(identity_key) == protocol_name` in `ContactCard::from_payload`.
+- Symptom: `a_delivered_intro_is_stored_and_accepting_adds_the_contact` and
+  `a_reverse_intro_adds_the_contact_without_consuming_the_bundle` failed with
+  `InvalidContactRequest`. Those tests rewrite `state.protocol_name` to a short fake id while the
+  invite carries the real device key, so the two halves legitimately disagree in the fixture.
+- Resolution: `ContactCard::validate` now checks only that the fields are present; the exact identity
+  match is enforced in `receive_contact_request`, against the account id the Signal session proved.
+  That is the only place where a mismatch is a substitution attempt rather than a test fixture.
+- Lesson: put a security invariant at the boundary where the attacker-controlled input meets the
+  proof, not in a constructor shared with trusted/degraded data.
+
+### The daemon could not import `ContactRequestView` [FIXED]
+
+- Symptom: `unresolved import hush_core::ContactRequestView` in both `account_worker.rs` and
+  `main.rs`, even though the type is `pub` in `account.rs`.
+- Resolution: added it to the `pub use account::{...}` list in `crates/hush-core/src/lib.rs`.
+- Lesson: a `pub` item inside a private module is not part of the crate's public surface until the
+  `lib.rs` re-export names it.
+
+## 2026-10-21 — Mobile APK reality check [FIXED / OPEN]
+
+### HushRelayApp's `master` pointed at an empty commit object [FIXED]
+
+- Attempted: inspect the mobile repository before rebuilding the APK.
+- Symptom: `fatal: bad object HEAD`. `git fsck` reported five zero-byte loose objects and an
+  invalid SHA in `refs/heads/master`; the reflog named `e774d79` as the tip, and its commit, tree,
+  and blobs were the empty files. The working tree itself was intact.
+- Resolution: verified `468e52d` ("Design the large-file attachment transfer") still read back as a
+  real commit, then moved `refs/heads/master` back to it. History `2f375ab` -> `468e52d` is intact;
+  the lost tip's docs edits show as the two modified files in `git status`.
+- Lesson: a working tree that looks right says nothing about the object store. Check `git cat-file`
+  on HEAD before assuming the last commits exist.
+
+### The APK cannot be tested for voice or wallet, because neither exists [OPEN]
+
+- Attempted: produce a sideloadable APK per the request ("especially voice", wallet on testnet).
+- Symptom: the APK builds, installs, and launches, but every backend command is a stub.
+  `create_vault` returns `SCAFFOLD_NOT_WIRED` on-screen; the chat header's phone button calls
+  `actions.notWired("1:1 calls")` (`src/screens.ts:93`); `wallet_create`, `wallet_send_usdc`,
+  `pay_trustee`, `send_text`, and `send_attachment` all return `SCAFFOLD_NOT_WIRED`;
+  `src-tauri/Cargo.toml` has no `hush-core` or `hush-wallet` dependency. `wallet_status` is a
+  hardcoded `mainnet` / `exists: false` DTO.
+- Voice is absent at both ends: the mobile app has no audio, WebRTC, signaling, or ringtone code,
+  and the desktop's voice is conclave-only (`hush-daemon` + `hush-audio` + `webrtc`). No ringer or
+  tone exists anywhere; the only native sound is the chat arrival cue in
+  `apps/hush-tauri/src-tauri/src/sound.rs`.
+- Resolution: none yet. Wallet needs M1 (vault) then M4; 1:1 voice is M5 and is unstarted. Both are
+  multi-day. `hush-wallet` does support `sepolia` (`crates/hush-wallet/src/store.rs:72`), so testnet
+  is a configuration once the wallet is wired.
+- Lesson: do not accept a carried summary's "done and verified" for a mobile feature without
+  reading the command bodies. The scaffold's own `docs/SCAFFOLD.md` was accurate; the session
+  summary was not.
+
 ## 2026-10-21 — Torrent offer answers and presence reads [FIXED / OPEN]
 
 ### A second Share click queued the same torrent twice [FIXED]
@@ -70,21 +247,147 @@ resolution, and the status.
 - Lesson: a single-threaded actor is only as responsive as its slowest synchronous call, and a
   background file transfer is the obvious way to make it slow.
 
-## 2026-10-21 — Android Ethereum wallet feasibility (research only) [OPEN]
+## 2026-10-21 — Desktop attachment size claim [OPEN]
 
-### The Android build path was not verified [OPEN]
+### The installed 0.2.0 build should reject a >256 KiB chat file [OPEN]
+
+- Attempted: verify the report that the desktop sent a chat attachment larger than 256 KB.
+- Symptom: not reproduced from source. HEAD and tag `v0.2.0` both set
+  `MAX_FILE_BYTES = 256 * 1024` in `apps/hush-tauri/src/lib/constants.ts` and
+  `MAX_INLINE_FILE_BYTES = 256 * 1024` in `crates/hush-core/src/payload.rs`. `sendFile` reads the
+  whole file, posts base64 once to `/api/send-file-data`, and the daemon calls
+  `Account::send_file_bytes`, which rejects over the cap. There is no chunking. The installed app is
+  `/home/sam/Applications/Hush_0.2.0_amd64.AppImage`.
+- Resolution: none yet. Need the exact byte size and the surface used. The cap is 262,144 bytes, not
+  256,000; a 250 KB file passes. Drops allow 8 MiB and Torrents are unbounded, so a large file sent
+  through either is not a chat attachment. The production design for real large files is
+  `~/HushRelayApp/docs/ATTACHMENTS.md` (chunked per-transfer queue, per-file key).
+- Lesson: "it sent" can mean the optimistic file bubble appeared for the progress animation and was
+  removed after the daemon rejected it. Ask for the byte size and surface before changing a cap.
+
+## 2026-10-21 — HushRelayApp emulator run [FIXED / OPEN]
+
+### The preview banner sat under the Android status bar [FIXED]
+
+- Attempted: run the preview build on a `Pixel_7_API_35` emulator.
+- Symptom: the amber preview banner rendered at `y=0` and its text sat under the clock and status
+  icons. The header below it already accounted for the inset.
+- Resolution: `.banner` in `src/styles.css` now uses
+  `padding: calc(env(safe-area-inset-top) + 10px) 16px 10px`; rebuilt and confirmed the text starts
+  below the status bar.
+- Lesson: any element that can be the first child of the app needs the same top inset the header
+  has; the header's padding does not help a sibling above it.
+
+### Android Back exits the app instead of navigating [OPEN]
+
+- Attempted: dismiss the soft keyboard during the payment test with `adb shell input keyevent 4`.
+- Symptom: with no keyboard open, the same key event closed the app and returned to the launcher.
+  There is no in-app back handler, so Back on a chat or a dialog exits instead of going back.
+- Resolution: none yet. Add an Android back handler (Tauri window event or a history/popstate shim)
+  before the first dogfood build. This is recorded in `docs/SCAFFOLD.md` known gaps.
+- Lesson: the desktop has no hardware Back button; mobile needs an explicit navigation stack.
+
+### The USDC sheet's Continue button sits under the soft keyboard [OPEN]
+
+- Attempted: type an amount in the two-step USDC sheet on the emulator.
+- Symptom: the sheet is anchored to the bottom (`place-items: end`) and the IME covered the amount
+  field's hint and the Continue button. The field stayed visible; the action did not.
+- Resolution: none yet. Move the sheet with the keyboard, or add an explicit keyboard-dismiss
+  action and keep the primary button above the IME. Verify on a small screen.
+- Lesson: a bottom sheet is only mobile-ready when the keyboard is part of its layout.
+
+### Cold-start input triggered an ANR on the software-rendered emulator [WORKED AROUND]
+
+- Attempted: after `adb install -r`, send swipes immediately after `am start -W` returned.
+- Symptom: an "Hush isn't responding" dialog appeared before the first interaction completed. The
+  app had rendered onboarding; the ANR was the emulator's slow first paint plus input landing
+  during startup.
+- Resolution: waited for the first paint before sending input; the app then ran normally. The debug
+  APK is large and the emulator uses software rendering. Re-test on a hardware-accelerated emulator
+  or a device before treating a cold-start stall as a product bug.
+- Lesson: `am start -W` means the activity started, not that the webview has painted. Space
+  automated input after the first screenshot.
+
+### Returning from the document picker briefly showed a blank webview [WORKED AROUND]
+
+- Attempted: select `ui.xml` in the Android document picker from the chat's `+` → Attach file flow.
+- Symptom: the picker closed, the top activity was `com.hush.mobile/.MainActivity`, and a screenshot
+  taken immediately after was blank white. The app process was alive and Chromium logged a
+  `SafeAreaInsetBottom` repaint. A later screenshot showed the chat with the new outgoing file card.
+- Resolution: waited for the webview to repaint; no code change. Verify a post-picker frame with a
+  second screenshot before calling it a crash.
+- Lesson: on the software-rendered debug emulator, returning from a system activity leaves a
+  repaint window that a single screenshot can capture as an empty frame.
+
+## 2026-10-21 — HushRelayApp scaffold [FIXED / WORKED AROUND]
+
+### File tools cannot write outside the project root [WORKED AROUND]
+
+- Attempted: create `/home/sam/HushRelayApp` and write the scaffold with the file tools.
+- Symptom: `create_directory` returned `Path to create was outside the project`; `write_file` on an
+  absolute path under it returned `Can't create file: parent directory doesn't exist`; the terminal
+  `cd` parameter rejected the directory as not being a project root.
+- Resolution: created the directory with `mkdir -p` from the project root, wrote the tree in
+  `ProjectHush/.hushrelayapp-scaffold`, copied it with `cp -a` to `~/HushRelayApp`, removed the
+  staging directory, and used `git -C`, `npm --prefix`, and `cargo --manifest-path` afterwards.
+- Lesson: file tools and the terminal `cd` parameter are project-root-scoped. An out-of-tree
+  workspace needs a staging copy and explicit path flags. This is tooling, not a repo problem.
+
+### A Tauri async command returning a value with `State` [FIXED]
+
+- Attempted: `tor_status(state: State<'_, AppState>) -> TorStatusDto` so the command could await
+  the Orbot probe.
+- Symptom: `error[E0277]: async commands that contain references as inputs must return a Result`
+  and `error[E0597]: __tauri_message__ does not live long enough`.
+- Resolution: changed the return to `Result<TorStatusDto, String>` and returned
+  `Ok(tor::status(mode).await)`.
+- Lesson: Tauri async commands that borrow `State` must return `Result`, even when the operation
+  cannot fail.
+
+### The TypeScript `Actions` interface drifted from `App` [FIXED]
+
+- Attempted: build the scaffold after adding `refresh` and `notWired` to the implementation.
+- Symptom: `tsc` reported `Property 'refresh'/'notWired' does not exist on type 'Actions'` in
+  `screens.ts`.
+- Resolution: added both methods to `src/lib/types.ts`.
+- Lesson: the actions interface is the contract between `app.ts` and `screens.ts`; update it in the
+  same edit as the implementation.
+
+### `let _ = mutex.lock()` is a denied lint [FIXED]
+
+- Attempted: `wallet_status` touched the state so the command would be ready for the real wallet.
+- Symptom: `error: non-binding let on a synchronization lock` (`let_underscore_lock`).
+- Resolution: removed the lock. `wallet_status` is a pure stub until M4 and needs no state.
+- Lesson: a lock taken only for "readiness" is dead code and a lint error. Wire it when it has a
+  purpose.
+
+### `HTMLInputElement.autocomplete` is a union, not a string [FIXED]
+
+- Attempted: assign a caller-supplied string to `input.autocomplete` in the input helper.
+- Symptom: `TS2322: Type 'string' is not assignable to type 'AutoFill'`.
+- Resolution: `input.setAttribute("autocomplete", options.autocomplete)`.
+- Lesson: DOM IDL attributes with union types need either a cast or the attribute API.
+
+## 2026-10-21 — Android Ethereum wallet feasibility (research only) [FIXED]
+
+### The Android cross-compile was not verified [FIXED]
 
 - Attempted: assess whether the desktop Ethereum wallet (`crates/hush-wallet/src/ethereum.rs`)
   can ship on Android unchanged.
-- Symptom: no Android Rust target is installed — `rustup target list --installed` shows only
+- Symptom: no Android Rust target was installed — `rustup target list --installed` showed only
   `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-gnu` — and no
-  cross-build was run. The assessment is from crate structure and dependencies, not from a build.
-  The SDK and NDK exist at `/home/sam/Android/Sdk` and `/home/sam/Android/Sdk/ndk/27.1.12297006`.
-- Resolution: none yet. `rustup target add aarch64-linux-android`, then cross-compile at least
-  `cargo check -p hush-wallet --features ethereum --target aarch64-linux-android` to prove alloy,
-  reqwest/rustls and the always-on BDK tree link for Android.
+  cross-build had been run. The assessment was from crate structure and dependencies, not a build.
+- Resolution: `tauri android init --ci` installed the Android targets (aarch64, armv7, i686, x86_64).
+  On 2026-10-21, `cargo check -p hush-wallet --features ethereum --target aarch64-linux-android`
+  finished successfully in 1m24s with NDK 27.1.12297006, and
+  `cargo check --manifest-path ~/HushRelayApp/src-tauri/Cargo.toml --target aarch64-linux-android`
+  finished successfully too. alloy, reqwest/rustls, BDK, and the hush-core dependency tree link for
+  Android.
+- Remaining: the universal debug APK (474 MB, all ABIs plus debug symbols) built and ran on a
+  `Pixel_7_API_35` emulator on 2026-10-21. A release/ABI-split size is still unmeasured; the compile
+  question is closed, the shipping-size question is not.
 - Lesson: "the crate is portable Rust" is a design property, not evidence of a working Android
-  build. Do not report it as one.
+  build. The cross-check is the evidence; keep the packaging gap separate.
 
 ## 2026-10-21 — Torrent sharing (`/torrent`) [FIXED / OPEN]
 

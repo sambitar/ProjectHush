@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use hush_core::{
-  Account, ChatRecord, ChatRetention, ConclaveRecord, InboxResult, MessagePayload,
-  PaperDescriptor, PaymentPolicy, PendingInvite, PendingIntroRequest, PlaceRecord, PlaceRole,
-  QueueMap, SignalBody, SignalPolicy, SignalRecord, TorrentPolicy, TrusteeReach, VoiceDescriptor,
+    Account, ChatRecord, ChatRetention, ConclaveRecord, ContactRequestView, InboxResult,
+    MessagePayload, PaperDescriptor, PaymentPolicy, PendingIntroRequest, PendingInvite,
+    PlaceRecord, PlaceRole, QueueMap, SignalBody, SignalPolicy, SignalRecord, TorrentPolicy,
+    TrusteeReach, VoiceDescriptor,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -108,7 +109,9 @@ fn sweep_open_dir(dir: &Path) {
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if now
             .duration_since(modified)
             .map(|d| d > MAX_AGE)
@@ -147,6 +150,31 @@ enum Work {
         invite: String,
         /// The reach this vault wants with the new trustee (Task 24).
         reach: TrusteeReach,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    PendingContactRequests {
+        reply: oneshot::Sender<WorkResult>,
+    },
+    RequestContact {
+        nickname: String,
+        invite: String,
+        note: Option<String>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    AcceptContactRequest {
+        account_id: String,
+        nickname: Option<String>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    DeclineContactRequest {
+        account_id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    CancelContactRequest {
+        account_id: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    RetryContactRequests {
         reply: oneshot::Sender<WorkResult>,
     },
     SetContactReach {
@@ -473,6 +501,18 @@ enum Work {
         path: PathBuf,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// Store bytes already in memory as a single-file vault blob (the browser
+    /// upload path for the Files pane).
+    BlobStore {
+        data: Vec<u8>,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    /// Whether any chat, mail, drop, draft or conclave record still points at
+    /// this blob. A caller that would delete the blob asks first.
+    BlobReferenced {
+        id_hex: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// Delete a stored blob (single or chunked).
     BlobDelete {
         id_hex: String,
@@ -695,6 +735,9 @@ pub struct ContactDto {
     /// The contact's vault name, from their invite — the suffix of their mail
     /// address. `None` when their invite predates vault naming.
     pub mail_vault: Option<String>,
+    /// Whether the peer's build can receive a chunked `FileOffer`. The UI uses
+    /// this to choose between the inline file path and the large-file path.
+    pub supports_file_transfer: bool,
     /// The **effective** reach for this relationship (Task 24): the narrower of
     /// this vault's choice and the peer's announced one. `mail_only` hides the
     /// chat and conclave affordances, because a surface works only when both
@@ -817,10 +860,17 @@ pub enum WorkResult {
     Exists,
     Invite(String),
     Contacts(Vec<ContactDto>),
+    /// Pending incoming 1:1 contact requests, newest first.
+    ContactRequests(Vec<ContactRequestView>),
+    /// The local nickname chosen when a request was accepted.
+    ContactRequestAccepted(String),
     /// The id of a signal that was sent, for correlating its ack.
     SignalId(String),
     /// An expiring message was delivered: its id and absolute deadline.
-    ExpireSent { id: String, expires_ms: u64 },
+    ExpireSent {
+        id: String,
+        expires_ms: u64,
+    },
     /// Whether a payment record was newly written. False means this contact
     /// already had one for the same transaction.
     PaymentRecorded(bool),
@@ -890,6 +940,8 @@ pub enum WorkResult {
     DraftSaved(String),
     Blob(Vec<u8>),
     BlobId(String),
+    /// Whether any record in the vault still points at a given blob.
+    Referenced(bool),
     /// The path a stored blob was materialized to for open/save.
     Path(String),
     /// Every conclave this vault holds, with its message log.
@@ -1121,6 +1173,7 @@ impl AccountWorker {
                                             online,
                                             mail_handle: c.mail_handle.clone(),
                                             mail_vault: c.mail_vault.clone(),
+                                            supports_file_transfer: c.supports_file_transfer,
                                             // Effective = the narrower of the two
                                             // sides' choices (Task 24).
                                             reach: c.reach.narrow(c.peer_reach),
@@ -1232,6 +1285,78 @@ impl AccountWorker {
                                         Ok(()) => WorkResult::Ok,
                                         Err(e) => WorkResult::Err(e.to_string()),
                                     },
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::PendingContactRequests { reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::ContactRequests(a.incoming_contact_requests()),
+                            };
+                            (reply, result)
+                        }
+                        Work::RequestContact {
+                            nickname,
+                            invite,
+                            note,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a.request_contact(&nickname, &invite, note.as_deref()).await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::AcceptContactRequest {
+                            account_id,
+                            nickname,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a
+                                    .accept_contact_request(&account_id, nickname.as_deref())
+                                    .await
+                                {
+                                    Ok(nick) => WorkResult::ContactRequestAccepted(nick),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::DeclineContactRequest { account_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.decline_contact_request(&account_id).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::CancelContactRequest { account_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.cancel_contact_request(&account_id).await {
+                                    Ok(()) => WorkResult::Ok,
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::RetryContactRequests { reply } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.retry_contact_requests().await {
+                                    Ok(_) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
                             };
@@ -2048,6 +2173,23 @@ impl AccountWorker {
                             };
                             (reply, result)
                         }
+                        Work::BlobStore { data, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => match a.store_blob(&data) {
+                                    Ok(id) => WorkResult::BlobId(hex::encode(id.0)),
+                                    Err(e) => WorkResult::Err(e.to_string()),
+                                },
+                            };
+                            (reply, result)
+                        }
+                        Work::BlobReferenced { id_hex, reply } => {
+                            let result = match account.as_ref() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => WorkResult::Referenced(a.blob_referenced(&id_hex)),
+                            };
+                            (reply, result)
+                        }
                         Work::BlobDelete { id_hex, reply } => {
                             let result = match account.as_ref() {
                                 None => WorkResult::Err("locked".into()),
@@ -2607,7 +2749,12 @@ impl AccountWorker {
         self.call(|reply| Work::Contacts { reply }).await
     }
 
-    pub async fn add_contact(&self, nickname: &str, invite: &str, reach: TrusteeReach) -> WorkResult {
+    pub async fn add_contact(
+        &self,
+        nickname: &str,
+        invite: &str,
+        reach: TrusteeReach,
+    ) -> WorkResult {
         self.call(|reply| Work::AddContact {
             nickname: nickname.to_string(),
             invite: invite.to_string(),
@@ -2615,6 +2762,63 @@ impl AccountWorker {
             reply,
         })
         .await
+    }
+
+    /// Pending incoming contact requests, newest first.
+    pub async fn pending_contact_requests(&self) -> WorkResult {
+        self.call(|reply| Work::PendingContactRequests { reply })
+            .await
+    }
+
+    /// Ask a peer to connect. The peer must accept before a contact exists.
+    pub async fn request_contact(
+        &self,
+        nickname: &str,
+        invite: &str,
+        note: Option<String>,
+    ) -> WorkResult {
+        self.call(|reply| Work::RequestContact {
+            nickname: nickname.to_string(),
+            invite: invite.to_string(),
+            note,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn accept_contact_request(
+        &self,
+        account_id: &str,
+        nickname: Option<String>,
+    ) -> WorkResult {
+        self.call(|reply| Work::AcceptContactRequest {
+            account_id: account_id.to_string(),
+            nickname,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn decline_contact_request(&self, account_id: &str) -> WorkResult {
+        self.call(|reply| Work::DeclineContactRequest {
+            account_id: account_id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn cancel_contact_request(&self, account_id: &str) -> WorkResult {
+        self.call(|reply| Work::CancelContactRequest {
+            account_id: account_id.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Re-put outgoing requests the relay refused. Driven by the outbox timer.
+    pub async fn retry_contact_requests(&self) -> WorkResult {
+        self.call(|reply| Work::RetryContactRequests { reply })
+            .await
     }
 
     pub async fn set_contact_reach(&self, nickname: &str, reach: TrusteeReach) -> WorkResult {
@@ -2647,11 +2851,7 @@ impl AccountWorker {
     }
 
     /// Turn torrent sharing on or off for one contact.
-    pub async fn set_contact_torrents(
-        &self,
-        nickname: &str,
-        policy: TorrentPolicy,
-    ) -> WorkResult {
+    pub async fn set_contact_torrents(&self, nickname: &str, policy: TorrentPolicy) -> WorkResult {
         self.call(|reply| Work::SetContactTorrents {
             nickname: nickname.to_string(),
             policy,
@@ -2699,12 +2899,7 @@ impl AccountWorker {
         self.call(|reply| Work::Places { reply }).await
     }
 
-    pub async fn adopt_place(
-        &self,
-        nickname: &str,
-        invite: &str,
-        label: &str,
-    ) -> WorkResult {
+    pub async fn adopt_place(&self, nickname: &str, invite: &str, label: &str) -> WorkResult {
         self.call(|reply| Work::AdoptPlace {
             nickname: nickname.to_string(),
             invite: invite.to_string(),
@@ -2956,11 +3151,7 @@ impl AccountWorker {
     }
 
     /// Fan a paper descriptor out to a conclave's joined trustees.
-    pub async fn send_paper_state(
-        &self,
-        conclave_id: &str,
-        paper: PaperDescriptor,
-    ) -> WorkResult {
+    pub async fn send_paper_state(&self, conclave_id: &str, paper: PaperDescriptor) -> WorkResult {
         self.call(|reply| Work::SendPaperState {
             conclave_id: conclave_id.to_string(),
             paper,
@@ -3079,11 +3270,7 @@ impl AccountWorker {
     }
 
     /// Open a voice room: announce the session to the conclave's trustees.
-    pub async fn send_voice_open(
-        &self,
-        conclave_id: &str,
-        session: VoiceDescriptor,
-    ) -> WorkResult {
+    pub async fn send_voice_open(&self, conclave_id: &str, session: VoiceDescriptor) -> WorkResult {
         self.call(|reply| Work::SendVoice {
             conclave_id: conclave_id.to_string(),
             payload: MessagePayload::VoiceOpen { session },
@@ -3272,7 +3459,8 @@ impl AccountWorker {
 
     /// Replace the Wallet's sealed sidecar state wholesale.
     pub async fn wallet_state_put(&self, bytes: Vec<u8>) -> WorkResult {
-        self.call(|reply| Work::WalletStatePut { bytes, reply }).await
+        self.call(|reply| Work::WalletStatePut { bytes, reply })
+            .await
     }
 
     /// Store a file from disk into the vault as a chunked blob; returns its
@@ -3280,6 +3468,20 @@ impl AccountWorker {
     pub async fn blob_store_file(&self, path: &PathBuf) -> WorkResult {
         let path = path.clone();
         self.call(|reply| Work::BlobStoreFile { path, reply }).await
+    }
+
+    /// Store in-memory bytes as a single-file vault blob; returns its hex id.
+    pub async fn blob_store(&self, data: Vec<u8>) -> WorkResult {
+        self.call(|reply| Work::BlobStore { data, reply }).await
+    }
+
+    /// Whether any vault record still points at a blob.
+    pub async fn blob_referenced(&self, id_hex: &str) -> WorkResult {
+        self.call(|reply| Work::BlobReferenced {
+            id_hex: id_hex.to_string(),
+            reply,
+        })
+        .await
     }
 
     /// Delete a stored blob by hex id.
@@ -3355,7 +3557,8 @@ impl AccountWorker {
     /// Flush conclave copies the relay refused. Called by the outbox timer and
     /// by the outbox retry route.
     pub async fn retry_pending_conclave(&self) -> WorkResult {
-        self.call(|reply| Work::RetryPendingConclave { reply }).await
+        self.call(|reply| Work::RetryPendingConclave { reply })
+            .await
     }
 
     /// Re-announce this vault's per-contact queues if the device rotated them.
@@ -3532,7 +3735,12 @@ impl AccountWorker {
     }
 
     /// Consume a received introduction: make the target a contact.
-    pub async fn accept_intro(&self, conclave_id: &str, target: &str, nickname: &str) -> WorkResult {
+    pub async fn accept_intro(
+        &self,
+        conclave_id: &str,
+        target: &str,
+        nickname: &str,
+    ) -> WorkResult {
         self.call(|reply| Work::AcceptIntro {
             conclave_id: conclave_id.to_string(),
             target: target.to_string(),
@@ -3604,7 +3812,10 @@ mod tests {
         assert_eq!(sanitize_open_name("../../etc/passwd"), "passwd");
         assert_eq!(sanitize_open_name("a\\b.mkv"), "a_b.mkv");
         // Spaces and other unsafe characters become underscores.
-        assert_eq!(sanitize_open_name("my movie (2024).mkv"), "my_movie__2024_.mkv");
+        assert_eq!(
+            sanitize_open_name("my movie (2024).mkv"),
+            "my_movie__2024_.mkv"
+        );
         // Empty or dot-only names fall back to a usable default.
         assert_eq!(sanitize_open_name(""), "file");
         assert_eq!(sanitize_open_name(".."), "file");

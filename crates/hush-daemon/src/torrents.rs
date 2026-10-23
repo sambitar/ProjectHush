@@ -193,6 +193,15 @@ impl TorrentsManager {
         })
     }
 
+    /// Whether a queued or library torrent still points at a vault blob.
+    ///
+    /// Used by the Files pane before deleting a blob: content addressing means
+    /// the same bytes can be both an imported file and a torrent's copy.
+    pub async fn blob_referenced(&self, blob_id: &str) -> Result<bool, String> {
+        self.ensure_loaded().await?;
+        Ok(self.state.lock().await.references_blob(blob_id))
+    }
+
     /// Validate a key without saving it (the Settings "Test connection").
     pub async fn test_key(&self, key: &str) -> Result<UserInfo, String> {
         if key.trim().is_empty() {
@@ -220,11 +229,7 @@ impl TorrentsManager {
             self.wake();
             return self.public_state().await;
         }
-        let info = self
-            .client
-            .user_me(key)
-            .await
-            .map_err(|e| e.to_string())?;
+        let info = self.client.user_me(key).await.map_err(|e| e.to_string())?;
         {
             let mut s = self.state.lock().await;
             s.api_key = Some(key.to_string());
@@ -278,7 +283,11 @@ impl TorrentsManager {
                 .unwrap_or("Torrent")
                 .trim_end_matches(".torrent")
                 .to_string();
-            let name = if name.is_empty() { "Torrent".into() } else { name };
+            let name = if name.is_empty() {
+                "Torrent".into()
+            } else {
+                name
+            };
             (SourceKind::Link, name, None)
         } else {
             return Err("That doesn't look like a magnet link or a .torrent URL.".into());
@@ -349,9 +358,7 @@ impl TorrentsManager {
         }
         let offer = {
             let s = self.state.lock().await;
-            s.offer(offer_id)
-                .cloned()
-                .ok_or("no such torrent offer")?
+            s.offer(offer_id).cloned().ok_or("no such torrent offer")?
         };
         if offer.status != OfferStatus::Pending {
             return Err("that offer has already been answered".into());
@@ -422,7 +429,11 @@ impl TorrentsManager {
     }
 
     /// Add a `.torrent` file's bytes.
-    pub async fn add_torrent_file(&self, name: &str, bytes: Vec<u8>) -> Result<PublicState, String> {
+    pub async fn add_torrent_file(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<PublicState, String> {
         self.ensure_loaded().await?;
         if bytes.is_empty() {
             return Err("That torrent file is empty.".into());
@@ -436,7 +447,8 @@ impl TorrentsManager {
             .strip_suffix(".torrent")
             .unwrap_or(&filename)
             .to_string();
-        let mut item = TorrentItem::new(uuid::Uuid::new_v4().to_string(), display, SourceKind::File);
+        let mut item =
+            TorrentItem::new(uuid::Uuid::new_v4().to_string(), display, SourceKind::File);
         item.source_data = Some(base64_encode(&bytes));
         {
             let mut s = self.state.lock().await;
@@ -556,6 +568,10 @@ impl TorrentsManager {
     }
 
     /// Delete a Library entry and its vault blobs.
+    ///
+    /// Blobs are content-addressed, so the same bytes can be an imported file
+    /// or a chat attachment. Each id is removed only when nothing else in the
+    /// vault still points at it; an uncertain answer leaves the bytes.
     pub async fn delete_library(&self, id: &str) -> Result<PublicState, String> {
         self.ensure_loaded().await?;
         let blobs = {
@@ -563,11 +579,45 @@ impl TorrentsManager {
             s.remove_library_entry(id)
         };
         for blob in blobs {
+            if self.blob_still_used(&blob).await {
+                continue;
+            }
             let _ = self.worker.blob_delete(&blob).await;
         }
         self.mark_dirty().await;
         self.persist().await?;
         self.public_state().await
+    }
+
+    /// Whether any other vault feature still points at this blob.
+    ///
+    /// The Library entry itself is already gone from the torrents state, so
+    /// this checks the remaining torrents, the Files library sidecar, and the
+    /// chat/mail/drop/draft/conclave records. A locked worker or an unreadable
+    /// sidecar is treated as "in use": leaving bytes is safe.
+    async fn blob_still_used(&self, blob: &str) -> bool {
+        if self.state.lock().await.references_blob(blob) {
+            return true;
+        }
+        match self
+            .worker
+            .secret_read(crate::files_store::STATE_FILE)
+            .await
+        {
+            WorkResult::Secret(raw) => match crate::files_store::decode(raw.as_deref()) {
+                Ok(state) => {
+                    if state.reference_count(blob) > 0 {
+                        return true;
+                    }
+                }
+                Err(_) => return true,
+            },
+            _ => return true,
+        }
+        match self.worker.blob_referenced(blob).await {
+            WorkResult::Referenced(value) => value,
+            _ => true,
+        }
     }
 
     /// Change the concurrent-download limit.
@@ -692,14 +742,26 @@ impl TorrentsManager {
         // still create the torrent to get an id for requestdl.
         let mut was_cached = false;
         if let Some(hash) = &hash {
-            if let Ok(map) = self.client.check_cached(key, std::slice::from_ref(hash)).await {
+            if let Ok(map) = self
+                .client
+                .check_cached(key, std::slice::from_ref(hash))
+                .await
+            {
                 was_cached = !map.is_empty();
             }
         }
 
         let result = match source {
-            SourceKind::Magnet => self.client.create_torrent_magnet(key, &source_data, None).await,
-            SourceKind::Link => self.client.create_torrent_link(key, &source_data, None).await,
+            SourceKind::Magnet => {
+                self.client
+                    .create_torrent_magnet(key, &source_data, None)
+                    .await
+            }
+            SourceKind::Link => {
+                self.client
+                    .create_torrent_link(key, &source_data, None)
+                    .await
+            }
             SourceKind::File => match base64_decode(&source_data) {
                 Ok(bytes) => {
                     self.client

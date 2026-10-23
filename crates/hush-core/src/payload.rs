@@ -7,6 +7,25 @@ pub const MAX_INLINE_FILE_BYTES: usize = 256 * 1024;
 /// `MAX_INLINE_FILE_BYTES`, shared across all of them.
 pub const MAX_MAIL_ATTACHMENTS: usize = 8;
 
+/// The largest file a chunked transfer may carry in v1.
+///
+/// Settled 2026-10-21: 25 MiB over a per-transfer relay queue. Larger files
+/// belong on a user-supplied replica, not the relay.
+pub const MAX_FILE_TRANSFER_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Plaintext bytes per transfer chunk.
+///
+/// The relay rejects a queue blob over 1 MiB, and the AEAD tag/nonce add
+/// overhead, so 512 KiB leaves generous headroom while keeping the chunk count
+/// (and therefore the manifest) small.
+pub const MAX_FILE_CHUNK_BYTES: u32 = 512 * 1024;
+
+/// A hard bound on a manifest's chunk list, independent of the size limit.
+pub const MAX_FILE_CHUNKS: usize = 64;
+
+/// A transfer file name is a display label, not a path.
+pub const MAX_FILE_NAME_BYTES: usize = 255;
+
 /// The largest body one expiring chat message may carry.
 ///
 /// Expiring messages are live-only and never stored, so the cap is only there
@@ -42,6 +61,126 @@ pub struct ConclaveFile {
     pub name: String,
     #[serde(with = "b64_bytes")]
     pub data: Vec<u8>,
+}
+
+/// One chunk in a `FileOffer` manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkRef {
+    /// Zero-based position. The manifest is rejected unless these are contiguous.
+    pub index: u32,
+    /// SHA-256 of the plaintext chunk, lower-case hex.
+    pub sha256: String,
+    /// Plaintext length. The last chunk may be shorter than the chunk size.
+    pub size: u32,
+}
+
+/// A large-file offer: the bytes live in a per-transfer relay queue, sealed
+/// under `file_key`, and this manifest only describes them.
+///
+/// The manifest rides inside the existing Signal session, so the relay never
+/// sees the name, the key, or the chunk hashes. The recipient validates every
+/// field before allocating anything: see [`FileOffer::validate`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileOffer {
+    /// Random id chosen by the sender; also the ack correlation key.
+    pub transfer_id: String,
+    /// The relay queue holding the ciphertext chunks (`xfer-…`).
+    pub queue_id: String,
+    /// The capability the recipient uses to drain the transfer queue. It
+    /// travels inside the Signal session, never to the relay.
+    pub read_token: String,
+    /// Display name; never a path.
+    pub name: String,
+    /// Total plaintext size in bytes.
+    pub size: u64,
+    /// Plaintext bytes per chunk, except possibly the last.
+    pub chunk_size: u32,
+    /// One entry per chunk, in order.
+    pub chunks: Vec<ChunkRef>,
+    /// SHA-256 of the whole plaintext, lower-case hex.
+    pub whole_sha256: String,
+    /// Random per-file key, 32 bytes, base64 in JSON.
+    #[serde(with = "b64_bytes")]
+    pub file_key: Vec<u8>,
+}
+
+impl FileOffer {
+    /// Reject a manifest that is malformed, oversized, or inconsistent before
+    /// the receiver allocates or fetches anything.
+    pub fn validate(&self) -> Result<(), crate::error::Error> {
+        if !safe_id(&self.transfer_id, 64) || !safe_id(&self.queue_id, 128) {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+        if self.read_token.is_empty()
+            || self.read_token.len() > 256
+            || !self.read_token.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+        if !safe_file_name(&self.name) {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+        if self.size == 0 || self.size > MAX_FILE_TRANSFER_BYTES {
+            return Err(crate::error::Error::FileTooLarge(
+                MAX_FILE_TRANSFER_BYTES as usize,
+            ));
+        }
+        if self.chunk_size == 0 || self.chunk_size > MAX_FILE_CHUNK_BYTES {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+        if self.chunks.is_empty() || self.chunks.len() > MAX_FILE_CHUNKS {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+        if self.file_key.len() != 32 {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+        if !valid_sha256(&self.whole_sha256) {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+
+        let mut total: u64 = 0;
+        for (position, chunk) in self.chunks.iter().enumerate() {
+            if chunk.index != position as u32
+                || chunk.size == 0
+                || chunk.size > self.chunk_size
+                || !valid_sha256(&chunk.sha256)
+            {
+                return Err(crate::error::Error::InvalidFileOffer);
+            }
+            total = total.saturating_add(u64::from(chunk.size));
+        }
+        if total != self.size {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+
+        let expected = (self.size + u64::from(self.chunk_size) - 1) / u64::from(self.chunk_size);
+        if expected != self.chunks.len() as u64 {
+            return Err(crate::error::Error::InvalidFileOffer);
+        }
+        Ok(())
+    }
+}
+
+fn safe_id(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn safe_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_FILE_NAME_BYTES
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A trustee's standing in a conclave.
@@ -260,6 +399,44 @@ pub enum MessagePayload {
         #[serde(with = "b64_bytes")]
         data: Vec<u8>,
     },
+    /// A large file offered by reference. The bytes are in a per-transfer relay
+    /// queue, sealed with `file_key`; this payload only carries the manifest.
+    ///
+    /// A build that does not know this tag decodes it as `Unknown` and ignores
+    /// it. Senders must check the contact's `supports_file_transfer` capability
+    /// first; they must not assume every peer can receive this.
+    FileOffer { offer: FileOffer },
+    /// The recipient has verified and stored a `FileOffer`; the sender may
+    /// burn the transfer queue.
+    FileReceived { transfer_id: String },
+    /// A 1:1 contact request: the sender wants to connect and has already
+    /// consumed the recipient's invite.
+    ///
+    /// This is the one payload an account that is not yet a contact may send.
+    /// It carries the sender's own standing invite, so the recipient never has
+    /// to obtain it out of band: accepting stores the sender and answers over
+    /// the session this first message opened. The relay still learns nothing —
+    /// the invite rides inside the Signal session like any chat line.
+    ContactRequest {
+        /// The sender's standing invite (pointer or full v2). The recipient
+        /// uses it only on accept, and never consumes its prekey bundle: the
+        /// session was already built by this message.
+        invite: String,
+        /// How the sender would like to be named on the recipient's device.
+        /// A hint, not identity.
+        display_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        /// Whether the sender's build can receive a chunked `FileOffer`.
+        #[serde(default)]
+        supports_file_transfer: bool,
+    },
+    /// The recipient accepted a [`Self::ContactRequest`]. The sender now stores
+    /// the contact and grants its per-contact queue.
+    ContactAccept,
+    /// The recipient declined a [`Self::ContactRequest`]. The sender keeps the
+    /// account id for routing but creates no contact.
+    ContactDecline,
     /// An internal mail message. Distinct from `Text`/`File` so the Mail rail can
     /// render threads, subjects and multiple attachments while riding the same
     /// encrypted session and relay queue.
@@ -1166,5 +1343,105 @@ mod tests {
     #[test]
     fn reach_defaults_to_full() {
         assert_eq!(TrusteeReach::default(), TrusteeReach::Full);
+    }
+
+    /// A contact request round-trips with its note and capability bit, and the
+    /// accept/decline tags are the snake_case names older builds will decode as
+    /// `Unknown` (and therefore ignore) rather than corrupt.
+    #[test]
+    fn contact_request_payloads_round_trip() {
+        let request = MessagePayload::ContactRequest {
+            invite: "hush1qqqq".into(),
+            display_name: "sam".into(),
+            note: Some("from the office".into()),
+            supports_file_transfer: true,
+        };
+        assert_eq!(MessagePayload::decode(&request.encode().unwrap()).unwrap(), request);
+        let json = String::from_utf8(request.encode().unwrap()).unwrap();
+        assert!(json.contains(r#""t":"contact_request""#), "json was {json}");
+        assert!(json.contains(r#""supports_file_transfer":true"#), "json was {json}");
+
+        for payload in [MessagePayload::ContactAccept, MessagePayload::ContactDecline] {
+            assert_eq!(MessagePayload::decode(&payload.encode().unwrap()).unwrap(), payload);
+        }
+    }
+
+    fn file_offer() -> FileOffer {
+        let hash = "a".repeat(64);
+        FileOffer {
+            transfer_id: "transfer-1".into(),
+            queue_id: "xfer-transfer-1".into(),
+            read_token: "read-token".into(),
+            name: "lease.pdf".into(),
+            size: 2048,
+            chunk_size: 1024,
+            chunks: vec![
+                ChunkRef {
+                    index: 0,
+                    sha256: hash.clone(),
+                    size: 1024,
+                },
+                ChunkRef {
+                    index: 1,
+                    sha256: hash,
+                    size: 1024,
+                },
+            ],
+            whole_sha256: "b".repeat(64),
+            file_key: vec![7u8; 32],
+        }
+    }
+
+    #[test]
+    fn a_file_offer_round_trips_and_validates() {
+        let payload = MessagePayload::FileOffer {
+            offer: file_offer(),
+        };
+        let decoded = MessagePayload::decode(&payload.encode().unwrap()).unwrap();
+        assert_eq!(decoded, payload);
+        match decoded {
+            MessagePayload::FileOffer { offer } => offer.validate().unwrap(),
+            other => panic!("expected a file offer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_offer_rejects_an_oversized_file() {
+        let mut offer = file_offer();
+        offer.size = MAX_FILE_TRANSFER_BYTES + 1;
+        assert!(matches!(
+            offer.validate(),
+            Err(crate::error::Error::FileTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn a_file_offer_rejects_a_gap_in_the_chunk_indexes() {
+        let mut offer = file_offer();
+        offer.chunks[1].index = 5;
+        assert!(matches!(
+            offer.validate(),
+            Err(crate::error::Error::InvalidFileOffer)
+        ));
+    }
+
+    #[test]
+    fn a_file_offer_rejects_a_wrong_key_length() {
+        let mut offer = file_offer();
+        offer.file_key = vec![7u8; 31];
+        assert!(matches!(
+            offer.validate(),
+            Err(crate::error::Error::InvalidFileOffer)
+        ));
+    }
+
+    #[test]
+    fn a_file_offer_rejects_a_path_shaped_name() {
+        let mut offer = file_offer();
+        offer.name = "../lease.pdf".into();
+        assert!(matches!(
+            offer.validate(),
+            Err(crate::error::Error::InvalidFileOffer)
+        ));
     }
 }

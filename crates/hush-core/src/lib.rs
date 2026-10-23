@@ -26,8 +26,8 @@ mod voice;
 mod wire;
 
 pub use account::{
-  Account, Contact, ContactQueues, DropInboxReport, MailOutcome, PendingInvite, PendingIntro,
-  PendingIntroRequest, PlaceRecord, PlaceRole, QueueMap,
+  Account, Contact, ContactQueues, ContactRequestView, DropInboxReport, MailOutcome, PendingInvite,
+  PendingIntro, PendingIntroRequest, PlaceRecord, PlaceRole, QueueMap,
 };
 pub use paths::{default_data_dir, default_runtime_dir, default_relay_db_path, resolve_data_dir};
 pub use config::{
@@ -64,9 +64,11 @@ pub use signals::{
     SignalStatus, TorrentPolicy, MAX_PING_NOTE_BYTES, MAX_SIGNAL_BYTES, MAX_SIGNAL_LOG,
 };
 pub use payload::{
-    ConclaveDescriptor, ConclaveTrustee, MessagePayload, PaperDescriptor, TrusteeReach,
-    TrusteeState, VoiceDescriptor, MailAttachment, DEFAULT_PAPER_TITLE, MAX_EXPIRE_TEXT_BYTES,
-    MAX_EXPIRE_TTL_MS, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS, MIN_EXPIRE_TTL_MS,
+    ChunkRef, ConclaveDescriptor, ConclaveTrustee, FileOffer, MessagePayload, PaperDescriptor,
+    TrusteeReach, TrusteeState, VoiceDescriptor, MailAttachment, DEFAULT_PAPER_TITLE,
+    MAX_EXPIRE_TEXT_BYTES, MAX_EXPIRE_TTL_MS, MAX_FILE_CHUNK_BYTES, MAX_FILE_CHUNKS,
+    MAX_FILE_NAME_BYTES, MAX_FILE_TRANSFER_BYTES, MAX_INLINE_FILE_BYTES, MAX_MAIL_ATTACHMENTS,
+    MIN_EXPIRE_TTL_MS,
 };
 pub use place::{
     place_now_unix, PlaceHop, SignedHop, VouchChain, MAX_PLACE_CHAIN_HOPS,

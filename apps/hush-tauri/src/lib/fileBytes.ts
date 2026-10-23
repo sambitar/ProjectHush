@@ -2,6 +2,42 @@ import { invoke } from "@tauri-apps/api/core";
 import { api, getApiBase } from "./api/daemon";
 import { isTauriShell } from "./tauriEnv";
 
+export interface PickedVaultFile {
+  path: string;
+  name: string;
+  size: number;
+}
+
+/**
+ * Ask the desktop shell for files to add to the vault.
+ *
+ * Only paths come back: the daemon reads and encrypts the file itself, so a
+ * large import never crosses the webview or the Tauri IPC bridge. A browser
+ * build has no shell picker; it falls back to [`pickBrowserFiles`].
+ */
+export async function pickVaultFilesFromPc(): Promise<PickedVaultFile[]> {
+  if (!isTauriShell()) return [];
+  return invoke<PickedVaultFile[]>("hush_pick_vault_files");
+}
+
+/** A multi-select file input, for builds without the desktop shell. */
+export function pickBrowserFiles(): Promise<File[]> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.style.display = "none";
+    const finish = (files: File[]): void => {
+      input.remove();
+      resolve(files);
+    };
+    input.onchange = () => finish(Array.from(input.files ?? []));
+    input.oncancel = () => finish([]);
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
 /**
  * The minimum a message needs for its bytes to be resolvable: either they are
  * already in memory, or a vault blob id points at them. Both 1:1 chat messages

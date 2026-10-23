@@ -772,20 +772,22 @@ export function settingsShape(f: SettingsFacts): string {
 // --- The Vault rail ---
 
 /**
- * Which of the Vault rail's four bodies is up.
+ * Which of the Vault rail's five bodies is up.
  *
  * One definition with two readers — the pane's builder and its region key — so
  * the two cannot disagree about which body is showing, the way `mailBody` keeps
  * the Mail rail's dispatch and its key together. It is the same shape of
- * decision: four flags that decide which builder runs, with the sub-identity
+ * decision: five flags that decide which builder runs, with the sub-identity
  * (whose files, which note) carried along rather than re-read at the far end.
  *
  * `files.nick` is null for the contact list; `notes.editor` is null for the
- * board and the note's id — or "new" — while the editor is open.
+ * board and the note's id — or "new" — while the editor is open. `ownfiles` is
+ * the vault's own library, distinct from files exchanged with a contact.
  */
 export type VaultBody =
   | { kind: "tile" }
   | { kind: "files"; nick: string | null }
+  | { kind: "ownfiles" }
   | { kind: "notes"; editor: string | null }
   | { kind: "wallet" };
 
@@ -810,6 +812,8 @@ export function vaultBodyKey(body: VaultBody): string {
       return "vaultBody:tile";
     case "files":
       return body.nick === null ? "vaultBody:files" : `vaultBody:files\n${body.nick}`;
+    case "ownfiles":
+      return "vaultBody:ownfiles";
     case "notes":
       return body.editor === null
         ? "vaultBody:notes"

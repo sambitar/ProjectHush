@@ -37,8 +37,8 @@ use crate::relay_client::{
 use crate::signal_persist::import_store;
 use crate::signal_protocol::{
     decrypt_message, encrypt_message, invite_from_bundle, mint_prekey_bundle,
-    process_contact_bundle, protocol_address, protocol_name_from_identity, sign_queue_grant,
-    verify_queue_grant,
+    process_contact_bundle, protocol_address, protocol_name_from_identity,
+    sender_identity_from_prekey, sign_queue_grant, verify_queue_grant,
 };
 use crate::signals::{
     prune_signal_log, PaymentPolicy, ReceivedSignal, ReceivedSignalAck, SignalBody, SignalPolicy,
@@ -192,6 +192,13 @@ pub struct Contact {
     /// naming; the UI falls back to [`DEFAULT_VAULT_NAME`].
     #[serde(default)]
     pub mail_vault: Option<String>,
+    /// Whether the peer's build can receive a chunked `FileOffer`.
+    ///
+    /// Learned from the invite, or from the published prekey record behind a
+    /// pointer invite. Default `false`, so an old peer keeps the inline file
+    /// path and never receives a manifest it cannot understand.
+    #[serde(default)]
+    pub supports_file_transfer: bool,
     /// True once a filed message — chat, file or mail — has arrived from this
     /// contact.
     ///
@@ -319,6 +326,8 @@ impl<'de> Deserialize<'de> for Contact {
                 mail_handle: Option<String>,
                 #[serde(default)]
                 mail_vault: Option<String>,
+                #[serde(default)]
+                supports_file_transfer: bool,
                 #[serde(default, alias = "inbound_ready")]
                 heard_from: bool,
                 #[serde(default)]
@@ -378,6 +387,7 @@ impl<'de> Deserialize<'de> for Contact {
                 delivery_queue_token,
                 mail_handle,
                 mail_vault,
+                supports_file_transfer,
                 heard_from,
                 reach,
                 peer_reach,
@@ -400,6 +410,7 @@ impl<'de> Deserialize<'de> for Contact {
                 delivery_queue_token,
                 mail_handle,
                 mail_vault,
+                supports_file_transfer,
                 heard_from,
                 reach,
                 peer_reach,
@@ -437,6 +448,7 @@ impl<'de> Deserialize<'de> for Contact {
                     delivery_queue_token: primary.delivery_queue_token,
                     mail_handle,
                     mail_vault,
+                    supports_file_transfer: false,
                     heard_from,
                     reach: TrusteeReach::Full,
                     peer_reach: TrusteeReach::Full,
@@ -470,6 +482,7 @@ impl<'de> Deserialize<'de> for Contact {
                     delivery_queue_token: None,
                     mail_handle,
                     mail_vault: None,
+                    supports_file_transfer: false,
                     heard_from,
                     reach: TrusteeReach::Full,
                     peer_reach: TrusteeReach::Full,
@@ -576,6 +589,158 @@ pub struct PendingIntro {
     pub reverse: bool,
 }
 
+/// Everything a contact record needs, without the prekey bundle.
+///
+/// A request carries only an invite string; the accepting side never consumes
+/// that bundle (the first message already built the session), so resolving a
+/// pointer through the relay's directory would be a needless network call and
+/// a new failure mode. A [`ShortInvite`] already names the identity key, the
+/// queue and its delivery token, which is the whole record a contact needs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ContactCard {
+    relay: String,
+    protocol_name: String,
+    identity_key: Vec<u8>,
+    queue_id: String,
+    queue_token: String,
+    handle: Option<String>,
+    vault: Option<String>,
+    supports_file_transfer: bool,
+}
+
+impl ContactCard {
+    fn from_payload(payload: &InvitePayload) -> Result<Self, Error> {
+        let card = Self {
+            relay: payload.relay.clone(),
+            protocol_name: payload.protocol_name.clone(),
+            identity_key: payload.identity_key.clone(),
+            queue_id: payload.queue_id.clone(),
+            queue_token: payload.queue_token.clone(),
+            handle: payload.handle.clone(),
+            vault: payload.vault.clone(),
+            supports_file_transfer: payload.supports_file_transfer,
+        };
+        card.validate()?;
+        Ok(card)
+    }
+
+    fn from_short(short: &ShortInvite) -> Result<Self, Error> {
+        let card = Self {
+            relay: short.effective_relay(),
+            protocol_name: short.protocol_name.clone(),
+            identity_key: hex::decode(&short.protocol_name).map_err(|_| Error::Corrupt)?,
+            queue_id: short.queue_id.clone(),
+            queue_token: short.queue_token.clone(),
+            handle: short.handle.clone(),
+            vault: short.vault.clone(),
+            // A pointer invite does not carry the capability bit. The request
+            // payload carries it separately and overwrites this on receipt.
+            supports_file_transfer: false,
+        };
+        card.validate()?;
+        Ok(card)
+    }
+
+    /// Reject a card missing the fields every contact record needs.
+    ///
+    /// The identity key is deliberately not compared to `protocol_name` here:
+    /// legacy intro fixtures and migrated invites can carry a synthetic name.
+    /// The exact match is enforced where it is a security boundary — in
+    /// `receive_contact_request`, against the account id the session proved.
+    fn validate(&self) -> Result<(), Error> {
+        if self.protocol_name.is_empty()
+            || self.identity_key.is_empty()
+            || self.queue_id.is_empty()
+            || self.queue_token.is_empty()
+        {
+            return Err(Error::InvalidContactRequest);
+        }
+        Ok(())
+    }
+}
+
+/// Decode an invite string into the routing half of a contact, without
+/// resolving a pointer through the relay's directory.
+///
+/// This is what a received contact request uses: the session already exists, so
+/// only identity, queue and tokens are needed. A pointer invite carries all of
+/// them in the code itself.
+fn contact_card_from_invite(invite: &str) -> Result<ContactCard, Error> {
+    let text = invite.trim();
+    if text
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("hush1"))
+    {
+        if let Ok(short) = ShortInvite::decode(text) {
+            return ContactCard::from_short(&short);
+        }
+    }
+    ContactCard::from_payload(&InvitePayload::decode(text)?)
+}
+
+/// Which side of a 1:1 contact request this record is.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ContactRequestDirection {
+    Incoming,
+    Outgoing,
+}
+
+/// The lifecycle of a request that is not (yet) a contact.
+///
+/// Declined and cancelled records are kept, not deleted: the account id is the
+/// only thing that can attribute a later steady-state message from that sender,
+/// because a relay blob carries no sender id. Hiding them from the UI is a view
+/// concern; forgetting them would strand the next message.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ContactRequestState {
+    Pending,
+    Declined,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ContactRequestRecord {
+    account_id: String,
+    /// This vault's local name for the peer.
+    nickname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    at_ms: u64,
+    direction: ContactRequestDirection,
+    state: ContactRequestState,
+    card: ContactCard,
+    /// The encrypted request body still owed to the relay.
+    ///
+    /// A request is a first (prekey) message: it is what lets a stranger
+    /// attribute us. Re-encrypting on retry would produce a steady-state
+    /// ciphertext the recipient could not attribute, so the exact bytes are
+    /// kept and re-put until the relay takes them. `None` once delivered or on
+    /// an incoming request (we never send that one back).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outbound: Option<Vec<u8>>,
+}
+
+/// One pending contact request, as the UI sees it. The invite and key material
+/// stay in the vault: the page decides accept or decline, and the backend acts.
+#[derive(Clone, Debug, Serialize)]
+pub struct ContactRequestView {
+    pub account_id: String,
+    pub nickname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub at_ms: u64,
+}
+
+/// Bound on request records kept for attribution. Pending entries are pruned
+/// last: an unresolved request matters more than a year-old decline.
+const MAX_CONTACT_REQUESTS: usize = 128;
+
+/// Longest free-text note a contact request may carry. It is rendered in a
+/// prompt, never in the chat log.
+const MAX_CONTACT_REQUEST_NOTE_BYTES: usize = 512;
+
 #[derive(Serialize, Deserialize)]
 struct AccountState {
     /// The relay this vault was created with: the clearnet canonical base.
@@ -641,6 +806,14 @@ struct AccountState {
     /// Introductions received and not yet accepted or dismissed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_intros: Vec<PendingIntro>,
+    /// 1:1 contact requests in flight.
+    ///
+    /// An incoming pending row is what the UI offers Accept/Decline for. An
+    /// outgoing row keeps the peer attributable while the answer is still owed:
+    /// a steady-state reply from them has no sender id on the wire, so the
+    /// account id in this record is what lets `recv` decrypt it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    contact_requests: Vec<ContactRequestRecord>,
     /// Reach announcements (Task 24) not yet delivered to the relay.
     ///
     /// `set_contact_reach` records the peer's copy of the choice here and
@@ -950,6 +1123,7 @@ impl Account {
             pending_invites: Vec::new(),
             pending_intro_requests: Vec::new(),
             pending_intros: Vec::new(),
+            contact_requests: Vec::new(),
             pending_reach: Vec::new(),
             pending_conclave: Vec::new(),
             regrant_all: false,
@@ -1173,6 +1347,21 @@ impl Account {
     pub fn store_blob_file(&self, path: &Path) -> Result<BlobId, Error> {
         let mut file = fs::File::open(path)?;
         self.vault.put_blob_stream(&mut file)
+    }
+
+    /// Store bytes already in memory as a single-file vault blob. See
+    /// [`Vault::put_blob`].
+    pub fn store_blob(&self, data: &[u8]) -> Result<BlobId, Error> {
+        self.vault.put_blob(data)
+    }
+
+    /// Whether any record in this vault still points at a blob.
+    ///
+    /// Blobs are content-addressed, so one set of bytes can be named by more
+    /// than one feature. A caller that is about to delete a blob asks this
+    /// first, so deleting one entry never breaks another.
+    pub fn blob_referenced(&self, blob_id_hex: &str) -> bool {
+        self.chat_log.references_blob(blob_id_hex)
     }
 
     /// Stream a stored blob out to a file on disk. See
@@ -1874,6 +2063,7 @@ impl Account {
     pub async fn add_contact(&mut self, nickname: &str, invite_str: &str) -> Result<(), Error> {
         let payload = self.decode_invite(invite_str).await?;
         self.validate_contact(nickname, &payload)?;
+        let card = ContactCard::from_payload(&payload)?;
         let bundle = payload.to_prekey_bundle()?;
         let local_name = self.state.protocol_name.clone();
         process_contact_bundle(
@@ -1883,7 +2073,7 @@ impl Account {
             &bundle,
         )
         .await?;
-        self.finish_contact(nickname, payload).await?;
+        self.finish_contact(nickname, card).await?;
         // Hand this account's per-contact queue to the contact, which is what
         // makes deleting them revocable. Best effort and one-shot: nothing
         // re-sends this, so a relay that is down here leaves the peer
@@ -1897,6 +2087,512 @@ impl Account {
             Err(e) => eprintln!("hush: could not grant a queue to {nickname}: {e}"),
         }
         Ok(())
+    }
+
+    /// Ask a peer to connect, without adding them unilaterally.
+    ///
+    /// The requester must hold the peer's invite (there is no directory), but
+    /// the peer does not need the requester's out of band: it travels inside
+    /// the request, over the session the request itself opens. Until the peer
+    /// answers, this vault stores no contact and can send nothing but the
+    /// request.
+    ///
+    /// The request is the first message on a fresh session, so it is a prekey
+    /// message and carries the identity the recipient needs to attribute it.
+    /// If the relay refuses the put, the exact bytes are kept on the record and
+    /// [`Self::retry_contact_requests`] re-puts them; re-encrypting would turn
+    /// the retry into a message a stranger cannot attribute.
+    pub async fn request_contact(
+        &mut self,
+        nickname: &str,
+        invite_str: &str,
+        note: Option<&str>,
+    ) -> Result<(), Error> {
+        let nickname = nickname.trim();
+        if nickname.is_empty() {
+            return Err(Error::InvalidHandle);
+        }
+        if note.is_some_and(|n| n.len() > MAX_CONTACT_REQUEST_NOTE_BYTES) {
+            return Err(Error::InvalidContactRequest);
+        }
+        let payload = self.decode_invite(invite_str).await?;
+        self.validate_contact(nickname, &payload)?;
+        let account_id = payload.protocol_name.clone();
+
+        // A request from this account may already be waiting here, or ours may
+        // still be in flight. Either way a second one only crosses the first on
+        // the wire; the honest answer is accept, or wait for the answer.
+        if self
+            .state
+            .contact_requests
+            .iter()
+            .any(|r| r.account_id == account_id && r.state == ContactRequestState::Pending)
+        {
+            return Err(Error::ContactRequestExists);
+        }
+        self.state
+            .contact_requests
+            .retain(|r| r.account_id != account_id);
+
+        let card = ContactCard::from_payload(&payload)?;
+        // A re-request after a decline reuses the existing session. Processing
+        // the bundle again would open a second session and make the peer's
+        // first-message attribution ambiguous; that peer already keeps our
+        // account id from the declined record, so a steady-state message is
+        // attributable too.
+        if !self.has_session(&account_id).await? {
+            let bundle = payload.to_prekey_bundle()?;
+            let local_name = self.state.protocol_name.clone();
+            process_contact_bundle(self.device.store_mut(), &local_name, &account_id, &bundle)
+                .await?;
+        }
+
+        self.state.contact_requests.push(ContactRequestRecord {
+            account_id: account_id.clone(),
+            nickname: nickname.to_string(),
+            note: note.map(str::to_string),
+            at_ms: now_ms(),
+            direction: ContactRequestDirection::Outgoing,
+            state: ContactRequestState::Pending,
+            card: card.clone(),
+            outbound: None,
+        });
+        self.prune_contact_requests();
+        self.save().await?;
+
+        let request = MessagePayload::ContactRequest {
+            invite: self.invite().await?,
+            display_name: self.display_name(),
+            note: note.map(str::to_string),
+            // Dark until the chunked receive path lands; the field exists so a
+            // later build can advertise it without a wire change.
+            supports_file_transfer: false,
+        };
+        let plain = request.encode()?;
+        let body = self
+            .seal_for(&account_id, &card.identity_key, &plain)
+            .await?;
+        // Encrypting advanced the ratchet whether or not the put succeeds.
+        self.save().await?;
+
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+            }
+            match self
+                .put_ciphertext(&card.queue_id, &card.queue_token, &body)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if let Some(record) = self
+            .state
+            .contact_requests
+            .iter_mut()
+            .find(|r| r.account_id == account_id)
+        {
+            record.outbound = Some(body);
+        }
+        self.save().await?;
+        Err(last_err.unwrap_or(Error::Relay("contact request was not delivered".into())))
+    }
+
+    /// Re-put every outgoing request the relay has not taken yet.
+    ///
+    /// The stored bytes are the original prekey ciphertext, so this is a retry
+    /// of the same message, not a second one. Returns how many reached the
+    /// relay.
+    pub async fn retry_contact_requests(&mut self) -> Result<usize, Error> {
+        let pending: Vec<(String, Vec<u8>, String, String)> = self
+            .state
+            .contact_requests
+            .iter()
+            .filter(|r| {
+                r.direction == ContactRequestDirection::Outgoing
+                    && r.state == ContactRequestState::Pending
+            })
+            .filter_map(|r| {
+                r.outbound.clone().map(|body| {
+                    (
+                        r.account_id.clone(),
+                        body,
+                        r.card.queue_id.clone(),
+                        r.card.queue_token.clone(),
+                    )
+                })
+            })
+            .collect();
+        let mut delivered = 0;
+        for (account_id, body, queue_id, queue_token) in pending {
+            match self.put_ciphertext(&queue_id, &queue_token, &body).await {
+                Ok(()) => {
+                    delivered += 1;
+                    if let Some(record) = self
+                        .state
+                        .contact_requests
+                        .iter_mut()
+                        .find(|r| r.account_id == account_id)
+                    {
+                        record.outbound = None;
+                    }
+                }
+                Err(e) => eprintln!(
+                    "hush: contact request retry to {} failed: {e}",
+                    short_name(&account_id)
+                ),
+            }
+        }
+        if delivered > 0 {
+            self.save().await?;
+        }
+        Ok(delivered)
+    }
+
+    /// Requests waiting for this vault to accept or decline.
+    pub fn incoming_contact_requests(&self) -> Vec<ContactRequestView> {
+        self.contact_request_views(ContactRequestDirection::Incoming)
+    }
+
+    /// Requests this vault sent that the peer has not answered yet.
+    pub fn outgoing_contact_requests(&self) -> Vec<ContactRequestView> {
+        self.contact_request_views(ContactRequestDirection::Outgoing)
+    }
+
+    fn contact_request_views(&self, direction: ContactRequestDirection) -> Vec<ContactRequestView> {
+        let mut views: Vec<ContactRequestView> = self
+            .state
+            .contact_requests
+            .iter()
+            .filter(|r| r.direction == direction && r.state == ContactRequestState::Pending)
+            .map(|r| ContactRequestView {
+                account_id: r.account_id.clone(),
+                nickname: r.nickname.clone(),
+                note: r.note.clone(),
+                at_ms: r.at_ms,
+            })
+            .collect();
+        views.sort_by_key(|v| std::cmp::Reverse(v.at_ms));
+        views
+    }
+
+    /// Accept a request: store the sender as a contact and answer over the
+    /// session the request opened.
+    ///
+    /// The requester's prekey bundle is deliberately **not** processed. This
+    /// vault already built a session while decrypting the request; consuming a
+    /// second bundle would leave two outbound sessions shadowing each other,
+    /// exactly the failure `add_contact_from_intro` exists to avoid.
+    pub async fn accept_contact_request(
+        &mut self,
+        account_id: &str,
+        nickname: Option<&str>,
+    ) -> Result<String, Error> {
+        let record = self
+            .state
+            .contact_requests
+            .iter()
+            .find(|r| {
+                r.account_id == account_id
+                    && r.direction == ContactRequestDirection::Incoming
+                    && r.state == ContactRequestState::Pending
+            })
+            .cloned()
+            .ok_or(Error::ContactRequestNotFound)?;
+        if normalize_relay(&record.card.relay) != normalize_relay(&self.state.relay) {
+            return Err(Error::RelayMismatch(
+                record.card.relay.clone(),
+                self.state.relay.clone(),
+            ));
+        }
+        let requested = nickname
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&record.nickname);
+        let nick = self.unique_contact_nick(requested);
+        let already_a_contact = self
+            .state
+            .contacts
+            .iter()
+            .any(|c| c.account_id == account_id);
+        if !already_a_contact {
+            self.finish_contact(&nick, record.card.clone()).await?;
+        }
+        self.state
+            .contact_requests
+            .retain(|r| r.account_id != account_id);
+        self.save().await?;
+
+        let accept = MessagePayload::ContactAccept.encode()?;
+        if let Err(e) = self
+            .deliver_to(
+                account_id,
+                &record.card.identity_key,
+                &record.card.queue_id,
+                &record.card.queue_token,
+                &accept,
+            )
+            .await
+        {
+            eprintln!(
+                "hush: contact accept to {} did not reach the relay: {e}",
+                short_name(account_id)
+            );
+        }
+        if !already_a_contact {
+            // The grant is the second proof of acceptance, and the first one a
+            // requester whose accept was lost can act on. Best effort for the
+            // same reason: the contact already exists locally.
+            match self.grant_queues_to(&nick).await {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "hush: the queue grant to {nick} did not reach the relay; it will \
+                     be re-driven"
+                ),
+                Err(e) => eprintln!("hush: could not grant a queue to {nick}: {e}"),
+            }
+        }
+        Ok(nick)
+    }
+
+    /// Decline a request. The sender is told, and the record is kept (hidden)
+    /// so a later steady-state message from them can still be attributed.
+    pub async fn decline_contact_request(&mut self, account_id: &str) -> Result<(), Error> {
+        let card = {
+            let record = self
+                .state
+                .contact_requests
+                .iter_mut()
+                .find(|r| {
+                    r.account_id == account_id
+                        && r.direction == ContactRequestDirection::Incoming
+                        && r.state == ContactRequestState::Pending
+                })
+                .ok_or(Error::ContactRequestNotFound)?;
+            record.state = ContactRequestState::Declined;
+            record.card.clone()
+        };
+        self.save().await?;
+        let decline = MessagePayload::ContactDecline.encode()?;
+        if let Err(e) = self
+            .deliver_to(
+                account_id,
+                &card.identity_key,
+                &card.queue_id,
+                &card.queue_token,
+                &decline,
+            )
+            .await
+        {
+            eprintln!(
+                "hush: contact decline to {} did not reach the relay: {e}",
+                short_name(account_id)
+            );
+        }
+        Ok(())
+    }
+
+    /// Withdraw a request this vault sent.
+    pub async fn cancel_contact_request(&mut self, account_id: &str) -> Result<(), Error> {
+        let card = {
+            let record = self
+                .state
+                .contact_requests
+                .iter_mut()
+                .find(|r| {
+                    r.account_id == account_id
+                        && r.direction == ContactRequestDirection::Outgoing
+                        && r.state == ContactRequestState::Pending
+                })
+                .ok_or(Error::ContactRequestNotFound)?;
+            record.state = ContactRequestState::Cancelled;
+            record.outbound = None;
+            record.card.clone()
+        };
+        self.save().await?;
+        // Best effort: a peer that never hears the cancellation keeps a pending
+        // prompt they can decline themselves.
+        let decline = MessagePayload::ContactDecline.encode()?;
+        let _ = self
+            .deliver_to(
+                account_id,
+                &card.identity_key,
+                &card.queue_id,
+                &card.queue_token,
+                &decline,
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Apply an incoming request. Called by `recv` after the session has already
+    /// authenticated the sender.
+    async fn receive_contact_request(
+        &mut self,
+        from_account: &str,
+        invite: &str,
+        display_name: &str,
+        note: Option<&str>,
+        supports_file_transfer: bool,
+    ) -> Result<(), Error> {
+        if note.is_some_and(|n| n.len() > MAX_CONTACT_REQUEST_NOTE_BYTES) {
+            return Err(Error::InvalidContactRequest);
+        }
+        let mut card = contact_card_from_invite(invite)?;
+        card.supports_file_transfer = supports_file_transfer;
+        // The session proved who sent this. An invite naming a different
+        // account is a substitution attempt, not a request. Both halves are
+        // checked: `protocol_name` is the label, the identity key is what the
+        // contact will actually encrypt to.
+        if card.protocol_name != from_account || hex::encode(&card.identity_key) != from_account {
+            return Err(Error::InvalidContactRequest);
+        }
+        if normalize_relay(&card.relay) != normalize_relay(&self.state.relay) {
+            return Err(Error::RelayMismatch(
+                card.relay.clone(),
+                self.state.relay.clone(),
+            ));
+        }
+
+        // A crossed add: both sides already trust each other. Answer so their
+        // pending row clears rather than leaving one side waiting forever.
+        if let Some(contact) = self
+            .state
+            .contacts
+            .iter()
+            .find(|c| c.account_id == from_account)
+        {
+            let (identity_key, queue_id, queue_token) = (
+                contact.identity_key.clone(),
+                contact.queue_id.clone(),
+                contact.queue_token.clone(),
+            );
+            let accept = MessagePayload::ContactAccept.encode()?;
+            let _ = self
+                .deliver_to(
+                    from_account,
+                    &identity_key,
+                    &queue_id,
+                    &queue_token,
+                    &accept,
+                )
+                .await;
+            return Ok(());
+        }
+
+        let name = if display_name.trim().is_empty() {
+            self.unique_request_nick(&short_name(from_account))
+        } else {
+            self.unique_request_nick(display_name.trim())
+        };
+        let record = ContactRequestRecord {
+            account_id: from_account.to_string(),
+            nickname: name,
+            note: note.map(str::to_string),
+            at_ms: now_ms(),
+            direction: ContactRequestDirection::Incoming,
+            state: ContactRequestState::Pending,
+            card,
+            outbound: None,
+        };
+        match self
+            .state
+            .contact_requests
+            .iter_mut()
+            .find(|r| r.account_id == from_account)
+        {
+            // A repeat resets a decline or a cancellation: consent can change.
+            Some(existing) => *existing = record,
+            None => self.state.contact_requests.push(record),
+        }
+        self.prune_contact_requests();
+        self.save().await?;
+        Ok(())
+    }
+
+    /// Mark an outgoing request accepted because the peer proved it some other
+    /// way — the queue grant that follows an accept, or a first chat line.
+    /// Returns whether a record was confirmed.
+    async fn confirm_pending_out(&mut self, account_id: &str) -> Result<bool, Error> {
+        let Some(record) = self
+            .state
+            .contact_requests
+            .iter()
+            .find(|r| {
+                r.account_id == account_id
+                    && r.direction == ContactRequestDirection::Outgoing
+                    && r.state == ContactRequestState::Pending
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        self.state
+            .contact_requests
+            .retain(|r| r.account_id != account_id);
+        if !self
+            .state
+            .contacts
+            .iter()
+            .any(|c| c.account_id == account_id)
+        {
+            self.finish_contact(&record.nickname, record.card).await?;
+        }
+        self.save().await?;
+        match self.grant_queues_to(&record.nickname).await {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "hush: the queue grant to {} did not reach the relay",
+                record.nickname
+            ),
+            Err(e) => eprintln!("hush: could not grant a queue to {}: {e}", record.nickname),
+        }
+        Ok(true)
+    }
+
+    /// A local name for a pending request that no contact or other pending
+    /// request already uses.
+    fn unique_request_nick(&self, base: &str) -> String {
+        let taken = |name: &str| {
+            self.state.contacts.iter().any(|c| c.nickname == name)
+                || self
+                    .state
+                    .contact_requests
+                    .iter()
+                    .any(|r| r.nickname == name && r.state == ContactRequestState::Pending)
+        };
+        if !taken(base) {
+            return base.to_string();
+        }
+        for i in 2..1000 {
+            let candidate = format!("{base}-{i}");
+            if !taken(&candidate) {
+                return candidate;
+            }
+        }
+        format!("{base}-{}", &Uuid::new_v4().to_string()[..8])
+    }
+
+    fn prune_contact_requests(&mut self) {
+        while self.state.contact_requests.len() > MAX_CONTACT_REQUESTS {
+            // Resolved records go first; only then the oldest pending one.
+            let idx = self
+                .state
+                .contact_requests
+                .iter()
+                .position(|r| r.state != ContactRequestState::Pending)
+                .unwrap_or(0);
+            self.state.contact_requests.remove(idx);
+        }
+    }
+
+    fn display_name(&self) -> String {
+        self.state
+            .mail_handle
+            .clone()
+            .unwrap_or_else(|| self.vault_name().to_string())
     }
 
     /// Add a contact from an intro card *without* consuming the invite's
@@ -1919,7 +2615,8 @@ impl Account {
         // reverse half must not build a session — so no pointer resolution.
         let payload = InvitePayload::decode(invite_str)?;
         self.validate_contact(nickname, &payload)?;
-        self.finish_contact(nickname, payload).await
+        self.finish_contact(nickname, ContactCard::from_payload(&payload)?)
+            .await
     }
 
     /// Decode any accepted invite format into a full payload.
@@ -1971,23 +2668,20 @@ impl Account {
     }
 
     /// Store a validated contact record and persist it.
-    async fn finish_contact(
-        &mut self,
-        nickname: &str,
-        payload: InvitePayload,
-    ) -> Result<(), Error> {
+    async fn finish_contact(&mut self, nickname: &str, card: ContactCard) -> Result<(), Error> {
         self.state.contacts.push(Contact {
             nickname: nickname.to_string(),
-            account_id: payload.protocol_name.clone(),
-            identity_key: payload.identity_key.clone(),
-            queue_id: payload.queue_id,
-            queue_token: payload.queue_token,
+            account_id: card.protocol_name.clone(),
+            identity_key: card.identity_key.clone(),
+            queue_id: card.queue_id.clone(),
+            queue_token: card.queue_token.clone(),
             // No grant yet: the contact has not told us where it wants our
             // messages for it, so until it does we deliver to its inbox.
             delivery_queue_id: None,
             delivery_queue_token: None,
-            mail_handle: payload.handle.clone(),
-            mail_vault: payload.vault.clone(),
+            mail_handle: card.handle.clone(),
+            mail_vault: card.vault.clone(),
+            supports_file_transfer: card.supports_file_transfer,
             heard_from: false,
             reach: TrusteeReach::Full,
             peer_reach: TrusteeReach::Full,
@@ -2004,7 +2698,7 @@ impl Account {
         // Adding a contact clears any revocation left from a previous delete, so
         // a re-added contact is granted a queue again instead of being treated
         // as still blocked.
-        self.state.revoked.retain(|a| a != &payload.protocol_name);
+        self.state.revoked.retain(|a| a != &card.protocol_name);
         self.save().await?;
         Ok(())
     }
@@ -4924,36 +5618,63 @@ impl Account {
             (Some(id), Some(token)) => (id, token),
             _ => (contact.queue_id.as_str(), contact.queue_token.as_str()),
         };
-        self.deliver_to(contact, queue_id, queue_token, plain).await
+        self.deliver_to(
+            &contact.account_id,
+            &contact.identity_key,
+            queue_id,
+            queue_token,
+            plain,
+        )
+        .await
     }
 
-    /// Encrypt to a contact and put the ciphertext in a named queue.
+    /// Encrypt to an account and put the ciphertext in a named queue.
     ///
     /// Split from [`Account::deliver`] so a queue grant can be sent to the
     /// contact's *inbox* even when a per-contact delivery queue is already
     /// known: the grant is what establishes that queue, so it must not be sent
     /// to it.
+    ///
+    /// Takes the routing fields rather than a `&Contact` because a contact
+    /// request is the one message sent before a contact exists. The session is
+    /// the same either way.
     async fn deliver_to(
         &mut self,
-        contact: &Contact,
+        account_id: &str,
+        identity_key: &[u8],
         queue_id: &str,
         queue_token: &str,
         plain: &[u8],
     ) -> Result<(), Error> {
-        self.ensure_session(&contact.account_id, &contact.identity_key)
-            .await?;
+        let body = self.seal_for(account_id, identity_key, plain).await?;
+        self.put_ciphertext(queue_id, queue_token, &body).await
+    }
+
+    /// Encrypt one payload to an account, returning the relay body.
+    ///
+    /// Split from the put so a contact request can keep the exact first-message
+    /// bytes: re-encrypting a retry would downgrade it from a prekey message to
+    /// one the recipient cannot attribute.
+    async fn seal_for(
+        &mut self,
+        account_id: &str,
+        identity_key: &[u8],
+        plain: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        self.ensure_session(account_id, identity_key).await?;
         let local_name = self.state.protocol_name.clone();
-        let ct = encrypt_message(
-            self.device.store_mut(),
-            &local_name,
-            &contact.account_id,
-            plain,
-        )
-        .await?;
-        let body = encode_relay_blob(&ct);
+        let ct = encrypt_message(self.device.store_mut(), &local_name, account_id, plain).await?;
+        Ok(encode_relay_blob(&ct))
+    }
+
+    async fn put_ciphertext(
+        &self,
+        queue_id: &str,
+        queue_token: &str,
+        body: &[u8],
+    ) -> Result<(), Error> {
         let relay = self.relay_client()?;
-        relay.put(queue_id, queue_token, &body).await?;
-        Ok(())
+        relay.put(queue_id, queue_token, body).await
     }
 
     /// Send this device's per-contact queue grant to a contact.
@@ -4999,7 +5720,13 @@ impl Account {
         // `add_contact` ignores the value on purpose — a contact is added whether
         // or not the relay is reachable at that moment.
         let delivered = match self
-            .deliver_to(&contact, &contact.queue_id, &contact.queue_token, &plain)
+            .deliver_to(
+                &contact.account_id,
+                &contact.identity_key,
+                &contact.queue_id,
+                &contact.queue_token,
+                &plain,
+            )
             .await
         {
             Ok(()) => true,
@@ -5018,6 +5745,19 @@ impl Account {
         // decrypt. The daemon masks this by saving again on its next send.
         self.save().await?;
         Ok(delivered)
+    }
+
+    /// Whether a session for an account is already loaded.
+    async fn has_session(&mut self, account_id: &str) -> Result<bool, Error> {
+        let remote = protocol_address(account_id)?;
+        Ok(self
+            .device
+            .store_mut()
+            .session_store
+            .load_session(&remote)
+            .await
+            .map_err(|_| Error::Corrupt)?
+            .is_some())
     }
 
     /// Make sure a session with a contact exists, opening one from its published
@@ -5241,6 +5981,16 @@ impl Account {
         let mut wallet_announce_to = Vec::new();
         let mut warnings = Vec::new();
         let mut dirty = false;
+        // Accounts that are not contacts but can still be named in a blob we
+        // may need to decrypt: pending and resolved contact requests. The relay
+        // carries no sender id, so these are what attribute a reply from a peer
+        // whose accept or decline is still the only history between us.
+        let mut extra_senders: Vec<String> = self
+            .state
+            .contact_requests
+            .iter()
+            .map(|r| r.account_id.clone())
+            .collect();
         // Who was joined before this poll, so a trustee that joins during it can
         // be reported to the caller (the paper hub hands it a snapshot) and one
         // that leaves can be too (the convener inherits a paper whose hub just
@@ -5340,7 +6090,26 @@ impl Account {
                                 .decrypt_from(&from, &ct)
                                 .await
                                 .map(|plain| (plain, from)),
-                            None => self.try_decrypt_from_any_contact(&ct).await,
+                            None => match self.try_decrypt_from_known(&ct, &extra_senders).await {
+                                Ok(found) => Ok(found),
+                                // A stranger's first message is the one case no
+                                // known session can open. Its prekey header names
+                                // the sender's identity key, which *is* the
+                                // account id, so it can be attributed without
+                                // the relay carrying a sender field.
+                                Err(Error::Session) => {
+                                    match self.decrypt_from_prekey_sender(&ct).await {
+                                        Ok((plain, sender)) => {
+                                            if !extra_senders.contains(&sender) {
+                                                extra_senders.push(sender.clone());
+                                            }
+                                            Ok((plain, sender))
+                                        }
+                                        Err(_) => Err(Error::Session),
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            },
                         },
                     };
                     let (plain, from_account) = match decrypted {
@@ -5373,6 +6142,98 @@ impl Account {
                     }
 
                     let payload = decode_legacy_payload(&plain)?;
+
+                    // A contact request is the one payload an account that is
+                    // not a contact may deliver. It is answered here, before the
+                    // stranger gate below, because that gate exists to drop
+                    // everything else.
+                    if let MessagePayload::ContactRequest {
+                        invite,
+                        display_name,
+                        note,
+                        supports_file_transfer,
+                    } = &payload
+                    {
+                        match self
+                            .receive_contact_request(
+                                &from_account,
+                                invite,
+                                display_name,
+                                note.as_deref(),
+                                *supports_file_transfer,
+                            )
+                            .await
+                        {
+                            Ok(()) => dirty = true,
+                            Err(e) => warnings.push(format!(
+                                "A contact request from {} was refused: {e}",
+                                short_name(&from_account)
+                            )),
+                        }
+                        consume!(blob_id);
+                        continue;
+                    }
+
+                    // The answer to a request this vault sent. A lost accept is
+                    // survivable because any later payload from the same account
+                    // confirms the relationship too (the session is the proof);
+                    // a lost decline is safe to ignore, since the request simply
+                    // stays pending until the peer acts again.
+                    if matches!(&payload, MessagePayload::ContactAccept) {
+                        self.confirm_pending_out(&from_account).await?;
+                        consume!(blob_id);
+                        dirty = true;
+                        continue;
+                    }
+                    if matches!(&payload, MessagePayload::ContactDecline) {
+                        if let Some(record) = self.state.contact_requests.iter_mut().find(|r| {
+                            r.account_id == from_account
+                                && r.direction == ContactRequestDirection::Outgoing
+                                && r.state == ContactRequestState::Pending
+                        }) {
+                            record.state = ContactRequestState::Declined;
+                            record.outbound = None;
+                            dirty = true;
+                        }
+                        consume!(blob_id);
+                        continue;
+                    }
+
+                    // Anything else from an account this vault knows nothing
+                    // about is unsolicited. Decryption proves who sent it, not
+                    // that it may write here, so it is consumed and dropped.
+                    let known_sender = self
+                        .state
+                        .contacts
+                        .iter()
+                        .any(|c| c.account_id == from_account)
+                        || self
+                            .state
+                            .contact_requests
+                            .iter()
+                            .any(|r| r.account_id == from_account);
+                    if !known_sender {
+                        warnings.push(
+                            "An unsolicited message from an unknown account was ignored."
+                                .to_string(),
+                        );
+                        consume!(blob_id);
+                        dirty = true;
+                        continue;
+                    }
+
+                    // A peer that answered a request with a grant or a first
+                    // chat line rather than an explicit `ContactAccept` has
+                    // still accepted. Confirm before handling the payload so it
+                    // is filed against a real contact.
+                    if self.state.contact_requests.iter().any(|r| {
+                        r.account_id == from_account
+                            && r.direction == ContactRequestDirection::Outgoing
+                            && r.state == ContactRequestState::Pending
+                    }) {
+                        self.confirm_pending_out(&from_account).await?;
+                        dirty = true;
+                    }
 
                     // A queue grant: the sender tells us where to deliver this
                     // account's messages for it. The signature is verified against
@@ -5961,7 +6822,9 @@ impl Account {
                     // never gated.
                     if matches!(
                         &payload,
-                        MessagePayload::Text { .. } | MessagePayload::File { .. }
+                        MessagePayload::Text { .. }
+                            | MessagePayload::File { .. }
+                            | MessagePayload::FileOffer { .. }
                     ) && !self
                         .effective_reach_for_account(&from_account)
                         .allows_live()
@@ -6022,6 +6885,19 @@ impl Account {
                         self.chat_log.append_text(&master, &nick, false, body)?;
                         self.enforce_chat_retention();
                         (None, Vec::new())
+                    }
+                    // The wire types exist, but this build does not yet run the
+                    // chunked transfer. Consume the manifest rather than
+                    // delivering it as chat; the sender's transfer queue expires
+                    // by TTL. Real invites do not advertise the capability yet,
+                    // so this arm is defensive, not the normal path.
+                    MessagePayload::FileOffer { .. } | MessagePayload::FileReceived { .. } => {
+                        warnings.push(format!(
+                            "A large-file transfer from {nick} was ignored — this build has not enabled it yet."
+                        ));
+                        consume!(blob_id);
+                        dirty = true;
+                        continue;
                     }
                     // A conclave message. A message never materialises a
                     // conclave, so a stray fan-out cannot invent one — the
@@ -6112,7 +6988,13 @@ impl Account {
                     | MessagePayload::PlaceIntroduce { .. }
                     | MessagePayload::Signal { .. }
                     | MessagePayload::SignalAck { .. }
-                    | MessagePayload::ExpireText { .. } => {
+                    | MessagePayload::ExpireText { .. }
+                    // Contact requests and their answers are consumed above; a
+                    // request never becomes a chat row, and an accept or decline
+                    // only moves the request record.
+                    | MessagePayload::ContactRequest { .. }
+                    | MessagePayload::ContactAccept
+                    | MessagePayload::ContactDecline => {
                         unreachable!("control payload handled above")
                     }
                     // A paper payload is not a chat message, so it must not
@@ -6401,20 +7283,29 @@ impl Account {
         decrypt_message(self.device.store_mut(), &local_name, account_id, ct).await
     }
 
-    /// Try every contact, to recover the sender of a blob on the shared inbox.
+    /// Try every account that could have sent a blob on the shared inbox: the
+    /// contacts, the request records (a peer whose only traffic is an accept or
+    /// a decline is not a contact yet), and any stranger learned earlier in this
+    /// same poll.
     ///
     /// A relay blob carries no sender id — that is the whole point of the queue
     /// model — so the sender can only be recovered by attempting decryption.
-    async fn try_decrypt_from_any_contact(
+    async fn try_decrypt_from_known(
         &mut self,
         ct: &[u8],
+        extra: &[String],
     ) -> Result<(Vec<u8>, String), Error> {
-        let candidates: Vec<String> = self
+        let mut candidates: Vec<String> = self
             .state
             .contacts
             .iter()
             .map(|c| c.account_id.clone())
             .collect();
+        for account_id in extra {
+            if !candidates.contains(account_id) {
+                candidates.push(account_id.clone());
+            }
+        }
         for account_id in candidates {
             if let Ok(plain) = self.decrypt_from(&account_id, ct).await {
                 return Ok((plain, account_id));
@@ -6423,19 +7314,45 @@ impl Account {
         Err(Error::Session)
     }
 
+    /// Decrypt a first (prekey) message from an account this vault has never
+    /// stored.
+    ///
+    /// The account id is the sender's hex identity key, and the prekey header
+    /// carries that key, so the address needed for decryption is derivable
+    /// without the relay naming anyone. Only `recv` calls this, and only for a
+    /// payload it is prepared to accept from a stranger (`ContactRequest`);
+    /// every other payload is dropped after decryption.
+    async fn decrypt_from_prekey_sender(&mut self, ct: &[u8]) -> Result<(Vec<u8>, String), Error> {
+        let identity = sender_identity_from_prekey(ct).ok_or(Error::Session)?;
+        let account_id = hex::encode(identity);
+        let plain = self.decrypt_from(&account_id, ct).await?;
+        Ok((plain, account_id))
+    }
+
     async fn save(&self) -> Result<(), Error> {
         let master = self.vault.master_key();
         let state_bytes = serde_json::to_vec(&self.state).map_err(|_| Error::Corrupt)?;
         let state_enc = encrypt(master, &state_bytes)?;
         fs::write(self.dir.join("account.enc"), state_enc)?;
 
-        // Every address a session could live under: one per contact.
-        let session_addresses: Vec<(String, u32)> = self
+        // Every address a session could live under: one per contact, plus one
+        // per contact request. A pending request already has a session — that
+        // is what opened it — and losing it across a restart would leave the
+        // peer's accept or decline undecryptable.
+        let mut session_addresses: Vec<(String, u32)> = self
             .state
             .contacts
             .iter()
             .map(|c| (c.account_id.clone(), DEVICE_ID))
+            .chain(
+                self.state
+                    .contact_requests
+                    .iter()
+                    .map(|r| (r.account_id.clone(), DEVICE_ID)),
+            )
             .collect();
+        session_addresses.sort();
+        session_addresses.dedup();
         self.device
             .save(&self.dir, master, &session_addresses)
             .await?;
@@ -6573,6 +7490,7 @@ mod tests {
             pending_invites: Vec::new(),
             pending_intro_requests: Vec::new(),
             pending_intros: Vec::new(),
+            contact_requests: Vec::new(),
             pending_reach: Vec::new(),
             pending_conclave: Vec::new(),
             regrant_all: false,
@@ -6947,6 +7865,7 @@ mod tests {
             delivery_queue_token: None,
             mail_handle: None,
             mail_vault: None,
+            supports_file_transfer: false,
             heard_from: false,
             reach: TrusteeReach::Full,
             peer_reach: TrusteeReach::Full,

@@ -3,6 +3,7 @@ import { copyModalOrigin, enterModal, leaveModal, stampModalOrigin } from "./lib
 import { api, AppError, getApiBase } from "./lib/api/daemon";
 import type {
   ContactDto,
+  ContactRequestDto,
   DropsKeyDto,
   PaymentPolicy,
   SignalPolicy,
@@ -19,6 +20,7 @@ import type {
   TorrentOfferDto,
   TorrentPolicy,
   TorrentsStateDto,
+  VaultFileDto,
   NoteDto,
   NotesStateDto,
   WalletChain,
@@ -54,6 +56,17 @@ import {
   toggleHidden as toggleReadsHidden,
   toggleSaved as toggleReadsSaved,
 } from "./lib/readsStore";
+import {
+  clearVaultFilesStore,
+  deleteVaultFile as deleteVaultFileRecord,
+  getVaultFilesState,
+  importVaultFileFromData,
+  importVaultFileFromPath,
+  isVaultFilesLoaded,
+  newestFirst as newestVaultFilesFirst,
+  peekVaultFilesState,
+  vaultFilesBytes,
+} from "./lib/vaultFilesStore";
 import {
   clearNotesStore,
   deleteNote as deleteNoteRecord,
@@ -146,6 +159,7 @@ import {
 import type { ChatMessage } from "./lib/api/types";
 import {
   MAX_FILE_BYTES,
+  MAX_VAULT_UPLOAD_BYTES,
   RECV_POLL_MS,
   RENDER_BATCH_MS,
   STARTUP_UPDATE_DELAY_MS,
@@ -208,6 +222,8 @@ import {
   attachFileActions,
   downloadBase64File,
   openVaultBlob,
+  pickBrowserFiles,
+  pickVaultFilesFromPc,
   readFileAsBase64,
   resolveMessageFileBytes,
   saveVaultBlob,
@@ -425,6 +441,7 @@ type ModalKey =
   | "conclaveDelete"
   | "externalConfirm"
   | "torrentsDelete"
+  | "ownFileDelete"
   | "noteView"
   | "chatHistory"
   | "expireMessage"
@@ -755,6 +772,9 @@ export class App {
   private root: HTMLElement;
   private status: StatusResponse | null = null;
   private contacts: ContactDto[] = [];
+  /** Pending 1:1 contact requests, newest first. Rendered above the contact
+   * list; accepting moves the sender into `contacts`. */
+  private contactRequests: ContactRequestDto[] = [];
   private rail: Rail = "chats";
   private selectedNick: string | null = null;
   /** Every live voice room, from `/api/voice/state`. Feeds the ring prompt
@@ -857,6 +877,15 @@ export class App {
   private filesOpen = false;
   private filesContactNick: string | null = null;
   private filesDirection: "received" | "sent" = "received";
+  // --- Your files (the vault's own file library) ---
+  /** True while the Vault pane is showing the imported-files library. */
+  private ownFilesOpen = false;
+  private ownFilesLoading = false;
+  private ownFilesError: string | null = null;
+  /** The file being encrypted into the vault, by display name. */
+  private ownFileImporting: string | null = null;
+  /** The library entry awaiting delete confirmation. */
+  private ownFileDeleteId: string | null = null;
   private recoveryModalCode: string | null = null;
   private mailFolder: MailFolder = "inbox";
   // --- Reads (news reader pane) ---
@@ -1761,6 +1790,8 @@ export class App {
       this.vaultName = status.vault_name ?? DEFAULT_VAULT_NAME;
       await this.reloadMailbox();
       await this.reloadConclaves();
+      this.contactRequests =
+        (await api.pendingContactRequests().catch(() => null)) ?? [];
     } catch {
       showToast("Some data could not be loaded. It will be retried on the next sync.", {
         kind: "error",
@@ -1886,7 +1917,7 @@ export class App {
       // so the state read is what turns it into a prompt. The ring also
       // chimes — at the poll cadence, never per read — unless the user muted
       // sounds, and stops the moment it is answered, dismissed, or expired.
-      const [r, fresh, voiceChanged] = await Promise.all([
+      const [r, fresh, voiceChanged, requestRows] = await Promise.all([
         api.recv(),
         // The contact list is a delta, but `recv` consumes the inbox. A
         // contacts read that fails must not reject the group and throw away a
@@ -1897,6 +1928,10 @@ export class App {
           .then((c) => c ?? [])
           .catch(() => this.contacts),
         this.refreshVoiceRooms(),
+        // Contact requests are their own read: a request is not a message, so
+        // `recv` never surfaces it as one. An old daemon without the route
+        // answers 404; that must not break the poll.
+        api.pendingContactRequests().catch(() => null),
       ]);
       await beat;
       // Two facts, and they part company here. A presence flip is patched in
@@ -1937,6 +1972,14 @@ export class App {
       // address announcement; this side only has to repaint.
       this.contacts = fresh;
       setKnownContacts(fresh.map((c) => c.nickname));
+      if (requestRows) {
+        const shapeOf = (rows: ContactRequestDto[]) =>
+          rows.map((row) => `${row.account_id}:${row.nickname}`).join("|");
+        if (shapeOf(requestRows) !== shapeOf(this.contactRequests)) {
+          this.contactRequests = requestRows;
+          this.scheduleBackgroundRender();
+        }
+      }
       if (!r) {
         // The recv read failed, but presence and the rings were read anyway.
         // The patch covers the presence flip — the one delta that arrives
@@ -2346,6 +2389,7 @@ export class App {
     this.zinesCommentError = null;
     clearReadsStore();
     clearNotesStore();
+    clearVaultFilesStore();
     clearTorrentsStore();
     clearWalletStore();
     this.walletOpen = false;
@@ -2386,6 +2430,11 @@ export class App {
     this.selectedNick = null;
     this.filesOpen = false;
     this.filesContactNick = null;
+    this.ownFilesOpen = false;
+    this.ownFilesLoading = false;
+    this.ownFilesError = null;
+    this.ownFileImporting = null;
+    this.ownFileDeleteId = null;
     this.mailThreadId = null;
     this.mailOpenId = null;
     this.mailComposeOpen = false;
@@ -2399,6 +2448,7 @@ export class App {
     this.conclaveCreateTrustees = [];
     this.conclaveInviteOpen = false;
     this.conclaveInviteTrustees = [];
+    this.contactRequests = [];
     this.conclaveEndId = null;
     this.conclaveDeleteId = null;
     this.conclaveDeleteConfirm = "";
@@ -2765,6 +2815,9 @@ export class App {
     if (this.torrentsDeleteId) {
       add("torrentsDelete", () => this.renderTorrentsDeleteModal());
     }
+    if (this.ownFileDeleteId) {
+      add("ownFileDelete", () => this.renderOwnFileDeleteModal());
+    }
     if (this.notesViewingId) add("noteView", () => this.renderNoteViewModal());
     if (this.chatHistoryNick) add("chatHistory", () => this.renderChatHistoryModal());
     if (this.expireMessage) add("expireMessage", () => this.renderExpireMessageModal());
@@ -2953,6 +3006,17 @@ export class App {
           this.torrentsDeleteId ?? "",
           entry?.name ?? "",
           String(entry?.files.length ?? 0),
+        ].join("\n");
+      }
+      // The name and size the confirmation sentence names.
+      case "ownFileDelete": {
+        const file = peekVaultFilesState().files.find(
+          (f) => f.id === this.ownFileDeleteId,
+        );
+        return [
+          this.ownFileDeleteId ?? "",
+          file?.name ?? "",
+          String(file?.size ?? 0),
         ].join("\n");
       }
       // One note as the popup draws it, and whether its inline delete is armed.
@@ -3166,7 +3230,7 @@ export class App {
   }
 
   /**
-   * The Vault rail's four interchangeable bodies, in one keyed region.
+   * The Vault rail's five interchangeable bodies, in one keyed region.
    *
    * The pane *is* the rail's scroll box (`.main-pane`), so keeping the element
    * across a repaint is what keeps the reader's place: the Wallet's cards, the
@@ -3191,7 +3255,7 @@ export class App {
   }
 
   /**
-   * Which of the rail's four bodies is up.
+   * Which of the rail's five bodies is up.
    *
    * One definition with two readers — the dispatch below and the region key — so
    * the two cannot disagree about which body is showing, the way `mailBody`
@@ -3205,6 +3269,7 @@ export class App {
         editor: this.notesEditorOpen ? (this.notesEditingId ?? "new") : null,
       };
     }
+    if (this.ownFilesOpen) return { kind: "ownfiles" };
     if (this.filesOpen) return { kind: "files", nick: this.filesContactNick };
     return { kind: "tile" };
   }
@@ -3218,6 +3283,8 @@ export class App {
         return this.renderWallet();
       case "notes":
         return this.renderNotes();
+      case "ownfiles":
+        return this.renderOwnFiles();
       case "files":
         return this.renderFiles();
       case "tile":
@@ -3245,6 +3312,8 @@ export class App {
         return this.walletBodyFacts();
       case "notes":
         return this.notesBodyFacts();
+      case "ownfiles":
+        return this.ownFilesBodyFacts();
       case "files":
         return this.filesBodyFacts();
       case "tile":
@@ -4241,6 +4310,7 @@ export class App {
       if (id === "vault") {
         // Keep the tiles' counts fresh without a request per render.
         void this.notesEnsureLoaded();
+        this.ownFilesEnsureLoaded();
         void refreshWallet()
           .then(() => {
             if (this.rail === "vault" && !this.walletOpen)
@@ -6004,6 +6074,12 @@ export class App {
     head.append(titles, add);
     pane.appendChild(head);
 
+    // Requests sit above the list: they are the one thing on this pane that is
+    // waiting on the user. Accepting moves the row into the contact list.
+    if (this.contactRequests.length) {
+      pane.appendChild(this.contactRequestsBox());
+    }
+
     // A filter over the cards, so a long list stays findable. It toggles the
     // rendered cards directly instead of re-rendering, so typing never loses
     // focus.
@@ -7333,6 +7409,86 @@ export class App {
    * carries the conclave it belongs to, which is how the patch knows whether the
    * box on screen is still the one the store is holding.
    */
+  /**
+   * Pending 1:1 contact requests.
+   *
+   * A request is not a contact: nothing is added until Accept. The row reuses
+   * the conclave-invite card styling so the two consent surfaces read alike.
+   */
+  private contactRequestsBox(): HTMLElement {
+    const box = document.createElement("div");
+    box.className = "conclave-invites";
+    for (const request of this.contactRequests) {
+      const card = document.createElement("div");
+      card.className = "conclave-invite-card";
+      card.dataset.contactRequest = request.account_id;
+      const title = document.createElement("div");
+      title.className = "text-15";
+      title.textContent = displayNick(request.nickname);
+      const from = document.createElement("div");
+      from.className = "muted text-12";
+      from.textContent = "wants to connect";
+      const row = document.createElement("div");
+      row.className = "conclave-invite-actions";
+      const accept = document.createElement("button");
+      accept.type = "button";
+      accept.className = "btn-primary pressable";
+      accept.textContent = "Accept";
+      accept.onclick = () => void this.acceptContactRequest(request);
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "btn-secondary pressable";
+      decline.textContent = "Decline";
+      decline.onclick = () => void this.declineContactRequest(request);
+      row.append(accept, decline);
+      card.append(title, from);
+      if (request.note) {
+        const note = document.createElement("div");
+        note.className = "text-13";
+        note.style.marginTop = "var(--space-2)";
+        note.textContent = request.note;
+        card.appendChild(note);
+      }
+      card.appendChild(row);
+      box.appendChild(card);
+    }
+    return box;
+  }
+
+  private async acceptContactRequest(request: ContactRequestDto): Promise<void> {
+    try {
+      const accepted = await api.acceptContactRequest(request.account_id);
+      const added = accepted?.nickname ?? request.nickname;
+      this.contacts = (await api.contacts()) ?? [];
+      setKnownContacts(this.contacts.map((c) => c.nickname));
+      this.contactRequests = this.contactRequests.filter(
+        (row) => row.account_id !== request.account_id,
+      );
+      this.announce(`Added ${added}.`);
+      this.scheduleRender();
+    } catch (e) {
+      showToast(
+        e instanceof AppError ? e.message : "Couldn't accept the request.",
+        { kind: "error" },
+      );
+    }
+  }
+
+  private async declineContactRequest(request: ContactRequestDto): Promise<void> {
+    try {
+      await api.declineContactRequest(request.account_id);
+      this.contactRequests = this.contactRequests.filter(
+        (row) => row.account_id !== request.account_id,
+      );
+      this.scheduleRender();
+    } catch (e) {
+      showToast(
+        e instanceof AppError ? e.message : "Couldn't decline the request.",
+        { kind: "error" },
+      );
+    }
+  }
+
   private conclaveInvitesBox(invites: PendingInvite[]): HTMLElement {
     const box = document.createElement("div");
     box.className = "conclave-invites";
@@ -9507,6 +9663,7 @@ export class App {
     this.filesOpen = true;
     this.walletOpen = false;
     this.notesOpen = false;
+    this.ownFilesOpen = false;
     this.notesEditorOpen = false;
     this.notesEditingId = null;
     this.filesContactNick = null;
@@ -15860,6 +16017,7 @@ export class App {
   private walletOpenWallet(): void {
     this.walletOpen = true;
     this.notesOpen = false;
+    this.ownFilesOpen = false;
     this.scheduleRender();
   }
 
@@ -18335,14 +18493,16 @@ export class App {
    * countdown and the "last backup 3 days ago" line move on their own, and a
    * shape built from the fields behind them would be identical while the tile
    * said the wrong thing. Everything else is the state the tile's own text is a
-   * pure function of: the vault's size, the file count, TorBox's three facts,
-   * the note count, and the wallet's.
+   * pure function of: the vault's size, the exchanged-file count, the imported
+   * file count and bytes, TorBox's three facts, the note count, and the
+   * wallet's.
    *
    * This is the one body in the rail that moves in the background — a file
-   * exchanged over mail, a torrent finishing into the library, a note saved, a
-   * balance synced — so its facts are read from the same stores the tile reads,
-   * and `mailAttachmentCounts` is one pass over the mail store for every contact
-   * rather than one per contact (see item 8 in the smoothness notes).
+   * exchanged over mail, a file imported into the vault, a torrent finishing
+   * into the library, a note saved, a balance synced — so its facts are read
+   * from the same stores the tile reads, and `mailAttachmentCounts` is one pass
+   * over the mail store for every contact rather than one per contact (see item
+   * 8 in the smoothness notes).
    */
   private vaultTileFacts(): string {
     const s = this.status;
@@ -18353,6 +18513,7 @@ export class App {
     const fileCount =
       allFileMessages().length +
       this.contacts.reduce((n, c) => n + (mailAttachments.get(c.nickname) ?? 0), 0);
+    const ownFiles = peekVaultFilesState();
     const lock = this.autoLockLines();
     const lastBackup = s?.last_backup_unix ?? 0;
     return [
@@ -18362,6 +18523,8 @@ export class App {
       lastBackup,
       this.backupTileHint(lastBackup),
       fileCount,
+      ownFiles.files.length,
+      vaultFilesBytes(ownFiles),
       torrents.has_key ? "key" : "no-key",
       torrents.library.length,
       torrents.library.reduce((sum, e) => sum + e.size, 0),
@@ -18419,6 +18582,17 @@ export class App {
     filesTile.querySelector(".files-open-btn")!.addEventListener("click", () => {
       this.filesOpenFiles();
     });
+    const ownFiles = peekVaultFilesState();
+    const ownFilesTile = document.createElement("div");
+    ownFilesTile.className = "tile";
+    const ownFilesHint =
+      ownFiles.files.length === 0
+        ? "Add files from this computer — encrypted with your vault key"
+        : `${ownFiles.files.length} file${ownFiles.files.length === 1 ? "" : "s"} · ${formatBytes(vaultFilesBytes(ownFiles))} sealed in your vault`;
+    ownFilesTile.innerHTML = `<div class="text-15">Your files</div><div class="muted text-13">${ownFilesHint}</div><button type="button" class="btn-secondary pressable own-files-tile-btn" style="margin-top:12px">Open your files</button>`;
+    ownFilesTile.querySelector(".own-files-tile-btn")!.addEventListener("click", () => {
+      this.ownFilesOpenLibrary();
+    });
     const torrentsState = getTorrentsState();
     const torrentsTile = document.createElement("div");
     torrentsTile.className = "tile";
@@ -18455,9 +18629,345 @@ export class App {
     walletTile.querySelector(".wallet-tile-btn")!.addEventListener("click", () => {
       this.walletOpenWallet();
     });
-    grid.append(storage, lock, backup, filesTile, torrentsTile, notesTile, walletTile);
+    grid.append(storage, lock, backup, filesTile, ownFilesTile, torrentsTile, notesTile, walletTile);
     pane.append(h, grid);
     return pane;
+  }
+
+  // --- Your files (the vault's own file library) --------------------------
+  //
+  // Reached from the Vault bento tile. Like Notes and Wallet it renders as a
+  // full-bleed sub-pane inside the Vault rather than a rail of its own: the
+  // bytes are sealed in the vault, so the vault is where they live. The
+  // exchanged-files browser next door is a different thing — attachments that
+  // came from or went to a contact — and the two tiles say so.
+
+  private ownFilesEnsureLoaded(): void {
+    if (isVaultFilesLoaded() || this.ownFilesLoading) return;
+    this.ownFilesLoad();
+  }
+
+  private ownFilesLoad(): void {
+    this.ownFilesLoading = true;
+    this.ownFilesError = null;
+    void getVaultFilesState()
+      .catch((e) => {
+        this.ownFilesError = e instanceof Error ? e.message : String(e);
+      })
+      .finally(() => {
+        this.ownFilesLoading = false;
+        if (this.rail === "vault") this.scheduleRender();
+      });
+  }
+
+  /** Open the library from the Vault tile: full-bleed, newest first. */
+  private ownFilesOpenLibrary(): void {
+    this.ownFilesOpen = true;
+    this.ownFileDeleteId = null;
+    this.walletOpen = false;
+    this.notesOpen = false;
+    this.notesEditorOpen = false;
+    this.notesEditingId = null;
+    this.filesOpen = false;
+    this.filesContactNick = null;
+    this.ownFilesError = null;
+    this.scheduleRender();
+    this.ownFilesEnsureLoaded();
+  }
+
+  private ownFilesBackToVault(): void {
+    this.ownFilesOpen = false;
+    this.ownFileDeleteId = null;
+    this.ownFilesError = null;
+    this.scheduleRender();
+  }
+
+  /**
+   * Everything the library pane draws.
+   *
+   * The rows in the order the builder draws them, the import line while one is
+   * running, and the error the pane shows. The import button's own busy state
+   * and the delete dialog have their own keys and shapes.
+   */
+  private ownFilesBodyFacts(): string {
+    const state = peekVaultFilesState();
+    return [
+      this.ownFilesLoading ? "loading" : "idle",
+      this.ownFileImporting ?? "",
+      this.ownFilesError ?? "",
+      newestVaultFilesFirst(state)
+        .map((f) => [f.id, f.name, f.size, f.added_at, f.blob_id].join("\n"))
+        .join("\n\n"),
+    ].join("\n");
+  }
+
+  private renderOwnFiles(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+    pane.style.padding = "var(--space-5)";
+
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn-secondary text-13 pressable";
+    back.textContent = "← Vault";
+    back.onclick = () => this.ownFilesBackToVault();
+
+    const h = document.createElement("h1");
+    h.className = "text-22";
+    h.style.marginTop = "var(--space-4)";
+    h.textContent = "Your files";
+    const hint = document.createElement("p");
+    hint.className = "muted text-13";
+    hint.style.marginTop = "var(--space-2)";
+    hint.textContent =
+      "Files you add from this computer. They are encrypted with your vault key and never leave this device.";
+
+    const addRow = document.createElement("div");
+    addRow.style.marginTop = "var(--space-4)";
+    addRow.style.display = "flex";
+    addRow.style.alignItems = "center";
+    addRow.style.gap = "var(--space-3)";
+    const addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "btn-primary pressable";
+    addBtn.style.maxWidth = "220px";
+    addBtn.textContent = "Add files…";
+    addBtn.disabled = this.ownFileImporting !== null;
+    addBtn.onclick = () => void this.ownFilesAdd();
+    addRow.appendChild(addBtn);
+    const importLine = document.createElement("span");
+    importLine.className = "muted text-13";
+    importLine.setAttribute("role", "status");
+    importLine.textContent = this.ownFileImporting
+      ? `Encrypting ${this.ownFileImporting}…`
+      : "";
+    addRow.appendChild(importLine);
+
+    const body = document.createElement("div");
+    body.style.marginTop = "var(--space-4)";
+
+    if (this.ownFilesError) {
+      const error = document.createElement("p");
+      error.className = "text-13";
+      error.style.color = "var(--danger)";
+      error.style.marginBottom = "var(--space-3)";
+      error.textContent = this.ownFilesError;
+      body.appendChild(error);
+    }
+
+    const state = peekVaultFilesState();
+    const files = newestVaultFilesFirst(state);
+    if (this.ownFilesLoading && files.length === 0) {
+      body.appendChild(busyNote("Opening your files…"));
+    } else if (files.length === 0) {
+      body.appendChild(
+        emptyState({
+          icon: "file",
+          title: "Nothing in your vault yet",
+          body: "Add documents, photos, archives or anything else from this computer. Only this device can open them.",
+          action: { label: "Add files…", onClick: () => void this.ownFilesAdd() },
+        }),
+      );
+    } else {
+      const list = document.createElement("div");
+      list.className = "own-files-list";
+      list.style.display = "flex";
+      list.style.flexDirection = "column";
+      list.style.gap = "var(--space-3)";
+      for (const file of files) list.appendChild(this.ownFileRow(file));
+      body.appendChild(list);
+    }
+
+    pane.append(back, h, hint, addRow, body);
+    return pane;
+  }
+
+  /** The line under a file's name: size, and its age when it is known. */
+  private ownFileMeta(file: VaultFileDto): string {
+    const added =
+      file.added_at > 0 ? ` · added ${formatRelative(file.added_at * 1000)}` : "";
+    return `${formatBytes(file.size)}${added}`;
+  }
+
+  /** One row in the library: name, size and age, then open/save/remove. */
+  private ownFileRow(file: VaultFileDto): HTMLElement {
+    const card = document.createElement("div");
+    card.className = "tile";
+
+    const head = document.createElement("div");
+    head.style.display = "flex";
+    head.style.alignItems = "center";
+    head.style.gap = "var(--space-3)";
+    const mark = icon(torrentFileIcon({ mimetype: null, name: file.name }));
+    mark.style.flex = "0 0 auto";
+    const meta = document.createElement("div");
+    meta.style.minWidth = "0";
+    const nameEl = document.createElement("div");
+    nameEl.className = "text-15";
+    nameEl.style.fontWeight = "500";
+    nameEl.style.overflowWrap = "anywhere";
+    nameEl.textContent = file.name;
+    const sub = document.createElement("div");
+    sub.className = "text-13 muted";
+    sub.textContent = this.ownFileMeta(file);
+    meta.append(nameEl, sub);
+    head.append(mark, meta);
+    card.appendChild(head);
+
+    attachFileActions(
+      card,
+      file.name,
+      () => resolveMessageFileBytes({ blobId: file.blob_id }),
+      file.blob_id,
+    );
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "text-13 pressable";
+    remove.style.marginTop = "var(--space-2)";
+    remove.style.color = "var(--danger)";
+    remove.textContent = "Remove from vault";
+    remove.onclick = () => {
+      this.ownFileDeleteId = file.id;
+      this.scheduleRender();
+    };
+    card.appendChild(remove);
+    return card;
+  }
+
+  /**
+   * Add from this computer. The desktop shell returns paths and the daemon
+   * encrypts the files itself; a browser build reads them as base64 under the
+   * upload cap. One repaint per file, so a multi-select shows where it is.
+   */
+  private async ownFilesAdd(): Promise<void> {
+    if (this.ownFileImporting !== null) return;
+    this.ownFilesError = null;
+    let added = 0;
+    try {
+      if (isTauriShell()) {
+        const picked = await pickVaultFilesFromPc();
+        for (const file of picked) {
+          this.ownFileImporting = file.name;
+          this.scheduleRender();
+          await importVaultFileFromPath(file.path);
+          added += 1;
+          this.scheduleRender();
+        }
+      } else {
+        const picked = await pickBrowserFiles();
+        for (const file of picked) {
+          if (file.size > MAX_VAULT_UPLOAD_BYTES) {
+            showToast(
+              `“${file.name}” is larger than the ${MAX_VAULT_UPLOAD_BYTES / (1024 * 1024)} MiB upload limit. Use the desktop app to add it.`,
+              { kind: "error" },
+            );
+            continue;
+          }
+          this.ownFileImporting = file.name;
+          this.scheduleRender();
+          const data = await readFileAsBase64(file);
+          await importVaultFileFromData(file.name, data);
+          added += 1;
+          this.scheduleRender();
+        }
+      }
+      if (added > 0) {
+        this.announce(
+          added === 1 ? "File added to your vault" : `${added} files added to your vault`,
+        );
+        await this.refreshStatus();
+      }
+    } catch (e) {
+      const msg =
+        e instanceof AppError
+          ? e.message
+          : e instanceof Error
+            ? e.message
+            : typeof e === "string"
+              ? e
+              : "Could not add that file.";
+      if (!msg.toLowerCase().includes("cancel")) {
+        this.ownFilesError = msg;
+        showToast(msg, { kind: "error" });
+      }
+    } finally {
+      this.ownFileImporting = null;
+      this.scheduleRender();
+    }
+  }
+
+  private renderOwnFileDeleteModal(): HTMLElement {
+    const id = this.ownFileDeleteId!;
+    const file = peekVaultFilesState().files.find((f) => f.id === id);
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal vault-file-delete-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", "Remove file from vault");
+
+    const h = document.createElement("h2");
+    h.className = "text-22";
+    h.textContent = "Remove from vault?";
+    const p = document.createElement("p");
+    p.className = "muted text-13";
+    p.style.marginTop = "var(--space-3)";
+    p.textContent =
+      "The entry is removed from your files. Its encrypted bytes are deleted too, unless another file or message in this vault still uses the same bytes. This cannot be undone.";
+
+    // The irreversible facts restated, not described: which file, how big.
+    const summary = document.createElement("div");
+    summary.className = "vault-file-summary";
+    const summaryName = document.createElement("div");
+    summaryName.className = "vault-file-summary-name text-15";
+    summaryName.textContent = file?.name ?? "This file";
+    const summaryMeta = document.createElement("div");
+    summaryMeta.className = "muted text-13";
+    summaryMeta.textContent = file ? this.ownFileMeta(file) : "";
+    summary.append(summaryName, summaryMeta);
+
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn-secondary pressable";
+    cancel.textContent = "Cancel";
+    cancel.onclick = () => {
+      this.ownFileDeleteId = null;
+      this.scheduleRender();
+    };
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "btn-primary pressable";
+    del.style.background = "var(--danger)";
+    del.textContent = "Remove";
+    del.onclick = async () => {
+      del.disabled = true;
+      try {
+        await deleteVaultFileRecord(id);
+        this.announce("File removed from your vault");
+        await this.refreshStatus();
+      } catch (e) {
+        showToast(e instanceof AppError ? e.message : "Could not remove that file.", {
+          kind: "error",
+        });
+      } finally {
+        this.ownFileDeleteId = null;
+        this.scheduleRender();
+      }
+    };
+    row.append(cancel, del);
+    modal.append(h, p, summary, row);
+    back.appendChild(modal);
+    back.onclick = (ev) => {
+      if (ev.target === back) {
+        this.ownFileDeleteId = null;
+        this.scheduleRender();
+      }
+    };
+    return back;
   }
 
   // --- Notes (private sticky-paper board) ---------------------------------
@@ -18493,6 +19003,7 @@ export class App {
   private notesOpenNotes(): void {
     this.notesOpen = true;
     this.walletOpen = false;
+    this.ownFilesOpen = false;
     this.notesEditorOpen = false;
     this.notesEditingId = null;
     this.notesError = null;
@@ -20756,46 +21267,13 @@ export class App {
         inv.spellcheck = false;
         invField.append(invText, inv);
 
-        // Reach (Task 24): two options, and the choice is announced to the peer
-        // so both ends agree. `Full` is the default, so the common case is the
-        // pre-selected one; mail-only is for the trustee you would rather not
-        // have a live channel with.
-        const reachField = document.createElement("fieldset");
-        reachField.className = "reach-picker";
-        const reachLegend = document.createElement("legend");
-        reachLegend.className = "text-13";
-        reachLegend.textContent = "How can they reach you?";
-        const reachOption = (value: TrusteeReach, label: string, hint: string) => {
-          const opt = document.createElement("label");
-          opt.className = "reach-option";
-          const input = document.createElement("input");
-          input.type = "radio";
-          input.name = "add-trust-reach";
-          input.value = value;
-          input.checked = value === "full";
-          const text = document.createElement("span");
-          text.className = "reach-option-text";
-          const strong = document.createElement("span");
-          strong.className = "text-13";
-          strong.textContent = label;
-          const sub = document.createElement("span");
-          sub.className = "text-13 muted";
-          sub.textContent = hint;
-          text.append(strong, sub);
-          opt.append(input, text);
-          return { opt, input };
-        };
-        const fullReach = reachOption(
-          "full",
-          "Mail, chat and conclaves",
-          "Everything Hush offers.",
-        );
-        const mailReach = reachOption(
-          "mail_only",
-          "Mail only",
-          "They can write, but there is no live chat or conclave.",
-        );
-        reachField.append(reachLegend, fullReach.opt, mailReach.opt);
+        // Reach is chosen after acceptance: a request is not a contact yet, so
+        // a policy set here would have nowhere to go. The Trust menu carries it
+        // once they accept.
+        const reachNote = document.createElement("p");
+        reachNote.className = "text-13 muted";
+        reachNote.textContent =
+          "They must accept before you can chat. You can choose how they reach you afterwards.";
 
         const err = document.createElement("p");
         err.className = "field-error text-13";
@@ -20804,7 +21282,7 @@ export class App {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "btn-primary pressable";
-        btn.textContent = "Add contact";
+        btn.textContent = "Send request";
         btn.style.marginTop = "var(--space-4)";
         // Both halves are required, so the button says so rather than letting a
         // round trip fail on a field that was never filled in.
@@ -20822,25 +21300,27 @@ export class App {
         };
         btn.onclick = async () => {
           err.hidden = true;
-          const reach: TrusteeReach = mailReach.input.checked ? "mail_only" : "full";
           try {
-            await api.addContact(nick.value.trim(), inv.value.trim(), reach);
-            this.contacts = (await api.contacts()) ?? [];
-            setKnownContacts(this.contacts.map((c) => c.nickname));
+            await api.requestContact(nick.value.trim(), inv.value.trim());
             this.addFriendOpen = false;
-            this.announce(`Added ${nick.value.trim()}.`);
+            this.announce(
+              `Request sent to ${nick.value.trim()}. They must accept before you can chat.`,
+            );
+            showToast("Request sent. They must accept before you can chat.", {
+              kind: "success",
+            });
             this.scheduleRender();
           } catch (e) {
             err.hidden = false;
             err.textContent =
-              e instanceof AppError ? e.message : "Couldn't add contact";
+              e instanceof AppError ? e.message : "Couldn't send the request";
           }
         };
         syncBtn();
         const hint = document.createElement("p");
         hint.className = "text-13 muted";
         hint.textContent = "Names live only on your device.";
-        body.append(nickField, invField, reachField, err, btn, hint);
+        body.append(nickField, invField, reachNote, err, btn, hint);
       }
     };
     // A tablist is expected to answer the arrow keys.

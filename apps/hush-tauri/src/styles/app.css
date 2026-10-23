@@ -2306,6 +2306,26 @@
   overflow-wrap: anywhere;
 }
 
+.vault-file-delete-modal {
+  width: min(440px, 100%);
+}
+
+.vault-file-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+
+.vault-file-summary-name {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
 .torrent-offer-note {
   margin-top: var(--space-3);
 }

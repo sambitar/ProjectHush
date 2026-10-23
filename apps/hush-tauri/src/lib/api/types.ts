@@ -135,6 +135,8 @@ export interface ContactDto {
   mail_handle?: string | null;
   /** The vault suffix of the contact's address, learned from their invite. */
   mail_vault?: string | null;
+  /** Whether the peer can receive a chunked large-file offer. */
+  supports_file_transfer?: boolean;
   /**
    * The effective reach for this relationship: the narrower of my choice and
    * theirs. When `mail_only`, chat and conclaves are hidden because they
@@ -291,6 +293,20 @@ export interface PendingInviteDto {
   /** The trustees the invite carried. */
   trustees: ConclaveTrusteeDto[];
   received_ms: number;
+}
+
+/**
+ * A pending 1:1 contact request.
+ *
+ * The account id is the peer's identity; the nickname is what this vault would
+ * call them if it accepts. The invite and key material never reach the page:
+ * accepting or declining is the decision, and the vault executes it.
+ */
+export interface ContactRequestDto {
+  account_id: string;
+  nickname: string;
+  note?: string | null;
+  at_ms: number;
 }
 
 /**
@@ -591,6 +607,31 @@ export interface NotesStateDto {
 export interface NotesNoteResponse {
   state: NotesStateDto;
   id: string;
+}
+
+// --- Your files (the vault's own encrypted file library) ----------------------
+
+/** One file imported into the vault from this computer. */
+export interface VaultFileDto {
+  id: string;
+  /** Display name only; the daemon strips any path components. */
+  name: string;
+  size: number;
+  /** Content address of the plaintext, lowercase hex. */
+  blob_id: string;
+  /** Unix seconds. */
+  added_at: number;
+}
+
+/** `GET /api/vault/files` — everything the vault holds. */
+export interface VaultFilesStateDto {
+  files: VaultFileDto[];
+}
+
+/** `POST /api/vault/files/*` — the new state plus the file that was added. */
+export interface VaultFileResponse {
+  file: VaultFileDto;
+  state: VaultFilesStateDto;
 }
 
 /** A conclave paper's descriptor: who made it and where live editing anchors. */

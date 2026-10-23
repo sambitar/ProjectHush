@@ -1,4 +1,13 @@
 export const MAX_FILE_BYTES = 256 * 1024;
+
+/**
+ * Largest file the browser build may upload into the vault's file library.
+ *
+ * The desktop shell picks a path and the daemon streams the file, so this cap
+ * is only the base64-in-a-request path. Keep it in step with
+ * `MAX_VAULT_FILE_UPLOAD_BYTES` in `crates/hush-daemon/src/main.rs`.
+ */
+export const MAX_VAULT_UPLOAD_BYTES = 24 * 1024 * 1024;
 export const RELAY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const RECV_POLL_MS = 4000;
 

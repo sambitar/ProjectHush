@@ -1,8 +1,8 @@
 mod account_worker;
 mod alloc;
+mod files_store;
 mod notes_store;
 mod paper_data;
-mod voice_data;
 mod paper_doc;
 mod paper_store;
 mod paths;
@@ -14,6 +14,7 @@ mod torbox;
 mod torrents;
 mod torrents_store;
 mod ui_prefs;
+mod voice_data;
 mod wallet;
 mod zine_store;
 
@@ -27,19 +28,19 @@ use std::time::{Duration, Instant};
 
 use account_worker::{AccountWorker, ContactDto, IntroLists, PenNameDto, PlaceDto, WorkResult};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, Method, StatusCode},
     routing::{delete, get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
-use hush_wallet::chain::TransferCheck;
 use hush_core::{
-    ChatRecord, ConclaveRecord, Error, MessagePayload, PaperDescriptor, PendingInvite,
-    PaymentPolicy, QueueMap, ReceivedMessage, SignalBody, SignalPolicy, TorrentPolicy,
-    TrusteeReach, VoiceEffect, VoiceManager, VoiceSession,
+    ChatRecord, ConclaveRecord, ContactRequestView, Error, MessagePayload, PaperDescriptor,
+    PaymentPolicy, PendingInvite, QueueMap, ReceivedMessage, SignalBody, SignalPolicy,
+    TorrentPolicy, TrusteeReach, VoiceEffect, VoiceManager, VoiceSession,
 };
+use hush_wallet::chain::TransferCheck;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -455,6 +456,16 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/notes/state", get(notes_state))
         .route("/api/notes/note", post(notes_save_note))
         .route("/api/notes/note/{id}", delete(notes_delete_note))
+        // The vault's own file library. Imports land as encrypted blobs; the
+        // sidecar holds only names and blob ids. `import` takes a local path
+        // (the desktop picker), `upload` takes base64 bytes (a browser build).
+        .route("/api/vault/files", get(vault_files_list))
+        .route("/api/vault/files/import", post(vault_file_import_path))
+        .route(
+            "/api/vault/files/upload",
+            post(vault_file_upload).layer(DefaultBodyLimit::max(VAULT_FILES_BODY_LIMIT)),
+        )
+        .route("/api/vault/files/{id}", delete(vault_file_delete))
         .route("/api/paper/{conclave_id}", get(paper_get))
         .route("/api/paper/{conclave_id}/create", post(paper_create))
         .route("/api/paper/{conclave_id}/update", post(paper_update))
@@ -485,12 +496,12 @@ fn api_router(state: Arc<App>) -> Router {
         // the `{zine_id}` parameter, and cannot collide with a real zine: an id
         // is a minted uuid.
         .route("/api/zines", get(zines_index).post(zines_write))
-        .route("/api/zines/pen-name", get(zines_pen_name).post(zines_set_pen_name))
-        .route("/api/zines/sections", get(zines_sections))
         .route(
-            "/api/zines/{zine_id}",
-            get(zines_get).delete(zines_forget),
+            "/api/zines/pen-name",
+            get(zines_pen_name).post(zines_set_pen_name),
         )
+        .route("/api/zines/sections", get(zines_sections))
+        .route("/api/zines/{zine_id}", get(zines_get).delete(zines_forget))
         .route("/api/zines/{zine_id}/mute", post(zines_mute))
         // The key epidemic, sender side: hand this post's read key to a contact.
         .route("/api/zines/{zine_id}/grant", post(zines_grant))
@@ -514,14 +525,14 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/atproto", get(atproto_view))
         .route("/api/atproto/connect", post(atproto_connect))
         .route("/api/atproto/disconnect", post(atproto_disconnect))
-        .route(
-            "/api/atproto/publication",
-            post(atproto_set_publication),
-        )
+        .route("/api/atproto/publication", post(atproto_set_publication))
         .route("/api/atproto/follows", post(atproto_set_follows))
         .route("/api/atproto/refresh", post(atproto_refresh))
         .route("/api/atproto/explore", get(atproto_explore))
-        .route("/api/atproto/explore/refresh", post(atproto_explore_refresh))
+        .route(
+            "/api/atproto/explore/refresh",
+            post(atproto_explore_refresh),
+        )
         .route("/api/atproto/document", get(atproto_document))
         .route("/api/torrents/state", get(torrents_state))
         .route("/api/torrents/key", post(torrents_set_key))
@@ -535,9 +546,18 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/torrents/remove", post(torrents_remove))
         .route("/api/torrents/concurrency", post(torrents_concurrency))
         .route("/api/torrents/share", post(torrents_share))
-        .route("/api/torrents/offers/{id}/accept", post(torrents_accept_offer))
-        .route("/api/torrents/offers/{id}/decline", post(torrents_decline_offer))
-        .route("/api/torrents/library/{id}", delete(torrents_delete_library))
+        .route(
+            "/api/torrents/offers/{id}/accept",
+            post(torrents_accept_offer),
+        )
+        .route(
+            "/api/torrents/offers/{id}/decline",
+            post(torrents_decline_offer),
+        )
+        .route(
+            "/api/torrents/library/{id}",
+            delete(torrents_delete_library),
+        )
         .route("/api/conclaves", get(conclaves).post(create_conclave))
         .route("/api/queues", get(queue_map))
         .route("/api/conclaves/message", post(send_conclave_message))
@@ -573,6 +593,14 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/invite", post(invite))
         .route("/api/contacts", get(contacts))
         .route("/api/contacts/add", post(add_contact))
+        .route("/api/contact-requests", get(pending_contact_requests))
+        .route("/api/contact-requests/request", post(request_contact))
+        .route("/api/contact-requests/accept", post(accept_contact_request))
+        .route(
+            "/api/contact-requests/decline",
+            post(decline_contact_request),
+        )
+        .route("/api/contact-requests/cancel", post(cancel_contact_request))
         .route("/api/contacts/remove", post(remove_contact))
         .route("/api/contacts/reach", post(set_contact_reach))
         .route("/api/contacts/signals", post(set_contact_signals))
@@ -720,10 +748,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let reads_cache = vault_dir.join("reads-cache");
     let worker = AccountWorker::spawn();
-    let torrents = Arc::new(torrents::TorrentsManager::new(
-        worker.clone(),
-        &vault_dir,
-    ));
+    let torrents = Arc::new(torrents::TorrentsManager::new(worker.clone(), &vault_dir));
     let wallet = Arc::new(wallet::WalletManager::new(worker.clone(), &vault_dir));
     let app = App {
         dir: vault_dir,
@@ -1049,6 +1074,7 @@ async fn outbox_loop(state: Arc<App>) {
         let _ = state.worker.retry_pending_reach().await;
         let _ = state.worker.retry_pending_conclave().await;
         let _ = state.worker.retry_regrants().await;
+        let _ = state.worker.retry_contact_requests().await;
     }
 }
 
@@ -1179,11 +1205,19 @@ async fn vault_create(
         ));
     }
     if body.passphrase.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "A vault needs a passphrase.".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "A vault needs a passphrase.".into(),
+        ));
     }
     match state
         .worker
-        .create(&state.dir, &body.passphrase, body.name.clone(), body.relay.clone())
+        .create(
+            &state.dir,
+            &body.passphrase,
+            body.name.clone(),
+            body.relay.clone(),
+        )
         .await
     {
         WorkResult::Created {
@@ -1583,7 +1617,8 @@ async fn queue_map(
 async fn create_conclave(
     State(state): State<Arc<App>>,
     Json(body): Json<CreateConclaveRequest>,
-) -> Result<Json<ConclaveRecord>, (StatusCode, Json<ApiError>)> {    touch(&state).await;
+) -> Result<Json<ConclaveRecord>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
     let result = map_err(
         state
             .worker
@@ -1797,7 +1832,12 @@ async fn intro_request(
     Json(body): Json<IntroTargetRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    map_err(state.worker.request_intro(&body.conclave_id, &body.target).await)?;
+    map_err(
+        state
+            .worker
+            .request_intro(&body.conclave_id, &body.target)
+            .await,
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1857,7 +1897,12 @@ async fn intro_dismiss(
     Json(body): Json<IntroTargetRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    map_err(state.worker.dismiss_intro(&body.conclave_id, &body.target).await)?;
+    map_err(
+        state
+            .worker
+            .dismiss_intro(&body.conclave_id, &body.target)
+            .await,
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2072,6 +2117,91 @@ async fn add_contact(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct RequestContactRequest {
+    nickname: String,
+    invite: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AcceptContactRequest {
+    account_id: String,
+    #[serde(default)]
+    nickname: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ContactRequestTarget {
+    account_id: String,
+}
+
+/// Pending incoming 1:1 contact requests, newest first.
+async fn pending_contact_requests(
+    State(state): State<Arc<App>>,
+) -> Result<Json<Vec<ContactRequestView>>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(state.worker.pending_contact_requests().await)?;
+    match result {
+        WorkResult::ContactRequests(list) => Ok(Json(list)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Ask a peer to connect. No contact exists until they accept.
+async fn request_contact(
+    State(state): State<Arc<App>>,
+    Json(body): Json<RequestContactRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .request_contact(&body.nickname, &body.invite, body.note)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Accept a request, returning the local nickname chosen for the new contact.
+async fn accept_contact_request(
+    State(state): State<Arc<App>>,
+    Json(body): Json<AcceptContactRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let result = map_err(
+        state
+            .worker
+            .accept_contact_request(&body.account_id, body.nickname)
+            .await,
+    )?;
+    match result {
+        WorkResult::ContactRequestAccepted(nickname) => {
+            Ok(Json(serde_json::json!({ "nickname": nickname })))
+        }
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+async fn decline_contact_request(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ContactRequestTarget>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.decline_contact_request(&body.account_id).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn cancel_contact_request(
+    State(state): State<Arc<App>>,
+    Json(body): Json<ContactRequestTarget>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(state.worker.cancel_contact_request(&body.account_id).await)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Set how this vault reaches a trustee, and announce it (Task 24).
 ///
 /// The choice is this vault's own; the effective reach for the pair is the
@@ -2252,6 +2382,7 @@ async fn outbox_retry(
     let _ = state.worker.retry_outbox().await;
     let _ = state.worker.retry_pending_reach().await;
     let _ = state.worker.retry_pending_conclave().await;
+    let _ = state.worker.retry_contact_requests().await;
     let _ = state.worker.retry_regrants().await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2367,10 +2498,7 @@ struct RecvResponse {
 /// mined yet is retried with backoff for a quarter of an hour; a refusal is
 /// logged and dropped, and a contact whose payments are off is never applied.
 ///
-async fn apply_payment_notices(
-    state: &Arc<App>,
-    signals: &[hush_core::ReceivedSignal],
-) -> bool {
+async fn apply_payment_notices(state: &Arc<App>, signals: &[hush_core::ReceivedSignal]) -> bool {
     {
         let now = Instant::now();
         let mut pending = state.pending_payments.lock().await;
@@ -2600,7 +2728,8 @@ async fn recv(
                 for received in &inbox.papers {
                     // Signalling moves the transport, not the text, so it is
                     // consumed before the document path can see it.
-                    if paper_handle_signal(&state, &received.from_account, &received.payload).await {
+                    if paper_handle_signal(&state, &received.from_account, &received.payload).await
+                    {
                         continue;
                     }
                     let hub_claim = match &received.payload {
@@ -2611,9 +2740,11 @@ async fn recv(
                     // *before* the payload lands, so an `adopt` that moves it can
                     // be told apart from an ordinary create.
                     let identity_before = match &received.payload {
-                        MessagePayload::PaperState { paper } => {
-                            Some(parsed.get(&paper.conclave_id).map(|f| f.descriptor.paper_id.clone()))
-                        }
+                        MessagePayload::PaperState { paper } => Some(
+                            parsed
+                                .get(&paper.conclave_id)
+                                .map(|f| f.descriptor.paper_id.clone()),
+                        ),
                         _ => None,
                     };
                     match paper_apply_inbound(
@@ -2812,8 +2943,7 @@ async fn recv(
                 for conclave_id in live {
                     let keep = match conclaves.get(&conclave_id) {
                         Some(record) => {
-                            !record.ended
-                                && record.joined().any(|t| t.account_id == me)
+                            !record.ended && record.joined().any(|t| t.account_id == me)
                         }
                         None => false,
                     };
@@ -2959,6 +3089,11 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         MessagePayload::QueueGrant { .. }
         | MessagePayload::ZineGrant { .. }
         | MessagePayload::Reach { .. }
+        // Contact requests and their answers are consumed by `recv` and never
+        // render as inbox rows.
+        | MessagePayload::ContactRequest { .. }
+        | MessagePayload::ContactAccept
+        | MessagePayload::ContactDecline
         | MessagePayload::PlaceAdopt { .. }
         | MessagePayload::PlaceAdoptAck { .. }
         | MessagePayload::PlaceIntroduce { .. }
@@ -2972,7 +3107,11 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         | MessagePayload::ConclaveIntro { .. }
         | MessagePayload::Signal { .. }
         | MessagePayload::SignalAck { .. }
-        | MessagePayload::ExpireText { .. } => None,
+        | MessagePayload::ExpireText { .. }
+        // Consumed by `recv` while the chunked transfer is not enabled; they
+        // never surface as inbox rows.
+        | MessagePayload::FileOffer { .. }
+        | MessagePayload::FileReceived { .. } => None,
         // A paper payload is not a chat message either: it is routed into the
         // paper store, never the inbox. A voice payload (Task 23) likewise
         // never renders in the inbox — its state surfaces through /api/voice/*.
@@ -3507,7 +3646,11 @@ async fn put_ui_prefs(
             }),
         ));
     }
-    if body.chat_auto_delete.keep_lines.is_some_and(|n| n > 100_000) {
+    if body
+        .chat_auto_delete
+        .keep_lines
+        .is_some_and(|n| n > 100_000)
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError {
@@ -4000,7 +4143,11 @@ async fn notes_persist(
             Json(ApiError { error: m }),
         )
     })?;
-    match state.worker.secret_write(notes_store::STATE_FILE, bytes).await {
+    match state
+        .worker
+        .secret_write(notes_store::STATE_FILE, bytes)
+        .await
+    {
         WorkResult::Ok => Ok(()),
         WorkResult::Err(msg) => Err(worker_err(msg)),
         _ => Err(unexpected_worker_response()),
@@ -4037,6 +4184,211 @@ async fn notes_delete_note(
     let mut parsed = notes_decode(&state).await?;
     parsed.delete_note(&id);
     notes_persist(&state, &parsed).await?;
+    Ok(Json(parsed))
+}
+
+// ---------------------------------------------------------------------------
+// Your files — the vault's own file library behind `/api/vault/files/*`.
+//
+// One sidecar (`vault-files.enc`) holds names, sizes and blob ids; the bytes
+// are content-addressed vault blobs, stored exactly like a chat attachment.
+// Importing from the desktop picker takes a local path and streams through
+// `Vault::put_blob_stream`, so a large file never crosses the webview. Browser
+// builds post base64 under a hard cap. Every route round-trips through the
+// account worker, so a locked vault answers 401 and the master key never leaves
+// the daemon.
+// ---------------------------------------------------------------------------
+
+/// Largest file a browser upload may carry, before base64 expansion. The
+/// desktop picker streams and has no such cap.
+const MAX_VAULT_FILE_UPLOAD_BYTES: usize = 24 * 1024 * 1024;
+
+/// Axum's global body limit is small on purpose. This one route accepts a
+/// base64 body for the upload cap above, with room for JSON and encoding slack.
+const VAULT_FILES_BODY_LIMIT: usize = 36 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct VaultFileResponse {
+    file: files_store::VaultFile,
+    state: files_store::VaultFilesState,
+}
+
+#[derive(Deserialize)]
+struct VaultFileImportPathRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct VaultFileUploadRequest {
+    name: String,
+    data_base64: String,
+}
+
+fn vault_file_bad(message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: message.into(),
+        }),
+    )
+}
+
+async fn vault_files_decode(
+    state: &App,
+) -> Result<files_store::VaultFilesState, (StatusCode, Json<ApiError>)> {
+    let raw = match state.worker.secret_read(files_store::STATE_FILE).await {
+        WorkResult::Secret(raw) => raw,
+        WorkResult::Err(msg) => return Err(worker_err(msg)),
+        _ => return Err(unexpected_worker_response()),
+    };
+    files_store::decode(raw.as_deref()).map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })
+}
+
+async fn vault_files_persist(
+    state: &App,
+    parsed: &files_store::VaultFilesState,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let bytes = parsed.encode().map_err(|m| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: m }),
+        )
+    })?;
+    match state
+        .worker
+        .secret_write(files_store::STATE_FILE, bytes)
+        .await
+    {
+        WorkResult::Ok => Ok(()),
+        WorkResult::Err(msg) => Err(worker_err(msg)),
+        _ => Err(unexpected_worker_response()),
+    }
+}
+
+/// Add one stored blob to the library and return the new state.
+async fn vault_file_record(
+    state: &App,
+    name: &str,
+    size: u64,
+    blob_id: &str,
+) -> Result<Json<VaultFileResponse>, (StatusCode, Json<ApiError>)> {
+    let mut parsed = vault_files_decode(state).await?;
+    let file = parsed.add(name, size, blob_id).map_err(vault_file_bad)?;
+    vault_files_persist(state, &parsed).await?;
+    Ok(Json(VaultFileResponse {
+        file,
+        state: parsed,
+    }))
+}
+
+async fn vault_files_list(
+    State(state): State<Arc<App>>,
+) -> Result<Json<files_store::VaultFilesState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    Ok(Json(vault_files_decode(&state).await?))
+}
+
+/// Import a file the daemon can read from disk. This is the desktop path: the
+/// shell picks the file, the daemon streams it straight into the vault.
+async fn vault_file_import_path(
+    State(state): State<Arc<App>>,
+    Json(body): Json<VaultFileImportPathRequest>,
+) -> Result<Json<VaultFileResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let path = PathBuf::from(body.path.trim());
+    if path.as_os_str().is_empty() {
+        return Err(vault_file_bad("Choose a file to add."));
+    }
+    let meta =
+        std::fs::metadata(&path).map_err(|_| vault_file_bad("That file could not be read."))?;
+    if !meta.is_file() {
+        return Err(vault_file_bad("That path is not a file."));
+    }
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let blob_id = match map_err(state.worker.blob_store_file(&path).await)? {
+        WorkResult::BlobId(id) => id,
+        _ => return Err(unexpected_worker_response()),
+    };
+    vault_file_record(&state, &name, meta.len(), &blob_id).await
+}
+
+/// Import base64 bytes. This is the browser build's path; the desktop shell
+/// uses [`vault_file_import_path`] so a large file is never held in memory.
+async fn vault_file_upload(
+    State(state): State<Arc<App>>,
+    Json(body): Json<VaultFileUploadRequest>,
+) -> Result<Json<VaultFileResponse>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let encoded = body.data_base64.trim();
+    // Check the encoded length first: decoding a body far over the cap would
+    // allocate the very buffer the cap exists to avoid.
+    if encoded.len() > MAX_VAULT_FILE_UPLOAD_BYTES / 3 * 4 + 8 {
+        return Err(vault_file_bad(format!(
+            "That file is larger than the {} MiB upload limit. Add it from the desktop app instead.",
+            MAX_VAULT_FILE_UPLOAD_BYTES / (1024 * 1024)
+        )));
+    }
+    let data = STANDARD
+        .decode(encoded)
+        .map_err(|_| vault_file_bad("invalid base64 file data"))?;
+    if data.len() > MAX_VAULT_FILE_UPLOAD_BYTES {
+        return Err(vault_file_bad(format!(
+            "That file is larger than the {} MiB upload limit.",
+            MAX_VAULT_FILE_UPLOAD_BYTES / (1024 * 1024)
+        )));
+    }
+    let size = data.len() as u64;
+    let blob_id = match map_err(state.worker.blob_store(data).await)? {
+        WorkResult::BlobId(id) => id,
+        _ => return Err(unexpected_worker_response()),
+    };
+    vault_file_record(&state, &body.name, size, &blob_id).await
+}
+
+/// Remove one entry. The blob goes too, but only when nothing else still
+/// points at it: content addressing means an identical chat attachment or
+/// torrent file may share the same bytes.
+async fn vault_file_delete(
+    State(state): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> Result<Json<files_store::VaultFilesState>, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let mut parsed = vault_files_decode(&state).await?;
+    let Some(file) = parsed.remove(&id) else {
+        // Idempotent, like every other delete route: the entry is gone either
+        // way, and a stale UI must not turn a retry into an error.
+        return Ok(Json(parsed));
+    };
+    vault_files_persist(&state, &parsed).await?;
+
+    if parsed.reference_count(&file.blob_id) > 0 {
+        return Ok(Json(parsed));
+    }
+    let referenced_elsewhere = match state.worker.blob_referenced(&file.blob_id).await {
+        WorkResult::Referenced(value) => value,
+        // A locked vault or a worker error must not be read as "unreferenced":
+        // leaving the bytes is safe, deleting a live attachment is not.
+        _ => true,
+    };
+    if referenced_elsewhere {
+        return Ok(Json(parsed));
+    }
+    if matches!(
+        state.torrents.blob_referenced(&file.blob_id).await,
+        Ok(true) | Err(_)
+    ) {
+        return Ok(Json(parsed));
+    }
+    let _ = state.worker.blob_delete(&file.blob_id).await;
     Ok(Json(parsed))
 }
 
@@ -4283,14 +4635,20 @@ async fn zines_persist(
             Json(ApiError { error: m }),
         )
     })?;
-    match state.worker.secret_write(zine_store::STATE_FILE, bytes).await {
+    match state
+        .worker
+        .secret_write(zine_store::STATE_FILE, bytes)
+        .await
+    {
         WorkResult::Ok => Ok(()),
         WorkResult::Err(msg) => Err(worker_err(msg)),
         _ => Err(unexpected_worker_response()),
     }
 }
 
-async fn zines_pen_name_dto(state: &App) -> Result<Option<PenNameDto>, (StatusCode, Json<ApiError>)> {
+async fn zines_pen_name_dto(
+    state: &App,
+) -> Result<Option<PenNameDto>, (StatusCode, Json<ApiError>)> {
     match state.worker.pen_name().await {
         WorkResult::PenName(pen) => Ok(pen),
         WorkResult::Err(msg) => Err(worker_err(msg)),
@@ -4397,14 +4755,14 @@ async fn zines_write(
     // The write is already durable before the wire is touched: a relay that is
     // unreachable, or that refuses, must not cost the author the article. The
     // blob is held either way, and the re-post sweep is what sends it later.
-    let (published, publish_error) = match zines_publish(&state, &mut parsed, &zine_id, revision).await
-    {
-        Ok(_) => (true, String::new()),
-        Err(e) => {
-            eprintln!("hush-daemon: publishing zine {zine_id} rev {revision} failed: {e}");
-            (false, e)
-        }
-    };
+    let (published, publish_error) =
+        match zines_publish(&state, &mut parsed, &zine_id, revision).await {
+            Ok(_) => (true, String::new()),
+            Err(e) => {
+                eprintln!("hush-daemon: publishing zine {zine_id} rev {revision} failed: {e}");
+                (false, e)
+            }
+        };
     zines_persist(&state, &parsed).await?;
     Ok(Json(ZineWriteView {
         zine_id,
@@ -4614,7 +4972,9 @@ async fn zines_place(
                     return true;
                 }
                 Err(e) => {
-                    eprintln!("hush-daemon: blob {hash} opened as the pen name but is not a comment: {e}");
+                    eprintln!(
+                        "hush-daemon: blob {hash} opened as the pen name but is not a comment: {e}"
+                    );
                     parsed.hold_blob(hash, body, at_ms, true);
                     return true;
                 }
@@ -4804,7 +5164,8 @@ async fn zines_grant(
         return Err((
             StatusCode::CONFLICT,
             Json(ApiError {
-                error: "this vault has no read key for that post, so it cannot be shared".to_string(),
+                error: "this vault has no read key for that post, so it cannot be shared"
+                    .to_string(),
             }),
         ));
     };
@@ -4859,7 +5220,10 @@ async fn zines_comment(
     };
     let pen_id = file.descriptor.pen_id.clone();
     let revision = file.descriptor.revision;
-    let Some(pen_pk) = hex::decode(&pen_id).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+    let Some(pen_pk) = hex::decode(&pen_id)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    else {
         // A post with no usable pen-name key is one whose author cannot be
         // addressed at all. Refused with the reason rather than published into
         // the void.
@@ -4888,8 +5252,14 @@ async fn zines_comment(
         .map(|p| p.name)
         .unwrap_or_default();
     let comment = zine_store::ZineCommentBlob::new(zine_id.clone(), byline, text, paper_now_ms());
-    let plaintext =
-        serde_json::to_vec(&comment).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: e.to_string() })))?;
+    let plaintext = serde_json::to_vec(&comment).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: e.to_string(),
+            }),
+        )
+    })?;
     let sealed = hush_core::seal_bytes_to_key(&plaintext, &pen_pk).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4942,14 +5312,14 @@ async fn zines_accept_comment(
     let revision = parsed
         .accept_comment(&zine_id, &body.comment_hash, paper_now_ms())
         .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
-    let (published, publish_error) = match zines_publish(&state, &mut parsed, &zine_id, revision).await
-    {
-        Ok(_) => (true, String::new()),
-        Err(e) => {
-            eprintln!("hush-daemon: republishing {zine_id} after a merge failed: {e}");
-            (false, e)
-        }
-    };
+    let (published, publish_error) =
+        match zines_publish(&state, &mut parsed, &zine_id, revision).await {
+            Ok(_) => (true, String::new()),
+            Err(e) => {
+                eprintln!("hush-daemon: republishing {zine_id} after a merge failed: {e}");
+                (false, e)
+            }
+        };
     zines_persist(&state, &parsed).await?;
     let pen_name = zines_pen_name_dto(&state).await?;
     Ok(Json(ZineWriteView {
@@ -5074,7 +5444,11 @@ async fn paper_persist(
             Json(ApiError { error: m }),
         )
     })?;
-    match state.worker.secret_write(paper_store::STATE_FILE, bytes).await {
+    match state
+        .worker
+        .secret_write(paper_store::STATE_FILE, bytes)
+        .await
+    {
         WorkResult::Ok => Ok(()),
         WorkResult::Err(msg) => Err(worker_err(msg)),
         _ => Err(unexpected_worker_response()),
@@ -5203,10 +5577,7 @@ async fn paper_inherit_hub(state: &Arc<App>, conclave_id: &str) -> bool {
     let Ok(mut parsed) = paper_sidecar(state).await else {
         return false;
     };
-    let Some(paper) = parsed
-        .get(conclave_id)
-        .map(|file| file.descriptor.clone())
-    else {
+    let Some(paper) = parsed.get(conclave_id).map(|file| file.descriptor.clone()) else {
         return false;
     };
     let hub = paper.hub.clone();
@@ -5423,14 +5794,17 @@ async fn paper_presence(
     Path(conclave_id): Path<String>,
 ) -> Result<Json<PaperPresenceView>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    paper_sidecar(&state).await?.get(&conclave_id).ok_or_else(|| {
-        (
-            PAPER_NOT_FOUND.1,
-            Json(ApiError {
-                error: PAPER_NOT_FOUND.0.into(),
-            }),
-        )
-    })?;
+    paper_sidecar(&state)
+        .await?
+        .get(&conclave_id)
+        .ok_or_else(|| {
+            (
+                PAPER_NOT_FOUND.1,
+                Json(ApiError {
+                    error: PAPER_NOT_FOUND.0.into(),
+                }),
+            )
+        })?;
     let peers = match paper_open_plane(&state, &conclave_id).await {
         Some(plane) => plane
             .presence()
@@ -5466,14 +5840,17 @@ async fn paper_publish_presence(
             }),
         )
     })?;
-    paper_sidecar(&state).await?.get(&conclave_id).ok_or_else(|| {
-        (
-            PAPER_NOT_FOUND.1,
-            Json(ApiError {
-                error: PAPER_NOT_FOUND.0.into(),
-            }),
-        )
-    })?;
+    paper_sidecar(&state)
+        .await?
+        .get(&conclave_id)
+        .ok_or_else(|| {
+            (
+                PAPER_NOT_FOUND.1,
+                Json(ApiError {
+                    error: PAPER_NOT_FOUND.0.into(),
+                }),
+            )
+        })?;
     let Some(plane) = paper_open_plane(&state, &conclave_id).await else {
         // No plane yet: the editor's next poll dials and presence resumes on its
         // own. Spawned sends below for the same reason an update's are — a
@@ -5490,14 +5867,20 @@ async fn paper_publish_presence(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn paper_get(    State(state): State<Arc<App>>,
+async fn paper_get(
+    State(state): State<Arc<App>>,
     Path(conclave_id): Path<String>,
 ) -> Result<Json<PaperView>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
     let parsed = paper_sidecar(&state).await?;
-    let file = parsed
-        .get(&conclave_id)
-        .ok_or_else(|| (PAPER_NOT_FOUND.1, Json(ApiError { error: PAPER_NOT_FOUND.0.into() })))?;
+    let file = parsed.get(&conclave_id).ok_or_else(|| {
+        (
+            PAPER_NOT_FOUND.1,
+            Json(ApiError {
+                error: PAPER_NOT_FOUND.0.into(),
+            }),
+        )
+    })?;
     let updates: Vec<Vec<u8>> = file.log.iter().map(|u| u.update.clone()).collect();
     let full = paper_doc::fold(&file.snapshot, &updates).map_err(|m| {
         (
@@ -5571,16 +5954,14 @@ async fn paper_update(
     if let Some(refusal) = paper_write_refusal(&state, &conclave_id).await {
         return Err(refusal);
     }
-    let raw = STANDARD
-        .decode(body.update.as_bytes())
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiError {
-                    error: "update is not valid base64".into(),
-                }),
-            )
-        })?;
+    let raw = STANDARD.decode(body.update.as_bytes()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "update is not valid base64".into(),
+            }),
+        )
+    })?;
     let origin = paper_account_id(&state).await?;
     let mut parsed = paper_sidecar(&state).await?;
     // Merge onto the document as it stands: fold the pending log, apply the
@@ -5613,12 +5994,7 @@ async fn paper_update(
         .apply_update(&conclave_id, &origin, &raw, paper_now_ms())
         .map_err(|m| (StatusCode::BAD_REQUEST, Json(ApiError { error: m })))?;
     let mut compacted = false;
-    if parsed
-        .get(&conclave_id)
-        .map(|p| p.log.len())
-        .unwrap_or(0)
-        >= PAPER_COMPACT_AFTER
-    {
+    if parsed.get(&conclave_id).map(|p| p.log.len()).unwrap_or(0) >= PAPER_COMPACT_AFTER {
         parsed
             .snapshot_replace(&conclave_id, &full, paper_now_ms())
             .map_err(|m| {
@@ -5761,9 +6137,14 @@ fn atproto_not_held(uri: &str) -> (StatusCode, Json<ApiError>) {
 async fn atproto_connection(
     state: &App,
 ) -> Result<hush_atproto::Connection, (StatusCode, Json<ApiError>)> {
-    match state.worker.secret_read(hush_atproto::CONNECTION_FILE).await {
-        WorkResult::Secret(raw) => hush_atproto::Connection::decode(raw.as_deref())
-            .map_err(|e| atproto_err(&e)),
+    match state
+        .worker
+        .secret_read(hush_atproto::CONNECTION_FILE)
+        .await
+    {
+        WorkResult::Secret(raw) => {
+            hush_atproto::Connection::decode(raw.as_deref()).map_err(|e| atproto_err(&e))
+        }
         WorkResult::Err(msg) => Err(worker_err(msg)),
         _ => Err(unexpected_worker_response()),
     }
@@ -5791,8 +6172,9 @@ async fn atproto_state(
     state: &App,
 ) -> Result<hush_atproto::AtprotoState, (StatusCode, Json<ApiError>)> {
     match state.worker.secret_read(hush_atproto::STATE_FILE).await {
-        WorkResult::Secret(raw) => hush_atproto::AtprotoState::decode(raw.as_deref())
-            .map_err(|e| atproto_err(&e)),
+        WorkResult::Secret(raw) => {
+            hush_atproto::AtprotoState::decode(raw.as_deref()).map_err(|e| atproto_err(&e))
+        }
         WorkResult::Err(msg) => Err(worker_err(msg)),
         _ => Err(unexpected_worker_response()),
     }
@@ -5804,7 +6186,11 @@ async fn atproto_persist_state(
     lane: &hush_atproto::AtprotoState,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
     let bytes = lane.encode().map_err(|e| atproto_err(&e))?;
-    match state.worker.secret_write(hush_atproto::STATE_FILE, bytes).await {
+    match state
+        .worker
+        .secret_write(hush_atproto::STATE_FILE, bytes)
+        .await
+    {
         WorkResult::Ok => Ok(()),
         WorkResult::Err(msg) => Err(worker_err(msg)),
         _ => Err(unexpected_worker_response()),
@@ -6613,7 +6999,10 @@ async fn paper_drain_once(state: &Arc<App>) {
         }
         if changed {
             if let Err(e) = paper_persist(state, &parsed).await {
-                eprintln!("hush-daemon: paper {conclave_id} could not be saved: {}", e.1.error);
+                eprintln!(
+                    "hush-daemon: paper {conclave_id} could not be saved: {}",
+                    e.1.error
+                );
             }
         }
         for (from, frame) in forwards {
@@ -6731,7 +7120,10 @@ async fn voice_plane_for(state: &Arc<App>, session_id: &str) -> Arc<voice_data::
 /// The plane for `session_id` when one already exists — never creates. A
 /// payload that arrives for a session with no plane has nothing on the media
 /// side to act on.
-async fn voice_plane_get(state: &Arc<App>, session_id: &str) -> Option<Arc<voice_data::VoicePlane>> {
+async fn voice_plane_get(
+    state: &Arc<App>,
+    session_id: &str,
+) -> Option<Arc<voice_data::VoicePlane>> {
     state.voice_planes.lock().await.get(session_id).cloned()
 }
 
@@ -6860,14 +7252,17 @@ async fn voice_open(
     // vault must not learn whether a conclave exists.
     let me = paper_account_id(&state).await?;
     let conclaves = voice_conclaves(&state).await;
-    let record = conclaves.iter().find(|c| c.id == conclave_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("no conclave {conclave_id} in this vault"),
-            }),
-        )
-    })?;
+    let record = conclaves
+        .iter()
+        .find(|c| c.id == conclave_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: format!("no conclave {conclave_id} in this vault"),
+                }),
+            )
+        })?;
     let session_id = uuid::Uuid::new_v4().to_string();
     let now = paper_now_ms();
     let descriptor = hush_core::VoiceDescriptor {
@@ -6880,9 +7275,7 @@ async fn voice_open(
         let mut mgr = state.voices.lock().await;
         mgr.open(&voice_conclave_descriptor(record), &me, session_id, now)
             .map_err(|e| voice_err(e.to_string()))?;
-        let live = mgr
-            .session(&conclave_id)
-            .expect("the room was just opened");
+        let live = mgr.session(&conclave_id).expect("the room was just opened");
         let view = voice_view_of(live, &me, &voice_rings_of(&state).await);
         // The opener's media plane exists from the open: it has nothing to
         // dial yet, but the first joiner's offer must find it ready to
@@ -6939,9 +7332,7 @@ async fn voice_join(
             .unwrap_or_default();
         mgr.join(&voice_conclave_descriptor(record), &me, &session_id)
             .map_err(|e| voice_err(e.to_string()))?;
-        let live = mgr
-            .session(&conclave_id)
-            .expect("the join just landed");
+        let live = mgr.session(&conclave_id).expect("the join just landed");
         // Answering the knock ends it: the stamp is only ever meaningful
         // while this vault has not joined, and a view that still rings an
         // answered room would be a lie the UI can see.
@@ -7336,8 +7727,12 @@ async fn voice_select_devices(
     if let Some(v) = req.output {
         cfg.voice_output_device = v;
     }
-    hush_core::config::save(&state.dir, &cfg)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { error: e })))?;
+    hush_core::config::save(&state.dir, &cfg).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: e }),
+        )
+    })?;
     let selector = voice_selected(&state);
     {
         let planes = state.voice_planes.lock().await;
@@ -7373,7 +7768,9 @@ async fn voice_input_meter(
     let health = plane.device_health().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiError { error: "no device queues".into() }),
+            Json(ApiError {
+                error: "no device queues".into(),
+            }),
         )
     })?;
     Ok(Json(VoiceMeterResponse {
@@ -7421,7 +7818,6 @@ async fn voice_test_output(
         output_name: health.and_then(|h| h.output_name),
     }))
 }
-
 
 /// Apply one voice payload received from a peer to the local manager and the
 /// media plane.
@@ -7476,7 +7872,11 @@ async fn voice_apply_inbound(
             // A join already on the roster is fine — the media handshake
             // still needs its answer (a duplicated offer over the fan-out).
             // Any other refusal (not a trustee, ended) must not be answered.
-            match mgr.join(&voice_conclave_descriptor(&record), from_account, session_id) {
+            match mgr.join(
+                &voice_conclave_descriptor(&record),
+                from_account,
+                session_id,
+            ) {
                 Ok(_) | Err(Error::AlreadyConclaveTrustee) => {}
                 Err(_) => return None,
             }
@@ -7500,18 +7900,23 @@ async fn voice_apply_inbound(
             // media half: the answer's real job is completing the handshake.
             let conclave_id = mgr.conclave_of(session_id)?.to_string();
             let record = conclave_of(&conclave_id)?;
-            let _ = mgr.join(&voice_conclave_descriptor(&record), from_account, session_id);
+            let _ = mgr.join(
+                &voice_conclave_descriptor(&record),
+                from_account,
+                session_id,
+            );
             // The PC this vault dialed with gets its remote description.
             let plane = voice_plane_for(state, session_id).await;
             if let Err(e) = plane.accept_answer(from_account, sdp).await {
-                eprintln!(
-                    "hush-daemon: voice answer from {from_account} did not apply: {e}"
-                );
+                eprintln!("hush-daemon: voice answer from {from_account} did not apply: {e}");
             }
             None
         }
         MessagePayload::VoiceMute {
-            session_id, who, muted, ..
+            session_id,
+            who,
+            muted,
+            ..
         } => {
             let conclave_id = mgr.conclave_of(session_id)?.to_string();
             mgr.mute(&conclave_id, session_id, who, *muted).ok()?;
@@ -8089,9 +8494,14 @@ async fn torrents_add_file(
     Json(body): Json<TorrentsAddFileRequest>,
 ) -> Result<Json<torrents::PublicState>, (StatusCode, Json<ApiError>)> {
     touch(&state).await;
-    let bytes = STANDARD
-        .decode(body.data_base64.as_bytes())
-        .map_err(|_| (StatusCode::BAD_REQUEST, Json(ApiError { error: "bad torrent file data".into() })))?;
+    let bytes = STANDARD.decode(body.data_base64.as_bytes()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "bad torrent file data".into(),
+            }),
+        )
+    })?;
     state
         .torrents
         .add_torrent_file(&body.name, bytes)
@@ -8119,14 +8529,16 @@ async fn torrent_contact_by_nick(
             ))
         }
     };
-    list.into_iter().find(|c| c.nickname == nickname).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiError {
-                error: "no such trustee".into(),
-            }),
-        )
-    })
+    list.into_iter()
+        .find(|c| c.nickname == nickname)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "no such trustee".into(),
+                }),
+            )
+        })
 }
 
 /// A trustee by account id, for an offer whose nickname may have changed.
@@ -8797,8 +9209,7 @@ mod wallet_api_tests {
         let (status, _) = request(&router, "GET", "/api/vault/secret/irc-client-cert", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let body =
-            serde_json::json!({ "value_base64": STANDARD.encode(b"pem-bytes") }).to_string();
+        let body = serde_json::json!({ "value_base64": STANDARD.encode(b"pem-bytes") }).to_string();
         let (status, _) = request(
             &router,
             "PUT",
@@ -8839,13 +9250,8 @@ mod wallet_api_tests {
         // empty name never reaches the handler at all (no path segment to
         // match), so it comes back as a plain 404.
         for name in ["..%2Fescape", "a%2Fb", ""] {
-            let (status, json) = request(
-                &router,
-                "GET",
-                &format!("/api/vault/secret/{name}"),
-                None,
-            )
-            .await;
+            let (status, json) =
+                request(&router, "GET", &format!("/api/vault/secret/{name}"), None).await;
             assert!(
                 status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
                 "{name} should be refused, got {status}: {json}"
@@ -8885,7 +9291,11 @@ mod wallet_api_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(
-            json["mnemonic"].as_str().unwrap().split_whitespace().count(),
+            json["mnemonic"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .count(),
             12
         );
         assert_eq!(json["state"]["exists"], true);
@@ -9207,7 +9617,13 @@ mod wallet_api_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         // The Ethereum account is the same phrase, on the network asked for.
-        assert_eq!(json["state"]["chains"][1]["address"].as_str().unwrap().len(), 42);
+        assert_eq!(
+            json["state"]["chains"][1]["address"]
+                .as_str()
+                .unwrap()
+                .len(),
+            42
+        );
         // Nothing is persisted about a balance; a fresh wallet reads zero.
         assert_eq!(json["state"]["chains"][1]["confirmed"], "0");
         assert_eq!(json["state"]["tokens"].as_array().unwrap().len(), 0);
@@ -9224,7 +9640,11 @@ mod notes_api_tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    pub(crate) fn build_app(dir: &std::path::Path, worker: AccountWorker, unlocked: bool) -> Arc<App> {
+    pub(crate) fn build_app(
+        dir: &std::path::Path,
+        worker: AccountWorker,
+        unlocked: bool,
+    ) -> Arc<App> {
         Arc::new(App {
             dir: dir.to_path_buf(),
             socket: None,
@@ -9346,6 +9766,238 @@ mod notes_api_tests {
         let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
         let (status, _) = request(&router, "GET", "/api/notes/state", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+/// The vault's own file library, driven end to end over a real unlocked vault.
+#[cfg(test)]
+mod vault_files_api_tests {
+    use super::*;
+    use crate::notes_api_tests::{build_app, request, unlocked_app};
+    use tempfile::TempDir;
+
+    fn upload_body(name: &str, bytes: &[u8]) -> String {
+        serde_json::json!({
+            "name": name,
+            "data_base64": STANDARD.encode(bytes),
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn files_round_trip_upload_list_open_and_delete() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        // Empty until something is imported.
+        let (status, state) = request(&router, "GET", "/api/vault/files", None).await;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert_eq!(state["files"].as_array().unwrap().len(), 0);
+
+        // Upload.
+        let (status, added) = request(
+            &router,
+            "POST",
+            "/api/vault/files/upload",
+            Some(&upload_body("report.txt", b"hello vault")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{added}");
+        let id = added["file"]["id"].as_str().unwrap().to_string();
+        let blob_id = added["file"]["blob_id"].as_str().unwrap().to_string();
+        assert_eq!(added["file"]["name"], "report.txt");
+        assert_eq!(added["file"]["size"], 11);
+        assert_eq!(added["state"]["files"].as_array().unwrap().len(), 1);
+
+        // The blob opens through the same route chat attachments use.
+        let (status, blob) = request(&router, "GET", &format!("/api/blob/{blob_id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{blob}");
+        assert_eq!(
+            STANDARD
+                .decode(blob["data_base64"].as_str().unwrap())
+                .unwrap(),
+            b"hello vault"
+        );
+
+        // Persisted: a fresh read re-decodes the sidecar.
+        let (status, state) = request(&router, "GET", "/api/vault/files", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state["files"][0]["id"], id);
+
+        // Delete removes the entry and the now-unreferenced blob.
+        let (status, state) =
+            request(&router, "DELETE", &format!("/api/vault/files/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert_eq!(state["files"].as_array().unwrap().len(), 0);
+        let (status, _) = request(&router, "GET", &format!("/api/blob/{blob_id}"), None).await;
+        // The blob route reports an absent or unreadable id as a bad request;
+        // the point is only that the bytes no longer open.
+        assert!(matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+        ));
+
+        // Deleting twice is a no-op, not an error.
+        let (status, _) = request(&router, "DELETE", &format!("/api/vault/files/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_shared_blob_survives_deleting_one_entry() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        let (_, first) = request(
+            &router,
+            "POST",
+            "/api/vault/files/upload",
+            Some(&upload_body("one.txt", b"same bytes")),
+        )
+        .await;
+        let (_, second) = request(
+            &router,
+            "POST",
+            "/api/vault/files/upload",
+            Some(&upload_body("two.txt", b"same bytes")),
+        )
+        .await;
+        let first_id = first["file"]["id"].as_str().unwrap().to_string();
+        let blob_id = first["file"]["blob_id"].as_str().unwrap().to_string();
+        assert_eq!(first["file"]["blob_id"], second["file"]["blob_id"]);
+
+        let (status, state) = request(
+            &router,
+            "DELETE",
+            &format!("/api/vault/files/{first_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{state}");
+        assert_eq!(state["files"].as_array().unwrap().len(), 1);
+
+        let (status, _) = request(&router, "GET", &format!("/api/blob/{blob_id}"), None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the other entry still needs these bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_path_streams_a_file_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let source = TempDir::new().unwrap();
+        let file = source.path().join("holiday photo.jpg");
+        std::fs::write(&file, b"jpeg-ish bytes").unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        let body = serde_json::json!({ "path": file.to_string_lossy() }).to_string();
+        let (status, added) =
+            request(&router, "POST", "/api/vault/files/import", Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{added}");
+        assert_eq!(added["file"]["name"], "holiday photo.jpg");
+        assert_eq!(added["file"]["size"], 14);
+
+        let blob_id = added["file"]["blob_id"].as_str().unwrap();
+        let (status, blob) = request(&router, "GET", &format!("/api/blob/{blob_id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{blob}");
+        assert_eq!(
+            STANDARD
+                .decode(blob["data_base64"].as_str().unwrap())
+                .unwrap(),
+            b"jpeg-ish bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_is_refused_with_a_reason() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let body = serde_json::json!({ "path": "/definitely/not/here.txt" }).to_string();
+        let (status, error) =
+            request(&router, "POST", "/api/vault/files/import", Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error["error"]
+            .as_str()
+            .unwrap()
+            .contains("could not be read"));
+    }
+
+    #[tokio::test]
+    async fn file_routes_are_401_while_locked() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+        let (status, _) = request(&router, "GET", "/api/vault/files", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Neither the display name nor the imported bytes may be readable on
+    /// disk: the sidecar and every blob are vault ciphertext.
+    #[tokio::test]
+    async fn the_index_and_the_bytes_are_ciphertext_at_rest() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        const NAME_MARKER: &str = "atrest-file-name-marker";
+        const BODY_MARKER: &str = "atrest-file-body-marker";
+        let name = format!("{NAME_MARKER}.txt");
+        let (status, added) = request(
+            &router,
+            "POST",
+            "/api/vault/files/upload",
+            Some(&upload_body(&name, BODY_MARKER.as_bytes())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{added}");
+
+        fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+            let mut all = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        all.push(path);
+                    }
+                }
+            }
+            all
+        }
+
+        // A marker could straddle a buffer edge; sliding windows keep the
+        // substring check honest for any needle shorter than the file.
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty()
+                && haystack.len() >= needle.len()
+                && haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        let mut saw_sidecar = false;
+        for path in walkdir(dir.path()) {
+            let raw = std::fs::read(&path).expect("vault file readable");
+            if path
+                .file_name()
+                .is_some_and(|n| n == files_store::STATE_FILE)
+            {
+                saw_sidecar = true;
+            }
+            assert!(
+                !contains(&raw, NAME_MARKER.as_bytes()),
+                "file name appears in plaintext in {path:?}"
+            );
+            assert!(
+                !contains(&raw, BODY_MARKER.as_bytes()),
+                "file bytes appear in plaintext in {path:?}"
+            );
+        }
+        assert!(saw_sidecar, "{} is written", files_store::STATE_FILE);
+
+        // Sanity: the name IS in the API's view, so the marker was real.
+        let (status, state) = request(&router, "GET", "/api/vault/files", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state["files"][0]["name"], name);
     }
 }
 
@@ -9490,7 +10142,11 @@ mod paper_api_tests {
             ("POST", "/api/paper/c-1/create", Some("{}")),
             // A well-formed body: the 401 must come from the lock, not from
             // JSON extraction failing first.
-            ("POST", "/api/paper/c-1/update", Some(r#"{"update":"AAA="}"#)),
+            (
+                "POST",
+                "/api/paper/c-1/update",
+                Some(r#"{"update":"AAA="}"#),
+            ),
         ] {
             let (status, _) = request(&router, method, uri, body).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
@@ -9625,7 +10281,9 @@ mod paper_api_tests {
             paper_apply_inbound(
                 &mut bob,
                 "aa",
-                &MessagePayload::PaperState { paper: winner.clone() },
+                &MessagePayload::PaperState {
+                    paper: winner.clone()
+                },
                 2_002,
             )
             .unwrap(),
@@ -9753,18 +10411,16 @@ mod paper_api_tests {
             "the adopted paper keeps its creator"
         );
         for (n, update) in [u1, u2].into_iter().enumerate() {
-            assert!(
-                paper_apply_inbound(
-                    &mut bob,
-                    "aa",
-                    &MessagePayload::PaperDelta {
-                        paper_id: paper_id.clone(),
-                        update
-                    },
-                    5 + n as u64,
-                )
-                .unwrap()
-            );
+            assert!(paper_apply_inbound(
+                &mut bob,
+                "aa",
+                &MessagePayload::PaperDelta {
+                    paper_id: paper_id.clone(),
+                    update
+                },
+                5 + n as u64,
+            )
+            .unwrap());
         }
 
         assert_eq!(
@@ -9779,7 +10435,8 @@ mod paper_api_tests {
     #[test]
     fn an_inbound_delta_is_recorded_against_its_sender() {
         let mut bob = paper_store::PapersState::default();
-        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1).unwrap();
+        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1)
+            .unwrap();
         paper_apply_inbound(
             &mut bob,
             "aa",
@@ -9833,7 +10490,8 @@ mod paper_api_tests {
     #[test]
     fn an_inbound_snapshot_merges_and_keeps_local_edits() {
         let mut bob = paper_store::PapersState::default();
-        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1).unwrap();
+        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1)
+            .unwrap();
         let bob_local = yjs_update_bytes("bob's line");
         bob.apply_update("c-1", "bb", &bob_local, 2).unwrap();
 
@@ -9941,7 +10599,8 @@ mod paper_api_tests {
     #[test]
     fn a_hub_claim_moves_the_rendezvous_and_presence_changes_nothing() {
         let mut bob = paper_store::PapersState::default();
-        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1).unwrap();
+        bob.adopt(inbound_descriptor("p-1", "c-1", "aa"), 1)
+            .unwrap();
         assert_eq!(bob.get("c-1").unwrap().descriptor.hub, "aa");
 
         // Convener-authoritative succession, already checked in `recv`: the
@@ -9965,44 +10624,38 @@ mod paper_api_tests {
         // The same claim twice is a no-op, and a claim about a paper this vault
         // does not hold changes nothing — a hub is a rendezvous, not a way to
         // conjure a paper.
-        assert!(
-            !paper_apply_inbound(
-                &mut bob,
-                "cc",
-                &MessagePayload::PaperHub {
-                    paper: inbound_descriptor("p-1", "c-1", "cc"),
-                },
-                3,
-            )
-            .unwrap()
-        );
-        assert!(
-            !paper_apply_inbound(
-                &mut bob,
-                "cc",
-                &MessagePayload::PaperHub {
-                    paper: inbound_descriptor("p-absent", "c-absent", "cc"),
-                },
-                4,
-            )
-            .unwrap()
-        );
+        assert!(!paper_apply_inbound(
+            &mut bob,
+            "cc",
+            &MessagePayload::PaperHub {
+                paper: inbound_descriptor("p-1", "c-1", "cc"),
+            },
+            3,
+        )
+        .unwrap());
+        assert!(!paper_apply_inbound(
+            &mut bob,
+            "cc",
+            &MessagePayload::PaperHub {
+                paper: inbound_descriptor("p-absent", "c-absent", "cc"),
+            },
+            4,
+        )
+        .unwrap());
 
         // Presence is v1 DataChannel-only, so a relay copy is reserved, not
         // unknown: accepted and ignored.
-        assert!(
-            !paper_apply_inbound(
-                &mut bob,
-                "aa",
-                &MessagePayload::PaperPresence {
-                    paper_id: "p-1".into(),
-                    peer: "aa".into(),
-                    state: vec![1],
-                },
-                5,
-            )
-            .unwrap()
-        );
+        assert!(!paper_apply_inbound(
+            &mut bob,
+            "aa",
+            &MessagePayload::PaperPresence {
+                paper_id: "p-1".into(),
+                peer: "aa".into(),
+                state: vec![1],
+            },
+            5,
+        )
+        .unwrap());
     }
 
     // -----------------------------------------------------------------------
@@ -10172,13 +10825,16 @@ mod paper_api_tests {
             }
             settle(5).await;
         }
-        assert!(applied, "the hub applied the update it received on a channel");
+        assert!(
+            applied,
+            "the hub applied the update it received on a channel"
+        );
 
         let mut forwarded = false;
         for _ in 0..200 {
-            if t2.drain().iter().any(|i| {
-                matches!(&i.frame, paper_data::InboundFrame::Update(bytes) if bytes == &edit)
-            }) {
+            if t2.drain().iter().any(
+                |i| matches!(&i.frame, paper_data::InboundFrame::Update(bytes) if bytes == &edit),
+            ) {
                 forwarded = true;
                 break;
             }
@@ -10274,7 +10930,8 @@ mod paper_api_tests {
         );
 
         // The document is still readable — read-only, not gone.
-        let (status, got) = request(&router, "GET", &format!("/api/paper/{conclave_id}"), None).await;
+        let (status, got) =
+            request(&router, "GET", &format!("/api/paper/{conclave_id}"), None).await;
         assert_eq!(status, StatusCode::OK, "{got}");
         assert_eq!(got["revision"], 1);
 
@@ -10496,122 +11153,122 @@ mod zines_api_tests {
     use crate::notes_api_tests::{build_app, request, unlocked_app};
     use crate::paper_api_tests::windows_are_subslice;
     use tempfile::TempDir;
-// -----------------------------------------------------------------------
-// Zines (Task 21, Phase 1)
-// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Zines (Task 21, Phase 1)
+    // -----------------------------------------------------------------------
 
-#[tokio::test]
-async fn zines_route_is_empty_until_a_pen_name_exists() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
+    #[tokio::test]
+    async fn zines_route_is_empty_until_a_pen_name_exists() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
 
-    let (status, view) = request(&router, "GET", "/api/zines", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["zines"].as_array().unwrap().len(), 0);
-    assert_eq!(view["sections"].as_array().unwrap().len(), 0);
-    assert!(view["pen_name"].is_null(), "no byline yet");
+        let (status, view) = request(&router, "GET", "/api/zines", None).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["zines"].as_array().unwrap().len(), 0);
+        assert_eq!(view["sections"].as_array().unwrap().len(), 0);
+        assert!(view["pen_name"].is_null(), "no byline yet");
 
-    // Writing before choosing a byline is refused, not silently published
-    // under one nobody chose.
-    let (status, err) = request(
-        &router,
-        "POST",
-        "/api/zines",
-        Some(r#"{"title":"First","body":"<p>hello</p>"}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert!(err["error"].as_str().unwrap().contains("pen name"), "{err}");
-}
+        // Writing before choosing a byline is refused, not silently published
+        // under one nobody chose.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"title":"First","body":"<p>hello</p>"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(err["error"].as_str().unwrap().contains("pen name"), "{err}");
+    }
 
-#[tokio::test]
-async fn a_pen_name_is_minted_then_renamed_without_moving_the_address() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
+    #[tokio::test]
+    async fn a_pen_name_is_minted_then_renamed_without_moving_the_address() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
 
-    let (status, view) = request(
-        &router,
-        "POST",
-        "/api/zines/pen-name",
-        Some(r#"{"name":"  Ada  "}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    let id = view["pen_name"]["id"].as_str().unwrap().to_string();
-    assert_eq!(view["pen_name"]["name"], "Ada", "the byline is trimmed");
-    assert_eq!(id.len(), 64);
+        let (status, view) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"  Ada  "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        let id = view["pen_name"]["id"].as_str().unwrap().to_string();
+        assert_eq!(view["pen_name"]["name"], "Ada", "the byline is trimmed");
+        assert_eq!(id.len(), 64);
 
-    // A blank byline is refused rather than minting an unnamed identity.
-    let (status, _) = request(
-        &router,
-        "POST",
-        "/api/zines/pen-name",
-        Some(r#"{"name":"   "}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+        // A blank byline is refused rather than minting an unnamed identity.
+        let (status, _) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"   "}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let (status, renamed) = request(
-        &router,
-        "POST",
-        "/api/zines/pen-name",
-        Some(r#"{"name":"Ada Lovelace"}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{renamed}");
-    assert_eq!(renamed["pen_name"]["name"], "Ada Lovelace");
-    assert_eq!(
-        renamed["pen_name"]["id"], id,
-        "a byline is not an identity: the address did not move"
-    );
+        let (status, renamed) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"Ada Lovelace"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{renamed}");
+        assert_eq!(renamed["pen_name"]["name"], "Ada Lovelace");
+        assert_eq!(
+            renamed["pen_name"]["id"], id,
+            "a byline is not an identity: the address did not move"
+        );
 
-    let (status, got) = request(&router, "GET", "/api/zines/pen-name", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(got["name"], "Ada Lovelace");
-}
+        let (status, got) = request(&router, "GET", "/api/zines/pen-name", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got["name"], "Ada Lovelace");
+    }
 
-#[tokio::test]
-async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-    let (_, pen) = request(
-        &router,
-        "POST",
-        "/api/zines/pen-name",
-        Some(r#"{"name":"ada"}"#),
-    )
-    .await;
-    let pen_id = pen["pen_name"]["id"].as_str().unwrap().to_string();
+    #[tokio::test]
+    async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let (_, pen) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"ada"}"#),
+        )
+        .await;
+        let pen_id = pen["pen_name"]["id"].as_str().unwrap().to_string();
 
-    // Create.
-    let (status, created) = request(
+        // Create.
+        let (status, created) = request(
         &router,
         "POST",
         "/api/zines",
         Some(r#"{"title":"On relays","sections":["Rust","rust","Networking"],"body":"<p>hello <strong>world</strong></p>"}"#),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{created}");
-    let row = &created["zines"][0];
-    assert_eq!(row["title"], "On relays");
-    assert_eq!(row["revision"], 1);
-    assert_eq!(row["authored"], true);
-    assert_eq!(row["preview"], "hello world");
-    // A create mints the post's id, and the answer carries it so the caller can
-    // open what it just published.
-    let id = created["zine_id"].as_str().unwrap().to_string();
-    assert_eq!(row["zine_id"], id, "the answer names the post it wrote");
-    assert_eq!(created["revision"], 1);
-    assert_ne!(
-        id, pen_id,
-        "the id addresses the post, not the pen name: that is what lets one \
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let row = &created["zines"][0];
+        assert_eq!(row["title"], "On relays");
+        assert_eq!(row["revision"], 1);
+        assert_eq!(row["authored"], true);
+        assert_eq!(row["preview"], "hello world");
+        // A create mints the post's id, and the answer carries it so the caller can
+        // open what it just published.
+        let id = created["zine_id"].as_str().unwrap().to_string();
+        assert_eq!(row["zine_id"], id, "the answer names the post it wrote");
+        assert_eq!(created["revision"], 1);
+        assert_ne!(
+            id, pen_id,
+            "the id addresses the post, not the pen name: that is what lets one \
          pen name hold many posts"
-    );
-    assert_eq!(
-        row["sections"].as_array().unwrap().len(),
-        2,
-        "`Rust` and `rust` are one section"
-    );
+        );
+        assert_eq!(
+            row["sections"].as_array().unwrap().len(),
+            2,
+            "`Rust` and `rust` are one section"
+        );
         assert_eq!(created["sections"][0]["count"], 1);
         let names: Vec<&str> = created["sections"]
             .as_array()
@@ -10619,31 +11276,34 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
             .iter()
             .map(|s| s["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"rust") && names.contains(&"networking"), "{names:?}");
+        assert!(
+            names.contains(&"rust") && names.contains(&"networking"),
+            "{names:?}"
+        );
 
-    // A second post under the same pen name: the first is not replaced.
-    let (status, second) = request(
-        &router,
-        "POST",
-        "/api/zines",
-        Some(r#"{"title":"On gossip","body":"<p>another one</p>"}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{second}");
-    let second_id = second["zine_id"].as_str().unwrap().to_string();
-    assert_ne!(second_id, id, "a second post gets its own id");
-    assert_eq!(
-        second["zines"].as_array().unwrap().len(),
-        2,
-        "the pen name now holds two posts"
-    );
-    assert_eq!(
-        second["zines"][0]["zine_id"], second_id,
-        "the newest is first, and both are this vault's"
-    );
+        // A second post under the same pen name: the first is not replaced.
+        let (status, second) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"title":"On gossip","body":"<p>another one</p>"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let second_id = second["zine_id"].as_str().unwrap().to_string();
+        assert_ne!(second_id, id, "a second post gets its own id");
+        assert_eq!(
+            second["zines"].as_array().unwrap().len(),
+            2,
+            "the pen name now holds two posts"
+        );
+        assert_eq!(
+            second["zines"][0]["zine_id"], second_id,
+            "the newest is first, and both are this vault's"
+        );
 
-    // Edit: a new revision of the first post, chained to the one before it.
-    let (status, edited) = request(
+        // Edit: a new revision of the first post, chained to the one before it.
+        let (status, edited) = request(
         &router,
         "POST",
         "/api/zines",
@@ -10652,336 +11312,345 @@ async fn zines_round_trip_a_create_an_edit_a_mute_and_a_forget() {
         )),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{edited}");
-    assert_eq!(edited["zine_id"], id, "the same post was revised");
-    assert_eq!(edited["revision"], 2);
-    let edited_first = edited["zines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|z| z["zine_id"] == id.as_str())
-        .unwrap();
-    assert_eq!(edited_first["title"], "On relays, again");
-    let untouched = edited["zines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|z| z["zine_id"] == second_id.as_str())
-        .unwrap();
-    assert_eq!(untouched["revision"], 1, "the other post did not move");
-    assert_eq!(untouched["title"], "On gossip");
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["zine_id"], id, "the same post was revised");
+        assert_eq!(edited["revision"], 2);
+        let edited_first = edited["zines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|z| z["zine_id"] == id.as_str())
+            .unwrap();
+        assert_eq!(edited_first["title"], "On relays, again");
+        let untouched = edited["zines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|z| z["zine_id"] == second_id.as_str())
+            .unwrap();
+        assert_eq!(untouched["revision"], 1, "the other post did not move");
+        assert_eq!(untouched["title"], "On gossip");
 
-    // The chain and the history are visible on the article.
-    let (status, one) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
-    assert_eq!(status, StatusCode::OK, "{one}");
-    assert_eq!(one["zine"]["descriptor"]["revision"], 2);
-    assert_eq!(
-        one["zine"]["descriptor"]["pen_id"], pen_id,
-        "the article carries the identity the post was written under"
-    );
-    assert_eq!(
-        one["zine"]["descriptor"]["prev_hash"].as_str().unwrap().len(),
-        64,
-        "revision 2 points back at revision 1's content hash"
-    );
-    assert_eq!(one["zine"]["history"][0]["revision"], 1);
-    assert_eq!(one["zine"]["history"][0]["title"], "On relays");
-    assert_eq!(one["zine"]["authored"], true);
-
-    // A revision naming a post this vault does not hold is refused rather than
-    // treated as a create, so a stale UI cannot resurrect a forgotten post.
-    let (status, err) = request(
-        &router,
-        "POST",
-        "/api/zines",
-        Some(r#"{"zine_id":"nope","title":"Ghost","body":"<p>x</p>"}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
-    assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
-    let (_, after) = request(&router, "GET", "/api/zines", None).await;
-    assert_eq!(
-        after["zines"].as_array().unwrap().len(),
-        2,
-        "the refused revision stored nothing"
-    );
-
-    // Filters.
-    let (_, by_section) = request(&router, "GET", "/api/zines?section=rust", None).await;
-    assert_eq!(by_section["zines"].as_array().unwrap().len(), 1);
-    let (_, by_missing) = request(&router, "GET", "/api/zines?section=nope", None).await;
-    assert_eq!(
-        by_missing["zines"].as_array().unwrap().len(),
-        0,
-        "an unknown section is an empty list, not an error"
-    );
-    let (_, by_pen) = request(&router, "GET", "/api/zines?pen=AD", None).await;
-    assert_eq!(by_pen["zines"].as_array().unwrap().len(), 2);
-
-    // Mute, then unmute. The row is found by id: the index is newest first, and
-    // which post that is depends on the corpus rather than on this test.
-    let (status, muted) = request(&router, "POST", &format!("/api/zines/{id}/mute"), Some("{}")).await;
-    assert_eq!(status, StatusCode::OK, "{muted}");
-    let muted_row = muted["zines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|z| z["zine_id"] == id.as_str())
-        .unwrap();
-    assert_eq!(muted_row["muted"], true);
-    let (_, unmuted) = request(
-        &router,
-        "POST",
-        &format!("/api/zines/{id}/mute"),
-        Some(r#"{"muted":false}"#),
-    )
-    .await;
-    let unmuted_row = unmuted["zines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|z| z["zine_id"] == id.as_str())
-        .unwrap();
-    assert_eq!(unmuted_row["muted"], false);
-
-    // Forget. The other post is untouched: forgetting is per post.
-    let (status, gone) = request(&router, "DELETE", &format!("/api/zines/{id}"), None).await;
-    assert_eq!(status, StatusCode::OK, "{gone}");
-    assert_eq!(gone["zines"].as_array().unwrap().len(), 1);
-    assert_eq!(gone["zines"][0]["zine_id"], second_id);
-    let (status, _) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = request(&router, "GET", &format!("/api/zines/{second_id}"), None).await;
-    assert_eq!(status, StatusCode::OK, "the other post is still held");
-}
-
-#[tokio::test]
-async fn a_draft_naming_a_post_this_vault_does_not_hold_is_refused() {
-    // The pen name comes from the vault, never from the request, so a caller
-    // does not choose which byline it publishes under. A draft naming an id
-    // this vault does not hold is a stale UI — and treating it as a create
-    // would let that stale UI write a second post under an id it made up.
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-    let (_, pen) = request(
-        &router,
-        "POST",
-        "/api/zines/pen-name",
-        Some(r#"{"name":"ada"}"#),
-    )
-    .await;
-    let mine = pen["pen_name"]["id"].as_str().unwrap().to_string();
-    let theirs = "b".repeat(64);
-
-    let (status, err) = request(
-        &router,
-        "POST",
-        "/api/zines",
-        Some(&format!(
-            r#"{{"zine_id":"{theirs}","title":"Not mine","body":"<p>x</p>"}}"#
-        )),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
-    assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
-    let (_, view) = request(&router, "GET", "/api/zines", None).await;
-    assert_eq!(
-        view["zines"].as_array().unwrap().len(),
-        0,
-        "nothing was written under any id"
-    );
-    let (status, _) = request(&router, "GET", &format!("/api/zines/{theirs}"), None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-
-    // And the pen name's own id is not a post id either, so it is refused the
-    // same way: the identity is not an address.
-    let (status, err) = request(
-        &router,
-        "POST",
-        "/api/zines",
-        Some(&format!(
-            r#"{{"zine_id":"{mine}","title":"Not mine either","body":"<p>x</p>"}}"#
-        )),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
-    assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
-}
-
-#[tokio::test]
-async fn a_zine_that_is_not_held_is_404_with_a_reason() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-    let ghost = "c".repeat(64);
-    for (method, uri, body) in [
-        ("GET", format!("/api/zines/{ghost}"), None),
-        ("DELETE", format!("/api/zines/{ghost}"), None),
-        ("POST", format!("/api/zines/{ghost}/mute"), Some("{}")),
-    ] {
-        let (status, err) = request(&router, method, &uri, body).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
-        assert!(err["error"].as_str().unwrap().contains("no zine"), "{err}");
-    }
-}
-
-#[tokio::test]
-async fn every_zine_route_is_401_while_locked() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
-    let id = "a".repeat(64);
-    for (method, uri, body) in [
-        ("GET", "/api/zines".to_string(), None),
-        ("GET", "/api/zines/sections".to_string(), None),
-        ("GET", "/api/zines/pen-name".to_string(), None),
-        (
-            "POST",
-            "/api/zines/pen-name".to_string(),
-            Some(r#"{"name":"ada"}"#),
-        ),
-        // Well-formed bodies: the 401 must come from the lock, not from
-        // JSON extraction failing first.
-        (
-            "POST",
-            "/api/zines".to_string(),
-            Some(r#"{"title":"t","body":"<p>b</p>"}"#),
-        ),
-        ("GET", format!("/api/zines/{id}"), None),
-        ("DELETE", format!("/api/zines/{id}"), None),
-        ("POST", format!("/api/zines/{id}/mute"), Some("{}")),
-    ] {
-        let (status, _) = request(&router, method, &uri, body).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
-    }
-}
-
-/// A draft zine is as private as a draft message: the sidecar lives in the
-/// vault dir for the life of the machine, so its bytes must never be the
-/// article. The byline is a marker too — a pen name is an identity, and a
-/// cleartext byline next to a cleartext title would be the whole graph.
-#[tokio::test]
-async fn zines_sidecar_is_ciphertext_at_rest() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-
-    const BYLINE: &str = "atrest-byline-marker";
-    const TITLE: &str = "atrest-title-marker";
-    const BODY: &str = "atrest-body-marker";
-    const SECTION: &str = "atrest-section-marker";
-
-    let (status, pen) = request(
-        &router,
-        "POST",
-        "/api/zines/pen-name",
-        Some(&format!(r#"{{"name":"{BYLINE}"}}"#)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{pen}");
-    let (status, created) = request(
-        &router,
-        "POST",
-        "/api/zines",
-        Some(&format!(
-            r#"{{"title":"{TITLE}","sections":["{SECTION}"],"body":"<p>{BODY}</p>"}}"#
-        )),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{created}");
-
-    let sidecar = std::fs::read(dir.path().join(zine_store::STATE_FILE))
-        .expect("zines.enc exists after a write");
-    assert!(!sidecar.is_empty(), "sidecar is not empty");
-    for marker in [BYLINE, TITLE, BODY, SECTION] {
-        assert!(
-            !windows_are_subslice(&sidecar, marker.as_bytes()),
-            "{marker} appears in plaintext on disk"
+        // The chain and the history are visible on the article.
+        let (status, one) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        assert_eq!(one["zine"]["descriptor"]["revision"], 2);
+        assert_eq!(
+            one["zine"]["descriptor"]["pen_id"], pen_id,
+            "the article carries the identity the post was written under"
         );
+        assert_eq!(
+            one["zine"]["descriptor"]["prev_hash"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64,
+            "revision 2 points back at revision 1's content hash"
+        );
+        assert_eq!(one["zine"]["history"][0]["revision"], 1);
+        assert_eq!(one["zine"]["history"][0]["title"], "On relays");
+        assert_eq!(one["zine"]["authored"], true);
+
+        // A revision naming a post this vault does not hold is refused rather than
+        // treated as a create, so a stale UI cannot resurrect a forgotten post.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"zine_id":"nope","title":"Ghost","body":"<p>x</p>"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
+        let (_, after) = request(&router, "GET", "/api/zines", None).await;
+        assert_eq!(
+            after["zines"].as_array().unwrap().len(),
+            2,
+            "the refused revision stored nothing"
+        );
+
+        // Filters.
+        let (_, by_section) = request(&router, "GET", "/api/zines?section=rust", None).await;
+        assert_eq!(by_section["zines"].as_array().unwrap().len(), 1);
+        let (_, by_missing) = request(&router, "GET", "/api/zines?section=nope", None).await;
+        assert_eq!(
+            by_missing["zines"].as_array().unwrap().len(),
+            0,
+            "an unknown section is an empty list, not an error"
+        );
+        let (_, by_pen) = request(&router, "GET", "/api/zines?pen=AD", None).await;
+        assert_eq!(by_pen["zines"].as_array().unwrap().len(), 2);
+
+        // Mute, then unmute. The row is found by id: the index is newest first, and
+        // which post that is depends on the corpus rather than on this test.
+        let (status, muted) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{id}/mute"),
+            Some("{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{muted}");
+        let muted_row = muted["zines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|z| z["zine_id"] == id.as_str())
+            .unwrap();
+        assert_eq!(muted_row["muted"], true);
+        let (_, unmuted) = request(
+            &router,
+            "POST",
+            &format!("/api/zines/{id}/mute"),
+            Some(r#"{"muted":false}"#),
+        )
+        .await;
+        let unmuted_row = unmuted["zines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|z| z["zine_id"] == id.as_str())
+            .unwrap();
+        assert_eq!(unmuted_row["muted"], false);
+
+        // Forget. The other post is untouched: forgetting is per post.
+        let (status, gone) = request(&router, "DELETE", &format!("/api/zines/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{gone}");
+        assert_eq!(gone["zines"].as_array().unwrap().len(), 1);
+        assert_eq!(gone["zines"][0]["zine_id"], second_id);
+        let (status, _) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = request(&router, "GET", &format!("/api/zines/{second_id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "the other post is still held");
     }
-    // The pen name's own file is a key, so it is ciphertext too.
-    let pen_file = std::fs::read(dir.path().join("pen-names.enc")).expect("pen-names.enc");
-    assert!(!windows_are_subslice(&pen_file, BYLINE.as_bytes()));
 
-    // Sanity: the markers were real, so the check above was not vacuous.
-    let (status, got) = request(&router, "GET", "/api/zines", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(got.to_string().contains(TITLE));
-    assert!(got.to_string().contains(BODY));
-}
+    #[tokio::test]
+    async fn a_draft_naming_a_post_this_vault_does_not_hold_is_refused() {
+        // The pen name comes from the vault, never from the request, so a caller
+        // does not choose which byline it publishes under. A draft naming an id
+        // this vault does not hold is a stale UI — and treating it as a create
+        // would let that stale UI write a second post under an id it made up.
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let (_, pen) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"ada"}"#),
+        )
+        .await;
+        let mine = pen["pen_name"]["id"].as_str().unwrap().to_string();
+        let theirs = "b".repeat(64);
 
-#[tokio::test]
-async fn a_hostile_body_is_sanitized_on_the_way_in() {
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-    request(
-        &router,
-        "POST",
-        "/api/zines/pen-name",
-        Some(r#"{"name":"ada"}"#),
-    )
-    .await;
-    let (status, view) = request(
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(&format!(
+                r#"{{"zine_id":"{theirs}","title":"Not mine","body":"<p>x</p>"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
+        let (_, view) = request(&router, "GET", "/api/zines", None).await;
+        assert_eq!(
+            view["zines"].as_array().unwrap().len(),
+            0,
+            "nothing was written under any id"
+        );
+        let (status, _) = request(&router, "GET", &format!("/api/zines/{theirs}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // And the pen name's own id is not a post id either, so it is refused the
+        // same way: the identity is not an address.
+        let (status, err) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(&format!(
+                r#"{{"zine_id":"{mine}","title":"Not mine either","body":"<p>x</p>"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("no post"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_zine_that_is_not_held_is_404_with_a_reason() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let ghost = "c".repeat(64);
+        for (method, uri, body) in [
+            ("GET", format!("/api/zines/{ghost}"), None),
+            ("DELETE", format!("/api/zines/{ghost}"), None),
+            ("POST", format!("/api/zines/{ghost}/mute"), Some("{}")),
+        ] {
+            let (status, err) = request(&router, method, &uri, body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            assert!(err["error"].as_str().unwrap().contains("no zine"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_zine_route_is_401_while_locked() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(build_app(dir.path(), AccountWorker::spawn(), false));
+        let id = "a".repeat(64);
+        for (method, uri, body) in [
+            ("GET", "/api/zines".to_string(), None),
+            ("GET", "/api/zines/sections".to_string(), None),
+            ("GET", "/api/zines/pen-name".to_string(), None),
+            (
+                "POST",
+                "/api/zines/pen-name".to_string(),
+                Some(r#"{"name":"ada"}"#),
+            ),
+            // Well-formed bodies: the 401 must come from the lock, not from
+            // JSON extraction failing first.
+            (
+                "POST",
+                "/api/zines".to_string(),
+                Some(r#"{"title":"t","body":"<p>b</p>"}"#),
+            ),
+            ("GET", format!("/api/zines/{id}"), None),
+            ("DELETE", format!("/api/zines/{id}"), None),
+            ("POST", format!("/api/zines/{id}/mute"), Some("{}")),
+        ] {
+            let (status, _) = request(&router, method, &uri, body).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+
+    /// A draft zine is as private as a draft message: the sidecar lives in the
+    /// vault dir for the life of the machine, so its bytes must never be the
+    /// article. The byline is a marker too — a pen name is an identity, and a
+    /// cleartext byline next to a cleartext title would be the whole graph.
+    #[tokio::test]
+    async fn zines_sidecar_is_ciphertext_at_rest() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+
+        const BYLINE: &str = "atrest-byline-marker";
+        const TITLE: &str = "atrest-title-marker";
+        const BODY: &str = "atrest-body-marker";
+        const SECTION: &str = "atrest-section-marker";
+
+        let (status, pen) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(&format!(r#"{{"name":"{BYLINE}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{pen}");
+        let (status, created) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(&format!(
+                r#"{{"title":"{TITLE}","sections":["{SECTION}"],"body":"<p>{BODY}</p>"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+
+        let sidecar = std::fs::read(dir.path().join(zine_store::STATE_FILE))
+            .expect("zines.enc exists after a write");
+        assert!(!sidecar.is_empty(), "sidecar is not empty");
+        for marker in [BYLINE, TITLE, BODY, SECTION] {
+            assert!(
+                !windows_are_subslice(&sidecar, marker.as_bytes()),
+                "{marker} appears in plaintext on disk"
+            );
+        }
+        // The pen name's own file is a key, so it is ciphertext too.
+        let pen_file = std::fs::read(dir.path().join("pen-names.enc")).expect("pen-names.enc");
+        assert!(!windows_are_subslice(&pen_file, BYLINE.as_bytes()));
+
+        // Sanity: the markers were real, so the check above was not vacuous.
+        let (status, got) = request(&router, "GET", "/api/zines", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(got.to_string().contains(TITLE));
+        assert!(got.to_string().contains(BODY));
+    }
+
+    #[tokio::test]
+    async fn a_hostile_body_is_sanitized_on_the_way_in() {
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"ada"}"#),
+        )
+        .await;
+        let (status, view) = request(
         &router,
         "POST",
         "/api/zines",
         Some(r#"{"title":"t","body":"<p>ok</p><script>alert(1)</script><a href=\"javascript:alert(1)\">x</a>"}"#),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    let id = view["zines"][0]["zine_id"].as_str().unwrap();
-    let (_, one) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
-    let body = one["zine"]["descriptor"]["body"].as_str().unwrap();
-    assert!(body.contains("<p>ok</p>"), "{body}");
-    assert!(!body.contains("script"), "{body}");
-    assert!(!body.contains("javascript:"), "{body}");
-}
+        assert_eq!(status, StatusCode::OK, "{view}");
+        let id = view["zines"][0]["zine_id"].as_str().unwrap();
+        let (_, one) = request(&router, "GET", &format!("/api/zines/{id}"), None).await;
+        let body = one["zine"]["descriptor"]["body"].as_str().unwrap();
+        assert!(body.contains("<p>ok</p>"), "{body}");
+        assert!(!body.contains("script"), "{body}");
+        assert!(!body.contains("javascript:"), "{body}");
+    }
 
-#[tokio::test]
-async fn a_zine_survives_a_restart() {
-    // The acceptance criterion for Phase 1: author a zine, restart, and it
-    // is still there — which means the sidecar has to be read back through
-    // a fresh worker, not just held in memory.
-    let dir = TempDir::new().unwrap();
-    let router = api_router(unlocked_app(dir.path()).await);
-    let (_, pen) = request(
-        &router,
-        "POST",
-        "/api/zines/pen-name",
-        Some(r#"{"name":"ada"}"#),
-    )
-    .await;
-    assert_eq!(pen["pen_name"]["name"], "ada");
-    let (_, created) = request(
-        &router,
-        "POST",
-        "/api/zines",
-        Some(r#"{"title":"Persisted","sections":["rust"],"body":"<p>still here</p>"}"#),
-    )
-    .await;
-    let id = created["zine_id"].as_str().unwrap().to_string();
+    #[tokio::test]
+    async fn a_zine_survives_a_restart() {
+        // The acceptance criterion for Phase 1: author a zine, restart, and it
+        // is still there — which means the sidecar has to be read back through
+        // a fresh worker, not just held in memory.
+        let dir = TempDir::new().unwrap();
+        let router = api_router(unlocked_app(dir.path()).await);
+        let (_, pen) = request(
+            &router,
+            "POST",
+            "/api/zines/pen-name",
+            Some(r#"{"name":"ada"}"#),
+        )
+        .await;
+        assert_eq!(pen["pen_name"]["name"], "ada");
+        let (_, created) = request(
+            &router,
+            "POST",
+            "/api/zines",
+            Some(r#"{"title":"Persisted","sections":["rust"],"body":"<p>still here</p>"}"#),
+        )
+        .await;
+        let id = created["zine_id"].as_str().unwrap().to_string();
 
-    // A brand-new worker over the same vault dir: the daemon restarting.
-    let worker = AccountWorker::spawn();
-    assert!(matches!(
-        worker.unlock(&dir.path().to_path_buf(), "pw").await,
-        WorkResult::Ok
-    ));
-    let restarted = api_router(build_app(dir.path(), worker, true));
-    let (status, view) = request(&restarted, "GET", "/api/zines", None).await;
-    assert_eq!(status, StatusCode::OK, "{view}");
-    assert_eq!(view["zines"][0]["title"], "Persisted");
-    assert_eq!(
-        view["zines"][0]["zine_id"], id,
-        "the minted post id survives a restart, so it is the id Phase 2 can \
+        // A brand-new worker over the same vault dir: the daemon restarting.
+        let worker = AccountWorker::spawn();
+        assert!(matches!(
+            worker.unlock(&dir.path().to_path_buf(), "pw").await,
+            WorkResult::Ok
+        ));
+        let restarted = api_router(build_app(dir.path(), worker, true));
+        let (status, view) = request(&restarted, "GET", "/api/zines", None).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["zines"][0]["title"], "Persisted");
+        assert_eq!(
+            view["zines"][0]["zine_id"], id,
+            "the minted post id survives a restart, so it is the id Phase 2 can \
          address a blob by"
-    );
-    assert_eq!(view["pen_name"]["name"], "ada");
-    assert_eq!(view["sections"][0]["name"], "rust");
-    let (status, one) = request(&restarted, "GET", &format!("/api/zines/{id}"), None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(one["zine"]["descriptor"]["body"]
-        .as_str()
-        .unwrap()
-        .contains("still here"));
-}
+        );
+        assert_eq!(view["pen_name"]["name"], "ada");
+        assert_eq!(view["sections"][0]["name"], "rust");
+        let (status, one) = request(&restarted, "GET", &format!("/api/zines/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(one["zine"]["descriptor"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("still here"));
+    }
 }
 
 /// Shared harness for daemon API tests: a real relay on a port and members
@@ -10999,8 +11668,7 @@ mod api_test_harness {
     /// A real relay, on a real port, with its own database on disk.
     pub(crate) async fn relay_on_a_port() -> (String, NamedTempFile) {
         let db = NamedTempFile::new().unwrap();
-        let app =
-            hush_relay::router(db.path().to_str().unwrap(), RelayConfig::default()).unwrap();
+        let app = hush_relay::router(db.path().to_str().unwrap(), RelayConfig::default()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -11324,7 +11992,10 @@ mod zines_bulletin_tests {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{created}");
-        assert_eq!(created["published"], true, "the relay took the blob: {created}");
+        assert_eq!(
+            created["published"], true,
+            "the relay took the blob: {created}"
+        );
         assert_eq!(created["publish_error"], "", "{created}");
 
         // The reader has no key, so the blob is held and counted rather than
@@ -11367,7 +12038,8 @@ mod zines_bulletin_tests {
         // an unlinked inode.
         let (_relay, _relay_db, a, b) = pair().await;
 
-        a.post("/api/zines/pen-name", Some(r#"{"name":"ada"}"#)).await;
+        a.post("/api/zines/pen-name", Some(r#"{"name":"ada"}"#))
+            .await;
         let (_, created) = a
             .post(
                 "/api/zines",
@@ -11382,7 +12054,10 @@ mod zines_bulletin_tests {
 
         // The author hands the key over their session.
         let (status, granted) = a
-            .post(&format!("/api/zines/{id}/grant"), Some(r#"{"contact":"bo"}"#))
+            .post(
+                &format!("/api/zines/{id}/grant"),
+                Some(r#"{"contact":"bo"}"#),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{granted}");
 
@@ -11394,7 +12069,10 @@ mod zines_bulletin_tests {
         assert_eq!(index["zines"].as_array().unwrap().len(), 1, "{index}");
         assert_eq!(index["zines"][0]["title"], "On relays");
         assert_eq!(index["zines"][0]["unreadable"], false);
-        assert_eq!(index["unreadable_blobs"], 0, "the held blob is readable now");
+        assert_eq!(
+            index["unreadable_blobs"], 0,
+            "the held blob is readable now"
+        );
         assert_eq!(index["zines"][0]["sections"][0], "rust");
 
         // The reader comments: sealed to the author's pen-name key, published to
@@ -11416,7 +12094,10 @@ mod zines_bulletin_tests {
         assert_eq!(pending.len(), 1, "{one}");
         assert_eq!(pending[0]["body"], "<p>nice one</p>");
         assert_eq!(
-            one["zine"]["descriptor"]["comments"].as_array().unwrap().len(),
+            one["zine"]["descriptor"]["comments"]
+                .as_array()
+                .unwrap()
+                .len(),
             0,
             "pulled is not merged: {one}"
         );
@@ -11475,11 +12156,17 @@ mod zines_bulletin_tests {
             "the refusal took it out of the pile"
         );
         assert_eq!(
-            after["zine"]["descriptor"]["comments"].as_array().unwrap().len(),
+            after["zine"]["descriptor"]["comments"]
+                .as_array()
+                .unwrap()
+                .len(),
             1,
             "and it is not in the thread"
         );
-        assert_eq!(after["zine"]["descriptor"]["revision"], 2, "a refusal is not an edit");
+        assert_eq!(
+            after["zine"]["descriptor"]["revision"], 2,
+            "a refusal is not an edit"
+        );
     }
 
     #[tokio::test]
@@ -11492,7 +12179,8 @@ mod zines_bulletin_tests {
         let c = Member::new(&relay).await;
         connect(&b, &c, "bo", "cy").await;
 
-        a.post("/api/zines/pen-name", Some(r#"{"name":"ada"}"#)).await;
+        a.post("/api/zines/pen-name", Some(r#"{"name":"ada"}"#))
+            .await;
         let (_, created) = a
             .post(
                 "/api/zines",
@@ -11503,14 +12191,23 @@ mod zines_bulletin_tests {
 
         // B reads it the ordinary way: drain, grant, drain.
         b.poll().await;
-        a.post(&format!("/api/zines/{id}/grant"), Some(r#"{"contact":"bo"}"#))
-            .await;
+        a.post(
+            &format!("/api/zines/{id}/grant"),
+            Some(r#"{"contact":"bo"}"#),
+        )
+        .await;
         b.poll().await;
-        assert_eq!(b.get("/api/zines").await.1["zines"][0]["title"], "On gossip");
+        assert_eq!(
+            b.get("/api/zines").await.1["zines"][0]["title"],
+            "On gossip"
+        );
 
         // B re-shares to C, who has never spoken to A.
         let (status, shared) = b
-            .post(&format!("/api/zines/{id}/grant"), Some(r#"{"contact":"cy"}"#))
+            .post(
+                &format!("/api/zines/{id}/grant"),
+                Some(r#"{"contact":"cy"}"#),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{shared}");
 
@@ -11521,7 +12218,10 @@ mod zines_bulletin_tests {
         let (_, index) = c.get("/api/zines").await;
         assert_eq!(index["zines"].as_array().unwrap().len(), 1, "{index}");
         assert_eq!(index["zines"][0]["title"], "On gossip");
-        assert_eq!(index["zines"][0]["authored"], false, "C is a reader, not the author");
+        assert_eq!(
+            index["zines"][0]["authored"], false,
+            "C is a reader, not the author"
+        );
 
         // A post this vault holds no key for cannot be passed on: the refusal is
         // about having the key, not about being entitled to share it.
@@ -11571,7 +12271,6 @@ mod zines_bulletin_tests {
     }
 }
 
-
 #[cfg(test)]
 mod atproto_api_tests {
     use super::*;
@@ -11610,7 +12309,10 @@ mod atproto_api_tests {
         auth: Mutex<Vec<String>>,
     }
 
-    async fn plc(State(stub): State<Arc<Stub>>, Path(did): Path<String>) -> Json<serde_json::Value> {
+    async fn plc(
+        State(stub): State<Arc<Stub>>,
+        Path(did): Path<String>,
+    ) -> Json<serde_json::Value> {
         let endpoint = stub
             .foreign
             .get(&did)
@@ -11635,7 +12337,9 @@ mod atproto_api_tests {
         StatusCode::OK
     }
 
-    async fn resolve_handle(Query(query): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+    async fn resolve_handle(
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
         let handle = query.get("handle").cloned().unwrap_or_default();
         Json(serde_json::json!({ "did": format!("did:plc:{handle}") }))
     }
@@ -11812,7 +12516,10 @@ mod atproto_api_tests {
 
         let (status, view) = request(&router, "GET", "/api/atproto", None).await;
         assert_eq!(status, StatusCode::OK, "{view}");
-        assert!(view["account"].is_null(), "no account before one is connected");
+        assert!(
+            view["account"].is_null(),
+            "no account before one is connected"
+        );
         assert!(view["publication"].is_null());
         assert_eq!(view["follows"].as_array().unwrap().len(), 0);
         assert_eq!(view["documents"].as_array().unwrap().len(), 0);
@@ -11852,7 +12559,10 @@ mod atproto_api_tests {
 
         let wire = view.to_string();
         for secret in ["app-pw", "access-1", "refresh-1"] {
-            assert!(!wire.contains(secret), "{secret} reached the webview: {wire}");
+            assert!(
+                !wire.contains(secret),
+                "{secret} reached the webview: {wire}"
+            );
         }
 
         // The session survives the request: the vault holds it, not the webview.
@@ -11886,7 +12596,10 @@ mod atproto_api_tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {err}");
-            assert!(err["error"].as_str().unwrap().contains("PDS"), "{bad}: {err}");
+            assert!(
+                err["error"].as_str().unwrap().contains("PDS"),
+                "{bad}: {err}"
+            );
         }
     }
 
@@ -11919,7 +12632,10 @@ mod atproto_api_tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{err}");
-        assert!(err["error"].as_str().unwrap().contains("publication"), "{err}");
+        assert!(
+            err["error"].as_str().unwrap().contains("publication"),
+            "{err}"
+        );
 
         // A post this vault does not hold is 404, not a conflict: there is
         // nothing to publish and nothing the member can change.
@@ -11981,7 +12697,10 @@ mod atproto_api_tests {
             record["record"]["textContent"], "hello world",
             "the body arrives reduced to plaintext, with no markup left"
         );
-        assert_eq!(record["record"]["tags"][0], "rust", "a section is normalized");
+        assert_eq!(
+            record["record"]["tags"][0], "rust",
+            "a section is normalized"
+        );
         assert_eq!(
             record["record"]["site"],
             "at://did:plc:writer/site.standard.publication/self"
@@ -11992,7 +12711,13 @@ mod atproto_api_tests {
         );
         let encoded = record.to_string();
         for private in [
-            "pen", "zine_id", "read_key", "revision", "prev_hash", "comment", "read key",
+            "pen",
+            "zine_id",
+            "read_key",
+            "revision",
+            "prev_hash",
+            "comment",
+            "read key",
         ] {
             assert!(
                 !encoded.contains(private),
@@ -12002,8 +12727,7 @@ mod atproto_api_tests {
 
         // The local half remembers where it went, so a row can link to it.
         assert_eq!(
-            published["zines"][0]["public"]["uri"],
-            published["uri"],
+            published["zines"][0]["public"]["uri"], published["uri"],
             "the index carries the public address back to the UI"
         );
         assert_eq!(published["zines"][0]["public"]["did"], "did:plc:writer");
@@ -12053,7 +12777,10 @@ mod atproto_api_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{second}");
 
-        assert_eq!(second["rkey"], first["rkey"], "one record, replaced in place");
+        assert_eq!(
+            second["rkey"], first["rkey"],
+            "one record, replaced in place"
+        );
         assert_eq!(second["uri"], first["uri"]);
         let written = stub.written.lock().unwrap().clone();
         let first_doc = written[1]["record"].clone();
@@ -12150,10 +12877,16 @@ mod atproto_api_tests {
         let dir = TempDir::new().unwrap();
         let router = api_router(unlocked_app(dir.path()).await);
         let mut repos = HashMap::new();
-        repos.insert("did:plc:one".to_string(), vec![document("One", 100, &["Rust"])]);
+        repos.insert(
+            "did:plc:one".to_string(),
+            vec![document("One", 100, &["Rust"])],
+        );
         repos.insert(
             "did:plc:two".to_string(),
-            vec![document("Two", 200, &["rust", "notes"]), document("Three", 50, &[])],
+            vec![
+                document("Two", 200, &["rust", "notes"]),
+                document("Three", 50, &[]),
+            ],
         );
         let mut foreign = HashMap::new();
         // A PDS nothing is listening on: reading this follow must fail alone.
@@ -12196,16 +12929,27 @@ mod atproto_api_tests {
             .collect();
         assert_eq!(titles, vec!["Two", "One", "Three"]);
         assert_eq!(refreshed["documents"][0]["preview"], "The body of Two.");
-        assert!(refreshed["documents"][0].get("text").is_none(), "no body in the index");
+        assert!(
+            refreshed["documents"][0].get("text").is_none(),
+            "no body in the index"
+        );
 
         // The tag facet counts case-insensitively and is most-used first.
         let tags: Vec<(String, u64)> = refreshed["tags"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|t| (t["name"].as_str().unwrap().to_string(), t["count"].as_u64().unwrap()))
+            .map(|t| {
+                (
+                    t["name"].as_str().unwrap().to_string(),
+                    t["count"].as_u64().unwrap(),
+                )
+            })
             .collect();
-        assert_eq!(tags, vec![("rust".to_string(), 2), ("notes".to_string(), 1)]);
+        assert_eq!(
+            tags,
+            vec![("rust".to_string(), 2), ("notes".to_string(), 1)]
+        );
 
         // A second pass over unchanged repos is not a change, which is what
         // makes a poll cheap enough to run on a timer.
@@ -12238,7 +12982,10 @@ mod atproto_api_tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
-        assert!(err["error"].as_str().unwrap().contains("no document"), "{err}");
+        assert!(
+            err["error"].as_str().unwrap().contains("no document"),
+            "{err}"
+        );
 
         let _ = stub;
     }
@@ -12403,7 +13150,11 @@ mod atproto_api_tests {
         assert_eq!(status, StatusCode::OK, "{view}");
         assert!(view["account"].is_null(), "the credential is gone");
         assert!(view["publication"].is_null(), "and the blog it wrote to");
-        assert_eq!(view["follows"].as_array().unwrap().len(), 1, "the list is not a credential");
+        assert_eq!(
+            view["follows"].as_array().unwrap().len(),
+            1,
+            "the list is not a credential"
+        );
 
         // With no account there is nothing to write as, and the refusal says so.
         let zine_id = write_a_zine(&router).await;
@@ -12440,8 +13191,16 @@ mod atproto_api_tests {
                 Some(r#"{"follows":[{"did":"did:plc:x"}]}"#),
             ),
             ("POST", "/api/atproto/refresh".to_string(), None),
-            ("GET", "/api/atproto/document?uri=at%3A%2F%2Fx".to_string(), None),
-            ("POST", format!("/api/zines/{}/publish", "a".repeat(64)), None),
+            (
+                "GET",
+                "/api/atproto/document?uri=at%3A%2F%2Fx".to_string(),
+                None,
+            ),
+            (
+                "POST",
+                format!("/api/zines/{}/publish", "a".repeat(64)),
+                None,
+            ),
         ] {
             let (status, _) = request(&router, method, &uri, body).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");

@@ -52,6 +52,13 @@ pub struct PreKeyRecord {
     pub kyber_pre_key_signature: Vec<u8>,
     #[serde(default)]
     pub one_time_prekeys: Vec<OneTimePreKey>,
+    /// Whether this build can receive a chunked `FileOffer`.
+    ///
+    /// A hint, not a security property: a peer that lies about it gets an offer
+    /// it ignores. Old records decode as `false`, so a pointer invite from an
+    /// old build falls back to the inline file path.
+    #[serde(default)]
+    pub supports_file_transfer: bool,
 }
 
 impl PreKeyRecord {

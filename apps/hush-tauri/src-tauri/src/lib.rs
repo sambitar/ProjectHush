@@ -75,9 +75,10 @@ async fn materialize_blob(
     id: &str,
     name: &str,
 ) -> Result<std::path::PathBuf, String> {
-    let client = state.client.as_ref().ok_or_else(|| {
-        "opening vault files needs the desktop Unix-socket transport".to_string()
-    })?;
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| "opening vault files needs the desktop Unix-socket transport".to_string())?;
     let body = serde_json::json!({ "name": name }).to_string();
     let reply = client
         .request("POST", &format!("/api/blob/{id}/materialize"), Some(body))
@@ -94,11 +95,7 @@ async fn materialize_blob(
 fn daemon_error(reply: &ApiReply) -> String {
     serde_json::from_str::<serde_json::Value>(&reply.body)
         .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.as_str())
-                .map(str::to_string)
-        })
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("daemon returned HTTP {}", reply.status))
 }
@@ -140,6 +137,38 @@ async fn hush_save_blob(
     copied.map(|_| ())
 }
 
+/// One file the desktop picker returned.
+#[derive(serde::Serialize)]
+struct PickedVaultFile {
+    path: String,
+    name: String,
+    size: u64,
+}
+
+/// Pick files from this computer for the vault's own file library.
+///
+/// Only the path crosses into the webview. The daemon opens and encrypts the
+/// file itself, so a multi-GB import never becomes a JS string or a Tauri IPC
+/// payload. Cancelling is an empty list, not an error.
+#[tauri::command]
+fn hush_pick_vault_files() -> Result<Vec<PickedVaultFile>, String> {
+    let Some(paths) = rfd::FileDialog::new().pick_files() else {
+        return Ok(Vec::new());
+    };
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().to_string();
+            let size = std::fs::metadata(&path).ok()?.len();
+            Some(PickedVaultFile {
+                path: path.to_string_lossy().to_string(),
+                name,
+                size,
+            })
+        })
+        .collect())
+}
+
 /// Open one URL in the user's browser, after the UI's own confirm step.
 /// Only http(s) is passed through: the webview must never become a launcher
 /// for file:// or other schemes a hostile page might have snuck into a link.
@@ -178,6 +207,7 @@ pub fn run() {
             hush_open_file,
             hush_open_blob,
             hush_save_blob,
+            hush_pick_vault_files,
             hush_open_url,
             hush_api,
             drops::drops_open,
@@ -359,12 +389,9 @@ mod tests {
                     .find('[')
                     .map(|i| start + i)
                     .unwrap_or_else(|| panic!("{}: commands.allow has no array", path.display()));
-                let close = rest[open..]
-                    .find(']')
-                    .map(|i| open + i)
-                    .unwrap_or_else(|| {
-                        panic!("{}: commands.allow array is unclosed", path.display())
-                    });
+                let close = rest[open..].find(']').map(|i| open + i).unwrap_or_else(|| {
+                    panic!("{}: commands.allow array is unclosed", path.display())
+                });
 
                 let mut named = 0;
                 for entry in rest[open + 1..close].split('"').skip(1).step_by(2) {

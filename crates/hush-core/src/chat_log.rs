@@ -85,7 +85,8 @@ pub enum MailState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
-pub enum ChatRecordPayload {    Text {
+pub enum ChatRecordPayload {
+    Text {
         body: String,
     },
     File {
@@ -253,8 +254,8 @@ impl ConclaveRecord {
                 let terminal = matches!(existing.state, TrusteeState::Left | TrusteeState::Kicked);
                 let incoming_live =
                     matches!(incoming.state, TrusteeState::Invited | TrusteeState::Joined);
-                let downgrade =
-                    existing.state == TrusteeState::Joined && incoming.state == TrusteeState::Invited;
+                let downgrade = existing.state == TrusteeState::Joined
+                    && incoming.state == TrusteeState::Invited;
                 let mut changed = false;
                 if !(terminal && incoming_live) && !downgrade && existing.state != incoming.state {
                     existing.state = incoming.state;
@@ -528,7 +529,11 @@ impl ChatLog {
     }
 
     /// Drop a record. Returns `false` when the id is unknown.
-    pub fn remove_record(&mut self, master: &[u8; MASTER_KEY_LEN], id: &str) -> Result<bool, Error> {
+    pub fn remove_record(
+        &mut self,
+        master: &[u8; MASTER_KEY_LEN],
+        id: &str,
+    ) -> Result<bool, Error> {
         let before = self.file.messages.len();
         self.file.messages.retain(|r| r.id != id);
         if self.file.messages.len() == before {
@@ -551,7 +556,9 @@ impl ChatLog {
     ) -> Result<usize, Error> {
         let before = self.file.messages.len();
         self.file.messages.retain(|r| {
-            !(is_chat_payload(r) && r.contact_nick == contact_nick && in_range(r.ts_ms, from_ms, to_ms))
+            !(is_chat_payload(r)
+                && r.contact_nick == contact_nick
+                && in_range(r.ts_ms, from_ms, to_ms))
         });
         let removed = before - self.file.messages.len();
         if removed > 0 {
@@ -603,13 +610,11 @@ impl ChatLog {
                 }
             }
             let mut i = 0;
-            self.file
-                .messages
-                .retain(|_| {
-                    let k = keep[i];
-                    i += 1;
-                    k
-                });
+            self.file.messages.retain(|_| {
+                let k = keep[i];
+                i += 1;
+                k
+            });
         }
 
         let removed = before - self.file.messages.len();
@@ -909,6 +914,38 @@ impl ChatLog {
         Ok(true)
     }
 
+    /// Whether any chat, mail, drop, draft or conclave record still points at
+    /// this vault blob.
+    ///
+    /// Blobs are content-addressed, so two features can name the same bytes —
+    /// an imported file and a chat attachment, say. A feature that offers to
+    /// delete a blob asks this first, so removing one entry cannot make an
+    /// unrelated one unreadable. Case-insensitive because the hex id is a
+    /// digest, not a user-visible identifier.
+    pub fn references_blob(&self, blob_id_hex: &str) -> bool {
+        let same = |id: &str| id.eq_ignore_ascii_case(blob_id_hex);
+        let in_attachments =
+            |attachments: &[MailAttachmentRecord]| attachments.iter().any(|a| same(&a.blob_id_hex));
+        self.file
+            .messages
+            .iter()
+            .any(|record| match &record.payload {
+                ChatRecordPayload::File { blob_id_hex, .. } => same(blob_id_hex),
+                ChatRecordPayload::Mail { attachments, .. }
+                | ChatRecordPayload::Drop { attachments, .. }
+                | ChatRecordPayload::Draft { attachments, .. } => in_attachments(attachments),
+                ChatRecordPayload::Text { .. } | ChatRecordPayload::Payment { .. } => false,
+            })
+            || self.file.conclaves.iter().any(|conclave| {
+                conclave.messages.iter().any(|message| {
+                    message
+                        .file
+                        .as_ref()
+                        .is_some_and(|file| same(&file.blob_id_hex))
+                })
+            })
+    }
+
     /// Mail records only, in log order. The Mail rail filters the same encrypted
     /// log the chat rail reads rather than keeping a second store.
     pub fn mail_records(&self) -> impl Iterator<Item = &ChatRecord> {
@@ -986,13 +1023,55 @@ mod tests {
     }
 
     #[test]
+    fn blob_references_are_seen_across_chat_mail_and_drafts() {
+        let dir = scratch("blob-refs");
+        let master = [7u8; MASTER_KEY_LEN];
+        let mut log = ChatLog::load(&dir, &master).unwrap();
+        let chat_blob = BlobId([0xAA; 32]);
+        let mail_blob = "bb".repeat(32);
+
+        assert!(!log.references_blob(&hex::encode(chat_blob.0)));
+        log.append_file(&master, "bob", true, "a.txt", &chat_blob, 3)
+            .unwrap();
+        log.append_mail(
+            &master,
+            "alice",
+            true,
+            "t-1",
+            None,
+            "body",
+            &[MailAttachmentRecord {
+                name: "b.txt".into(),
+                blob_id_hex: mail_blob.clone(),
+                size: 4,
+            }],
+            MailState::Sent,
+        )
+        .unwrap();
+
+        // Case-insensitive, and every record kind is covered.
+        assert!(log.references_blob(&hex::encode(chat_blob.0).to_uppercase()));
+        assert!(log.references_blob(&mail_blob));
+        assert!(!log.references_blob(&"cc".repeat(32)));
+    }
+
+    #[test]
     fn a_queued_message_keeps_its_state_across_a_reload() {
         let dir = scratch("queued");
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
         let id = log
-            .append_mail(&master, "alice", true, "t-1", None, "waiting", &[], MailState::Queued)
+            .append_mail(
+                &master,
+                "alice",
+                true,
+                "t-1",
+                None,
+                "waiting",
+                &[],
+                MailState::Queued,
+            )
             .unwrap();
 
         let reloaded = ChatLog::load(&dir, &master).unwrap();
@@ -1139,7 +1218,9 @@ mod tests {
             .unwrap();
 
         let reloaded = ChatLog::load(&dir, &master).unwrap();
-        let conclave = reloaded.conclave(&id).expect("the conclave survives a reload");
+        let conclave = reloaded
+            .conclave(&id)
+            .expect("the conclave survives a reload");
         assert_eq!(conclave.name, "Standup");
         assert_eq!(conclave.convener, "self");
         assert_eq!(conclave.trustees.len(), 3);
@@ -1157,18 +1238,18 @@ mod tests {
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
-        assert!(
-            log.create_conclave_with_id(
+        assert!(log
+            .create_conclave_with_id(
                 &master,
                 "c-1",
                 "Trip",
                 "convener",
                 &[trustee("convener", "alice", TrusteeState::Joined)]
             )
-            .unwrap()
-        );
+            .unwrap());
         assert!(
-            !log.create_conclave_with_id(&master, "c-1", "Again", "convener", &[]).unwrap(),
+            !log.create_conclave_with_id(&master, "c-1", "Again", "convener", &[])
+                .unwrap(),
             "the same id is not created twice"
         );
         assert_eq!(log.conclave("c-1").unwrap().name, "Trip");
@@ -1235,10 +1316,9 @@ mod tests {
         let mut log = ChatLog::load(&dir, &master).unwrap();
         // A record written before consent existed: a bare nickname, which decodes
         // with an empty account id.
-        assert!(
-            log.create_conclave_with_id(&master, "m-1", "Standup", "", &[])
-                .unwrap()
-        );
+        assert!(log
+            .create_conclave_with_id(&master, "m-1", "Standup", "", &[])
+            .unwrap());
         log.update_conclave(&master, "m-1", |c| {
             c.trustees = vec![trustee("", "bob", TrusteeState::Joined)];
         })
@@ -1259,7 +1339,9 @@ mod tests {
         assert_eq!(c.trustee("bob-id").unwrap().state, TrusteeState::Joined);
         assert_eq!(c.convener, "self");
         // A second hydration is a no-op.
-        assert!(!log.hydrate_trustees(&master, "m-1", "self", |_| None).unwrap());
+        assert!(!log
+            .hydrate_trustees(&master, "m-1", "self", |_| None)
+            .unwrap());
     }
 
     /// The pre-existing "Daily sync" shape: the legacy nickname list names the
@@ -1273,10 +1355,9 @@ mod tests {
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
-        assert!(
-            log.create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
-                .unwrap()
-        );
+        assert!(log
+            .create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
+            .unwrap());
         log.update_conclave(&master, "m-1", |c| {
             c.trustees = vec![
                 trustee("", "alice", TrusteeState::Joined),
@@ -1311,10 +1392,9 @@ mod tests {
         let master = [7u8; MASTER_KEY_LEN];
 
         let mut log = ChatLog::load(&dir, &master).unwrap();
-        assert!(
-            log.create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
-                .unwrap()
-        );
+        assert!(log
+            .create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
+            .unwrap());
         // The shape the old hydration left: the local account's nickname as its
         // own account id, next to a properly resolved contact.
         log.update_conclave(&master, "m-1", |c| {
@@ -1334,7 +1414,9 @@ mod tests {
         assert!(c.is_joined("alice-id"));
         assert!(c.is_joined("bob-id"));
         // Now idempotent: nothing left to heal.
-        assert!(!log.hydrate_trustees(&master, "m-1", "alice-id", |_| None).unwrap());
+        assert!(!log
+            .hydrate_trustees(&master, "m-1", "alice-id", |_| None)
+            .unwrap());
     }
 
     /// The two legacy copies of one conclave disagreed: one vault's nickname list
@@ -1350,11 +1432,9 @@ mod tests {
         let alice_dir = dir.join("alice");
         fs::create_dir_all(&alice_dir).unwrap();
         let mut alice_log = ChatLog::load(&alice_dir, &master).unwrap();
-        assert!(
-            alice_log
-                .create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
-                .unwrap()
-        );
+        assert!(alice_log
+            .create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
+            .unwrap());
         alice_log
             .update_conclave(&master, "m-1", |c| {
                 c.trustees = vec![
@@ -1373,11 +1453,9 @@ mod tests {
         let bob_dir = dir.join("bob");
         fs::create_dir_all(&bob_dir).unwrap();
         let mut bob_log = ChatLog::load(&bob_dir, &master).unwrap();
-        assert!(
-            bob_log
-                .create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
-                .unwrap()
-        );
+        assert!(bob_log
+            .create_conclave_with_id(&master, "m-1", "Daily sync", "", &[])
+            .unwrap());
         bob_log
             .update_conclave(&master, "m-1", |c| {
                 c.trustees = vec![trustee("", "alice", TrusteeState::Joined)];
@@ -1472,7 +1550,10 @@ mod tests {
         // The whole record — messages included — is gone, and it stays gone
         // after a reload.
         let reloaded = ChatLog::load(&dir, &master).unwrap();
-        assert!(reloaded.conclave(&id).is_none(), "the record does not survive a reload");
+        assert!(
+            reloaded.conclave(&id).is_none(),
+            "the record does not survive a reload"
+        );
         assert_eq!(reloaded.conclaves().len(), 0);
         assert_eq!(reloaded.chat_records().count(), 0);
     }
@@ -1483,7 +1564,11 @@ mod tests {
     fn a_log_written_before_the_rename_still_loads() {
         let json = r#"{"messages":[],"meetings":[{"id":"m-1","name":"Standup","members":["bob"],"created_ms":1,"messages":[]}]}"#;
         let file: ChatLogFile = serde_json::from_str(json).unwrap();
-        assert_eq!(file.conclaves.len(), 1, "the old `meetings` key still loads");
+        assert_eq!(
+            file.conclaves.len(),
+            1,
+            "the old `meetings` key still loads"
+        );
         assert_eq!(file.conclaves[0].id, "m-1");
         assert!(!file.conclaves[0].ended, "an old record loads as active");
         // The bare nickname decodes into a trustee with an unknown account id,

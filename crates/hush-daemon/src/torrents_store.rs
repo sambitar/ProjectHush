@@ -192,12 +192,7 @@ impl TorrentItem {
     /// temp files). Counting from disk means a resumed transfer reports its
     /// real position instead of restarting the bar at 0%.
     pub fn refresh_download_totals(&mut self, on_disk: u64) {
-        let done_bytes: u64 = self
-            .files
-            .iter()
-            .filter(|f| f.done)
-            .map(|f| f.size)
-            .sum();
+        let done_bytes: u64 = self.files.iter().filter(|f| f.done).map(|f| f.size).sum();
         self.dl_total = self.files.iter().map(|f| f.size).sum();
         self.dl_done = (done_bytes + on_disk).min(self.dl_total);
     }
@@ -290,6 +285,19 @@ impl TorrentsState {
 
     pub fn item(&self, id: &str) -> Option<&TorrentItem> {
         self.items.iter().find(|i| i.id == id)
+    }
+
+    /// Whether a queued or library torrent still points at this vault blob.
+    ///
+    /// The torrents sidecar is the only other place a blob id is kept outside
+    /// the chat log, so a caller deleting a blob asks here too.
+    pub fn references_blob(&self, blob_id: &str) -> bool {
+        let same = |id: Option<&str>| id.is_some_and(|id| id.eq_ignore_ascii_case(blob_id));
+        self.items
+            .iter()
+            .flat_map(|i| i.files.iter())
+            .chain(self.library.iter().flat_map(|e| e.files.iter()))
+            .any(|f| same(f.blob_id.as_deref()))
     }
 
     pub fn item_mut(&mut self, id: &str) -> Option<&mut TorrentItem> {
@@ -472,11 +480,7 @@ mod tests {
         ] {
             assert!(s.is_active(), "{s:?} should be active");
         }
-        for s in [
-            ItemStatus::Completed,
-            ItemStatus::Paused,
-            ItemStatus::Error,
-        ] {
+        for s in [ItemStatus::Completed, ItemStatus::Paused, ItemStatus::Error] {
             assert!(!s.is_active(), "{s:?} should be inactive");
         }
     }
@@ -510,7 +514,11 @@ mod tests {
         state.move_to_library("a");
         assert!(state.items.is_empty());
         assert_eq!(state.library.len(), 1);
-        assert_eq!(state.library[0].files.len(), 1, "unstored file is not filed");
+        assert_eq!(
+            state.library[0].files.len(),
+            1,
+            "unstored file is not filed"
+        );
         assert_eq!(state.library[0].files[0].path, "one.mkv");
 
         // Calling again is a harmless no-op.
@@ -593,7 +601,10 @@ mod tests {
         let mut item = TorrentItem::new("queued".into(), "One".into(), SourceKind::Magnet);
         item.hash = Some(hash.clone());
         state.items.push(item);
-        assert_eq!(state.id_for_hash(&hash.to_ascii_uppercase()), Some("queued"));
+        assert_eq!(
+            state.id_for_hash(&hash.to_ascii_uppercase()),
+            Some("queued")
+        );
 
         state.library.push(LibraryEntry {
             id: "filed".into(),
@@ -673,7 +684,10 @@ mod tests {
         i.source_data = Some("magnet:?xt=urn:btih:secret".into());
         i.size = 1234;
         let public = i.public_clone();
-        assert!(public.source_data.is_none(), "the magnet must not reach the UI");
+        assert!(
+            public.source_data.is_none(),
+            "the magnet must not reach the UI"
+        );
         assert_eq!(public.id, "a");
         assert_eq!(public.size, 1234);
         // The original still holds it, so a restart can resume the add.

@@ -1,9 +1,10 @@
 [[permission]]
 identifier = "allow-hush-files"
-description = "Open and save files through the OS: chat attachments and vault blobs"
+description = "Open, save and pick files through the OS: chat attachments, vault blobs and the vault's own file library"
 commands.allow = [
     "hush_save_file",
     "hush_open_file",
     "hush_open_blob",
     "hush_save_blob",
+    "hush_pick_vault_files",
 ]

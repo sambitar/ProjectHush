@@ -3,6 +3,7 @@ import { isTauriShell } from "../tauriEnv";
 import type {
   ChatRecordDto,
   ContactDto,
+  ContactRequestDto,
   IntroListsDto,
   InviteResponse,
   MailboxDto,
@@ -34,6 +35,8 @@ import type {
   TorrentShareDto,
   TorrentsStateDto,
   TrusteeReach,
+  VaultFileResponse,
+  VaultFilesStateDto,
   WalletAddressDto,
   WalletAnnounceResult,
   WalletChain,
@@ -382,6 +385,32 @@ export const api = {
     }),
   /** Invitations received but not yet accepted or declined. */
   pendingInvites: () => request<PendingInviteDto[]>("/api/conclaves/invites"),
+  /** Pending 1:1 contact requests, newest first. */
+  pendingContactRequests: () =>
+    request<ContactRequestDto[]>("/api/contact-requests"),
+  /** Ask a peer to connect; they must accept before a contact exists. */
+  requestContact: (nickname: string, invite: string, note?: string) =>
+    request<null>("/api/contact-requests/request", {
+      method: "POST",
+      body: JSON.stringify({ nickname, invite, note }),
+    }),
+  /** Accept a request and learn the nickname the vault chose for the contact. */
+  acceptContactRequest: (accountId: string, nickname?: string) =>
+    request<{ nickname: string }>("/api/contact-requests/accept", {
+      method: "POST",
+      body: JSON.stringify({ account_id: accountId, nickname }),
+    }),
+  declineContactRequest: (accountId: string) =>
+    request<null>("/api/contact-requests/decline", {
+      method: "POST",
+      body: JSON.stringify({ account_id: accountId }),
+    }),
+  /** Withdraw a request this vault sent. */
+  cancelContactRequest: (accountId: string) =>
+    request<null>("/api/contact-requests/cancel", {
+      method: "POST",
+      body: JSON.stringify({ account_id: accountId }),
+    }),
   /** The introduction queues: requests to answer or relay, invites to accept. */
   introLists: () => request<IntroListsDto>("/api/conclaves/intros"),
   /**
@@ -544,6 +573,25 @@ export const api = {
     request<NotesStateDto>(`/api/notes/note/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
+  // --- Your files (the vault's own encrypted file library). The desktop
+  // picker sends a path so the daemon streams the file; the browser build
+  // uploads base64 under a hard cap. ---
+  vaultFiles: () => request<VaultFilesStateDto>("/api/vault/files"),
+  vaultFileImportPath: (path: string) =>
+    request<VaultFileResponse>("/api/vault/files/import", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }),
+  vaultFileUpload: (name: string, data_base64: string) =>
+    request<VaultFileResponse>("/api/vault/files/upload", {
+      method: "POST",
+      body: JSON.stringify({ name, data_base64 }),
+    }),
+  vaultFileDelete: (id: string) =>
+    request<VaultFilesStateDto>(
+      `/api/vault/files/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
   // --- Paper (the conclave's shared collaborative document). The daemon owns
   // the merged CRDT state; the editor sends opaque updates and reads back
   // merged ones. 401 until unlocked, 404 when the conclave has no paper. ---

@@ -34,12 +34,20 @@ pub enum Error {
     ReachMailOnly,
     #[error("contact already exists")]
     ContactExists,
+    #[error("a contact request with this account is already pending")]
+    ContactRequestExists,
+    #[error("no pending contact request for this account")]
+    ContactRequestNotFound,
+    #[error("invalid contact request")]
+    InvalidContactRequest,
     #[error("unsupported invite version")]
     UnsupportedInvite,
     #[error("passphrase required: use --passphrase or set HUSH_PASSPHRASE")]
     PassphraseRequired,
     #[error("file too large (max {0} bytes)")]
     FileTooLarge(usize),
+    #[error("invalid file offer")]
+    InvalidFileOffer,
     #[error("invite relay {0} does not match this vault relay {1}")]
     RelayMismatch(String, String),
     #[error("handle must be 1-64 characters of a-z, 0-9, dot, underscore or dash")]

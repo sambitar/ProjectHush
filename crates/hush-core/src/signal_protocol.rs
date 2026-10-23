@@ -1,9 +1,9 @@
 use std::time::SystemTime;
 
 use libsignal_protocol::{
-    DeviceId, IdentityKeyPair, InMemSignalProtocolStore, KeyPair, KyberPreKeyId,
-    KyberPreKeyRecord, PreKeyBundle, PreKeyId, PreKeyRecord, ProtocolAddress,
-    SignedPreKeyId, SignedPreKeyRecord, Timestamp,
+    DeviceId, IdentityKeyPair, InMemSignalProtocolStore, KeyPair, KyberPreKeyId, KyberPreKeyRecord,
+    PreKeyBundle, PreKeyId, PreKeyRecord, ProtocolAddress, SignedPreKeyId, SignedPreKeyRecord,
+    Timestamp,
 };
 use libsignal_protocol::{
     GenericSignedPreKey, IdentityKeyStore, KyberPreKeyStore, PreKeyStore, SignedPreKeyStore,
@@ -39,7 +39,10 @@ pub fn sign_queue_grant(
 ) -> Result<Vec<u8>, Error> {
     let mut csprng = OsRng.unwrap_err();
     key.private_key()
-        .calculate_signature(&queue_grant_signing_bytes(queue_id, delivery_token), &mut csprng)
+        .calculate_signature(
+            &queue_grant_signing_bytes(queue_id, delivery_token),
+            &mut csprng,
+        )
         .map(|sig| sig.into_vec())
         .map_err(|_| Error::Corrupt)
 }
@@ -58,8 +61,10 @@ pub fn verify_queue_grant(
     let Ok(key) = libsignal_protocol::IdentityKey::try_from(identity_key) else {
         return false;
     };
-    key.public_key()
-        .verify_signature(&queue_grant_signing_bytes(queue_id, delivery_token), signature)
+    key.public_key().verify_signature(
+        &queue_grant_signing_bytes(queue_id, delivery_token),
+        signature,
+    )
 }
 
 /// Build the address of an account's one device.
@@ -114,7 +119,10 @@ pub async fn mint_prekey_bundle(
     let kyber_pre_key_id: u32 = csprng.random();
 
     let pre_key_bundle = PreKeyBundle::new(
-        store.get_local_registration_id().await.map_err(|_| Error::Corrupt)?,
+        store
+            .get_local_registration_id()
+            .await
+            .map_err(|_| Error::Corrupt)?,
         device_id,
         Some((PreKeyId::from(pre_key_id), pre_key_pair.public_key)),
         SignedPreKeyId::from(signed_pre_key_id),
@@ -265,6 +273,10 @@ pub async fn mint_publishable_prekeys(
         kyber_pre_key_public: kyber_pre_key_public.to_vec(),
         kyber_pre_key_signature: kyber_pre_key_signature.to_vec(),
         one_time_prekeys,
+        // Inline path only until the chunked transfer lands (A2). Advertising
+        // `true` before the receive path exists would invite offers this build
+        // has to discard.
+        supports_file_transfer: false,
     })
 }
 
@@ -316,6 +328,9 @@ pub fn invite_from_bundle(
             .to_vec(),
         handle: handle.map(|h| h.to_string()),
         vault: vault_name.map(|v| v.to_string()),
+        // Same staged gate as `mint_publishable_prekeys`: flip this on with the
+        // chunked receive path, not before.
+        supports_file_transfer: false,
     })
 }
 
@@ -394,6 +409,27 @@ pub async fn decrypt_message(
     )
     .await
     .map_err(|_| Error::Session)
+}
+
+/// The sender's identity key from a first (prekey) message, if this blob is
+/// one.
+///
+/// A relay blob carries no sender id, so an inbox read can only attribute a
+/// message by decryption. For a known contact that means trying each session;
+/// for a stranger it means reading the identity key the prekey message already
+/// names. The account id is `hex(identity_key)` (see
+/// [`protocol_name_from_identity`]), so this yields exactly the value the
+/// sender's invite carries — no directory, no relay metadata, and no relaxed
+/// authentication: the key is the one the message was built with.
+///
+/// Returns `None` for anything that is not a prekey message. A steady-state
+/// ciphertext has no sender field and must be attributed against a known
+/// session instead.
+pub fn sender_identity_from_prekey(bytes: &[u8]) -> Option<Vec<u8>> {
+    use libsignal_protocol::PreKeySignalMessage;
+    PreKeySignalMessage::try_from(bytes)
+        .ok()
+        .map(|message| message.identity_key().serialize().to_vec())
 }
 
 fn parse_ciphertext(bytes: &[u8]) -> Result<libsignal_protocol::CiphertextMessage, Error> {
