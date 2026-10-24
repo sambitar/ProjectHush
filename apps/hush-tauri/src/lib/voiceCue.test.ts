@@ -122,3 +122,37 @@ test("an unread status cannot mistake an unknown opener for this vault", () => {
 test("no live rooms is silence", () => {
   assert.equal(cue([]), "none");
 });
+
+// A 1:1 call shares the same two clips. These pin the phase mapping, which the
+// call UI drives from `syncCallOverlay` rather than from the room poll.
+
+test("an unanswered 1:1 offer rings, in front or behind", () => {
+  assert.equal(cue([], { call: "incoming" }), "ring");
+  assert.equal(cue([], { call: "incoming", windowVisible: false }), "ring");
+});
+
+test("an outgoing call plays the ringback until it is answered", () => {
+  assert.equal(cue([], { call: "ringing" }), "tone");
+  assert.equal(cue([], { call: "connecting" }), "none");
+  assert.equal(cue([], { call: "active" }), "none");
+});
+
+test("a hidden window does not play the call ringback", () => {
+  assert.equal(cue([], { call: "ringing", windowVisible: false }), "none");
+});
+
+test("an incoming call outranks a conclave ringback and a conclave ring outranks a call ringback", () => {
+  const mine = room({ opener: "me", i_am_in: true });
+  assert.equal(cue([mine], { call: "incoming" }), "ring");
+  assert.equal(cue([room()], { call: "ringing" }), "ring");
+});
+
+test("the sound switch silences a ringing call too", () => {
+  assert.equal(cue([], { call: "incoming", soundsEnabled: false }), "none");
+  assert.equal(cue([], { call: "ringing", soundsEnabled: false }), "none");
+});
+
+test("a finished call leaves the room cue to decide", () => {
+  assert.equal(cue([], { call: null }), "none");
+  assert.equal(cue([room()], { call: "active" }), "ring");
+});

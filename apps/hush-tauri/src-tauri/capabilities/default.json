@@ -9,6 +9,7 @@
     "allow-hush-files",
     "allow-hush-url",
     "allow-hush-api",
+    "allow-hush-mobile",
     "allow-drops",
     "allow-chat-sound",
     "allow-voice-cue",

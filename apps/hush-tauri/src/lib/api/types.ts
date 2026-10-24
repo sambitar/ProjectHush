@@ -429,6 +429,14 @@ export interface DropsDrainDto {
   remaining: number;
 }
 
+export interface RecvCallDto {
+  from: string;
+  kind: "offer" | "answer" | "end";
+  session_id: string;
+  sdp: string | null;
+  reason: string | null;
+}
+
 export interface RecvResponse {
   messages: ReceivedDto[];
   /**
@@ -438,6 +446,8 @@ export interface RecvResponse {
   expire_messages: ExpireMessageDto[];
   /** Accepted trustee signals, out of band. Never chat rows. */
   signals: ReceivedSignalDto[];
+  /** 1:1 call signalling (offer/answer/end). Never chat rows. */
+  calls?: RecvCallDto[];
   /** Acknowledgements for signals this vault sent. */
   signal_acks: ReceivedSignalAckDto[];
   warnings: string[];

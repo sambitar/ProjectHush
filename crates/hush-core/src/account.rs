@@ -18,8 +18,8 @@ use crate::device::{DeviceKeys, DEVICE_ID, LEGACY_DEVICE_FILE};
 use crate::error::Error;
 use crate::invite::{InvitePayload, ShortInvite};
 use crate::message::{
-    InboxResult, ReceivedAttachment, ReceivedEphemeral, ReceivedMessage, ReceivedPaper,
-    ReceivedVoice,
+    InboxResult, ReceivedAttachment, ReceivedCall, ReceivedEphemeral, ReceivedMessage,
+    ReceivedPaper, ReceivedVoice,
 };
 use crate::payload::{ConclaveDescriptor, ConclaveTrustee, TrusteeReach, TrusteeState};
 use crate::payload::{
@@ -3082,6 +3082,59 @@ impl Account {
         Ok(())
     }
 
+    /// Send one 1:1 call-signalling payload (Task 17).
+    ///
+    /// Deliberately not a chat row: nothing is written to the log, and the other
+    /// side sees it only through [`InboxResult::calls`]. The SDP is the JSON
+    /// both WebRTC stacks agree on and already carries gathered candidates.
+    pub async fn send_call_offer(
+        &mut self,
+        nickname: &str,
+        session_id: &str,
+        sdp: &str,
+    ) -> Result<(), Error> {
+        self.send_payload(
+            nickname,
+            MessagePayload::CallOffer {
+                session_id: session_id.to_string(),
+                sdp: sdp.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn send_call_answer(
+        &mut self,
+        nickname: &str,
+        session_id: &str,
+        sdp: &str,
+    ) -> Result<(), Error> {
+        self.send_payload(
+            nickname,
+            MessagePayload::CallAnswer {
+                session_id: session_id.to_string(),
+                sdp: sdp.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn send_call_end(
+        &mut self,
+        nickname: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<(), Error> {
+        self.send_payload(
+            nickname,
+            MessagePayload::CallEnd {
+                session_id: session_id.to_string(),
+                reason: reason.to_string(),
+            },
+        )
+        .await
+    }
+
     /// Send a chat line that both sides delete after `ttl_ms`.
     ///
     /// Live-only, like [`Account::send_text`], and deliberately not filed on
@@ -5973,6 +6026,7 @@ impl Account {
         let mut ephemeral = Vec::new();
         let mut papers = Vec::new();
         let mut voices = Vec::new();
+        let mut calls = Vec::new();
         let mut zine_grants = Vec::new();
         let mut signals = Vec::new();
         let mut signal_acks = Vec::new();
@@ -7086,6 +7140,21 @@ impl Account {
                         dirty = true;
                         continue;
                     }
+                    // 1:1 call signalling (Task 17). Not chat, never filed; the
+                    // caller's call state machine owns the SDP. The session is
+                    // the authentication, so no further authority check.
+                    MessagePayload::CallOffer { .. }
+                    | MessagePayload::CallAnswer { .. }
+                    | MessagePayload::CallEnd { .. } => {
+                        calls.push(ReceivedCall {
+                            from_account: from_account.clone(),
+                            from_nick: nick.clone(),
+                            payload: payload.clone(),
+                        });
+                    consume!(blob_id);
+                        dirty = true;
+                        continue;
+                    }
                     // A voice payload in someone else's name (a forged open, a
                     // mute or leave for another trustee) or for a conclave this
                     // vault has never joined is consumed and dropped — the
@@ -7186,6 +7255,7 @@ impl Account {
             ephemeral,
             papers,
             voices,
+            calls,
             signals,
             signal_acks,
             wallet_announce_to,

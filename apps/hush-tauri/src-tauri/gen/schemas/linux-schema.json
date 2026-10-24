@@ -201,6 +201,12 @@
           "markdownDescription": "Open, save and pick files through the OS: chat attachments, vault blobs and the vault's own file library"
         },
         {
+          "description": "Proxy UI requests to the in-process vault backend on Android",
+          "type": "string",
+          "const": "allow-hush-mobile",
+          "markdownDescription": "Proxy UI requests to the in-process vault backend on Android"
+        },
+        {
           "description": "Open external http(s) links in the user's browser",
           "type": "string",
           "const": "allow-hush-url",

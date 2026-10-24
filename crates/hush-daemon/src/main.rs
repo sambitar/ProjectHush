@@ -116,6 +116,11 @@ struct App {
     /// created on demand when a room opens or an offer arrives. Same contract
     /// as `paper_planes`: runtime-only, a peer-connection map, safe to lose.
     voice_planes: Mutex<HashMap<String, Arc<voice_data::VoicePlane>>>,
+    /// 1:1 call media planes, keyed by the call's session id. The phone builds
+    /// its side in the WebView, but the desktop shell has no WebRTC (WebKitGTK
+    /// on this platform ships without it), so the daemon owns the desktop half:
+    /// same plane type as conclave voice, one connection per call. Runtime-only.
+    call_planes: Mutex<HashMap<String, Arc<voice_data::VoicePlane>>>,
     /// Conclave voice's ring stamps, keyed by session id: the deadline until
     /// which an inbound open should ring this vault, so the UI can offer an
     /// answer instead of a silent pill. Runtime-only and self-expiring — the
@@ -314,6 +319,65 @@ struct IntroducePlaceRequest {
 struct SendTextRequest {
     to: String,
     text: String,
+}
+
+/// One leg of 1:1 call signalling. The SDP is gathered to completion before it
+/// is sent (non-trickle), so there is no candidate payload to route.
+#[derive(Deserialize)]
+struct CallSdpRequest {
+    to: String,
+    session_id: String,
+    sdp: String,
+}
+
+#[derive(Deserialize)]
+struct CallEndRequest {
+    to: String,
+    session_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// The phone's WebView speaks raw SDP, but the daemon's `VoicePlane` passes the
+/// whole `RTCSessionDescription` as JSON. These two adapters sit at the call
+/// boundary: what leaves over the relay is always the raw SDP string, which is
+/// the only format both media stacks share.
+fn sdp_of_plane(serialized: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(serialized)
+        .ok()
+        .and_then(|v| v.get("sdp").and_then(|s| s.as_str()).map(str::to_string))
+        .unwrap_or_else(|| serialized.to_string())
+}
+
+fn sdp_as_description(kind: &str, sdp: &str) -> String {
+    serde_json::json!({ "type": kind, "sdp": sdp }).to_string()
+}
+
+/// Media-plane request bodies for the desktop's daemon-owned half of a 1:1
+/// call. `to` is the contact's local nickname, which the plane uses as its
+/// peer key; `session_id` is the UI-generated call id.
+#[derive(Deserialize)]
+struct CallMediaOfferRequest {
+    to: String,
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+struct CallMediaAnswerRequest {
+    to: String,
+    session_id: String,
+    sdp: String,
+}
+
+#[derive(Deserialize)]
+struct CallMediaEndRequest {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+struct CallMediaMuteRequest {
+    session_id: String,
+    muted: bool,
 }
 
 #[derive(Deserialize)]
@@ -617,6 +681,13 @@ fn api_router(state: Arc<App>) -> Router {
         .route("/api/send-expire", post(send_expire_text))
         .route("/api/send-file", post(send_file))
         .route("/api/send-file-data", post(send_file_data))
+        .route("/api/call/offer", post(call_offer))
+        .route("/api/call/answer", post(call_answer))
+        .route("/api/call/end", post(call_end))
+        .route("/api/call/media/offer", post(call_media_offer))
+        .route("/api/call/media/answer", post(call_media_answer))
+        .route("/api/call/media/end", post(call_media_end))
+        .route("/api/call/media/mute", post(call_media_mute))
         .route("/api/presence/heartbeat", post(presence_heartbeat))
         .route("/api/presence/offline", post(presence_offline))
         .route("/api/recv", post(recv))
@@ -690,6 +761,9 @@ pub(crate) async fn force_lock(state: &Arc<App>) {
     // this *is* the leave, and peers see it as one. The media planes go the
     // same way: every peer connection closes, every capture stream stops.
     voice_planes_shutdown(state).await;
+    // 1:1 call media ends with the lock too: a locked vault holds no keys and
+    // must not keep a mic or a peer connection open.
+    call_planes_shutdown(state).await;
     state.voices.lock().await.clear();
 }
 
@@ -771,6 +845,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         paper_planes: Mutex::new(HashMap::new()),
         voices: Mutex::new(VoiceManager::new()),
         voice_planes: Mutex::new(HashMap::new()),
+        call_planes: Mutex::new(HashMap::new()),
         voice_rings: Mutex::new(HashMap::new()),
         device_probe: Mutex::new(None),
         pending_payments: Mutex::new(HashMap::new()),
@@ -2396,9 +2471,125 @@ async fn send_text(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Send a live chat line that both sides forget at the returned deadline.
-///
-/// Nothing is written to the chat log on either side; the response carries the
+async fn call_offer(
+    State(state): State<Arc<App>>,
+    Json(body): Json<CallSdpRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .send_call_offer(&body.to, &body.session_id, &body.sdp)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn call_answer(
+    State(state): State<Arc<App>>,
+    Json(body): Json<CallSdpRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .send_call_answer(&body.to, &body.session_id, &body.sdp)
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn call_end(
+    State(state): State<Arc<App>>,
+    Json(body): Json<CallEndRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    map_err(
+        state
+            .worker
+            .send_call_end(
+                &body.to,
+                &body.session_id,
+                body.reason.as_deref().unwrap_or("hangup"),
+            )
+            .await,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Place a call's outgoing media in the daemon (desktop only): build the plane's
+/// offer, then send it as the call's signal. The phone side does this in the
+/// WebView and never reaches here.
+async fn call_media_offer(
+    State(state): State<Arc<App>>,
+    Json(body): Json<CallMediaOfferRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let _me = paper_account_id(&state).await?;
+    let plane = call_plane_for(&state, &body.session_id).await;
+    let sdp = match plane.offer(&body.to).await {
+        Ok(sdp) => sdp_of_plane(&sdp),
+        Err(e) => {
+            eprintln!("hush-daemon: call offer to {} failed: {e}", body.to);
+            return Err(voice_err(e));
+        }
+    };
+    map_err(
+        state
+            .worker
+            .send_call_offer(&body.to, &body.session_id, &sdp)
+            .await,
+    )?;
+    eprintln!("hush-daemon: call offer to {} sent", body.to);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Answer an incoming call's offer with the daemon's plane and send the answer
+/// back as the call's signal.
+async fn call_media_answer(
+    State(state): State<Arc<App>>,
+    Json(body): Json<CallMediaAnswerRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let _me = paper_account_id(&state).await?;
+    let plane = call_plane_for(&state, &body.session_id).await;
+    let sdp = plane
+        .answer(&body.to, &sdp_as_description("offer", &body.sdp))
+        .await
+        .map_err(|e| {
+            eprintln!("hush-daemon: call answer to {} failed: {e}", body.to);
+            voice_err(e)
+        })?;
+    let sdp = sdp_of_plane(&sdp);
+    map_err(
+        state
+            .worker
+            .send_call_answer(&body.to, &body.session_id, &sdp)
+            .await,
+    )?;
+    eprintln!("hush-daemon: call answer to {} sent ({} bytes)", body.to, sdp.len());
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Hang up the local media half; the caller also fans out a `CallEnd` signal.
+async fn call_media_end(
+    State(state): State<Arc<App>>,
+    Json(body): Json<CallMediaEndRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    call_plane_drop(&state, &body.session_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn call_media_mute(
+    State(state): State<Arc<App>>,
+    Json(body): Json<CallMediaMuteRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    touch(&state).await;
+    let plane = call_plane_for(&state, &body.session_id).await;
+    plane.set_muted(body.muted);
+    Ok(StatusCode::NO_CONTENT)
+}
 /// deadline the sender's UI arms its own timer with.
 async fn send_expire_text(
     State(state): State<Arc<App>>,
@@ -2479,6 +2670,9 @@ struct RecvResponse {
     /// Live chat lines that expire. Never written to the chat log on either
     /// side; the caller holds them only until `expires_ms`.
     expire_messages: Vec<ExpireDto>,
+    /// 1:1 call signalling from this poll. Never chat rows: the SDP is held only
+    /// for the life of the call.
+    calls: Vec<CallDto>,
     /// Accepted trustee signals, out of band. Never chat rows.
     signals: Vec<hush_core::ReceivedSignal>,
     /// Acknowledgements for signals this vault sent.
@@ -2488,6 +2682,39 @@ struct RecvResponse {
     /// today only a verified incoming payment. The UI re-reads its history so
     /// the line appears without the pane guessing at a record id.
     chat_appended: bool,
+}
+
+/// One call-signalling leg as the UI reads it. Mirrors the phone's DTO so the
+/// shared UI has one shape on both targets.
+#[derive(Serialize)]
+struct CallDto {
+    from: String,
+    kind: &'static str,
+    session_id: String,
+    sdp: Option<String>,
+    reason: Option<String>,
+}
+
+fn call_dto(call: hush_core::ReceivedCall) -> Option<CallDto> {
+    let (kind, session_id, sdp, reason) = match call.payload {
+        MessagePayload::CallOffer { session_id, sdp } => {
+            ("offer", session_id, Some(sdp), None)
+        }
+        MessagePayload::CallAnswer { session_id, sdp } => {
+            ("answer", session_id, Some(sdp), None)
+        }
+        MessagePayload::CallEnd {
+            session_id, reason, ..
+        } => ("end", session_id, None, Some(reason)),
+        _ => return None,
+    };
+    Some(CallDto {
+        from: call.from_nick,
+        kind,
+        session_id,
+        sdp,
+        reason,
+    })
 }
 
 /// Apply the payment notices in an inbox batch.
@@ -2984,6 +3211,27 @@ async fn recv(
     if let Err((_, Json(err))) = zines_sync(&state, &inbox.zine_grants).await {
         eprintln!("hush-daemon: zines sync failed: {}", err.error);
     }
+    // The desktop's media half follows inbound call signalling. The offer is
+    // surfaced to the UI and its accept routes back into `/api/call/media/answer`;
+    // the answer and the end are driven here, where the payload already landed.
+    for call in &inbox.calls {
+        match &call.payload {
+            MessagePayload::CallAnswer { session_id, sdp } => {
+                if let Some(plane) = state.call_planes.lock().await.get(session_id).cloned() {
+                    if let Err(e) = plane
+                        .accept_answer(&call.from_nick, &sdp_as_description("answer", sdp))
+                        .await
+                    {
+                        eprintln!("hush-daemon: call answer refused: {e}");
+                    }
+                }
+            }
+            MessagePayload::CallEnd { session_id, .. } => {
+                call_plane_drop(&state, session_id).await;
+            }
+            _ => {}
+        }
+    }
     Ok(Json(RecvResponse {
         messages: inbox.messages.into_iter().filter_map(to_dto).collect(),
         expire_messages: inbox
@@ -2997,6 +3245,7 @@ async fn recv(
                 expires_ms: m.expires_ms,
             })
             .collect(),
+        calls: inbox.calls.into_iter().filter_map(call_dto).collect(),
         signals: inbox.signals,
         signal_acks: inbox.signal_acks,
         warnings: inbox.warnings,
@@ -3089,6 +3338,11 @@ fn to_dto(msg: ReceivedMessage) -> Option<ReceivedDto> {
         MessagePayload::QueueGrant { .. }
         | MessagePayload::ZineGrant { .. }
         | MessagePayload::Reach { .. }
+        // 1:1 call signalling (Task 17) is consumed by `recv` into
+        // `InboxResult::calls`; it is not an inbox row.
+        | MessagePayload::CallOffer { .. }
+        | MessagePayload::CallAnswer { .. }
+        | MessagePayload::CallEnd { .. }
         // Contact requests and their answers are consumed by `recv` and never
         // render as inbox rows.
         | MessagePayload::ContactRequest { .. }
@@ -7107,6 +7361,7 @@ async fn voice_plane_for(state: &Arc<App>, session_id: &str) -> Arc<voice_data::
         .or_insert_with(|| {
             Arc::new(voice_data::VoicePlane::with_selector(
                 hush_core::config::resolve_stun_url(&state.dir),
+                Some(hush_core::config::resolve_turn_config(&state.dir)),
                 voice_media_mode(),
                 voice_data::DeviceSelector {
                     input: hush_core::config::resolve_voice_input_device(&state.dir),
@@ -7135,6 +7390,36 @@ async fn voice_plane_drop(state: &Arc<App>, session_id: &str) {
     }
 }
 
+/// The media plane for a 1:1 call, created on demand keyed by the call's
+/// session id. `peer` inside the plane is the contact's local nickname, which
+/// is stable across the call's offer/answer/accept/forget on this side and
+/// needs no account-id resolution.
+async fn call_plane_for(state: &Arc<App>, session_id: &str) -> Arc<voice_data::VoicePlane> {
+    let mut planes = state.call_planes.lock().await;
+    planes
+        .entry(session_id.to_string())
+        .or_insert_with(|| {
+            Arc::new(voice_data::VoicePlane::with_selector(
+                hush_core::config::resolve_stun_url(&state.dir),
+                Some(hush_core::config::resolve_turn_config(&state.dir)),
+                voice_media_mode(),
+                voice_data::DeviceSelector {
+                    input: hush_core::config::resolve_voice_input_device(&state.dir),
+                    output: hush_core::config::resolve_voice_output_device(&state.dir),
+                },
+            ))
+        })
+        .clone()
+}
+
+/// Remove and close one call's plane (the caller hung up, or the peer's end
+/// arrived).
+async fn call_plane_drop(state: &Arc<App>, session_id: &str) {
+    if let Some(plane) = state.call_planes.lock().await.remove(session_id) {
+        plane.shutdown();
+    }
+}
+
 /// Close every voice plane. Locking the vault calls this beside
 /// `paper_planes_shutdown`: a locked vault holds no sessions and no sockets.
 /// The ring stamps go with them — a locked vault cannot answer, so there is
@@ -7145,6 +7430,18 @@ async fn voice_planes_shutdown(state: &Arc<App>) {
         planes.drain().map(|(_, plane)| plane).collect()
     };
     state.voice_rings.lock().await.clear();
+    for plane in planes {
+        plane.shutdown();
+    }
+}
+
+/// Close every 1:1 call plane. Locking the vault calls this beside
+/// `voice_planes_shutdown`.
+async fn call_planes_shutdown(state: &Arc<App>) {
+    let planes: Vec<Arc<voice_data::VoicePlane>> = {
+        let mut planes = state.call_planes.lock().await;
+        planes.drain().map(|(_, plane)| plane).collect()
+    };
     for plane in planes {
         plane.shutdown();
     }
@@ -7598,6 +7895,7 @@ async fn voice_probe_ensure(
     }
     let plane = Arc::new(voice_data::VoicePlane::with_selector(
         hush_core::config::resolve_stun_url(&state.dir),
+        Some(hush_core::config::resolve_turn_config(&state.dir)),
         voice_data::MediaMode::Device,
         voice_data::DeviceSelector {
             input: hush_core::config::resolve_voice_input_device(&state.dir),
@@ -8846,6 +9144,7 @@ mod drops_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
             voice_planes: Mutex::new(HashMap::new()),
+            call_planes: Mutex::new(HashMap::new()),
             voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
             pending_payments: Mutex::new(HashMap::new()),
@@ -9129,6 +9428,7 @@ mod wallet_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
             voice_planes: Mutex::new(HashMap::new()),
+            call_planes: Mutex::new(HashMap::new()),
             voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
             pending_payments: Mutex::new(HashMap::new()),
@@ -9662,6 +9962,7 @@ mod notes_api_tests {
             paper_planes: Mutex::new(HashMap::new()),
             voices: Mutex::new(VoiceManager::new()),
             voice_planes: Mutex::new(HashMap::new()),
+            call_planes: Mutex::new(HashMap::new()),
             voice_rings: Mutex::new(HashMap::new()),
             device_probe: Mutex::new(None),
             pending_payments: Mutex::new(HashMap::new()),

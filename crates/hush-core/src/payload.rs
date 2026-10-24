@@ -376,7 +376,9 @@ fn default_paper_title() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum MessagePayload {
-    Text { body: String },
+    Text {
+        body: String,
+    },
     /// A chat line that is deleted from both sides at `expires_ms`.
     ///
     /// Unlike [`MessagePayload::Text`], this payload is **never** written to
@@ -405,10 +407,14 @@ pub enum MessagePayload {
     /// A build that does not know this tag decodes it as `Unknown` and ignores
     /// it. Senders must check the contact's `supports_file_transfer` capability
     /// first; they must not assume every peer can receive this.
-    FileOffer { offer: FileOffer },
+    FileOffer {
+        offer: FileOffer,
+    },
     /// The recipient has verified and stored a `FileOffer`; the sender may
     /// burn the transfer queue.
-    FileReceived { transfer_id: String },
+    FileReceived {
+        transfer_id: String,
+    },
     /// A 1:1 contact request: the sender wants to connect and has already
     /// consumed the recipient's invite.
     ///
@@ -486,12 +492,16 @@ pub enum MessagePayload {
     /// vault has never seen no longer creates it. The invite is stored as a
     /// pending record the recipient must explicitly accept or decline, and only
     /// on acceptance does the conclave exist locally. Sent by the convener only.
-    ConclaveInvite { descriptor: ConclaveDescriptor },
+    ConclaveInvite {
+        descriptor: ConclaveDescriptor,
+    },
     /// An acknowledgement that an invited trustee joined.
     ///
     /// Sent to the convener, who re-broadcasts the authoritative trustee list so
     /// the convener's record distinguishes invited from joined on every peer.
-    ConclaveAccept { descriptor: ConclaveDescriptor },
+    ConclaveAccept {
+        descriptor: ConclaveDescriptor,
+    },
     /// A declined invitation.
     ///
     /// Deliberately silent to the convener beyond the state change: no further
@@ -506,7 +516,9 @@ pub enum MessagePayload {
     /// Sent by the leaver to the convener, who applies it and re-broadcasts the
     /// trustee list, so every joined trustee converges from one authority rather
     /// than a peer-to-peer flood.
-    ConclaveLeave { descriptor: ConclaveDescriptor },
+    ConclaveLeave {
+        descriptor: ConclaveDescriptor,
+    },
     /// The convener's authoritative trustee snapshot, sent to every joined
     /// trustee.
     ///
@@ -514,13 +526,17 @@ pub enum MessagePayload {
     /// reach the other trustees as a convener-originated update, so there is
     /// exactly one writer whose view everyone else adopts. Receivers accept it
     /// only from the convener named in the descriptor.
-    ConclaveUpdate { descriptor: ConclaveDescriptor },
+    ConclaveUpdate {
+        descriptor: ConclaveDescriptor,
+    },
     /// The convener ended the conclave for everyone.
     ///
     /// The record and its message log stay in every vault; the descriptor's
     /// `ended` flag makes it read-only on every peer rather than only on the
     /// convener's.
-    ConclaveEnd { descriptor: ConclaveDescriptor },
+    ConclaveEnd {
+        descriptor: ConclaveDescriptor,
+    },
     /// A request for an introduction inside a conclave.
     ///
     /// Two joined trustees who are not each other's contacts cannot exchange
@@ -604,12 +620,16 @@ pub enum MessagePayload {
     /// and it is applied only from a known contact, because the session is the
     /// authentication. Forged, the worst it can do is hide a surface the sender
     /// was not going to use anyway, so there is no signature.
-    Reach { scope: TrusteeReach },
+    Reach {
+        scope: TrusteeReach,
+    },
     /// A paper's descriptor, sent when a paper is created or adopted.
     ///
     /// Creator-authoritative at creation: the creator names themselves as hub.
     /// Later hub changes are convener-authoritative and ride `PaperHub`.
-    PaperState { paper: PaperDescriptor },
+    PaperState {
+        paper: PaperDescriptor,
+    },
     /// One opaque yrs update.
     ///
     /// Authority-free by design: a CRDT merges an update anywhere, in any
@@ -646,7 +666,9 @@ pub enum MessagePayload {
     /// Accepted only when the sender is the convener of `paper.conclave_id`,
     /// which is why the descriptor has to carry that id: the check is
     /// `sender == conclave(paper.conclave_id).convener`.
-    PaperHub { paper: PaperDescriptor },
+    PaperHub {
+        paper: PaperDescriptor,
+    },
     /// One half of a paper's DataChannel handshake, sent by the peer that
     /// offers.
     ///
@@ -662,18 +684,26 @@ pub enum MessagePayload {
     /// separate candidate variant: the handshake is one round trip, and the
     /// relay path is already live while it happens, so waiting for gathering to
     /// finish costs the user nothing.
-    PaperOffer { paper_id: String, sdp: String },
+    PaperOffer {
+        paper_id: String,
+        sdp: String,
+    },
     /// The hub's reply to `PaperOffer`.
     ///
     /// Sent only by the paper's hub, and only to the peer that offered: the
     /// topology is a star, so a peer never answers another peer.
-    PaperAnswer { paper_id: String, sdp: String },
+    PaperAnswer {
+        paper_id: String,
+        sdp: String,
+    },
     /// A trustee opened a voice room in this conclave (Task 23).
     ///
     /// Authority-checked on receipt against the conclave roster the receiver
     /// already holds: only a joined trustee may open. A room is joined
     /// explicitly per trustee — joining is the consent, so there is no ring.
-    VoiceOpen { session: VoiceDescriptor },
+    VoiceOpen {
+        session: VoiceDescriptor,
+    },
     /// One half of a voice session's WebRTC handshake, sent by the trustee that
     /// joins, to each trustee already in the room (the mesh has no hub to offer
     /// to).
@@ -683,12 +713,18 @@ pub enum MessagePayload {
     /// candidates so the handshake is one round trip, and there is deliberately
     /// no separate candidate variant unless renegotiation proves to need one.
     /// Meaningful only for a session the sender has seen `VoiceOpen` for.
-    VoiceOffer { session_id: String, sdp: String },
+    VoiceOffer {
+        session_id: String,
+        sdp: String,
+    },
     /// The reply to a `VoiceOffer`, from a trustee already in the room.
     ///
     /// One per joining pair, never re-broadcast: a mesh peer answers only the
     /// peer that offered.
-    VoiceAnswer { session_id: String, sdp: String },
+    VoiceAnswer {
+        session_id: String,
+        sdp: String,
+    },
     /// Local capture muted or unmuted.
     ///
     /// Advisory only: the sender stops capturing *before* the flag is sent, so
@@ -799,6 +835,30 @@ pub enum MessagePayload {
         #[serde(default)]
         ack: bool,
         body: crate::signals::SignalBody,
+    },
+    /// A 1:1 call offer (Task 17), sent inside the contact's Signal session.
+    ///
+    /// Same SDP-only, non-trickle shape as [`MessagePayload::VoiceOffer`]: the
+    /// sender gathers ICE candidates before offering, so one payload carries
+    /// the whole handshake half. The session id is the caller's random id and
+    /// names the call on both sides.
+    CallOffer {
+        session_id: String,
+        sdp: String,
+    },
+    /// The callee's answer to [`MessagePayload::CallOffer`].
+    CallAnswer {
+        session_id: String,
+        sdp: String,
+    },
+    /// Either side ended the call.
+    ///
+    /// Consumed by `recv` and handed to the caller out of band; never a chat
+    /// row. `reason` is diagnostic (`hangup`, `declined`, `busy`, `failed`) and
+    /// has no protocol authority.
+    CallEnd {
+        session_id: String,
+        reason: String,
     },
     /// One acknowledgement of a [`MessagePayload::Signal`].
     ///
@@ -988,11 +1048,14 @@ mod tests {
     /// still decode, so a rename does not strand queued or in-flight messages.
     #[test]
     fn a_legacy_meeting_payload_still_decodes() {
-        let json = r#"{"t":"meeting","meeting_id":"m-1","name":"Standup","members":["bob"],"body":"hi"}"#;
+        let json =
+            r#"{"t":"meeting","meeting_id":"m-1","name":"Standup","members":["bob"],"body":"hi"}"#;
         let p: MessagePayload = serde_json::from_str(json).unwrap();
         match p {
             MessagePayload::Conclave {
-                conclave_id, trustees, ..
+                conclave_id,
+                trustees,
+                ..
             } => {
                 assert_eq!(conclave_id, "m-1");
                 assert_eq!(trustees, vec!["bob".to_string()]);
@@ -1155,7 +1218,8 @@ mod tests {
     /// dropped while the handshake is in flight.
     #[test]
     fn paper_signalling_round_trips() {
-        let sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\na=candidate:1 1 udp 1 127.0.0.1 9 typ host\r\n";
+        let sdp =
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\na=candidate:1 1 udp 1 127.0.0.1 9 typ host\r\n";
         for p in [
             MessagePayload::PaperOffer {
                 paper_id: "p-1".into(),
@@ -1169,8 +1233,12 @@ mod tests {
             let decoded = MessagePayload::decode(&p.encode().unwrap()).unwrap();
             assert_eq!(decoded, p);
             match decoded {
-                MessagePayload::PaperOffer { sdp, .. } | MessagePayload::PaperAnswer { sdp, .. } => {
-                    assert!(sdp.contains("a=candidate:"), "candidates must survive the wire")
+                MessagePayload::PaperOffer { sdp, .. }
+                | MessagePayload::PaperAnswer { sdp, .. } => {
+                    assert!(
+                        sdp.contains("a=candidate:"),
+                        "candidates must survive the wire"
+                    )
                 }
                 other => panic!("expected paper signalling, got {other:?}"),
             }
@@ -1302,7 +1370,10 @@ mod tests {
     #[test]
     fn an_unknown_voice_tag_decodes_to_unknown() {
         let json = br#"{"t":"voice_ice","session_id":"v-1","candidate":"x"}"#;
-        assert_eq!(MessagePayload::decode(json).unwrap(), MessagePayload::Unknown);
+        assert_eq!(
+            MessagePayload::decode(json).unwrap(),
+            MessagePayload::Unknown
+        );
     }
 
     /// A reach announcement round-trips, and the tag is the snake_case one the
@@ -1356,13 +1427,25 @@ mod tests {
             note: Some("from the office".into()),
             supports_file_transfer: true,
         };
-        assert_eq!(MessagePayload::decode(&request.encode().unwrap()).unwrap(), request);
+        assert_eq!(
+            MessagePayload::decode(&request.encode().unwrap()).unwrap(),
+            request
+        );
         let json = String::from_utf8(request.encode().unwrap()).unwrap();
         assert!(json.contains(r#""t":"contact_request""#), "json was {json}");
-        assert!(json.contains(r#""supports_file_transfer":true"#), "json was {json}");
+        assert!(
+            json.contains(r#""supports_file_transfer":true"#),
+            "json was {json}"
+        );
 
-        for payload in [MessagePayload::ContactAccept, MessagePayload::ContactDecline] {
-            assert_eq!(MessagePayload::decode(&payload.encode().unwrap()).unwrap(), payload);
+        for payload in [
+            MessagePayload::ContactAccept,
+            MessagePayload::ContactDecline,
+        ] {
+            assert_eq!(
+                MessagePayload::decode(&payload.encode().unwrap()).unwrap(),
+                payload
+            );
         }
     }
 

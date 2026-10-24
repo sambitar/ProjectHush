@@ -7,6 +7,298 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-24 — Desktop 1:1 calls (M5, the media half)
+
+### WebKitGTK on this platform ships without WebRTC, so the desktop WebView can never build an offer [FIXED]
+
+- Attempted: enable WebRTC in the desktop shell so the shared call UI could use
+  `RTCPeerConnection`. Tried `WebKitSettings::set_enable_webrtc(true)` in `setup`, then a page
+  reload, then terminating the web process and reloading via its `web-process-terminated` signal.
+- Symptom: the call button died with `ERR Can't find variable: RTCPeerConnection`. A standalone
+  WebKitGTK probe (enable-webrtc set **before** first load, real `https://example.com` page, fresh
+  web process after terminate+reload) still reported `typeof RTCPeerConnection === "undefined"`
+  while `navigator.mediaDevices` was fine. The `RTCPeerConnection` strings in `libwebkit2gtk` are
+  the inspector's, not the runtime binding: this distro build has `ENABLE_WEB_RTC` off.
+- Resolution: the desktop's call media is now owned by the daemon, reusing the conclave voice
+  `VoicePlane` (webrtc-rs + cpal) — the architecture the plan deferred as "desktop calls remain
+  unbuilt" (§5.4). The phone and a browser tab keep the WebView media path. Verified end to end:
+  desktop → emulator shows the daemon streaming audio (`voice stats sent=175 decoded=197
+  played=190 live=1`) while the emulator's WebView reports `connectionState: connected`.
+- Lesson: a JS media API gated behind a compile-time WebKit flag cannot be recovered at runtime,
+  whatever the settings object says. Check `typeof` on a plain HTTPS page before assuming it is a
+  secure-context or ordering problem.
+
+### The daemon plane and the WebView disagree on the SDP wire format [FIXED]
+
+- Attempted: route the desktop's `VoicePlane` offer/answer through the existing 1:1 call signals
+  to a WebView peer.
+- Symptom: the call signalled and the peer rang, but answering tore the peer's connection straight
+  to `closed`. The plane serialises the whole `RTCSessionDescription` as JSON
+  (`{"type":"offer","sdp":"…"}`), and the WebView speaks the bare SDP string, so each side fed the
+  other a string the other could not parse.
+- Resolution: two adapters at the call boundary in `hush-daemon` — `sdp_of_plane` (unwraps the
+  `.sdp` field before sending) and `sdp_as_description` (wraps the WebView's bare SDP before the
+  plane consumes it). The relay now carries only the raw SDP string, the one format both stacks
+  share.
+- Lesson: two WebRTC implementations interoperate on SDP/ICE/DTLS, but the *envelope* around the
+  SDP is not part of the wire contract — make the boundary explicit.
+
+### The mobile backend never republished prekeys on unlock [FIXED]
+
+- Attempted: add a fresh vault as a contact of the phone/emulator after its published prekey
+  record had gone stale.
+- Symptom: a first contact request from a new account arrived but could not be decrypted
+  (`Could not decrypt a queued message — unknown sender or session not ready`), and the request
+  never surfaced. The pointer invite names only the account, so a peer fetches the prekey bundle
+  from the relay at accept time; the phone had never minted/published a fresh pool, so the record
+  no longer matched its store.
+- Resolution: `mobile.rs` now runs the same `publish_prekeys(64)` on unlock the daemon does,
+  behind the same 20 s cap. The desktop daemon already did this; the phone path was the gap.
+- Lesson: the in-process mobile backend must mirror the daemon's unlock bookkeeping, not just its
+  request/response shape.
+
+### A second contact request from the same sender is undecryptable [OPEN]
+
+- Attempted: re-send a contact request after cancelling the first.
+- Symptom: the retry reuses the session the first request opened, so it leaves as a steady-state
+  message — but the recipient never stored that session (it never processed the first request),
+  and every retry is refused as unknown. Observed with several throwaway vaults against the
+  emulator; the first request from a brand-new sender works.
+- Needed: `request_contact` must re-open a prekey session when the peer may not hold the current
+  one (or the recipient must keep the session from a request it declines/ignores). Product-level;
+  not on the voice critical path but it makes invites flaky.
+
+### Running a daemon on a copy of the vault overwrote the account's live prekey record [WORKED AROUND]
+
+- Attempted: inspect the emulator's state by pulling a copy of its vault and running a second
+  daemon against the copy.
+- Symptom: that daemon's unlock published a fresh prekey bundle for the account, and the relay now
+  held keys only the copy owned — the live app could no longer decrypt any new sender. This was
+  the trigger for the two entries above, not a separate repo defect.
+- Resolution: deleted the relay's junk blobs and leaned on the unlock republish (above) to restore
+  a consistent record. Tooling-related: never run a writer for an account whose live instance is
+  also writing.
+
+### A header drawn while a contact was offline kept the call button disabled after they came online [FIXED]
+
+- Attempted: click the call button in a chat whose peer was online.
+- Symptom: presence flips are patched in place, and `patchOpenChat` updated the dot, the label and
+  the composer but not the call button, so a header rendered offline stayed disabled until a full
+  rebuild — exactly the user's "they appear offline to each other" state.
+- Resolution: `patchOpenChat` now updates the call button's `disabled` and `title` from the same
+  contact it already patches.
+
+### `awaitIce` gave up after 3 s and shipped host-only candidates [FIXED]
+
+- Attempted: a non-trickle offer/answer over a NAT.
+- Symptom: the SDP could leave before the STUN reply landed, so it carried host candidates only,
+  which do not cross a NAT; the answer's local description showed zero `typ srflx` candidates.
+- Resolution: the gather bound is 10 s and logs a warning when it is hit; a working STUN lookup
+  adds well under a second, so the cap only fires on a broken path.
+
+### The desktop-as-answerer answer put the DTLS fingerprint at session level, so the phone never went live [FIXED]
+
+- Attempted: phone → desktop 1:1 call (the phone offers, the desktop's daemon answers).
+- Symptom: the desktop accepts and shows "In call", but the phone hangs on "Connecting…" then
+  drops; the daemon logs `call answer to X sent` yet never prints a `voice stats … live=1` line.
+  The answer's `a=fingerprint` sat at the **session** level while `a=ice-ufrag`/`a=ice-pwd` sat in
+  the **media** section. Chromium's WebView wires the DTLS transport from the media-level copy and
+  left the transport unwired, so ICE/DTLS never completed.
+- Resolution: `VoicePlane::build` now sets
+  `SettingEngineBuilder::new().with_sdp_media_level_fingerprints(true)` on every peer connection,
+  so the fingerprint lands beside the ICE credentials (media level) in both offer and answer. Added
+  `fingerprints_are_media_level_for_chromium` to lock it in. Verified against a headless Chromium
+  peer: the daemon's answer now reaches `connectionState: connected` / `iceConnectionState:
+  connected`.
+- Lesson: an earlier repro reported `Failed to parse SessionDescription. Invalid SDP line.` for the
+  same answer — that was a helper-script artifact (splitting on `\r\n` and re-joining silently
+  dropped the trailing newline, which Chromium requires). The answer always parsed; the real defect
+  was fingerprint placement, which only shows up as a stuck connection, not a parse error.
+
+### The company firewall blocks peer-to-peer media, and the STUN-only design had no fallback [FIXED]
+
+- Attempted: a real phone → desktop call after the SDP fix above.
+- Symptom: the daemon sent a well-formed answer (`call answer to phone sent`), the phone parsed it,
+  but the call still stuck on "Connecting…" then dropped, with no `voice stats … live=1` on either
+  side. The phone and desktop were on the same subnet (`10.111.221.x`) behind the same NAT
+  (`24.48.169.181`), and both got `srflx` candidates — yet the media never crossed.
+- Root cause: the corporate WiFi does client isolation (or refuses hairpin NAT), so two devices on
+  the same network cannot reach each other's UDP media directly. STUN discovers addresses but cannot
+  punch through that; the project was deliberately STUN-only (`docs/ops/voice-stun-checklist.md`:
+  "Out of scope: TURN … Symmetric-NAT calls fail cleanly"), so there was no relay fallback. The
+  "desktop-as-caller worked" result was against the emulator on the same machine, which never
+  touches the firewall.
+- Resolution: enabled TURN on the project's coturn (`hushrelay.space:3478`, TCP + UDP) with
+  `lt-cred-mech` credentials, and wired it into both media halves — `resolve_turn_config` in
+  `hush-core`, the daemon's `VoicePlane::build`, and the phone WebView's `__HUSH_TURN__` injection
+  (`mobile.rs` → `app.ts`). Verified: the phone and the daemon both now gather `typ relay`
+  candidates on `37.27.150.250`, and a headless-Chromium peer reaches `connected` against the
+  daemon over the relay.
+- Trade-off to keep in mind: TURN relays media through the server, so the server sees call
+  *metadata* (who called whom, when, volume) but not the audio, which stays end-to-end encrypted
+  (DTLS-SRTP). This reverses the "no TURN" privacy decision; the credential is soft (anti-abuse,
+  not a secret) and should move to time-limited REST-API credentials later.
+
+## 2026-10-23 — Preview (desktop + Android)
+
+### `hush-cli` stopped compiling because of the in-flight payload variants [FIXED]
+
+- Attempted: `scripts/run-one-ui.sh`, which builds `hush-cli` alongside the desktop binary.
+- Symptom: `error[E0004]: non-exhaustive patterns: MessagePayload::FileOffer { .. },
+  FileReceived { .. }, ContactRequest { .. } and 2 more not covered` in
+  `crates/hush-cli/src/main.rs`. The contact-request/vault-file work added the variants; the CLI's
+  `recv` match was not updated.
+- Resolution: added the five variants to the existing no-op control-payload arm, with a comment
+  saying `recv` applies them and the CLI has nothing to print. The desktop launcher then built.
+- Lesson: a new `MessagePayload` variant is a compile break in every consumer; grep the enum name
+  rather than waiting for the build.
+
+### The APK was x86_64-only, so a real phone refused it [FIXED]
+
+- Attempted: hand the built APK to a physical Android device.
+- Symptom: the device/installer reported the app was built for simulators. `aapt dump badging`
+  confirmed `native-code: 'x86_64'`; the emulator-only build had left the universal flavor with
+  one ABI, and `jniLibs` also carried only that arch.
+- Resolution: rebuild with both targets —
+  `npx tauri android build --debug --target aarch64 x86_64 --apk --ci`. The resulting universal
+  APK reports `native-code: 'arm64-v8a' 'x86_64'` and installs on phones and the emulator.
+- Lesson: state the target when handing over an APK. `--target x86_64` is for the emulator; a
+  phone needs `aarch64`, and a mixed universal build covers both.
+
+### The unlock refresh dropped the address when contacts answered 501 [FIXED]
+
+- Attempted: create a vault on the phone with a nickname and check that Mail showed the address.
+- Symptom: Mail said "No address yet" and the vault name fell back to `@hush`, although the
+  create flow had run `set_mail_handle` successfully. `refreshStatus` assigned `mailHandle` and
+  `vaultName` only after `api.contacts()`, and the phone's 501 threw into the shared catch, so
+  the two assignments were skipped on every unlock.
+- Resolution: the status-derived identity is assigned as soon as the status document is stored,
+  before the auxiliary loads, and the phone now serves `/api/contacts`, `/api/mail`,
+  `/api/conclaves`, `/api/conclaves/invites`, and `/api/contact-requests` from local vault state.
+  Verified on the emulator: Mail shows `sam2@phone2` after a clean first run.
+- Lesson: never make one screen's identity fields depend on an unrelated request succeeding.
+
+### Android 15 edge-to-edge put the phone header under the status bar [FIXED]
+
+- Attempted: screenshot the phone shell after the bottom bar landed.
+- Symptom: the "Chats" title and the compose button drew on top of the clock and notification
+  icons. `targetSdk = 37` means Android 15 draws the WebView edge-to-edge.
+- Resolution: the viewport now declares `viewport-fit=cover`, and the shell and the lock/create
+  screens pad by `env(safe-area-inset-top/bottom)`. The header clears the status bar and the
+  bottom bar clears the gesture area.
+
+### A windowed emulator died shortly after boot; headless plus scrcpy is stable [WORKED AROUND]
+
+- Attempted: launch `emulator -avd Pixel_7_API_35 -gpu swiftshader_indirect` with its own window
+  so the user could interact.
+- Symptom: the process disappeared after boot with no error in `/tmp/hush-emulator.log`, no OOM
+  line available from `journalctl -k`. The same AVD ran for a long session in `-no-window` mode.
+- Resolution: run headless as before and mirror it with `scrcpy --render-driver=software`, which
+  gives an interactive "Hush Android" window without the emulator's Qt/GPU path.
+- Still needed: a stable hardware-accelerated windowed recipe if the emulator is to be used
+  without scrcpy. Tooling, not a repo problem.
+
+## 2026-10-23 — Android shell (M0/M1)
+
+### The phone rendered the desktop shell, so its dialogs overflowed [FIXED]
+
+- Attempted: verify first-run on a Pixel 7 / API 35 emulator.
+- Symptom: the app opened and the flow completed, but the layout was the desktop rail plus
+  `.shell { min-width: 720px }`; the recovery-code modal was clipped at the right edge, so only
+  part of "I've saved it" was on screen.
+- Resolution: `syncMobileShell` now paints one screen at a time (chats list or thread, a settings
+  list or one section) over a bottom bar, and `[data-shell="mobile"]` removes the minimum width,
+  hides the rail, converts mail's folder column to a strip, and sizes dialogs to the viewport.
+  Verified on the emulator: bottom bar on every tab, single-pane Settings with a back bar, and
+  the recovery modal fits with its button fully visible.
+- Lesson: a viewport meta tag alone does not make a desktop layout mobile; a `min-width` on the
+  shell establishes a layout viewport wider than the screen, and `position: fixed` dialogs
+  inside it inherit that width.
+
+### Vault creation blocks on the first prekey publish [OPEN]
+
+- Attempted: tap "Create vault" on the emulator and time the transition.
+- Symptom: the passphrase fields cleared and the ring bloomed, but the main shell took roughly
+  30–40 seconds to appear. `Account::create` awaits `publish_prekeys(64)` before returning;
+  on the emulator's slow network that call held the create response.
+- Resolution: not changed. The core is shared with the desktop and the publish is already
+  best-effort; the fix is to bound it (a timeout, or hand it to the worker after the response),
+  decided for both targets rather than patched in the phone module.
+- Lesson: "best effort" without a deadline is still on the critical path.
+
+### arm64 links and packages but has not run on hardware [OPEN]
+
+- Attempted: run the built APK on the only emulator image available.
+- Symptom: the emulator is x86_64 only, so the arm64 APK cannot be installed there. The arm64
+  build (`--target aarch64`) compiles and packages `libc++_shared.so`, but nothing has executed
+  it.
+- Resolution: verified the shell end to end on x86_64, which exercises the same Rust and JS
+  code. Still needed: install on a physical arm64 device before calling M1 device-verified.
+- Lesson: a successful cross-build is not a runtime check.
+
+### `dlopen` failed on `__cxa_pure_virtual` at app start [FIXED]
+
+- Attempted: launch the first debug APK; the activity died immediately.
+- Symptom: `java.lang.UnsatisfiedLinkError: dlopen failed: cannot locate symbol
+  "__cxa_pure_virtual" referenced by "...libhush_tauri_lib.so"`. `readelf -d` showed no
+  `DT_NEEDED` for a C++ runtime, while `nm -D` showed undefined `__cxa_*` symbols. Android's
+  audio path (oboe, through rodio/cpal) is C++, but Rust did not ask for the runtime.
+- Resolution: `build.rs` emits `cargo:rustc-link-lib=c++_shared` for Android. The Tauri CLI
+  then detects the NEEDED entry and symlinks the NDK's `libc++_shared.so` into `jniLibs` for
+  packaging. No Gradle copy task is needed; adding one produced duplicate-resource failures.
+- Lesson: check `readelf -d` and `nm -D` on the built `.so` before blaming the APK or Gradle.
+
+### `rfd` has no Android backend [FIXED]
+
+- Attempted: `cargo check -p hush-tauri --target aarch64-linux-android`.
+- Symptom: 12 `E0277` errors in `rfd` (`FolderPickerDialogImpl`, `FileSaveDialogImpl`,
+  `MessageDialogImpl` are not implemented for Android).
+- Resolution: `rfd` moved to a non-Android/iOS target dependency, the file commands compile
+  only under `cfg(desktop)`, and the phone has its own handler list without them. The phone
+  rejects file actions for now instead of registering buttons that cannot work.
+
+### The mobile build required the desktop daemon sidecar [FIXED]
+
+- Attempted: first Android check after `tauri android init`.
+- Symptom: `resource path "binaries/hush-daemon-aarch64-linux-android" doesn't exist`, from
+  `bundle.externalBin` in `tauri.conf.json`.
+- Resolution: `tauri.android.conf.json` overrides `externalBin` and `resources` to empty. The
+  phone runs no daemon and ships no Tor binary.
+
+### The transport marker set in `setup` never reached the page [FIXED]
+
+- Attempted: inject `window.__HUSH_TRANSPORT__ = { kind: "mobile" }` from `setup`, as the
+  desktop shell does.
+- Symptom: the first launch showed "Welcome back" instead of the create screen. The `eval`
+  ran against the initial blank document and was discarded when the WebView navigated to the
+  app URL, so `daemon.ts` fell back to `http://127.0.0.1:9876`, failed, and left `status` null.
+- Resolution: `Builder::on_page_load` re-injects `mobile::INIT_JS` on every load. The create
+  screen then appeared.
+
+### The permission guard read its own parser after a second handler list [FIXED]
+
+- Attempted: add a mobile `generate_handler!` list and keep the existing
+  "every registered command has a permission" test.
+- Symptom: the test failed claiming commands named `".find("`, `///`, and
+  `while let Some(open) = rest.find(...)` were registered. The parser now looped over every
+  `generate_handler![` in the file, including the string literals in its own source.
+- Resolution: the parser only scans the production half, split at `#[cfg(test)]`. It still
+  reads every handler list, so a phone-only command without a permission fails the test.
+
+### `adb shell input text` dropped leading characters [WORKED AROUND]
+
+- Attempted: fill the create form on the emulator with one `input text` per field.
+- Symptom: `phone` arrived as `ph`; the field had focus and the later fields were complete.
+- Resolution: re-entered with a longer pause after the tap. Tooling, not a repo problem; the
+  host test covers the same backend path without the emulator.
+
+### `cargo` target flags need the NDK C++ toolchain too [WORKED AROUND]
+
+- Attempted: cross-check the Tauri shell with only the linker, `CC`, and `AR` set.
+- Symptom: `oboe-sys` failed with `aarch64-linux-android-clang++: No such file or directory`.
+- Resolution: set `CXX_<target>` and `RANLIB_<target>` as well. The Tauri CLI sets these for
+  its own builds; manual `cargo` invocations must do the same.
+
 ## 2026-10-23 — Vault file library (Your files)
 
 ### Torrent deletion could delete a file the new library still needs [FIXED]

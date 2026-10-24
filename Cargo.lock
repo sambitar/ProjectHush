@@ -4530,8 +4530,11 @@ name = "hush-tauri"
 version = "0.6.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bytes",
+ "hex",
  "http-body-util",
+ "hush-core",
  "hyper",
  "hyper-util",
  "libc",
@@ -4544,6 +4547,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
  "tower-service",
  "url",

@@ -80,6 +80,8 @@ import {
   Redo2,
   Mic,
   MicOff,
+  Phone,
+  PhoneOff,
   Forward,
   type IconNode,
 } from "lucide";
@@ -169,6 +171,8 @@ const ICONS = {
   redo: Redo2,
   mic: Mic,
   micOff: MicOff,
+  phone: Phone,
+  phoneOff: PhoneOff,
   forward: Forward,
 } satisfies Record<string, IconNode>;
 

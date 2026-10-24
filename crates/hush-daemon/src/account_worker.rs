@@ -235,6 +235,26 @@ enum Work {
         text: String,
         reply: oneshot::Sender<WorkResult>,
     },
+    /// One leg of 1:1 call signalling. The SDP is complete (non-trickle), so
+    /// nothing follows it on the wire.
+    SendCallOffer {
+        to: String,
+        session_id: String,
+        sdp: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SendCallAnswer {
+        to: String,
+        session_id: String,
+        sdp: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
+    SendCallEnd {
+        to: String,
+        session_id: String,
+        reason: String,
+        reply: oneshot::Sender<WorkResult>,
+    },
     /// A live chat line that both sides forget after `ttl_ms`.
     SendExpireText {
         to: String,
@@ -1461,6 +1481,60 @@ impl AccountWorker {
                                     Ok(()) => WorkResult::Ok,
                                     Err(e) => WorkResult::Err(e.to_string()),
                                 },
+                            };
+                            (reply, result)
+                        }
+                        Work::SendCallOffer {
+                            to,
+                            session_id,
+                            sdp,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a.send_call_offer(&to, &session_id, &sdp).await {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::SendCallAnswer {
+                            to,
+                            session_id,
+                            sdp,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a.send_call_answer(&to, &session_id, &sdp).await {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::SendCallEnd {
+                            to,
+                            session_id,
+                            reason,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => WorkResult::Err("locked".into()),
+                                Some(a) => {
+                                    match a
+                                        .send_call_end(&to, &session_id, &reason)
+                                        .await
+                                    {
+                                        Ok(()) => WorkResult::Ok,
+                                        Err(e) => WorkResult::Err(e.to_string()),
+                                    }
+                                }
                             };
                             (reply, result)
                         }
@@ -2934,6 +3008,36 @@ impl AccountWorker {
         self.call(|reply| Work::SendText {
             to: to.to_string(),
             text: text.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn send_call_offer(&self, to: &str, session_id: &str, sdp: &str) -> WorkResult {
+        self.call(|reply| Work::SendCallOffer {
+            to: to.to_string(),
+            session_id: session_id.to_string(),
+            sdp: sdp.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn send_call_answer(&self, to: &str, session_id: &str, sdp: &str) -> WorkResult {
+        self.call(|reply| Work::SendCallAnswer {
+            to: to.to_string(),
+            session_id: session_id.to_string(),
+            sdp: sdp.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn send_call_end(&self, to: &str, session_id: &str, reason: &str) -> WorkResult {
+        self.call(|reply| Work::SendCallEnd {
+            to: to.to_string(),
+            session_id: session_id.to_string(),
+            reason: reason.to_string(),
             reply,
         })
         .await

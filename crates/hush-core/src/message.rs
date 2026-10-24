@@ -39,6 +39,11 @@ pub struct InboxResult {
     /// is not a chat message. The manager is in-memory — a voice session is
     /// live-only — so these are applied and then gone.
     pub voices: Vec<ReceivedVoice>,
+    /// 1:1 call-signalling payloads from contacts (Task 17).
+    ///
+    /// Taken out of `messages` and consumed by the caller's call state machine;
+    /// nothing here is written to the chat log.
+    pub calls: Vec<ReceivedCall>,
     /// Trustee signals accepted during this poll, newest last.
     ///
     /// Kept out of `messages` for the same reason as `papers`, `voices` and
@@ -149,5 +154,18 @@ pub struct ReceivedVoice {
     pub from_account: String,
     /// The sender's nickname, for diagnostics.
     pub from_nick: String,
+    pub payload: crate::payload::MessagePayload,
+}
+
+/// One 1:1 call-signalling payload received from a contact (Task 17).
+///
+/// Kept out of `messages` for the same reason as `voices`: call signalling is
+/// not chat and must never render as a row. It is consumed by the caller's
+/// call state machine and never written to the vault.
+#[derive(Debug, Clone)]
+pub struct ReceivedCall {
+    pub from_account: String,
+    pub from_nick: String,
+    /// One of `CallOffer`, `CallAnswer`, `CallEnd`.
     pub payload: crate::payload::MessagePayload,
 }

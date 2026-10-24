@@ -56,8 +56,8 @@ pub use mail::{
     format_address, normalize_handle, normalize_vault_name, DEFAULT_VAULT_NAME, MAX_HANDLE_LEN,
 };
 pub use message::{
-    InboxResult, ReceivedAttachment, ReceivedEphemeral, ReceivedMessage, ReceivedPaper,
-    ReceivedZineGrant,
+    InboxResult, ReceivedAttachment, ReceivedCall, ReceivedEphemeral, ReceivedMessage,
+    ReceivedPaper, ReceivedZineGrant,
 };
 pub use signals::{
     PaymentPolicy, ReceivedSignal, ReceivedSignalAck, SignalBody, SignalPolicy, SignalRecord,

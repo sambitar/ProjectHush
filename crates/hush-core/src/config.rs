@@ -43,6 +43,13 @@ pub const ENV_RELAY_ONION_URL: &str = "HUSH_RELAY_ONION_URL";
 /// Environment override for the STUN server used by the Conclave Paper data
 /// channel.
 pub const ENV_STUN_URL: &str = "HUSH_STUN_URL";
+/// Environment override for the TURN relay server(s) used by call media, a
+/// comma-separated list of `turn:`/`turns:` URLs.
+pub const ENV_TURN_URLS: &str = "HUSH_TURN_URLS";
+/// Environment override for the TURN relay username.
+pub const ENV_TURN_USERNAME: &str = "HUSH_TURN_USERNAME";
+/// Environment override for the TURN relay credential.
+pub const ENV_TURN_CREDENTIAL: &str = "HUSH_TURN_CREDENTIAL";
 /// Environment override for the PLC directory `did:plc` identifiers resolve
 /// against.
 pub const ENV_ATPROTO_PLC_URL: &str = "HUSH_ATPROTO_PLC_URL";
@@ -86,10 +93,23 @@ pub struct ClientConfig {
     /// it up automatically in Tor relay mode and the user never types one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onion_relay: Option<String>,
-    /// STUN server for the Conclave Paper data channel. Operator config, and
-    /// deliberately without a default — see [`resolve_stun_url`].
+    /// STUN server for the Conclave Paper data channel and phone voice. Operator
+    /// override; falls back to the shipped self-hosted endpoint — see
+    /// [`resolve_stun_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stun_url: Option<String>,
+    /// TURN relay server(s) for call media, for networks where peer-to-peer
+    /// cannot traverse the NAT (symmetric NAT, client isolation). Operator
+    /// override; falls back to the shipped self-hosted endpoint — see
+    /// [`resolve_turn_config`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_urls: Option<Vec<String>>,
+    /// TURN relay username. Operator override; baked-in default otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_username: Option<String>,
+    /// TURN relay credential. Operator override; baked-in default otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_credential: Option<String>,
     /// The directory a `did:plc` resolves against. Operator config: a deployment
     /// that must go through a mirror names one here. Absent means the public
     /// directory, which the daemon supplies so the default lives in one place
@@ -126,6 +146,9 @@ impl Default for ClientConfig {
             relay_url: None,
             onion_relay: None,
             stun_url: None,
+            turn_urls: None,
+            turn_username: None,
+            turn_credential: None,
             atproto_plc_url: None,
             daemon_addr: None,
             daemon_socket: None,
@@ -225,22 +248,83 @@ pub fn is_baked_default_onion(url: &str) -> bool {
     }
 }
 
-/// Effective STUN server for the Conclave Paper data channel, when one is on
-/// file (env or config file).
+/// Effective STUN server for the Conclave Paper data channel and phone voice:
+/// env first, then the config file, then [`DEFAULT_STUN_URL`].
 ///
-/// There is deliberately no default. A public STUN server would learn the
-/// public address of every peer that opens a paper — the exact metadata this
-/// project refuses to hand a third party — so an operator either runs one (the
-/// same self-hosted one Task 17 needs) or peers gather host candidates only and
-/// connect where they can see each other directly. With no STUN and no TURN, a
-/// symmetric NAT falls back to the relay path rather than failing; see
-/// `hush_daemon::paper_data`.
+/// The default is our own host, not a third-party service. It sees an IP and a
+/// port, never who is calling whom, and it is required for the phone media path:
+/// two peers behind NAT cannot exchange audio with host candidates alone. With
+/// no TURN, a symmetric NAT still fails honestly rather than being routed
+/// through a first-party relay (docs/ops/voice-stun-checklist.md).
+pub const DEFAULT_STUN_URL: &str = "stun:hushrelay.space:3478";
+
 pub fn resolve_stun_url(data_dir: &Path) -> Option<String> {
     if let Some(v) = non_empty(std::env::var(ENV_STUN_URL).ok().as_deref()) {
         return Some(v.to_string());
     }
     let file = load(data_dir);
-    non_empty(file.stun_url.as_deref()).map(str::to_string)
+    if let Some(v) = non_empty(file.stun_url.as_deref()) {
+        return Some(v.to_string());
+    }
+    Some(DEFAULT_STUN_URL.to_string())
+}
+
+/// The shipped TURN endpoints: the project's own coturn, reachable on TCP
+/// (firewall-friendly — media and control multiplex over one connection) and
+/// UDP (faster where UDP is not blocked). Both are served by the same coturn as
+/// STUN, on `hushrelay.space:3478`.
+pub const DEFAULT_TURN_URLS: &[&str] = &[
+    "turn:hushrelay.space:3478?transport=tcp",
+    "turn:hushrelay.space:3478?transport=udp",
+];
+/// The shipped TURN username. This is a soft credential: it gates allocations
+/// against casual abuse, not a secret — it ships in the binary so a fresh
+/// install gets firewall traversal with no operator setup.
+pub const DEFAULT_TURN_USERNAME: &str = "hush";
+/// The shipped TURN credential, same soft-credential posture as the username.
+pub const DEFAULT_TURN_CREDENTIAL: &str = "hdBBhWzx4eHNkLIDtMWJhKhfaKi7gPH";
+
+/// A TURN relay the media path falls back to when peer-to-peer cannot traverse
+/// the NAT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnConfig {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+}
+
+/// Effective TURN relay for call media: env first, then the config file, then
+/// the shipped self-hosted default. Each field resolves independently, so an
+/// operator can override just the credential without restating the URLs.
+///
+/// The default is always present — the call media path needs TURN to reach a
+/// peer behind a symmetric NAT or a client-isolating firewall (the company-WiFi
+/// case). An operator who deliberately wants none can point `urls` at an empty
+/// list in the config file.
+pub fn resolve_turn_config(data_dir: &Path) -> TurnConfig {
+    let file = load(data_dir);
+    let urls = non_empty(std::env::var(ENV_TURN_URLS).ok().as_deref())
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| file.turn_urls.clone())
+        .unwrap_or_else(|| DEFAULT_TURN_URLS.iter().map(|s| s.to_string()).collect());
+    let username = non_empty(std::env::var(ENV_TURN_USERNAME).ok().as_deref())
+        .map(str::to_string)
+        .or_else(|| non_empty(file.turn_username.as_deref()).map(str::to_string))
+        .unwrap_or_else(|| DEFAULT_TURN_USERNAME.to_string());
+    let credential = non_empty(std::env::var(ENV_TURN_CREDENTIAL).ok().as_deref())
+        .map(str::to_string)
+        .or_else(|| non_empty(file.turn_credential.as_deref()).map(str::to_string))
+        .unwrap_or_else(|| DEFAULT_TURN_CREDENTIAL.to_string());
+    TurnConfig {
+        urls,
+        username,
+        credential,
+    }
 }
 
 /// The PLC directory a `did:plc` resolves against, when an operator configured
@@ -345,16 +429,22 @@ mod tests {
         std::env::remove_var(ENV_DAEMON_ADDR);
         std::env::remove_var(ENV_DAEMON_SOCKET);
         std::env::remove_var(ENV_STUN_URL);
+        std::env::remove_var(ENV_TURN_URLS);
+        std::env::remove_var(ENV_TURN_USERNAME);
+        std::env::remove_var(ENV_TURN_CREDENTIAL);
         f()
     }
 
     #[test]
-    fn stun_is_absent_by_default_and_follows_env_then_file() {
+    fn stun_defaults_to_our_host_and_follows_env_then_file() {
         with_clean_env(|| {
             let dir = tempfile::tempdir().unwrap();
-            // No default, by design: a public STUN server would learn the public
-            // address of every peer that opens a paper.
-            assert_eq!(resolve_stun_url(dir.path()), None);
+            // The default is our own host, not a third party; without it a phone
+            // would gather host candidates only and never connect across NAT.
+            assert_eq!(
+                resolve_stun_url(dir.path()),
+                Some(DEFAULT_STUN_URL.to_string())
+            );
 
             save(
                 dir.path(),
@@ -374,6 +464,43 @@ mod tests {
                 resolve_stun_url(dir.path()),
                 Some("stun:stun.from-env:3478".to_string())
             );
+        });
+    }
+
+    #[test]
+    fn turn_defaults_to_our_host_and_follows_env_then_file() {
+        with_clean_env(|| {
+            let dir = tempfile::tempdir().unwrap();
+            // The default is the project's own coturn, on TCP (firewall
+            // friendly) and UDP; a fresh install gets NAT traversal with no
+            // operator setup.
+            let default = resolve_turn_config(dir.path());
+            assert_eq!(default.urls, DEFAULT_TURN_URLS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            assert_eq!(default.username, DEFAULT_TURN_USERNAME);
+            assert_eq!(default.credential, DEFAULT_TURN_CREDENTIAL);
+
+            save(
+                dir.path(),
+                &ClientConfig {
+                    turn_urls: Some(vec!["turn:turn.internal:3478".into()]),
+                    turn_username: Some("file-user".into()),
+                    turn_credential: Some("file-pass".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let from_file = resolve_turn_config(dir.path());
+            assert_eq!(from_file.urls, vec!["turn:turn.internal:3478"]);
+            assert_eq!(from_file.username, "file-user");
+            assert_eq!(from_file.credential, "file-pass");
+
+            std::env::set_var(ENV_TURN_URLS, "turn:env-a:1, turn:env-b:2");
+            std::env::set_var(ENV_TURN_USERNAME, "env-user");
+            std::env::set_var(ENV_TURN_CREDENTIAL, "env-pass");
+            let from_env = resolve_turn_config(dir.path());
+            assert_eq!(from_env.urls, vec!["turn:env-a:1", "turn:env-b:2"]);
+            assert_eq!(from_env.username, "env-user");
+            assert_eq!(from_env.credential, "env-pass");
         });
     }
 

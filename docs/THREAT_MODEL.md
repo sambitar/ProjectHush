@@ -67,7 +67,7 @@ One encrypted collaborative document per conclave, added 2026-10-12. The surface
 | New surface | What it may see | Rule |
 |---|---|---|
 | Relay | Same as today: ciphertext, size, time, queue id, IP. Paper adds **more, smaller, more frequent blobs** while a paper is open | **No change** to what is visible; the *timing* signal is richer — accepted, same as any live feature; padding is out of scope |
-| STUN server | Querying IP + port | Self-hosted, configured only via `ClientConfig::stun_url` and with **no default**. **No TURN** — a peer behind symmetric NAT simply falls back to relay cadence |
+| STUN server | Querying IP + port | Self-hosted default (`stun:hushrelay.space:3478`), overridable only via `ClientConfig::stun_url`. **No TURN** — a peer behind symmetric NAT simply falls back to relay cadence |
 | Hub daemon | Each peer's IP (ICE), and doc updates (it merges and re-fans-out) | **Accepted** — trustees are mutually trusted; the hub sees no more plaintext than any trustee already holds in their own vault |
 | DataChannel peers | Each other's IP | Same accepted limit as calls, stated in copy |
 | Doc bytes at rest | Nothing in plaintext | `papers.enc` is sealed under the vault master key; locked vault = unreadable; the editor runs from local assets only |
@@ -149,7 +149,7 @@ peer connections; Phase 1 (signaling) landed, real audio behind the engine spike
 |---|---|---|
 | Relay (control plane) | Same as today: ciphertext, size, time, queue id, IP. Voice signaling is ordinary fanned-out Signal ciphertext; the relay carries **no media** | **No change.** The `Voice*` payloads are indistinguishable from any other conclave fan-out |
 | Joined trustees | Every other joined trustee's IP and ICE candidates | **Accepted** — the mesh exposes the set, not one peer. A mic is louder than a message, which is why joining a room is an explicit consent act; the exposure is stated in copy |
-| STUN server | Querying IP + port, no party linkage | Self-hosted via the existing `ClientConfig::stun_url` (no default). Runbook: [`docs/ops/voice-stun-checklist.md`](ops/voice-stun-checklist.md) |
+| STUN server | Querying IP + port, no party linkage | Self-hosted default (`stun:hushrelay.space:3478`), overridable via the existing `ClientConfig::stun_url`. Runbook: [`docs/ops/voice-stun-checklist.md`](ops/voice-stun-checklist.md) |
 | First-party relay (TURN) | — | **None** in v1; never first-party. A peer behind symmetric NAT gets a clear failure, not a relay |
 | Media on disk | Nothing | Never written, no temp files, no recording or transcription — ever ([`DESIGN.md`](DESIGN.md)); voice state is memory-only, so a restart or a lock ends the session |
 | Vault | Nothing new in v1 | No call-history rows, no chat notices for voice events; the session leaves no trace |

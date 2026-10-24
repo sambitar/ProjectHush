@@ -1,21 +1,35 @@
 use tauri::Manager;
 
+#[cfg(desktop)]
 mod daemon_client;
+#[cfg(desktop)]
 mod daemon_supervisor;
+#[cfg(desktop)]
 mod drops;
+// The phone backend compiles on the host under `test` so its vault lifecycle
+// can be exercised without an emulator.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+mod mobile;
 mod sound;
+#[cfg(desktop)]
 mod tor;
 
+#[cfg(desktop)]
 use daemon_client::{ApiReply, DaemonClient, Transport};
+#[cfg(desktop)]
 use daemon_supervisor::{DaemonState, Plan};
+#[cfg(desktop)]
 use drops::DropsState;
+#[cfg(desktop)]
 use tor::TorManager;
 
 /// Holds the socket-backed client; absent in TCP mode, where JS uses `fetch`.
+#[cfg(desktop)]
 struct ProxyState {
     client: Option<DaemonClient>,
 }
 
+#[cfg(desktop)]
 fn sanitize_file_name(name: &str) -> String {
     let base = std::path::Path::new(name)
         .file_name()
@@ -38,6 +52,7 @@ fn sanitize_file_name(name: &str) -> String {
     }
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn hush_save_file(default_name: String, bytes: Vec<u8>) -> Result<(), String> {
     let name = sanitize_file_name(&default_name);
@@ -49,6 +64,7 @@ fn hush_save_file(default_name: String, bytes: Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn hush_open_file(file_name: String, bytes: Vec<u8>) -> Result<(), String> {
     let name = sanitize_file_name(&file_name);
@@ -61,6 +77,7 @@ fn hush_open_file(file_name: String, bytes: Vec<u8>) -> Result<(), String> {
 }
 
 /// A decoded daemon `MaterializeResponse`.
+#[cfg(desktop)]
 #[derive(serde::Deserialize)]
 struct MaterializeReply {
     path: String,
@@ -70,6 +87,7 @@ struct MaterializeReply {
 ///
 /// This is the streaming egress: the daemon writes chunk by chunk, so a
 /// multi-GB file never materialises in the webview or crosses IPC as bytes.
+#[cfg(desktop)]
 async fn materialize_blob(
     state: &tauri::State<'_, ProxyState>,
     id: &str,
@@ -92,6 +110,7 @@ async fn materialize_blob(
 }
 
 /// The daemon's `{ "error": "..." }` body as a human string, or the raw body.
+#[cfg(desktop)]
 fn daemon_error(reply: &ApiReply) -> String {
     serde_json::from_str::<serde_json::Value>(&reply.body)
         .ok()
@@ -102,6 +121,7 @@ fn daemon_error(reply: &ApiReply) -> String {
 
 /// Open a vault blob in the user's OS handler without pulling the bytes into
 /// the webview. The daemon materializes the file; the shell opens the path.
+#[cfg(desktop)]
 #[tauri::command]
 async fn hush_open_blob(
     state: tauri::State<'_, ProxyState>,
@@ -114,6 +134,7 @@ async fn hush_open_blob(
 
 /// Save a vault blob to a user-chosen path, again without the webview holding
 /// the bytes: the daemon materializes, the shell copies to the chosen path.
+#[cfg(desktop)]
 #[tauri::command]
 async fn hush_save_blob(
     state: tauri::State<'_, ProxyState>,
@@ -138,6 +159,7 @@ async fn hush_save_blob(
 }
 
 /// One file the desktop picker returned.
+#[cfg(desktop)]
 #[derive(serde::Serialize)]
 struct PickedVaultFile {
     path: String,
@@ -150,6 +172,7 @@ struct PickedVaultFile {
 /// Only the path crosses into the webview. The daemon opens and encrypts the
 /// file itself, so a multi-GB import never becomes a JS string or a Tauri IPC
 /// payload. Cancelling is an empty list, not an error.
+#[cfg(desktop)]
 #[tauri::command]
 fn hush_pick_vault_files() -> Result<Vec<PickedVaultFile>, String> {
     let Some(paths) = rfd::FileDialog::new().pick_files() else {
@@ -182,6 +205,7 @@ fn hush_open_url(url: String) -> Result<(), String> {
 }
 
 /// Proxy one daemon API call over the Unix socket (DR-02).
+#[cfg(desktop)]
 #[tauri::command]
 async fn hush_api(
     state: tauri::State<'_, ProxyState>,
@@ -200,6 +224,7 @@ async fn hush_api(
 pub fn run() {
     let window_title = std::env::var("HUSH_WINDOW_TITLE").unwrap_or_else(|_| "Hush".to_string());
 
+    #[cfg(desktop)]
     let mut builder = tauri::Builder::default()
         .manage(DaemonState::default())
         .invoke_handler(tauri::generate_handler![
@@ -230,103 +255,167 @@ pub fn run() {
             .plugin(tauri_plugin_process::init());
     }
 
+    // Android runs no daemon process (docs/MOBILE_APP_PLAN.md §5.1), so its
+    // handler list is the in-process vault API plus the controls that really do
+    // work on a phone. File dialogs and Drops stay desktop-only rather than
+    // being registered as buttons that cannot work here.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let builder = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            hush_open_url,
+            sound::play_chat_sound,
+            sound::set_voice_cue,
+            mobile::hush_mobile_api
+        ])
+        // The phone has no socket to name. Inject on every page load: the
+        // WebView navigates to the app URL after `setup`, which discards an
+        // `eval` issued there.
+        .on_page_load(|webview, _payload| {
+            if let Some(state) = webview.try_state::<mobile::MobileBackend>() {
+                let stun = state.stun_url().map(str::to_string);
+                let _ = webview.eval(&mobile::init_js(stun.as_deref(), state.turn_config()));
+            }
+        });
+
+    // Calls need the microphone on every target. WebKit asks the app first and
+    // then the OS; without a handler the media request never settles on Linux,
+    // which is indistinguishable from a call button that does nothing. Allow
+    // the microphone only, and leave every other kind on the platform default.
+    let builder = builder.on_permission_request(|_webview, kind| match kind {
+        tauri::webview::PermissionKind::Microphone => tauri::webview::PermissionResponse::Allow,
+        _ => tauri::webview::PermissionResponse::Default,
+    });
+
     let app = builder
         .setup(move |app| {
-            // The daemon comes first, because the transport the window is told
-            // about depends on whether this process starts one. A bundled copy
-            // has a daemon staged beside its executable and no run script behind
-            // it, so it starts the daemon here; a repository run is handed
-            // `HUSH_API_URL` by `scripts/run-one-ui.sh` and keeps that.
-            let transport = match daemon_supervisor::plan_for_app(app.handle()) {
-                Plan::External => daemon_client::transport_from_env(),
-                Plan::Sidecar { bin, socket, vault } => {
-                    let log_dir = socket
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or_else(std::env::temp_dir);
-                    match daemon_supervisor::Daemon::start(&bin, &socket, &vault, &log_dir) {
-                        Ok(mut daemon) => {
-                            // The window opens either way; a daemon that never
-                            // answers leaves its reason in daemon.log, and the
-                            // UI reports the socket as unreachable.
-                            if !daemon.wait_ready(daemon_supervisor::READY_TIMEOUT) {
-                                eprintln!(
-                                    "hush: the bundled daemon did not answer on {}; \
-                                     see {}",
-                                    socket.display(),
-                                    log_dir.join("daemon.log").display()
-                                );
-                            }
-                            let socket = daemon.socket().display().to_string();
-                            if let Some(state) = app.try_state::<DaemonState>() {
-                                if let Ok(mut slot) = state.0.lock() {
-                                    *slot = Some(daemon);
+            #[cfg(desktop)]
+            {
+                // The daemon comes first, because the transport the window is told
+                // about depends on whether this process starts one. A bundled copy
+                // has a daemon staged beside its executable and no run script behind
+                // it, so it starts the daemon here; a repository run is handed
+                // `HUSH_API_URL` by `scripts/run-one-ui.sh` and keeps that.
+                let transport = match daemon_supervisor::plan_for_app(app.handle()) {
+                    Plan::External => daemon_client::transport_from_env(),
+                    Plan::Sidecar { bin, socket, vault } => {
+                        let log_dir = socket
+                            .parent()
+                            .map(std::path::Path::to_path_buf)
+                            .unwrap_or_else(std::env::temp_dir);
+                        match daemon_supervisor::Daemon::start(&bin, &socket, &vault, &log_dir) {
+                            Ok(mut daemon) => {
+                                // The window opens either way; a daemon that never
+                                // answers leaves its reason in daemon.log, and the
+                                // UI reports the socket as unreachable.
+                                if !daemon.wait_ready(daemon_supervisor::READY_TIMEOUT) {
+                                    eprintln!(
+                                        "hush: the bundled daemon did not answer on {}; \
+                                         see {}",
+                                        socket.display(),
+                                        log_dir.join("daemon.log").display()
+                                    );
                                 }
+                                let socket = daemon.socket().display().to_string();
+                                if let Some(state) = app.try_state::<DaemonState>() {
+                                    if let Ok(mut slot) = state.0.lock() {
+                                        *slot = Some(daemon);
+                                    }
+                                }
+                                Transport::Unix { path: socket }
                             }
-                            Transport::Unix { path: socket }
-                        }
-                        Err(why) => {
-                            eprintln!("hush: {why}; the window will report the daemon unreachable");
-                            Transport::Unix {
-                                path: socket.display().to_string(),
+                            Err(why) => {
+                                eprintln!(
+                                    "hush: {why}; the window will report the daemon unreachable"
+                                );
+                                Transport::Unix {
+                                    path: socket.display().to_string(),
+                                }
                             }
                         }
                     }
-                }
-            };
-
-            match &transport {
-                Transport::Unix { path } => app.manage(ProxyState {
-                    client: Some(DaemonClient::new(std::path::Path::new(path))),
-                }),
-                Transport::Tcp { .. } => app.manage(ProxyState { client: None }),
-            };
-
-            // Tor lives under the app's local data dir, not in the vault, and is
-            // owned by this process. It is managed at the app level: the relay
-            // switch keeps it alive for the whole session, and the Drop view
-            // shares the same process rather than owning it.
-            let data_dir = app
-                .path()
-                .app_local_data_dir()
-                .unwrap_or_else(|_| std::env::temp_dir().join("hush-tauri"))
-                .join("tor");
-            let resource_dir = app.path().resource_dir().ok();
-            app.manage(TorManager::new(data_dir, resource_dir));
-            app.manage(DropsState::new());
-
-            if let Some(window) = app.get_webview_window("main") {
-                let display = match &transport {
-                    Transport::Unix { path } => format!("unix://{}", path),
-                    Transport::Tcp { base } => base.clone(),
                 };
-                let init_js = format!(
-                    "window.__HUSH_API__ = {}; window.__HUSH_TRANSPORT__ = {};",
-                    serde_json::to_string(&display).expect("api url json"),
-                    serde_json::to_string(&transport).expect("transport json")
-                );
-                window.set_title(&window_title)?;
-                window.eval(&init_js)?;
+
+                match &transport {
+                    Transport::Unix { path } => app.manage(ProxyState {
+                        client: Some(DaemonClient::new(std::path::Path::new(path))),
+                    }),
+                    Transport::Tcp { .. } => app.manage(ProxyState { client: None }),
+                };
+
+                // Tor lives under the app's local data dir, not in the vault, and is
+                // owned by this process. It is managed at the app level: the relay
+                // switch keeps it alive for the whole session, and the Drop view
+                // shares the same process rather than owning it.
+                let data_dir = app
+                    .path()
+                    .app_local_data_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir().join("hush-tauri"))
+                    .join("tor");
+                let resource_dir = app.path().resource_dir().ok();
+                app.manage(TorManager::new(data_dir, resource_dir));
+                app.manage(DropsState::new());
+
+                if let Some(window) = app.get_webview_window("main") {
+                    let display = match &transport {
+                        Transport::Unix { path } => format!("unix://{}", path),
+                        Transport::Tcp { base } => base.clone(),
+                    };
+                    let init_js = format!(
+                        "window.__HUSH_API__ = {}; window.__HUSH_TRANSPORT__ = {};",
+                        serde_json::to_string(&display).expect("api url json"),
+                        serde_json::to_string(&transport).expect("transport json")
+                    );
+                    window.set_title(&window_title)?;
+                    window.eval(&init_js)?;
+                }
             }
+
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                // The phone's vault lives in app-private storage. Android's
+                // backup rules must exclude it (docs/MOBILE_APP_PLAN.md §8).
+                let dir = app
+                    .path()
+                    .app_local_data_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir().join("hush-mobile"))
+                    .join("vault");
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    eprintln!("hush: could not create {}: {e}", dir.display());
+                }
+                app.manage(mobile::MobileBackend::spawn(dir));
+
+                if let Some(window) = app.get_webview_window("main") {
+                    window.set_title(&window_title)?;
+                }
+            }
+
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
-        if let tauri::RunEvent::Exit = event {
-            if let Some(tor) = app_handle.try_state::<TorManager>() {
-                tor.stop();
-            }
-            // The daemon this process started goes with it: left running it would
-            // hold the vault lock, and the next launch could not unlock.
-            if let Some(state) = app_handle.try_state::<DaemonState>() {
-                if let Ok(mut slot) = state.0.lock() {
-                    if let Some(mut daemon) = slot.take() {
-                        daemon.stop();
+        #[cfg(desktop)]
+        {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(tor) = app_handle.try_state::<TorManager>() {
+                    tor.stop();
+                }
+                // The daemon this process started goes with it: left running it would
+                // hold the vault lock, and the next launch could not unlock.
+                if let Some(state) = app_handle.try_state::<DaemonState>() {
+                    if let Ok(mut slot) = state.0.lock() {
+                        if let Some(mut daemon) = slot.take() {
+                            daemon.stop();
+                        }
                     }
                 }
             }
+        }
+        #[cfg(not(desktop))]
+        {
+            // The in-process backend owns no child process and needs no teardown.
+            let _ = (app_handle, event);
         }
     });
 }
@@ -337,29 +426,46 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// The command names in the `generate_handler![...]` list, with any
+    /// The command names in every `generate_handler![...]` list, with any
     /// `module::` prefix stripped — a permission names the command alone.
+    ///
+    /// There is one list per target now (desktop and mobile), so every list is
+    /// read; stopping at the first would let a phone-only command ship without a
+    /// permission.
     fn registered_commands(lib_rs: &str) -> BTreeSet<String> {
-        let open = lib_rs
-            .find("generate_handler![")
-            .expect("lib.rs registers its commands with generate_handler!");
-        let body = &lib_rs[open..];
-        let close = body
-            .find("])")
-            .expect("the generate_handler list ends with `])`");
-        body[..close]
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with("generate_handler"))
-            .map(|line| {
-                line.trim_end_matches(',')
-                    .rsplit("::")
-                    .next()
-                    .expect("rsplit always yields one item")
-                    .trim()
-                    .to_string()
-            })
-            .collect()
+        // Only the production half: the parser's own source below mentions the
+        // macro name in strings, and scanning the test module would read those.
+        let production = lib_rs.split("#[cfg(test)]").next().unwrap_or(lib_rs);
+        let mut commands = BTreeSet::new();
+        let mut rest = production;
+        let mut lists = 0;
+        while let Some(open) = rest.find("generate_handler![") {
+            let body = &rest[open..];
+            let close = body
+                .find("])")
+                .expect("a generate_handler list ends with `])`");
+            for line in body[..close].lines().skip(1) {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                commands.insert(
+                    line.trim_end_matches(',')
+                        .rsplit("::")
+                        .next()
+                        .expect("rsplit always yields one item")
+                        .trim()
+                        .to_string(),
+                );
+            }
+            lists += 1;
+            rest = &body[close + 2..];
+        }
+        assert!(
+            lists > 0,
+            "lib.rs registers its commands with generate_handler!"
+        );
+        commands
     }
 
     /// The commands named by every `commands.allow` under `permissions/`.

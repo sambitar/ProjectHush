@@ -3,7 +3,12 @@ interface Window {
   /** Set by the Tauri shell; absent when the UI runs in a plain browser. */
   __HUSH_TRANSPORT__?:
     | { kind: "unix"; path: string }
-    | { kind: "tcp"; base: string };
+    | { kind: "tcp"; base: string }
+    | { kind: "mobile" };
+  /** STUN endpoint injected by the phone shell for WebView call media. */
+  __HUSH_STUN__?: string | null;
+  /** TURN relay config injected by the phone shell for WebView call media. */
+  __HUSH_TURN__?: { urls: string[]; username: string; credential: string } | null;
   /**
    * How many times the shell has been rebuilt, counted by `App.render()`.
    *

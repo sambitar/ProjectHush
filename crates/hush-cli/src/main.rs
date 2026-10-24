@@ -130,9 +130,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name,
         } => {
             if tor && onion.is_none() {
-                return Err("--tor needs --onion: Tor relay mode moves the relay path to the \
+                return Err(
+                    "--tor needs --onion: Tor relay mode moves the relay path to the \
                             onion address, so there must be one on file."
-                    .into());
+                        .into(),
+                );
             }
             let relay = config::resolve_relay_url(&dir, relay.as_deref());
             let mut account = Account::create(&dir, &passphrase, &relay).await?;
@@ -168,7 +170,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("relay: {} (direct)", account.relay());
                 }
                 "show" => {
-                    println!("switch: {}", if account.relay_tor_mode() { "tor" } else { "direct" });
+                    println!(
+                        "switch: {}",
+                        if account.relay_tor_mode() {
+                            "tor"
+                        } else {
+                            "direct"
+                        }
+                    );
                     println!("relay: {}", account.relay());
                     match account.onion_relay() {
                         Some(onion) => println!("onion: {}", onion),
@@ -176,9 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 "set" => {
-                    let url = url.as_deref().ok_or(
-                        "relay set needs --url <http(s)://host:port>",
-                    )?;
+                    let url = url
+                        .as_deref()
+                        .ok_or("relay set needs --url <http(s)://host:port>")?;
                     account.set_relay_clearnet(url).await?;
                     println!("relay: {} (direct base updated)", account.relay());
                 }
@@ -324,6 +333,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | MessagePayload::ConclaveIntro { .. }
                     | MessagePayload::Signal { .. }
                     | MessagePayload::SignalAck { .. }
+                    // File offers and contact-request handshakes are applied by
+                    // `recv`; the CLI has nothing to print for them.
+                    | MessagePayload::FileOffer { .. }
+                    | MessagePayload::FileReceived { .. }
+                    | MessagePayload::ContactRequest { .. }
+                    | MessagePayload::ContactAccept
+                    | MessagePayload::ContactDecline
+                    // 1:1 call signalling is consumed by `recv` for a call
+                    // state machine; the CLI has no call surface.
+                    | MessagePayload::CallOffer { .. }
+                    | MessagePayload::CallAnswer { .. }
+                    | MessagePayload::CallEnd { .. }
                     // Expiring chat lines arrive out of band in
                     // `inbox.ephemeral`, never as filed inbox items.
                     | MessagePayload::ExpireText { .. } => {}
@@ -442,10 +463,7 @@ fn parse_reach(v: &str) -> Result<TrusteeReach, hush_core::Error> {
 
 /// The two strings a member publishes together: the drop key and the page URL
 /// that posts to it.
-async fn drop_key_show(
-    dir: &PathBuf,
-    passphrase: &Option<String>,
-) -> Result<String, String> {
+async fn drop_key_show(dir: &PathBuf, passphrase: &Option<String>) -> Result<String, String> {
     let account = open(dir, passphrase).await.map_err(|e| e.to_string())?;
     match account.drop_public_key() {
         Some(pk) => {
@@ -462,10 +480,7 @@ async fn drop_key_show(
 /// Generate the drop keypair, strictly: a second call is an error, because
 /// quietly returning the same key means someone thinks they rotated when they
 /// did not.
-async fn drop_keygen(
-    dir: &PathBuf,
-    passphrase: &Option<String>,
-) -> Result<String, String> {
+async fn drop_keygen(dir: &PathBuf, passphrase: &Option<String>) -> Result<String, String> {
     let mut account = open(dir, passphrase).await.map_err(|e| e.to_string())?;
     match account.create_drop_keys() {
         Ok(pk) => Ok(format!(
@@ -482,10 +497,7 @@ async fn drop_keygen(
 
 /// Rotate: the old key is retired, not deleted, so drops sealed to it before
 /// the rotation still drain until the relay's TTL expires them.
-async fn drop_rotate(
-    dir: &PathBuf,
-    passphrase: &Option<String>,
-) -> Result<String, String> {
+async fn drop_rotate(dir: &PathBuf, passphrase: &Option<String>) -> Result<String, String> {
     let mut account = open(dir, passphrase).await.map_err(|e| e.to_string())?;
     let pk = account.rotate_drop_keys().map_err(|e| e.to_string())?;
     Ok(format!(

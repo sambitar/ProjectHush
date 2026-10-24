@@ -4,6 +4,32 @@
 code-level constraints, the consequences of the settled Places model, and the decisions still open.
 Where the two disagree, the addendum wins until the decision is taken.
 
+**Progress (2026-10-23, `feature/android-shell`).**
+
+- **M0 done.** `hush-wallet --features ethereum` links for `aarch64-linux-android`
+  (release rlib 12 MB; 602 MB of target output). NDK 27.1.12297006; the `CC`, `CXX`, `AR`,
+  and `RANLIB` vars must point at the NDK clang, as expected.
+- **M1 shell done.** `npx tauri android init` generated `src-tauri/gen/android`. The desktop
+  seams stay behind `cfg(desktop)` (`rfd`, the daemon sidecar, the file commands, Drops) and
+  the phone registers its own handler list. `build.rs` links `libc++_shared` for the Android
+  audio stack, which the Tauri CLI then packages.
+- **M1 backend done.** `src-tauri/src/mobile.rs` owns the account on a dedicated thread and
+  answers `/api/status`, `/api/unlock`, `/api/vault/create`, `/api/lock`, `/api/mail/handle`,
+  `/api/messages`, `/api/recovery/acknowledge`, and the read-only `/api/contacts`, `/api/mail`,
+  `/api/conclaves`, `/api/conclaves/invites`, and `/api/contact-requests` in process. Everything
+  else answers 501 rather than pretending a desktop feature exists. No daemon process runs.
+- **Phone shell done.** The Android build no longer renders the desktop rail: a bottom bar
+  carries Chats / Trusts / Mail / Settings; chats are single-pane (list, then the thread with a
+  back control); Settings is a section list then one section; mail's folder column is a strip;
+  and dialogs fit the viewport. Safe-area insets handle Android 15 edge-to-edge.
+- **Verified on a Pixel 7 / API 35 x86_64 emulator:** first run creates a vault, unlocks it,
+  sets the address, shows the recovery code once (fully on screen), acknowledges it, and lands
+  on the phone shell. `cargo test -p hush-tauri` covers the backend lifecycle on the host.
+- **Next slice (M2):** contacts, invites, and sending chat. On the phone those routes are still
+  501, so "Add a trust" opens the desktop dialog and fails on submit, and the phone cannot yet
+  be adopted as a Place. Only Android/x86_64 has run; the arm64 APK builds but has not run on
+  hardware.
+
 ## Scope
 
 - Determine exactly what moves into the mobile app.
@@ -222,6 +248,18 @@ Arti if the external dependency is unacceptable. Do not silently fall back to cl
   while a foreground service is running. This is a product constraint, not a bug; state it in the
   call UI.
 
+**Status (2026-10-24):** M5 is implemented and verified end to end. Signaling is
+`CallOffer`/`CallAnswer`/`CallEnd` over the existing Signal session (`hush-core`), with the phone
+routing them through `/api/call/*` in the in-process backend. Media follows this section exactly:
+the phone and a browser tab use the WebView's WebRTC (STUN from `DEFAULT_STUN_URL` =
+`stun:hushrelay.space:3478`, non-trickle SDP), and the desktop owns its half in the daemon through
+`/api/call/media/*` on the conclave `VoicePlane` (webrtc-rs + cpal). The daemon↔WebView SDP boundary
+is adapted in `hush-daemon` (`sdp_of_plane` / `sdp_as_description`). The ringtone and ringback reuse
+the conclave voice cues (`voiceCueFor`). Desktop→emulator shows the daemon streaming audio
+(`sent=… decoded=… played=… live=1`) with the emulator's WebView at `connectionState: connected`.
+Open items that remain: a foreground-service ring, and a clearer "could not connect" state for a
+NAT that STUN cannot traverse (host-only candidates).
+
 ### 5.5 Storage and attachments
 
 - The phone's vault is app-private, encrypted, and small; attachments are the only unbounded part.
@@ -406,8 +444,8 @@ Until 1–4 exist, a mobile wallet is a crate cross-build and a UI mock, not a f
 
 ## 12. Doc conflicts to fix
 
-- [`2026-10-18-android-linking.md`](plans/2026-10-18-android-linking.md) §5 still says "Wallet
-  (Task 8) — unbuilt". The wallet is built; that line is stale.
+- [`2026-10-18-android-linking.md`](plans/2026-10-18-android-linking.md) §5 said "Wallet
+  (Task 8) — unbuilt". Corrected 2026-10-23: the wallet is built; the phone remains undecided.
 - This plan's "invite → same ETH address" and "linked to the same identity" conflict with D1/D4/D6.
   The addendum's §2 is the corrected model.
 - The Windows plan's "wallet is Unix-socket-only" is still true for desktop; the Android in-process

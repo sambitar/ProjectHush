@@ -1,11 +1,20 @@
 import { groupDirectory, isFollowing, rowSubtitle, toggleFollow } from "./lib/explorePage";
 import { copyModalOrigin, enterModal, leaveModal, stampModalOrigin } from "./lib/modalFx";
-import { api, AppError, getApiBase } from "./lib/api/daemon";
+import {
+  api,
+  AppError,
+  getApiBase,
+  HUSH_STUN_DEFAULT,
+  HUSH_TURN_DEFAULT,
+  isDesktopShell,
+  isMobileShell,
+} from "./lib/api/daemon";
 import type {
   ContactDto,
   ContactRequestDto,
   DropsKeyDto,
   PaymentPolicy,
+  RecvCallDto,
   SignalPolicy,
   StatusResponse,
   TrusteeReach,
@@ -457,6 +466,29 @@ type ModalKey =
   | "zinesPublish"
   | "updatePrompt";
 
+/**
+ * The live 1:1 call. On the phone and in a browser the media is the WebView's
+ * WebRTC; on the desktop the daemon owns it and every media field stays null.
+ */
+interface ActiveCall {
+  sessionId: string;
+  nick: string;
+  pc: RTCPeerConnection | null;
+  local: MediaStream | null;
+  remote: MediaStream | null;
+  direction: "outgoing" | "incoming";
+  phase: "ringing" | "connecting" | "active";
+  micMuted: boolean;
+  audio: HTMLAudioElement | null;
+}
+
+/** An offer waiting for the user. */
+interface IncomingCall {
+  nick: string;
+  sessionId: string;
+  sdp: string;
+}
+
 type SettingsSection =
   | "appearance"
   | "profile"
@@ -851,6 +883,12 @@ export class App {
   private torActionError: string | null = null;
   private search = "";
   private settingsSection: SettingsSection = "appearance";
+  /** The live 1:1 call (Task 17), if any. */
+  private call: ActiveCall | null = null;
+  /** An offer waiting for the user to accept or decline. */
+  private incomingCall: IncomingCall | null = null;
+  /** On the phone, Settings is a list until a section is opened. */
+  private mobileSettingsOpen = false;
   /** The Voice section's input meter poll; null when the section is closed. */
   private voiceMeterTimer: number | null = null;
   private liveRegion!: HTMLElement;
@@ -1389,6 +1427,10 @@ export class App {
 
   constructor(root: HTMLElement) {
     this.root = root;
+    // The phone is one screen at a time, not the desktop's rail-plus-panes.
+    // Everything that differs is under `[data-shell="mobile"]` in the CSS, and
+    // `syncMobileShell` picks the single pane to paint.
+    if (isMobileShell()) document.documentElement.dataset.shell = "mobile";
     // An expiring line deletes itself in the store; the shell only has to
     // repaint. Registered here, not in start(), which runs again after every
     // unlock and would accumulate listeners.
@@ -1765,6 +1807,12 @@ export class App {
       status = null;
     }
     this.status = status;
+    // The identity fields come from the status document itself. They must not
+    // wait on the auxiliary loads below: a 501/network failure there used to
+    // skip these assignments, which left the phone saying "No address yet"
+    // beside a vault that had one.
+    this.mailHandle = status?.mail_handle ?? null;
+    this.vaultName = status?.vault_name ?? DEFAULT_VAULT_NAME;
     if (!status || status.locked) {
       this.stopPoll();
       // A locked vault holds no keys, so the voice read would only 401 — and
@@ -1786,8 +1834,6 @@ export class App {
       // unlocked, and the thread must have its history just the same.
       const history = await api.messages();
       if (history) loadHistory(history);
-      this.mailHandle = status.mail_handle ?? null;
-      this.vaultName = status.vault_name ?? DEFAULT_VAULT_NAME;
       await this.reloadMailbox();
       await this.reloadConclaves();
       this.contactRequests =
@@ -1999,6 +2045,8 @@ export class App {
         return;
       }
       for (const w of r.warnings) this.announce(w);
+      // Call signalling rides the same poll and is never a chat row.
+      void this.handleCallSignals(r.calls ?? []);
       let mailArrived = false;
       let conclaveArrived = false;
       let expireArrived = false;
@@ -2123,8 +2171,11 @@ export class App {
         (conclavesLoad.changed && !conclavesLoad.grewOnly);
       if (!shellNeeded && this.patchBackground()) return;
       if (!editing) this.scheduleBackgroundRender();
-    } catch {
-      /* daemon busy */
+    } catch (e) {
+      // A poll that dies must leave a trace: without one, a failed `recv` is
+      // indistinguishable from "nothing arrived" and the inbox silently stops
+      // draining. The console line is what logcat shows on the phone.
+      console.warn("[poll] recv failed:", e instanceof Error ? e.message : String(e));
     } finally {
       this.pollInFlight = false;
     }
@@ -2189,6 +2240,10 @@ export class App {
         soundsEnabled: chatSoundEnabled(),
         windowVisible: document.visibilityState === "visible",
         now: Date.now(),
+        // A 1:1 call uses the same two clips as a conclave room: the offer
+        // waiting for an answer rings, and the unanswered outgoing call plays
+        // the ringback until the answer arrives.
+        call: this.incomingCall ? "incoming" : (this.call?.phase ?? null),
       }),
     );
   }
@@ -2484,6 +2539,11 @@ export class App {
       this.shellEl = null;
       this.stopDropsPoll();
       this.stopTorPoll();
+      // A locked vault has no keys, so a call cannot continue. Signal the end
+      // best effort, then tear down the media locally and drop the card.
+      this.incomingCall = null;
+      if (this.call) void this.endCall();
+      this.syncCallOverlay();
       setTorrentsPaneOpen(false);
       // A device with no vault is not a locked vault: there is no passphrase to
       // check against and no recovery code to redeem, so the first run creates
@@ -2606,6 +2666,10 @@ export class App {
    * cannot go stale, and the panes left are cheap.
    */
   private syncShell(shell: HTMLElement): void {
+    if (isMobileShell()) {
+      this.syncMobileShell(shell);
+      return;
+    }
     const regions: RegionSpec[] = [
       { key: this.railKey(), build: () => this.renderRail() },
     ];
@@ -2684,6 +2748,171 @@ export class App {
       regions.push(this.settingsPaneRegion());
     }
     syncRegions(shell, regions);
+  }
+
+  /**
+   * The phone's shell: one screen at a time over the bottom bar.
+   *
+   * The panes are the desktop ones — rewriting them would fork a lot of
+   * behavior that is not desktop-specific — but the navigation and the
+   * two-pane assumptions are not carried over. Chats show the list until a
+   * thread is opened, then the thread with a way back; mail shows its folders
+   * as a strip above the list. See docs/MOBILE_APP_PLAN.md §13.
+   */
+  private syncMobileShell(shell: HTMLElement): void {
+    const rails = ["chats", "trusts", "mail", "settings"];
+    if (!rails.includes(this.rail)) {
+      // A selection carried over from the desktop layout (or an old build)
+      // names a screen the phone does not have.
+      this.rail = "chats";
+    }
+    const regions: RegionSpec[] = [];
+    if (this.rail === "chats") {
+      const open =
+        this.selectedNick !== null &&
+        this.chatContacts().some((c) => c.nickname === this.selectedNick);
+      if (open) {
+        regions.push({
+          key: `mobileBack:${this.selectedNick ?? ""}`,
+          build: () =>
+            this.renderMobileBack("Chats", () => {
+              this.selectedNick = null;
+              this.scheduleRender();
+            }),
+        });
+        regions.push({
+          key: this.chatPaneKey(),
+          build: () => this.renderMainChat(),
+          update: (el) => this.updateMainChat(el),
+        });
+      } else {
+        regions.push({
+          key: this.convListKey(),
+          build: () => this.renderConvList(),
+          update: (el) => this.syncConvList(el),
+        });
+      }
+    } else if (this.rail === "trusts") {
+      regions.push({
+        key: this.trustsKey(),
+        build: () => this.renderTrusts(),
+        update: (el) => this.syncTrustsPane(el),
+      });
+    } else if (this.rail === "mail") {
+      regions.push({
+        key: mailFoldersKey(this.mailAddress()),
+        build: () => this.renderMailFolders(),
+        update: (el) => this.syncMailFolders(el),
+      });
+      regions.push(this.mailMainRegion());
+    } else {
+      // Settings on the phone is a list, then one section at a time; the
+      // desktop two-column page would put a 200px column on a 393px screen.
+      if (this.mobileSettingsOpen) {
+        regions.push({
+          key: `mobileSettingsBack:${this.settingsSection}`,
+          build: () =>
+            this.renderMobileBack("Settings", () => {
+              this.mobileSettingsOpen = false;
+              this.scheduleRender();
+            }),
+        });
+        regions.push({
+          key: `mobileSettingsBody:${this.settingsSection}`,
+          build: () => this.renderMobileSettingsBody(),
+        });
+      } else {
+        regions.push({
+          key: "mobileSettingsList",
+          build: () => this.renderMobileSettingsList(),
+        });
+      }
+    }
+    // Last child: the bar sits at the bottom of the column.
+    regions.push({ key: this.railKey(), build: () => this.renderMobileNav() });
+    syncRegions(shell, regions);
+  }
+
+  /** The phone's bottom bar: only the surfaces that exist on this place. */
+  private renderMobileNav(): HTMLElement {
+    const nav = document.createElement("nav");
+    nav.className = "rail mobile-nav";
+    nav.setAttribute("aria-label", "Main");
+    nav.append(
+      this.railBtn("chats", "Chats", "chats", unreadTotal()),
+      this.railBtn("trusts", "Trusts", "trusts"),
+      this.railBtn("mail", "Mail", "mail", unreadCount(this.mailPrefs())),
+      this.railBtn("settings", "Settings", "settings"),
+    );
+    return nav;
+  }
+
+  /** A back affordance above a single-pane screen. */
+  private renderMobileBack(label: string, onBack: () => void): HTMLElement {
+    const bar = document.createElement("div");
+    bar.className = "mobile-back";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "mobile-back-btn pressable";
+    button.textContent = `‹ ${label}`;
+    button.setAttribute("aria-label", `Back to ${label}`);
+    button.onclick = onBack;
+    bar.appendChild(button);
+    return bar;
+  }
+
+  /**
+   * Settings on the phone: a section list, then one section at a time.
+   *
+   * Sections that only exist on the desktop (Drops, TorBox, the voice device
+   * pickers) are not offered here; see docs/MOBILE_APP_PLAN.md §4.
+   */
+  private renderMobileSettingsList(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane mobile-settings-list";
+    const title = document.createElement("h2");
+    title.className = "text-22";
+    title.textContent = "Settings";
+    title.style.padding = "var(--space-4) var(--space-4) var(--space-2)";
+    pane.appendChild(title);
+    const sections: { id: SettingsSection; label: string }[] = [
+      { id: "appearance", label: "Appearance" },
+      { id: "profile", label: "Profile" },
+      { id: "relay", label: "Relay" },
+      { id: "notifications", label: "Notifications" },
+      { id: "places", label: "Places" },
+      { id: "security", label: "Security" },
+      { id: "recovery", label: "Recovery" },
+      { id: "backup", label: "Backup" },
+      { id: "about", label: "About" },
+    ];
+    for (const s of sections) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "mobile-settings-row pressable";
+      const label = document.createElement("span");
+      label.className = "text-15";
+      label.textContent = s.label;
+      const chevron = document.createElement("span");
+      chevron.className = "muted";
+      chevron.textContent = "›";
+      row.append(label, chevron);
+      row.onclick = () => {
+        this.settingsSection = s.id;
+        this.mobileSettingsOpen = true;
+        this.scheduleRender();
+      };
+      pane.appendChild(row);
+    }
+    return pane;
+  }
+
+  /** One Settings section, full width, under the back bar. */
+  private renderMobileSettingsBody(): HTMLElement {
+    const pane = document.createElement("div");
+    pane.className = "main-pane";
+    pane.appendChild(this.settingsBody());
+    return pane;
   }
 
   /**
@@ -3628,6 +3857,17 @@ export class App {
       label.classList.toggle("online", contact.online);
       label.textContent = contact.online ? "Online" : "Offline";
     }
+    // The header is drawn once and patched from then on, so the call button has
+    // to be brought forward with the presence it depends on — otherwise a
+    // header drawn while the peer was offline keeps a disabled button after
+    // they come back, and the call is unreachable until a full rebuild.
+    const call = header.querySelector<HTMLButtonElement>("[data-call-button]");
+    if (call) {
+      call.disabled = !contact.online || contact.reach !== "full";
+      call.title = contact.online
+        ? "Call"
+        : "They are offline; calls need you both online";
+    }
     // The composer's presence half, on the patch path: `patchBackground` handles
     // a presence flip without a render, so the box has to be brought forward
     // here too. It goes through the same `updateComposer` the region's update
@@ -4420,7 +4660,7 @@ export class App {
     search.className = "search-pill";
     search.appendChild(icon("search"));
     const inp = document.createElement("input");
-    inp.placeholder = "Search or press Ctrl+K";
+    inp.placeholder = isMobileShell() ? "Search chats" : "Search or press Ctrl+K";
     inp.value = this.search;
     search.appendChild(inp);
     const rows = document.createElement("div");
@@ -4745,8 +4985,358 @@ export class App {
         },
       ],
     });
-    header.append(left, menu.element);
+    const call = document.createElement("button");
+    call.type = "button";
+    call.className = "btn-icon-round pressable";
+    call.dataset.callButton = nick;
+    call.setAttribute("aria-label", `Call ${displayNick(nick)}`);
+    call.title = contact.online
+      ? "Call"
+      : "They are offline; calls need you both online";
+    call.appendChild(icon("phone"));
+    call.disabled = !contact.online || contact.reach !== "full";
+    call.onclick = () => void this.startCall(nick);
+    header.append(left, call, menu.element);
     return header;
+  }
+
+  // ---------------------------------------------------------------- calls
+
+  /**
+   * Start a 1:1 call: WebView media, Rust signalling (Task 17).
+   *
+   * The SDP is gathered to completion before it is sent (non-trickle), which is
+   * the same one-round-trip shape the conclave voice plane uses and needs no
+   * candidate messages. With no STUN configured only host candidates are
+   * gathered, so this works on the same network; a reflexive path needs the
+   * configured STUN server the call plan discusses.
+   */
+  private async startCall(nick: string): Promise<void> {
+    if (this.call || this.incomingCall) return;
+    const contact = this.contacts.find((c) => c.nickname === nick);
+    if (!contact?.online) {
+      showToast(`${displayNick(nick)} is offline. Calls need you both online.`, {
+        kind: "error",
+      });
+      return;
+    }
+    const sessionId = crypto.randomUUID();
+    try {
+      if (isDesktopShell()) {
+        // The desktop shell has no WebRTC in its WebView, so the daemon owns
+        // the media plane: ask it for an offer and let it fan the call signal
+        // out. The card flips to "In call" when the answer arrives.
+        this.call = {
+          sessionId,
+          nick,
+          pc: null,
+          local: null,
+          remote: null,
+          direction: "outgoing",
+          phase: "ringing",
+          micMuted: false,
+          audio: null,
+        };
+        this.syncCallOverlay();
+        await api.callMediaOffer(nick, sessionId);
+        return;
+      }
+      if (!navigator.mediaDevices?.getUserMedia) {
+        showToast("This build cannot capture audio.", { kind: "error" });
+        return;
+      }
+      const { pc, local, remote, audio } = await this.newCallPeer(sessionId);
+      this.call = {
+        sessionId,
+        nick,
+        pc,
+        local,
+        remote,
+        direction: "outgoing",
+        phase: "ringing",
+        micMuted: false,
+        audio,
+      };
+      this.syncCallOverlay();
+      const offer = await pc.createOffer({ offerToReceiveAudio: true });
+      await pc.setLocalDescription(offer);
+      await this.awaitIce(pc);
+      await api.callOffer(nick, sessionId, pc.localDescription?.sdp ?? "");
+    } catch (e) {
+      this.dropCall();
+      showToast(e instanceof Error ? e.message : "The call could not start.", {
+        kind: "error",
+      });
+    }
+  }
+
+  private async newCallPeer(
+    sessionId: string,
+  ): Promise<{
+    pc: RTCPeerConnection;
+    local: MediaStream;
+    remote: MediaStream;
+    audio: HTMLAudioElement;
+  }> {
+    const local = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // The shipped STUN + TURN endpoints: the phone shell injects the vault's
+    // value, the desktop shell injects nothing, and a browser tab relies on the
+    // default. TURN is the fallback for peers a symmetric NAT or a
+    // client-isolating firewall keeps out of reach of peer-to-peer UDP.
+    const stun = window.__HUSH_STUN__ ?? HUSH_STUN_DEFAULT;
+    const turn = window.__HUSH_TURN__ ?? HUSH_TURN_DEFAULT;
+    const iceServers: RTCIceServer[] = [];
+    if (stun) iceServers.push({ urls: stun });
+    if (turn?.urls?.length) {
+      iceServers.push({
+        urls: turn.urls,
+        username: turn.username,
+        credential: turn.credential,
+      });
+    }
+    const pc = new RTCPeerConnection({ iceServers });
+    const remote = new MediaStream();
+    const audio = document.createElement("audio");
+    audio.autoplay = true;
+    audio.setAttribute("playsinline", "");
+    audio.style.display = "none";
+    document.body.appendChild(audio);
+    local.getTracks().forEach((track) => pc.addTrack(track, local));
+    pc.ontrack = (event) => {
+      audio.srcObject = event.streams[0] ?? remote;
+      void audio.play().catch(() => {});
+    };
+    pc.onconnectionstatechange = () => {
+      if (!this.call || this.call.sessionId !== sessionId) return;
+      if (pc.connectionState === "connected") {
+        this.call.phase = "active";
+        this.syncCallOverlay();
+      } else if (pc.connectionState === "failed") {
+        showToast("The call could not connect.", { kind: "error" });
+        void this.endCall();
+      }
+    };
+    return { pc, local, remote, audio };
+  }
+
+  /**
+   * Resolve when ICE gathering finishes, or after a bounded wait.
+   *
+   * The SDP is sent once, with no trickle and no second candidate message, so
+   * waiting is not optional: a description that leaves before the STUN reply
+   * lands carries host candidates only, and host candidates do not cross a NAT.
+   * The bound is generous because only a broken path reaches it; a working
+   * STUN lookup adds well under a second.
+   */
+  private awaitIce(pc: RTCPeerConnection): Promise<void> {
+    if (pc.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = (timedOut = false) => {
+        pc.removeEventListener("icegatheringstatechange", check);
+        if (timedOut) {
+          console.warn("[call] ICE gathering did not finish; sending host candidates only");
+        }
+        resolve();
+      };
+      const check = () => {
+        if (pc.iceGatheringState === "complete") done();
+      };
+      pc.addEventListener("icegatheringstatechange", check);
+      window.setTimeout(() => done(true), 10_000);
+    });
+  }
+
+  /** Apply the call payloads from one recv poll. */
+  private async handleCallSignals(calls: RecvCallDto[]): Promise<void> {
+    for (const row of calls) {
+      if (row.kind === "offer") {
+        if (this.call || this.incomingCall) {
+          await api.callEnd(row.from, row.session_id, "busy").catch(() => {});
+          continue;
+        }
+        this.incomingCall = {
+          nick: row.from,
+          sessionId: row.session_id,
+          sdp: row.sdp ?? "",
+        };
+        this.syncCallOverlay();
+        if (document.visibilityState !== "visible") requestAttention();
+      } else if (row.kind === "answer") {
+        if (!this.call || this.call.sessionId !== row.session_id) continue;
+        if (isDesktopShell()) {
+          // The daemon already finished the media handshake in its recv pass;
+          // there is nothing left to apply here — just mark the call up.
+          this.call.phase = "active";
+        } else {
+          await this.call.pc
+            ?.setRemoteDescription({ type: "answer", sdp: row.sdp ?? "" })
+            .catch(() => {});
+          this.call.phase = "connecting";
+        }
+        this.syncCallOverlay();
+      } else if (row.kind === "end") {
+        if (this.incomingCall?.sessionId === row.session_id) {
+          this.incomingCall = null;
+          this.syncCallOverlay();
+        } else if (this.call?.sessionId === row.session_id) {
+          const why = row.reason === "declined" ? "Call declined" : null;
+          if (why) showToast(why, { kind: "info" });
+          this.dropCall();
+        }
+      }
+    }
+  }
+
+  private async acceptIncomingCall(): Promise<void> {
+    const incoming = this.incomingCall;
+    if (!incoming || this.call) return;
+    this.incomingCall = null;
+    try {
+      if (isDesktopShell()) {
+        this.call = {
+          sessionId: incoming.sessionId,
+          nick: incoming.nick,
+          pc: null,
+          local: null,
+          remote: null,
+          direction: "incoming",
+          phase: "active",
+          micMuted: false,
+          audio: null,
+        };
+        this.syncCallOverlay();
+        await api.callMediaAnswer(incoming.nick, incoming.sessionId, incoming.sdp);
+        return;
+      }
+      const { pc, local, remote, audio } = await this.newCallPeer(incoming.sessionId);
+      this.call = {
+        sessionId: incoming.sessionId,
+        nick: incoming.nick,
+        pc,
+        local,
+        remote,
+        direction: "incoming",
+        phase: "connecting",
+        micMuted: false,
+        audio,
+      };
+      await pc.setRemoteDescription({ type: "offer", sdp: incoming.sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await this.awaitIce(pc);
+      await api.callAnswer(incoming.nick, incoming.sessionId, pc.localDescription?.sdp ?? "");
+      this.syncCallOverlay();
+    } catch (e) {
+      this.dropCall();
+      showToast(e instanceof Error ? e.message : "The call could not be answered.", {
+        kind: "error",
+      });
+    }
+  }
+
+  private async declineIncomingCall(): Promise<void> {
+    const incoming = this.incomingCall;
+    this.incomingCall = null;
+    if (incoming) {
+      await api.callEnd(incoming.nick, incoming.sessionId, "declined").catch(() => {});
+    }
+    this.syncCallOverlay();
+  }
+
+  private async endCall(): Promise<void> {
+    const call = this.call;
+    if (call) {
+      await api.callEnd(call.nick, call.sessionId, "hangup").catch(() => {});
+      if (isDesktopShell()) {
+        await api.callMediaEnd(call.sessionId).catch(() => {});
+      }
+    }
+    this.dropCall();
+  }
+
+  /** Tear down local media and the peer connection without signalling. */
+  private dropCall(): void {
+    const call = this.call;
+    this.call = null;
+    if (call) {
+      call.pc?.close();
+      call.local?.getTracks().forEach((track) => track.stop());
+      call.audio?.remove();
+    }
+    this.syncCallOverlay();
+  }
+
+  private toggleCallMute(): void {
+    const call = this.call;
+    if (!call) return;
+    call.micMuted = !call.micMuted;
+    if (isDesktopShell()) {
+      void api.callMediaMute(call.sessionId, call.micMuted).catch(() => {});
+    } else {
+      call.local?.getAudioTracks().forEach((track) => {
+        track.enabled = !call.micMuted;
+      });
+    }
+    this.syncCallOverlay();
+  }
+
+  /** Draw the call card above the shell; it lives on `body` so a render keeps it. */
+  private syncCallOverlay(): void {
+    // Every way a call starts, connects, ends, or is dropped goes through this
+    // method, so it is also the one place the ringtone and ringback follow the
+    // call's phase without waiting for the next poll.
+    this.updateVoiceCue();
+    document.getElementById("hush-call")?.remove();
+    const incoming = this.incomingCall;
+    const call = this.call;
+    if (!incoming && !call) return;
+    const overlay = document.createElement("div");
+    overlay.id = "hush-call";
+    overlay.className = "call-overlay";
+    const card = document.createElement("div");
+    card.className = "call-card";
+    const title = document.createElement("div");
+    title.className = "text-17";
+    title.textContent = displayNick(incoming?.nick ?? call?.nick ?? "");
+    const status = document.createElement("div");
+    status.className = "text-13 muted";
+    status.textContent = incoming
+      ? "Incoming call"
+      : call?.phase === "active"
+        ? "In call"
+        : call?.phase === "ringing"
+          ? "Ringing…"
+          : "Connecting…";
+    const actions = document.createElement("div");
+    actions.className = "call-actions";
+    if (incoming) {
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "btn-secondary pressable";
+      decline.textContent = "Decline";
+      decline.onclick = () => void this.declineIncomingCall();
+      const accept = document.createElement("button");
+      accept.type = "button";
+      accept.className = "btn-primary pressable";
+      accept.textContent = "Accept";
+      accept.onclick = () => void this.acceptIncomingCall();
+      actions.append(decline, accept);
+    } else if (call) {
+      const mute = document.createElement("button");
+      mute.type = "button";
+      mute.className = "btn-secondary pressable";
+      mute.textContent = call.micMuted ? "Unmute" : "Mute";
+      mute.onclick = () => this.toggleCallMute();
+      const end = document.createElement("button");
+      end.type = "button";
+      end.className = "btn-primary pressable";
+      end.textContent = "End call";
+      end.onclick = () => void this.endCall();
+      actions.append(mute, end);
+    }
+    card.append(title, status, actions);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
   }
 
   /**

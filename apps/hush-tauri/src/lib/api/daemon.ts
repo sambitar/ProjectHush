@@ -64,7 +64,8 @@ import type {
 
 type Transport =
   | { kind: "unix"; path: string }
-  | { kind: "tcp"; base: string };
+  | { kind: "tcp"; base: string }
+  | { kind: "mobile" };
 
 /**
  * `?api=http://127.0.0.1:9877` points one browser tab at one daemon, so a single
@@ -82,12 +83,46 @@ function apiFromQuery(): string | null {
 export const HUSH_RELAY_DEFAULT = "https://hushrelay.space";
 
 /**
+ * The STUN endpoint calls use when the shell injects none. Same host as the
+ * relay, never a third-party service; it learns an IP+port, not a party pair.
+ * The phone shell injects the vault's value (`__HUSH_STUN__`) instead, so an
+ * operator override reaches the device; the desktop shell does not link the
+ * vault crate, so it and a plain browser fall back to the shipped default.
+ */
+export const HUSH_STUN_DEFAULT = "stun:hushrelay.space:3478";
+
+/** A TURN relay the call media path falls back to. */
+export interface TurnConfig {
+  urls: string[];
+  username: string;
+  credential: string;
+}
+
+/**
+ * The TURN relay config calls use when the shell injects none. Same coturn as
+ * STUN; media relays through it only for peers that cannot connect
+ * peer-to-peer (symmetric NAT, client-isolating firewalls). The username and
+ * credential are soft — they gate allocations against casual abuse, not a
+ * secret. The phone shell injects the vault's value (`__HUSH_TURN__`).
+ */
+export const HUSH_TURN_DEFAULT: TurnConfig = {
+  urls: [
+    "turn:hushrelay.space:3478?transport=tcp",
+    "turn:hushrelay.space:3478?transport=udp",
+  ],
+  username: "hush",
+  credential: "hdBBhWzx4eHNkLIDtMWJhKhfaKi7gPH",
+};
+
+/**
  * How to reach the daemon. The desktop shell injects the real transport
  * (Unix socket by default, DR-02); a plain browser falls back to loopback HTTP.
  */
 function transport(): Transport {
   const t = window.__HUSH_TRANSPORT__;
-  if (t && (t.kind === "unix" || t.kind === "tcp")) return t;
+  if (t && (t.kind === "unix" || t.kind === "tcp" || t.kind === "mobile")) {
+    return t;
+  }
   return {
     kind: "tcp",
     base: window.__HUSH_API__ || apiFromQuery() || "http://127.0.0.1:9876",
@@ -96,7 +131,30 @@ function transport(): Transport {
 
 export function getApiBase(): string {
   const t = transport();
+  if (t.kind === "mobile") return "in-process";
   return t.kind === "unix" ? `unix://${t.path}` : t.base;
+}
+
+/** True when the UI runs against the phone's in-process backend. */
+export function isMobileShell(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    window.__HUSH_TRANSPORT__?.kind === "mobile"
+  );
+}
+
+/**
+ * True when the UI runs in the desktop shell (the daemon over a Unix socket).
+ *
+ * The desktop owns call media in the daemon's WebRTC stack rather than the
+ * WebView's: WebKitGTK on Linux ships without `RTCPeerConnection`. A browser
+ * tab (tcp transport) and the phone (mobile) keep the WebView media path.
+ */
+export function isDesktopShell(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    window.__HUSH_TRANSPORT__?.kind === "unix"
+  );
 }
 
 export class AppError extends Error {
@@ -117,6 +175,15 @@ async function send(
   body: string | undefined,
 ): Promise<RawReply> {
   const t = transport();
+  if (t.kind === "mobile") {
+    // Android has no daemon process: the same paths are dispatched inside the
+    // Tauri Rust backend (docs/MOBILE_APP_PLAN.md §5.1).
+    return invoke<RawReply>("hush_mobile_api", {
+      method,
+      path,
+      body: body ?? null,
+    });
+  }
   if (t.kind === "unix") {
     if (!isTauriShell()) {
       throw new AppError(
@@ -276,6 +343,44 @@ export const api = {
     request<{ blob_id: string }>("/api/send-file-data", {
       method: "POST",
       body: JSON.stringify({ to, name, data_base64 }),
+    }),
+  callOffer: (to: string, session_id: string, sdp: string) =>
+    request<null>("/api/call/offer", {
+      method: "POST",
+      body: JSON.stringify({ to, session_id, sdp }),
+    }),
+  callAnswer: (to: string, session_id: string, sdp: string) =>
+    request<null>("/api/call/answer", {
+      method: "POST",
+      body: JSON.stringify({ to, session_id, sdp }),
+    }),
+  callEnd: (to: string, session_id: string, reason = "hangup") =>
+    request<null>("/api/call/end", {
+      method: "POST",
+      body: JSON.stringify({ to, session_id, reason }),
+    }),
+  // Desktop-only: the daemon owns the media plane, so these replace the
+  // WebView's `RTCPeerConnection` on that target. The phone and a browser tab
+  // use `callOffer`/`callAnswer` with their own WebRTC instead.
+  callMediaOffer: (to: string, session_id: string) =>
+    request<null>("/api/call/media/offer", {
+      method: "POST",
+      body: JSON.stringify({ to, session_id }),
+    }),
+  callMediaAnswer: (to: string, session_id: string, sdp: string) =>
+    request<null>("/api/call/media/answer", {
+      method: "POST",
+      body: JSON.stringify({ to, session_id, sdp }),
+    }),
+  callMediaEnd: (session_id: string) =>
+    request<null>("/api/call/media/end", {
+      method: "POST",
+      body: JSON.stringify({ session_id }),
+    }),
+  callMediaMute: (session_id: string, muted: boolean) =>
+    request<null>("/api/call/media/mute", {
+      method: "POST",
+      body: JSON.stringify({ session_id, muted }),
     }),
   presenceHeartbeat: () =>
     request<null>("/api/presence/heartbeat", { method: "POST" }),

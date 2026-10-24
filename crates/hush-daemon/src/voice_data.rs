@@ -35,11 +35,12 @@ use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::media_stream::MediaStreamTrack;
 use webrtc::peer_connection::{
     MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState,
+    RTCIceGatheringState, RTCIceServer, RTCPeerConnectionState, SettingEngineBuilder,
 };
 use webrtc::runtime::{channel, default_runtime, Receiver, Runtime, Sender};
 
 use hush_audio::{fill_tone, resample, to_i16, Decoder, Encoder, JitterBuffer};
+use hush_core::config::TurnConfig;
 use serde::Serialize;
 
 /// The default registry's Opus payload type — what the media engine
@@ -105,6 +106,7 @@ struct Link {
 
 struct Inner {
     stun: Option<String>,
+    turn: Option<TurnConfig>,
     mode: MediaMode,
     links: Mutex<HashMap<String, Link>>,
     muted: AtomicBool,
@@ -817,14 +819,20 @@ impl VoicePlane {
     /// this default-selector form is the tests' convenience.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(stun: Option<String>, mode: MediaMode) -> Self {
-        Self::with_selector(stun, mode, DeviceSelector::default())
+        Self::with_selector(stun, None, mode, DeviceSelector::default())
     }
 
     /// A plane with a device preference — what the daemon builds from the
     /// voice device names on file in the config.
-    pub fn with_selector(stun: Option<String>, mode: MediaMode, selector: DeviceSelector) -> Self {
+    pub fn with_selector(
+        stun: Option<String>,
+        turn: Option<TurnConfig>,
+        mode: MediaMode,
+        selector: DeviceSelector,
+    ) -> Self {
         let inner = Arc::new(Inner {
             stun,
+            turn,
             mode,
             links: Mutex::new(HashMap::new()),
             muted: AtomicBool::new(false),
@@ -1072,22 +1080,47 @@ impl VoicePlane {
         media_engine
             .register_default_codecs()
             .map_err(|e| format!("no codec registry: {e}"))?;
+        // Chromium (the phone's and a browser's WebView) wants the DTLS
+        // fingerprint beside the ICE credentials in the media section, not at
+        // the session level. A session-level fingerprint is legal but some
+        // Chromium builds refuse to wire the DTLS transport without a
+        // media-level copy, which is why the desktop-as-answerer call stuck on
+        // "Connecting" and never went live.
+        let setting_engine = SettingEngineBuilder::new()
+            .with_sdp_media_level_fingerprints(true)
+            .build();
         let mut builder = PeerConnectionBuilder::new()
             .with_handler(handler)
             .with_runtime(runtime())
             .with_media_engine(media_engine)
+            .with_setting_engine(setting_engine)
             // Bind every interface: a LAN peer has to be reachable on the
             // interface the two machines actually share, not just loopback.
             .with_udp_addrs(vec!["0.0.0.0:0".to_string()]);
-        // No STUN unless the operator configured one: a public server would
-        // learn the address of every peer that joins a voice room.
+        // STUN discovers the peer's address; TURN relays media for the peers
+        // that cannot connect peer-to-peer (symmetric NAT, client-isolating
+        // firewalls). Both default to the operator's own coturn; a plane with
+        // neither gathers host candidates only, which is the loopback/LAN test
+        // posture.
+        let mut ice_servers: Vec<RTCIceServer> = Vec::new();
         if let Some(stun) = self.inner.stun.as_ref() {
+            ice_servers.push(RTCIceServer {
+                urls: vec![stun.clone()],
+                ..Default::default()
+            });
+        }
+        if let Some(turn) = self.inner.turn.as_ref() {
+            ice_servers.push(RTCIceServer {
+                urls: turn.urls.clone(),
+                username: turn.username.clone(),
+                credential: turn.credential.clone(),
+                ..Default::default()
+            });
+        }
+        if !ice_servers.is_empty() {
             builder = builder.with_configuration(
                 webrtc::peer_connection::RTCConfigurationBuilder::new()
-                    .with_ice_servers(vec![RTCIceServer {
-                        urls: vec![stun.clone()],
-                        ..Default::default()
-                    }])
+                    .with_ice_servers(ice_servers)
                     .build(),
             );
         }
@@ -1196,6 +1229,45 @@ mod tests {
                 "B must receive and play A's audio: {:?}",
                 b.stats()
             );
+
+            a.shutdown();
+            b.shutdown();
+        });
+    }
+
+    /// The phone's and a browser's WebView (Chromium) will not wire the DTLS
+    /// transport unless the `a=fingerprint` line sits beside the ICE
+    /// credentials in the media section. A session-level fingerprint parses but
+    /// leaves the desktop-as-answerer call stuck on "Connecting" — the bug this
+    /// asserts against. Both directions share [`build`], so assert both.
+    #[test]
+    fn fingerprints_are_media_level_for_chromium() {
+        fn sdp_of(serialized: &str) -> String {
+            serde_json::from_str::<serde_json::Value>(serialized)
+                .ok()
+                .and_then(|v| v.get("sdp").and_then(|s| s.as_str()).map(str::to_string))
+                .expect("the description carries its SDP")
+        }
+
+        block_on(async {
+            let a = VoicePlane::new(None, MediaMode::Tone);
+            let b = VoicePlane::new(None, MediaMode::Tone);
+            let offer = a.offer("b").await.expect("A offers");
+            let answer = b.answer("a", &offer).await.expect("B answers");
+
+            for (label, sdp) in [("offer", sdp_of(&offer)), ("answer", sdp_of(&answer))] {
+                let audio = sdp
+                    .find("m=audio")
+                    .unwrap_or_else(|| panic!("{label} carries an audio m-line"));
+                let fingerprint = sdp
+                    .find("a=fingerprint")
+                    .unwrap_or_else(|| panic!("{label} carries a fingerprint"));
+                assert!(
+                    fingerprint > audio,
+                    "{label} must put a=fingerprint in the media section (after m=audio), \
+                     not at the session level"
+                );
+            }
 
             a.shutdown();
             b.shutdown();

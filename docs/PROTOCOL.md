@@ -411,9 +411,10 @@ conclave messages, and nothing on the relay learns the paper exists.
   re-broadcasts an update it receives over one channel to its other channels; the relay is still
   fanning out underneath, so the channel is a latency optimization, never the guarantee. When it is
   unusable the daemon sends over the relay and the UI badge reads `relay` instead of `live`.
-- **STUN, no TURN.** `ClientConfig::stun_url` is the one place a STUN server is configured and it has
-  **no default** — a public one would learn the address of every peer that opens a paper. There is no
-  TURN, so symmetric NAT degrades to the relay rather than being traversed.
+- **STUN, no TURN.** `ClientConfig::stun_url` is the one place a STUN server is configured, and it
+  defaults to our own host (`stun:hushrelay.space:3478`), never a third-party one. It sees an
+  IP+port, not who is talking to whom. There is no TURN, so a symmetric NAT still falls back to the
+  relay rather than being traversed.
 - **Presence.** Cursors, colour, and display name are `y-protocols` awareness frames carried over the
   DataChannel **only** — there is no relay copy and a 30-second TTL in daemon memory, so presence is
   ephemeral and a peer that drops off simply disappears.

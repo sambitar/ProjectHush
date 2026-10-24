@@ -210,7 +210,8 @@ blobs (`crates/hush-daemon/src/torrents.rs` — the pipeline writes files into t
 - Torrent Library files — the listing can sync; the files are desktop blobs. Watching a single
   video on the phone would mean pulling it through the cache cap on tap — a policy question, not
   free
-- Wallet (Task 8) — unbuilt, and unix-socket-gated today; undecided for any phone
+- Wallet (Task 8) — built; the desktop wallet is Unix-socket-gated, and mobile is undecided.
+  The Android plan's M4 is where a phone wallet would be scoped, not here
 
 **Android platform realities, independent of A/B/C:**
 

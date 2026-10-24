@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-hush-mobile"
+description = "Proxy UI requests to the in-process vault backend on Android"
+commands.allow = ["hush_mobile_api"]

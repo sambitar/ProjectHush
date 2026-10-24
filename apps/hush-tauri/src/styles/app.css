@@ -6110,4 +6110,167 @@ fieldset.chat-history-section {
   display: none;
 }
 
+/* The 1:1 call card. It lives on `body` (not the shell) so a render keeps it
+   attached; the WebView owns the media and this is only chrome. */
+.call-overlay {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: var(--space-3);
+  padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom, 0px));
+  z-index: 200;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.call-card {
+  pointer-events: auto;
+  width: min(440px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-2);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.call-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.call-actions .btn-primary,
+.call-actions .btn-secondary {
+  width: auto;
+  flex: 1;
+}
+
+/* ------------------------------------------------------------------ phone */
+
+/* The phone build is one screen at a time over a bottom bar
+   (docs/MOBILE_APP_PLAN.md §13). The desktop rail and its minimum width are
+   not carried over; the panes are reused inside this frame. */
+[data-shell="mobile"] .shell {
+  min-width: 0;
+  height: 100dvh;
+  flex-direction: column;
+  /* Android 15 draws the WebView edge-to-edge; the status bar height is the
+     inset, and the notification bar must not sit on the pane title. */
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+[data-shell="mobile"] .mobile-nav {
+  width: 100%;
+  height: auto;
+  flex-direction: row;
+  justify-content: space-around;
+  align-items: stretch;
+  flex-shrink: 0;
+  gap: 0;
+  padding: var(--space-2) var(--space-3);
+  padding-bottom: calc(var(--space-2) + env(safe-area-inset-bottom, 0px));
+  border-right: 0;
+  border-top: 1px solid var(--border);
+}
+
+[data-shell="mobile"] .mobile-nav .rail-btn {
+  width: auto;
+  flex: 1;
+  padding: var(--space-2) 0;
+}
+
+[data-shell="mobile"] .conv-list {
+  width: 100%;
+  flex: 1;
+  border-right: 0;
+  min-height: 0;
+}
+
+[data-shell="mobile"] .main-pane {
+  width: 100%;
+}
+
+[data-shell="mobile"] .unlock-screen {
+  padding-top: calc(var(--space-5) + env(safe-area-inset-top, 0px));
+  padding-bottom: calc(var(--space-5) + env(safe-area-inset-bottom, 0px));
+}
+
+[data-shell="mobile"] .mobile-settings-list {
+  padding-bottom: var(--space-4);
+}
+
+[data-shell="mobile"] .mobile-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: var(--space-4);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  text-align: left;
+}
+
+[data-shell="mobile"] .mobile-back {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+[data-shell="mobile"] .mobile-back-btn {
+  border: 0;
+  background: transparent;
+  color: var(--accent-strong);
+  font-size: 15px;
+  padding: var(--space-2);
+}
+
+/* Mail's folder column becomes a horizontal strip on the phone; the list or
+   reader below it keeps the full width. */
+[data-shell="mobile"] .mail-folders {
+  width: 100%;
+  flex-shrink: 0;
+  flex-direction: row;
+  align-items: center;
+  border-right: 0;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0;
+  overflow-x: auto;
+}
+
+[data-shell="mobile"] .mail-address {
+  margin: 0 var(--space-3);
+  white-space: nowrap;
+}
+
+[data-shell="mobile"] .mail-folder-list {
+  flex-direction: row;
+  padding: var(--space-2);
+  overflow-x: auto;
+}
+
+[data-shell="mobile"] .mail-folder {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* Dialogs are phone-width, not the desktop's 480px card. The shell's old
+   720px minimum width was what pushed the recovery modal off-screen. */
+[data-shell="mobile"] .modal-backdrop {
+  padding: var(--space-3);
+}
+
+[data-shell="mobile"] .modal {
+  width: min(440px, 100%);
+  max-height: calc(100dvh - var(--space-6));
+}
+
 
