@@ -6,7 +6,7 @@
 //! the contact on both sides and starts the normal queue-grant exchange.
 
 use hush_core::Account;
-use hush_relay::{RelayConfig, router};
+use hush_relay::{router, RelayConfig};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
 
@@ -134,19 +134,28 @@ async fn a_declined_request_creates_no_contact_and_can_be_asked_again() {
 }
 
 #[tokio::test]
-async fn a_second_request_to_a_pending_peer_is_refused() {
+async fn a_retry_to_a_pending_peer_re_sends_as_a_fresh_prekey_message() {
     let (mut alice, mut bob, _alice_dir, _bob_dir, _relay_dir) = pair().await;
     let bob_invite = bob.invite().await.unwrap();
 
     alice
-        .request_contact("bob", &bob_invite, None)
+        .request_contact("bob", &bob_invite, Some("first"))
         .await
         .unwrap();
-    let again = alice.request_contact("bob", &bob_invite, None).await;
-    assert!(
-        again.is_err(),
-        "a second request must not cross the first one"
-    );
+    // The first request is never polled, so bob holds no session for alice.
+    // Asking again must not be refused: the retry has to arrive under the
+    // sender's own identity, which only a fresh prekey message can do.
+    alice
+        .request_contact("bob", &bob_invite, Some("second try"))
+        .await
+        .unwrap();
+
+    let inbox = bob.recv().await.unwrap();
+    assert!(inbox.warnings.is_empty(), "{:?}", inbox.warnings);
+    let pending = bob.incoming_contact_requests();
+    assert_eq!(pending.len(), 1, "a retry is one request, not two");
+    assert_eq!(pending[0].account_id, alice.protocol_name());
+    assert_eq!(pending[0].note.as_deref(), Some("second try"));
 }
 
 #[tokio::test]
@@ -176,11 +185,20 @@ async fn two_requests_crossing_on_the_wire_converge() {
     // Both sides ask at the same time. Each request is a prekey message on a
     // session the other side also opened; libsignal keeps both attributable, so
     // the result must be a pending request on each side, not a lost pair.
-    alice.request_contact("bob", &b_inv, Some("a")).await.unwrap();
-    bob.request_contact("alice", &a_inv, Some("b")).await.unwrap();
+    alice
+        .request_contact("bob", &b_inv, Some("a"))
+        .await
+        .unwrap();
+    bob.request_contact("alice", &a_inv, Some("b"))
+        .await
+        .unwrap();
     let alice_inbox = alice.recv().await.unwrap();
     let bob_inbox = bob.recv().await.unwrap();
-    assert!(alice_inbox.warnings.is_empty(), "{:?}", alice_inbox.warnings);
+    assert!(
+        alice_inbox.warnings.is_empty(),
+        "{:?}",
+        alice_inbox.warnings
+    );
     assert!(bob_inbox.warnings.is_empty(), "{:?}", bob_inbox.warnings);
     assert_eq!(alice.incoming_contact_requests().len(), 1);
     assert_eq!(bob.incoming_contact_requests().len(), 1);
@@ -189,14 +207,83 @@ async fn two_requests_crossing_on_the_wire_converge() {
 
     let aid = alice.incoming_contact_requests()[0].account_id.clone();
     let bid = bob.incoming_contact_requests()[0].account_id.clone();
-    alice.accept_contact_request(&aid, Some("bob")).await.unwrap();
-    bob.accept_contact_request(&bid, Some("alice")).await.unwrap();
+    alice
+        .accept_contact_request(&aid, Some("bob"))
+        .await
+        .unwrap();
+    bob.accept_contact_request(&bid, Some("alice"))
+        .await
+        .unwrap();
     let alice_inbox = alice.recv().await.unwrap();
     let bob_inbox = bob.recv().await.unwrap();
-    assert!(alice_inbox.warnings.is_empty(), "{:?}", alice_inbox.warnings);
+    assert!(
+        alice_inbox.warnings.is_empty(),
+        "{:?}",
+        alice_inbox.warnings
+    );
     assert!(bob_inbox.warnings.is_empty(), "{:?}", bob_inbox.warnings);
     assert_eq!(alice.contacts().len(), 1);
     assert_eq!(bob.contacts().len(), 1);
     assert_eq!(alice.contacts()[0].nickname, "bob");
     assert_eq!(bob.contacts()[0].nickname, "alice");
+}
+
+#[tokio::test]
+async fn a_strangers_request_survives_an_unlock_with_an_empty_identity_store() {
+    // The identity store is trust-on-first-use and is rebuilt from disk on every
+    // unlock. With nothing pinned, a stranger's first prekey message used to be
+    // decrypted under whichever contact was tried first, refused there as
+    // someone else's card, and consumed — so the request vanished without a
+    // trace and the sender was told it was already pending.
+    let (relay, _relay_dir) = spawn_relay().await;
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let carol_dir = TempDir::new().unwrap();
+    let mut alice = Account::create(alice_dir.path(), "alice-pass", &relay)
+        .await
+        .unwrap();
+    let mut bob = Account::create(bob_dir.path(), "bob-pass", &relay)
+        .await
+        .unwrap();
+    let mut carol = Account::create(carol_dir.path(), "carol-pass", &relay)
+        .await
+        .unwrap();
+
+    // Bob has exactly one contact, so exactly one address the stranger could be
+    // mis-attributed to.
+    let bob_invite = bob.invite().await.unwrap();
+    carol
+        .request_contact("bob", &bob_invite, Some("carol here"))
+        .await
+        .unwrap();
+    bob.recv().await.unwrap();
+    bob.accept_contact_request(carol.protocol_name(), Some("carol"))
+        .await
+        .unwrap();
+    carol.recv().await.unwrap();
+    assert_eq!(bob.contacts().len(), 1);
+
+    // A fresh unlock: the store comes back from `device.enc` alone.
+    drop(bob);
+    let mut bob = Account::open(bob_dir.path(), "bob-pass").await.unwrap();
+
+    alice
+        .request_contact("bob", &bob_invite, Some("first time"))
+        .await
+        .unwrap();
+    let inbox = bob.recv().await.unwrap();
+    assert!(inbox.warnings.is_empty(), "{:?}", inbox.warnings);
+    let pending = bob.incoming_contact_requests();
+    assert_eq!(pending.len(), 1, "the request must not be swallowed");
+    assert_eq!(pending[0].account_id, alice.protocol_name());
+    assert_eq!(pending[0].note.as_deref(), Some("first time"));
+
+    // The existing contact still reaches bob under its own identity, so the
+    // stranger did not take over carol's address.
+    bob.heartbeat_presence().await.unwrap();
+    carol.send_text("bob", "still me").await.unwrap();
+    let inbox = bob.recv().await.unwrap();
+    assert!(inbox.warnings.is_empty(), "{:?}", inbox.warnings);
+    assert_eq!(inbox.messages.len(), 1);
+    assert_eq!(inbox.messages[0].from_nick, "carol");
 }

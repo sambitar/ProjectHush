@@ -11,11 +11,18 @@
 //! same reason `AccountWorker` does: the Signal stores are not `Send`, so the
 //! account is created, used and dropped on one thread.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use hush_core::{Account, InboxResult, MessagePayload, PlaceRole};
+use hush_core::{
+    Account, ConclaveDescriptor, ConclaveRecord, InboxResult, MessagePayload, PlaceRole,
+    VoiceEffect, VoiceManager, VoiceSession,
+};
+use hush_voice::{DeviceSelector, MediaMode, VoicePlane};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -182,6 +189,34 @@ enum Work {
     AcknowledgeRecovery {
         reply: oneshot::Sender<ApiReply>,
     },
+    VoiceOpen {
+        conclave_id: String,
+        reply: oneshot::Sender<ApiReply>,
+    },
+    VoiceJoin {
+        conclave_id: String,
+        reply: oneshot::Sender<ApiReply>,
+    },
+    VoiceLeave {
+        conclave_id: String,
+        reply: oneshot::Sender<ApiReply>,
+    },
+    VoiceMute {
+        conclave_id: String,
+        muted: bool,
+        reply: oneshot::Sender<ApiReply>,
+    },
+    VoiceGet {
+        conclave_id: String,
+        reply: oneshot::Sender<ApiReply>,
+    },
+    VoiceStats {
+        conclave_id: String,
+        reply: oneshot::Sender<ApiReply>,
+    },
+    VoiceState {
+        reply: oneshot::Sender<ApiReply>,
+    },
     Status {
         dir: PathBuf,
         reply: oneshot::Sender<ApiReply>,
@@ -206,6 +241,9 @@ impl MobileBackend {
         let stun_url = hush_core::config::resolve_stun_url(&dir);
         let turn = hush_core::config::resolve_turn_config(&dir);
         let (tx, mut rx) = mpsc::channel::<Work>(16);
+        // The account thread reads the vault directory for the voice planes it
+        // builds, so it keeps its own copy.
+        let self_dir = dir.clone();
         thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -213,7 +251,46 @@ impl MobileBackend {
                 .expect("mobile backend runtime");
             rt.block_on(async move {
                 let mut account: Option<Account> = None;
+                // The voice room state machine and its media planes live beside
+                // the account, on the same thread, for the same reason: the
+                // Signal stores are not `Send`, and a room's authority is
+                // session truth that never reaches the vault.
+                let mut voices = VoiceManager::new();
+                let mut voice_planes: HashMap<String, Arc<VoicePlane>> = HashMap::new();
+                let mut voice_rings: HashMap<String, u64> = HashMap::new();
+                // Offers are gathered lazily on the next request instead of
+                // inside `voice_join`: ICE gathering takes seconds per peer and
+                // the UI's join click must not wait on it, but the account that
+                // sends the offer lives on this thread, so a spawned task could
+                // not reach it.
+                let mut pending_dials: Vec<(String, String, String)> = Vec::new();
                 while let Some(work) = rx.recv().await {
+                    if !pending_dials.is_empty() {
+                        if let Some(a) = account.as_mut() {
+                            for (conclave_id, session_id, peer) in
+                                pending_dials.drain(..).collect::<Vec<_>>()
+                            {
+                                let plane = voice_plane_for(&dir, &mut voice_planes, &session_id);
+                                match plane.offer(&peer).await {
+                                    Ok(sdp) => {
+                                        if let Err(e) = a
+                                            .send_conclave_voice_offer(
+                                                &conclave_id,
+                                                &session_id,
+                                                &sdp,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!("hush: voice offer fan-out failed: {e}");
+                                        }
+                                    }
+                                    Err(e) => eprintln!("hush: voice offer to {peer} failed: {e}"),
+                                }
+                            }
+                        } else {
+                            pending_dials.clear();
+                        }
+                    }
                     let (reply, result) = match work {
                         Work::Create {
                             dir,
@@ -271,6 +348,13 @@ impl MobileBackend {
                         }
                         Work::Lock { reply } => {
                             account = None;
+                            // A locked vault holds no keys and no sockets: the
+                            // room state and every media plane go with it, and a
+                            // ring nobody can answer stops ringing.
+                            voice_planes_shutdown(&mut voice_planes);
+                            voices = VoiceManager::new();
+                            voice_rings.clear();
+                            pending_dials.clear();
                             (reply, no_content())
                         }
                         Work::SetMailHandle { handle, reply } => {
@@ -478,7 +562,23 @@ impl MobileBackend {
                             let result = match account.as_mut() {
                                 None => error(400, "locked"),
                                 Some(a) => match a.recv().await {
-                                    Ok(inbox) => ok_json(recv_json(inbox)),
+                                    Ok(inbox) => {
+                                        if !inbox.voices.is_empty()
+                                            || !inbox.joined.is_empty()
+                                            || !inbox.departed.is_empty()
+                                        {
+                                            voice_apply_poll(
+                                                &dir,
+                                                a,
+                                                &mut voices,
+                                                &mut voice_planes,
+                                                &mut voice_rings,
+                                                &inbox,
+                                            )
+                                            .await;
+                                        }
+                                        ok_json(recv_json(inbox))
+                                    }
                                     Err(e) => error(400, &e.to_string()),
                                 },
                             };
@@ -555,6 +655,274 @@ impl MobileBackend {
                             };
                             (reply, result)
                         }
+                        Work::VoiceOpen { conclave_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => voice_error("locked".into()),
+                                Some(a) => {
+                                    let me = a.protocol_name().to_string();
+                                    let record = match a
+                                        .conclaves()
+                                        .iter()
+                                        .find(|c| c.id == conclave_id)
+                                        .cloned()
+                                    {
+                                        Some(record) => record,
+                                        None => {
+                                            return_reply(reply, error(404, "no such conclave"));
+                                            continue;
+                                        }
+                                    };
+                                    let session_id = uuid::Uuid::new_v4().to_string();
+                                    let now = voice_now_ms();
+                                    let descriptor = hush_core::VoiceDescriptor {
+                                        session_id: session_id.clone(),
+                                        conclave_id: conclave_id.clone(),
+                                        opener: me.clone(),
+                                        started_ms: now,
+                                    };
+                                    let opened = voices
+                                        .open(
+                                            &voice_conclave_descriptor(&record),
+                                            &me,
+                                            session_id.clone(),
+                                            now,
+                                        )
+                                        .map_err(|e| voice_error(e.to_string()));
+                                    if let Err(e) = opened {
+                                        return_reply(reply, e);
+                                        continue;
+                                    }
+                                    let view = voices
+                                        .session(&conclave_id)
+                                        .map(|s| voice_view_of(s, &me, &voice_rings))
+                                        .map(ok_json)
+                                        .unwrap_or_else(|| voice_error("no voice session".into()));
+                                    // The opener's plane exists from the open: it has
+                                    // nothing to dial yet, but the first joiner's
+                                    // offer must find it ready to answer.
+                                    voice_plane_for(&dir, &mut voice_planes, &session_id);
+                                    if let Err(e) =
+                                        a.send_conclave_voice_open(&conclave_id, descriptor).await
+                                    {
+                                        eprintln!("hush: voice open fan-out failed: {e}");
+                                    }
+                                    view
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::VoiceJoin { conclave_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => voice_error("locked".into()),
+                                Some(a) => {
+                                    let me = a.protocol_name().to_string();
+                                    let record = match a
+                                        .conclaves()
+                                        .iter()
+                                        .find(|c| c.id == conclave_id)
+                                        .cloned()
+                                    {
+                                        Some(record) => record,
+                                        None => {
+                                            return_reply(reply, error(404, "no such conclave"));
+                                            continue;
+                                        }
+                                    };
+                                    let Some(session_id) = voices
+                                        .session(&conclave_id)
+                                        .map(|s| s.session.session_id.clone())
+                                    else {
+                                        return_reply(reply, voice_error("no voice session".into()));
+                                        continue;
+                                    };
+                                    let existing: Vec<String> = voices
+                                        .session(&conclave_id)
+                                        .map(|s| {
+                                            s.joined.iter().map(|m| m.account.clone()).collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let joined = voices
+                                        .join(&voice_conclave_descriptor(&record), &me, &session_id)
+                                        .map_err(|e| voice_error(e.to_string()));
+                                    if let Err(e) = joined {
+                                        return_reply(reply, e);
+                                        continue;
+                                    }
+                                    voice_rings.remove(&session_id);
+                                    let view = voices
+                                        .session(&conclave_id)
+                                        .map(|s| voice_view_of(s, &me, &voice_rings))
+                                        .map(ok_json)
+                                        .unwrap_or_else(|| voice_error("no voice session".into()));
+                                    voice_plane_for(&dir, &mut voice_planes, &session_id);
+                                    for peer in existing.iter().filter(|p| *p != &me) {
+                                        pending_dials.push((
+                                            conclave_id.clone(),
+                                            session_id.clone(),
+                                            peer.clone(),
+                                        ));
+                                    }
+                                    view
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::VoiceLeave { conclave_id, reply } => {
+                            let result = match account.as_mut() {
+                                None => voice_error("locked".into()),
+                                Some(a) => {
+                                    let me = a.protocol_name().to_string();
+                                    let Some(before) = voices.session(&conclave_id).cloned() else {
+                                        return_reply(reply, voice_error("no voice session".into()));
+                                        continue;
+                                    };
+                                    let session_id = before.session.session_id.clone();
+                                    let effect = voices
+                                        .leave(&conclave_id, &session_id, &me)
+                                        .map_err(|e| voice_error(e.to_string()));
+                                    let effect = match effect {
+                                        Ok(effect) => effect,
+                                        Err(e) => {
+                                            return_reply(reply, e);
+                                            continue;
+                                        }
+                                    };
+                                    if effect == VoiceEffect::Ended {
+                                        voice_plane_drop(&mut voice_planes, &session_id);
+                                        voice_rings.remove(&session_id);
+                                    } else if let Some(plane) =
+                                        voice_plane_get(&voice_planes, &session_id)
+                                    {
+                                        plane.forget(&me);
+                                    }
+                                    if let Err(e) = a
+                                        .send_conclave_voice_leave(&conclave_id, &session_id, &me)
+                                        .await
+                                    {
+                                        eprintln!("hush: voice leave fan-out failed: {e}");
+                                    }
+                                    let view = match voices.session(&conclave_id) {
+                                        Some(live) => voice_view_of(live, &me, &voice_rings),
+                                        None => serde_json::json!({
+                                            "session_id": session_id,
+                                            "conclave_id": conclave_id,
+                                            "opener": before.session.opener,
+                                            "started_ms": before.session.started_ms,
+                                            "joined": [],
+                                            "i_am_in": false,
+                                            "ringing_until_ms": null,
+                                        }),
+                                    };
+                                    ok_json(view)
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::VoiceMute {
+                            conclave_id,
+                            muted,
+                            reply,
+                        } => {
+                            let result = match account.as_mut() {
+                                None => voice_error("locked".into()),
+                                Some(a) => {
+                                    let me = a.protocol_name().to_string();
+                                    let Some(session_id) = voices
+                                        .session(&conclave_id)
+                                        .map(|s| s.session.session_id.clone())
+                                    else {
+                                        return_reply(reply, voice_error("no voice session".into()));
+                                        continue;
+                                    };
+                                    let applied = voices
+                                        .mute(&conclave_id, &session_id, &me, muted)
+                                        .map_err(|e| voice_error(e.to_string()));
+                                    if let Err(e) = applied {
+                                        return_reply(reply, e);
+                                        continue;
+                                    }
+                                    // Capture stops before the flag fans out, so the
+                                    // wire never carries audio the flag calls muted.
+                                    voice_plane_for(&dir, &mut voice_planes, &session_id)
+                                        .set_muted(muted);
+                                    if let Err(e) = a
+                                        .send_conclave_voice_mute(
+                                            &conclave_id,
+                                            &session_id,
+                                            &me,
+                                            muted,
+                                        )
+                                        .await
+                                    {
+                                        eprintln!("hush: voice mute fan-out failed: {e}");
+                                    }
+                                    let view = voices
+                                        .session(&conclave_id)
+                                        .map(|s| voice_view_of(s, &me, &voice_rings))
+                                        .map(ok_json)
+                                        .unwrap_or_else(|| voice_error("no voice session".into()));
+                                    view
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::VoiceGet { conclave_id, reply } => {
+                            let result = match account.as_ref() {
+                                None => voice_error("locked".into()),
+                                Some(a) => {
+                                    let me = a.protocol_name();
+                                    voices
+                                        .session(&conclave_id)
+                                        .map(|s| ok_json(voice_view_of(s, me, &voice_rings)))
+                                        .unwrap_or_else(|| voice_error("no voice session".into()))
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::VoiceStats { conclave_id, reply } => {
+                            let result = match account.as_ref() {
+                                None => voice_error("locked".into()),
+                                Some(_) => {
+                                    let session_id = voices
+                                        .session(&conclave_id)
+                                        .map(|s| s.session.session_id.clone());
+                                    let Some(session_id) = session_id else {
+                                        return_reply(reply, voice_error("no voice session".into()));
+                                        continue;
+                                    };
+                                    match voice_plane_get(&voice_planes, &session_id) {
+                                        Some(plane) => {
+                                            let s = plane.stats();
+                                            ok_json(serde_json::json!({
+                                                "session_id": session_id,
+                                                "sent_frames": s.sent_frames,
+                                                "decoded_frames": s.decoded_frames,
+                                                "played_frames": s.played_frames,
+                                                "peers_live": s.peers_live,
+                                            }))
+                                        }
+                                        None => error(404, "no live media plane for this room"),
+                                    }
+                                }
+                            };
+                            (reply, result)
+                        }
+                        Work::VoiceState { reply } => {
+                            let result = match account.as_ref() {
+                                None => voice_error("locked".into()),
+                                Some(a) => {
+                                    let me = a.protocol_name();
+                                    ok_json(serde_json::json!({
+                                        "rooms": voices
+                                            .rooms()
+                                            .iter()
+                                            .map(|s| voice_view_of(s, me, &voice_rings))
+                                            .collect::<Vec<_>>(),
+                                    }))
+                                }
+                            };
+                            (reply, result)
+                        }
                         Work::Status { dir, reply } => {
                             (reply, ok_json(status(&dir, account.as_ref())))
                         }
@@ -563,7 +931,12 @@ impl MobileBackend {
                 }
             });
         });
-        Self { dir, stun_url, turn, tx }
+        Self {
+            dir: self_dir,
+            stun_url,
+            turn,
+            tx,
+        }
     }
 
     /// The STUN endpoint the WebView's peer connection should use.
@@ -581,6 +954,9 @@ impl MobileBackend {
     /// `path` is matched exactly, without a query string, which is how the UI
     /// calls these four endpoints today.
     pub async fn dispatch(&self, method: &str, path: &str, body: Option<&str>) -> ApiReply {
+        if let Some(reply) = self.dispatch_voice(method, path, body).await {
+            return reply;
+        }
         match (method, path) {
             ("GET", "/api/status") => {
                 let dir = self.dir.clone();
@@ -803,10 +1179,100 @@ impl MobileBackend {
         rx.await
             .unwrap_or_else(|_| error(500, "The phone's vault backend stopped."))
     }
+
+    /// `/api/voice/*` — the conclave voice surface, which carries a conclave id
+    /// in the path and so cannot be an exact match. Returns `None` for anything
+    /// that is not a voice route, so the caller falls through to the table.
+    ///
+    /// `/api/voice/devices*` is deliberately not handled: it is the desktop's
+    /// Settings panel, which asks a daemon about host audio devices. The phone
+    /// has one device set and no picker, so it falls through to the 501.
+    async fn dispatch_voice(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Option<ApiReply> {
+        if path == "/api/voice/state" {
+            return Some(match method {
+                "GET" => self.call(|reply| Work::VoiceState { reply }).await,
+                _ => error(405, "method not allowed"),
+            });
+        }
+        let rest = path.strip_prefix("/api/voice/")?;
+        if rest.starts_with("devices") {
+            return None;
+        }
+        let conclave_id = percent_decode(rest.split('/').next().unwrap_or_default());
+        let action = rest.split_once('/').map(|(_, a)| a).unwrap_or("");
+        let reply = match (method, action) {
+            ("GET", "") => {
+                self.call(|reply| Work::VoiceGet { conclave_id, reply })
+                    .await
+            }
+            ("GET", "stats") => {
+                self.call(|reply| Work::VoiceStats { conclave_id, reply })
+                    .await
+            }
+            ("POST", "open") => {
+                self.call(|reply| Work::VoiceOpen { conclave_id, reply })
+                    .await
+            }
+            ("POST", "join") => {
+                self.call(|reply| Work::VoiceJoin { conclave_id, reply })
+                    .await
+            }
+            ("POST", "leave") => {
+                self.call(|reply| Work::VoiceLeave { conclave_id, reply })
+                    .await
+            }
+            ("POST", "mute") => match parse::<VoiceMuteRequest>(body) {
+                Ok(request) => {
+                    self.call(|reply| Work::VoiceMute {
+                        conclave_id,
+                        muted: request.muted,
+                        reply,
+                    })
+                    .await
+                }
+                Err(message) => error(400, &message),
+            },
+            _ => return None,
+        };
+        Some(reply)
+    }
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(body: Option<&str>) -> Result<T, String> {
     serde_json::from_str(body.unwrap_or_default()).map_err(|e| format!("bad request body: {e}"))
+}
+
+/// Decode one path segment. Conclave ids are UUIDs, so this is a no-op in
+/// practice; it exists so a `%`-escaped id from `encodeURIComponent` is not
+/// compared verbatim against an unescaped one.
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let high = (bytes[i + 1] as char).to_digit(16);
+            let low = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                out.push((high * 16 + low) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[derive(Deserialize)]
+struct VoiceMuteRequest {
+    muted: bool,
 }
 
 #[derive(Deserialize)]
@@ -1158,6 +1624,287 @@ pub async fn hush_mobile_api(
     Ok(state.dispatch(&method, &path, body.as_deref()).await)
 }
 
+/// Send a reply from inside a handler that is abandoning the request early.
+///
+/// The work loop builds `(reply, result)` after the match, so an arm that has to
+/// stop before that has to hand the reply back itself.
+fn return_reply(reply: oneshot::Sender<ApiReply>, result: ApiReply) {
+    let _ = reply.send(result);
+}
+
+// ---------------------------------------------------------------------------
+// Conclave voice on the phone.
+//
+// The room's state machine and its media plane are the same ones the desktop
+// daemon drives (`hush_core::VoiceManager` + `hush_voice::VoicePlane`); this is
+// the same control surface over the in-process backend instead of the socket.
+// A locked vault is a 401, a restart is a leave, and nothing here is written to
+// the vault: a room is live-only session truth.
+// ---------------------------------------------------------------------------
+
+/// How long an inbound open keeps ringing this vault. Long enough to be heard
+/// across the UI's poll, short enough that a missed ring degrades to the pill's
+/// "Join voice" affordance.
+const VOICE_RING_TTL_MS: u64 = 30_000;
+
+fn voice_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The media plane for `session_id`, created on demand. The phone always runs
+/// the real devices: there is no dogfood tone mode here.
+fn voice_plane_for(
+    dir: &Path,
+    planes: &mut HashMap<String, Arc<VoicePlane>>,
+    session_id: &str,
+) -> Arc<VoicePlane> {
+    planes
+        .entry(session_id.to_string())
+        .or_insert_with(|| {
+            Arc::new(VoicePlane::with_selector(
+                hush_core::config::resolve_stun_url(dir),
+                Some(hush_core::config::resolve_turn_config(dir)),
+                MediaMode::Device,
+                DeviceSelector {
+                    input: hush_core::config::resolve_voice_input_device(dir),
+                    output: hush_core::config::resolve_voice_output_device(dir),
+                },
+            ))
+        })
+        .clone()
+}
+
+fn voice_plane_get(
+    planes: &HashMap<String, Arc<VoicePlane>>,
+    session_id: &str,
+) -> Option<Arc<VoicePlane>> {
+    planes.get(session_id).cloned()
+}
+
+fn voice_plane_drop(planes: &mut HashMap<String, Arc<VoicePlane>>, session_id: &str) {
+    if let Some(plane) = planes.remove(session_id) {
+        plane.shutdown();
+    }
+}
+
+fn voice_planes_shutdown(planes: &mut HashMap<String, Arc<VoicePlane>>) {
+    for (_, plane) in planes.drain() {
+        plane.shutdown();
+    }
+}
+
+/// The status a voice refusal maps to. The manager's messages are the `Error`
+/// display strings and are stable, so the mapping is explicit.
+fn voice_error(msg: String) -> ApiReply {
+    let status = if msg == "locked" {
+        401
+    } else if msg.contains("already open") || msg.contains("full") {
+        409
+    } else if msg.contains("no voice session") || msg.contains("conclave not found") {
+        404
+    } else if msg.contains("not a trustee") || msg.contains("has ended") {
+        403
+    } else {
+        400
+    };
+    error(status, &msg)
+}
+
+/// The descriptor-shaped view of a record, for the manager's authority checks.
+fn voice_conclave_descriptor(record: &ConclaveRecord) -> ConclaveDescriptor {
+    ConclaveDescriptor {
+        conclave_id: record.id.clone(),
+        name: record.name.clone(),
+        convener: record.convener.clone(),
+        trustees: record.trustees.clone(),
+        ended: record.ended,
+    }
+}
+
+fn voice_view_of(
+    session: &VoiceSession,
+    me: &str,
+    rings: &HashMap<String, u64>,
+) -> serde_json::Value {
+    let now = voice_now_ms();
+    serde_json::json!({
+        "session_id": session.session.session_id,
+        "conclave_id": session.session.conclave_id,
+        "opener": session.session.opener,
+        "started_ms": session.session.started_ms,
+        "joined": session
+            .joined
+            .iter()
+            .map(|m| serde_json::json!({ "account": m.account, "muted": m.muted }))
+            .collect::<Vec<_>>(),
+        "i_am_in": session.joined.iter().any(|m| m.account == me),
+        "ringing_until_ms": rings
+            .get(&session.session.session_id)
+            .copied()
+            .filter(|until| *until > now),
+    })
+}
+
+/// Apply one poll's voice payloads, sweep dead rooms, and send the answers the
+/// offers asked for.
+///
+/// The account is needed for two things only: the conclave roster (authority)
+/// and the answer fan-out. Everything else is in-memory room state.
+async fn voice_apply_poll(
+    dir: &Path,
+    account: &mut Account,
+    voices: &mut VoiceManager,
+    planes: &mut HashMap<String, Arc<VoicePlane>>,
+    rings: &mut HashMap<String, u64>,
+    inbox: &InboxResult,
+) {
+    let conclaves: HashMap<String, ConclaveRecord> = account
+        .conclaves()
+        .iter()
+        .cloned()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+    let now = voice_now_ms();
+    let mut answers: Vec<(String, String, String)> = Vec::new();
+    for received in &inbox.voices {
+        if let Some(answer) = voice_apply_inbound(
+            dir,
+            voices,
+            planes,
+            rings,
+            &conclaves,
+            &received.from_account,
+            &received.payload,
+            now,
+        )
+        .await
+        {
+            answers.push(answer);
+        }
+    }
+
+    // Sweep rooms whose conclave ended or that this vault can no longer speak
+    // for: a `ConclaveEnd` carries no voice payload of its own, so the room
+    // would otherwise outlive the conclave until a restart.
+    let me = account.protocol_name().to_string();
+    let live: Vec<String> = voices
+        .rooms()
+        .iter()
+        .map(|s| s.session.conclave_id.clone())
+        .collect();
+    for conclave_id in live {
+        let keep = match conclaves.get(&conclave_id) {
+            Some(record) => !record.ended && record.joined().any(|t| t.account_id == me),
+            None => false,
+        };
+        if !keep {
+            let session_id = voices
+                .session(&conclave_id)
+                .map(|s| s.session.session_id.clone());
+            voices.end_conclave(&conclave_id);
+            if let Some(session_id) = session_id {
+                voice_plane_drop(planes, &session_id);
+                rings.remove(&session_id);
+            }
+        }
+    }
+
+    for (conclave_id, session_id, sdp) in answers {
+        if let Err(e) = account
+            .send_conclave_voice_answer(&conclave_id, &session_id, &sdp)
+            .await
+        {
+            eprintln!("hush: voice answer fan-out failed: {e}");
+        }
+    }
+}
+
+/// Apply one voice payload received from a peer.
+///
+/// Authority was checked in `recv` (the sender is who the payload claims); what
+/// remains is the room's own rules, and an offer **is** the sender's join.
+/// Returns `(conclave, session, answer SDP)` when the payload asks for an answer.
+async fn voice_apply_inbound(
+    dir: &Path,
+    mgr: &mut VoiceManager,
+    planes: &mut HashMap<String, Arc<VoicePlane>>,
+    rings: &mut HashMap<String, u64>,
+    conclaves: &HashMap<String, ConclaveRecord>,
+    from_account: &str,
+    payload: &MessagePayload,
+    now: u64,
+) -> Option<(String, String, String)> {
+    match payload {
+        MessagePayload::VoiceOpen { session } => {
+            let record = conclaves.get(&session.conclave_id)?;
+            mgr.open(
+                &voice_conclave_descriptor(record),
+                &session.opener,
+                session.session_id.clone(),
+                now,
+            )
+            .ok()?;
+            // A peer's open is a knock the UI answers.
+            rings.insert(session.session_id.clone(), now + VOICE_RING_TTL_MS);
+            // Have the answering side ready: the joiner's offer can arrive in
+            // the same batch as the open.
+            voice_plane_for(dir, planes, &session.session_id);
+            None
+        }
+        MessagePayload::VoiceOffer { session_id, sdp } => {
+            let conclave_id = mgr.conclave_of(session_id)?.to_string();
+            let record = conclaves.get(&conclave_id)?;
+            // A join already on the roster is fine — the media handshake still
+            // needs its answer. Any other refusal must not be answered.
+            match mgr.join(&voice_conclave_descriptor(record), from_account, session_id) {
+                Ok(_) | Err(hush_core::Error::AlreadyConclaveTrustee) => {}
+                Err(_) => return None,
+            }
+            let plane = voice_plane_for(dir, planes, session_id);
+            let answer = plane.answer(from_account, sdp).await.ok()?;
+            Some((conclave_id, session_id.clone(), answer))
+        }
+        MessagePayload::VoiceAnswer { session_id, sdp } => {
+            let conclave_id = mgr.conclave_of(session_id)?.to_string();
+            let record = conclaves.get(&conclave_id)?;
+            let _ = mgr.join(&voice_conclave_descriptor(record), from_account, session_id);
+            let plane = voice_plane_for(dir, planes, session_id);
+            if let Err(e) = plane.accept_answer(from_account, sdp).await {
+                eprintln!("hush: voice answer from {from_account} did not apply: {e}");
+            }
+            None
+        }
+        MessagePayload::VoiceMute {
+            session_id,
+            who,
+            muted,
+            ..
+        } => {
+            let conclave_id = mgr.conclave_of(session_id)?.to_string();
+            mgr.mute(&conclave_id, session_id, who, *muted).ok()?;
+            None
+        }
+        MessagePayload::VoiceLeave { session_id, who } => {
+            let conclave_id = mgr.conclave_of(session_id)?.to_string();
+            let ended = matches!(
+                mgr.leave(&conclave_id, session_id, who),
+                Ok(VoiceEffect::Ended)
+            );
+            if ended {
+                voice_plane_drop(planes, session_id);
+                rings.remove(session_id);
+            } else if let Some(plane) = voice_plane_get(planes, session_id) {
+                plane.forget(who);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,5 +2042,61 @@ mod tests {
         let missing = backend.dispatch("GET", "/api/notes/state", None).await;
         assert_eq!(missing.status, 501);
         assert!(missing.body.contains("not available on the phone"));
+    }
+
+    #[tokio::test]
+    async fn voice_routes_are_phone_local() {
+        let dir = tempfile::tempdir().expect("a temp vault dir");
+        let backend = MobileBackend::spawn(dir.path().to_path_buf());
+
+        // A locked vault holds no keys and must not even learn a room exists.
+        let locked = backend.dispatch("GET", "/api/voice/state", None).await;
+        assert_eq!(locked.status, 401, "{}", locked.body);
+
+        let created = backend
+            .dispatch(
+                "POST",
+                "/api/vault/create",
+                Some(
+                    r#"{"passphrase":"correct horse","name":"phone","relay":"http://127.0.0.1:1"}"#,
+                ),
+            )
+            .await;
+        assert_eq!(created.status, 200, "{}", created.body);
+        let unlocked = backend
+            .dispatch(
+                "POST",
+                "/api/unlock",
+                Some(r#"{"passphrase":"correct horse"}"#),
+            )
+            .await;
+        assert_eq!(unlocked.status, 204, "{}", unlocked.body);
+
+        let state = backend.dispatch("GET", "/api/voice/state", None).await;
+        assert_eq!(state.status, 200, "{}", state.body);
+        assert_eq!(body(&state)["rooms"], serde_json::json!([]));
+
+        // A conclave id in the path is routed, not swallowed by the 501 arm.
+        let nowhere = "00000000-0000-0000-0000-000000000000";
+        let open = backend
+            .dispatch("POST", &format!("/api/voice/{nowhere}/open"), None)
+            .await;
+        assert_eq!(open.status, 404, "{}", open.body);
+        let stats = backend
+            .dispatch("GET", &format!("/api/voice/{nowhere}/stats"), None)
+            .await;
+        assert_eq!(stats.status, 404, "{}", stats.body);
+        let mute = backend
+            .dispatch(
+                "POST",
+                &format!("/api/voice/{nowhere}/mute"),
+                Some(r#"{"muted":true}"#),
+            )
+            .await;
+        assert_eq!(mute.status, 404, "{}", mute.body);
+
+        // The host audio-device picker is a desktop Settings screen.
+        let devices = backend.dispatch("GET", "/api/voice/devices", None).await;
+        assert_eq!(devices.status, 501);
     }
 }

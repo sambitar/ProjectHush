@@ -7,6 +7,117 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-10-25 — Phone conclave voice
+
+### The extracted voice crate's tests did not compile [FIXED]
+
+- Attempted: move `voice_data.rs` out of the daemon into `crates/hush-voice` so the phone can share the media plane.
+- Symptom: `cargo test -p hush-voice` failed with `E0061`: the device-fallback test still called
+  `VoicePlane::with_selector(stun, mode, selector)` after the constructor grew a `turn: Option<TurnConfig>`
+  parameter. The daemon had never run that test, so the breakage had gone unnoticed.
+- Resolution: pass `None` for TURN in the test. All 7 tests pass, including the loopback audio and the
+  mute-gate test.
+- Lesson: a test that is never run is not a test. The extraction moved it into a crate whose tests do run.
+
+### The voice plane does cross-compile for Android, but only with the NDK compiler env [FIXED]
+
+- Attempted: add `hush-voice` to the phone build.
+- Symptom: a bare `cargo check --target aarch64-linux-android -p hush-voice` failed in `hush-audio`'s
+  build script with `failed to find tool "aarch64-linux-android-clang"`, then `…-clang++` for the
+  C++ half. `cargo check` does not know about the NDK; only the Tauri/Gradle build exports the
+  cross compilers.
+- Resolution: set `CC_aarch64_linux_android`, `CXX_aarch64_linux_android`, `AR_…` and the linker to
+  `ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang` (minSdk
+  is 24). Everything then builds: vendored Opus via `cc`, `cpal` through `oboe`, and `webrtc`/`rtc`.
+  The release APK grew from 24.6 MB to 30.8 MB.
+- Lesson: check the ABIs and the C/C++ toolchain before writing wiring, not after.
+
+### An offer cannot be gathered inside `voice_join` on a single-threaded backend [WORKED AROUND]
+
+- Symptom: the desktop daemon spawns the dial because `plane.offer` gathers ICE inline for seconds per
+  peer. The phone's backend is one thread that owns the account (the Signal stores are `!Send`), so a
+  spawned task cannot reach the account to send the offer, and blocking the loop would stall `recv`.
+- Resolution: `voice_join` records the peers to dial and returns immediately; the next request on the
+  loop gathers and sends them. The UI polls, so the dial leaves within a second or two.
+- Lesson: mirroring a daemon handler is not a copy when the daemon has a thread pool and the target does not.
+
+### The native plane opens the microphone itself, so the WebView has to ask for it [FIXED]
+
+- Symptom: on a fresh install nothing has ever prompted for `RECORD_AUDIO`. The WebView path asked for
+  it via `getUserMedia` during a 1:1 call; the native plane (oboe) has no such hook.
+- Resolution: `ensureMicPermission()` in `app.ts` (mobile only) takes a throwaway `getUserMedia({audio})`
+  before `voiceOpen`/`voiceJoin`, stops the track immediately, and lets the plane open its own stream.
+  The Android manifest already declares `RECORD_AUDIO` and `MODIFY_AUDIO_SETTINGS`.
+- Lesson: a permission that only one of two media paths requests is a bug waiting for the other path.
+
+## 2026-10-25 — Contact request never reaches the desktop
+
+### The Signal identity store is never persisted, so a stranger's request is mis-attributed to a contact and destroyed [FIXED]
+
+- Attempted: add the desktop from a newly imaged Android device by invite.
+- Symptom: the desktop never showed a pending request. The phone reported `ContactRequestExists`
+  on every later attempt. The desktop's `POST /api/recv` returned
+  `Could not decrypt a queued message — unknown sender or session not ready`, and the queue drained
+  clean. Reproduced with a throwaway vault calling `request_contact` against the live
+  `evetest` invite; the request was accepted by the relay (`PUT … 2012 bytes -> 200 OK`) and then
+  vanished: no pending row, no warning to the caller. Daemon log with `HUSH_DEBUG_INBOX` showed
+  `filed blob … payload=ContactRequest` attributed to `sam2` (a contact), and
+  `A contact request from 05faf49b… was refused: invalid contact request` (attributed to `phone`).
+- Cause: `signal_persist::export_store` wrote `known_identities: Vec::new()` and the matching
+  import loop therefore never restored anything, so every unlock started with an empty identity
+  store. libsignal's `InMemIdentityKeyStore::is_trusted_identity` trusts an unknown address on
+  first use, so a stranger's prekey message decrypted under the **first contact tried** in
+  `try_decrypt_from_known`. The plaintext was a `ContactRequest` naming the real sender, so
+  `receive_contact_request` rejected it as `InvalidContactRequest` and `recv` consumed and acked
+  the blob. The request existed nowhere afterwards. This also silently overwrote the contact's
+  identity in memory and its session on disk — the same code path a spoofing attacker would need.
+- Resolution: `export_store` now derives `known_identities` from `get_identity` for every session
+  address; `finish_open` re-pins every contact and pending request from the key its record already
+  carries (returning whether anything changed, so `open` only saves when it did); and
+  `try_decrypt_from_known` refuses to try a prekey message against any address other than the one
+  named in its header. Verified against the live relay: after a restart and unlock, a brand-new
+  requester is filed on the first poll (previously the first request after each unlock was always
+  the one eaten). Regression test `a_strangers_request_survives_an_unlock_with_an_empty_identity_store`.
+- Honest gap: that unit test does **not** reproduce the exact production ordering. In the test the
+  stranger's prekey message is rejected by the *pinned* identity check rather than being
+  mis-attributed, so the test also passed before the fix. The live relay run and the daemon log are
+  the evidence for the defect; the test locks in the intended behaviour, not the old failure.
+- Lesson: a trust-on-first-use identity store that is not persisted is not "tofu" — it is a fresh
+  stranger on every restart, and any address it is offered can be claimed. Persisting sessions
+  without persisting trusted identities is the dangerous half of the pair.
+
+### A retry to a peer whose request is still pending was refused with no way forward [FIXED]
+
+- Attempted: re-add the desktop from the phone after the first request was lost (see above).
+- Symptom: `ContactRequestExists`, every time. The pending outgoing row was written **before** the
+  relay put, so a request that was accepted but then dropped by the peer's inbox left the sender
+  permanently refused, with no UI action that could clear it.
+- Resolution: `request_contact` now treats its own pending outgoing row as a retry and re-sends on a
+  **fresh prekey session** (a steady-state message is exactly what a peer that never saw the first
+  request cannot attribute). A pending *incoming* row still refuses, because that one is the peer's
+  to answer. This closes the older `[OPEN]` "second contact request is undecryptable" entry below.
+  Test: `a_retry_to_a_pending_peer_re_sends_as_a_fresh_prekey_message`.
+- Lesson: do not record "in flight" before the transport accepts it, and never make a stuck state
+  reachable through the UI with no escape.
+
+### Debugging this took four wrong turns worth recording [WORKED AROUND]
+
+- The warning text `unknown sender or session not ready` is produced for every decrypt failure, so
+  it says nothing about *why*. `signal_protocol::decrypt_message` maps every libsignal error to
+  `Error::Session`; a temporary env-gated `eprintln!` of the real error and of the blob's
+  `PreKeySignalMessage`/`SignalMessage` parse state is what finally separated "not a prekey
+  message" from "wrong address".
+- The inbox also held leftover ASCII probe blobs from the previous session's raw `PUT` tests. They
+  can never decrypt, are never acked, and reappear on every poll, drowning the log. Deleted them
+  from the relay DB; probe blobs must be removed after use.
+- Blobs vanishing from the queue without a log line made a "PUT is not persisted" theory look
+  plausible for a while. It was not: the UI's own `recv` poll was draining and acking the
+  successfully-filed ones between my `PUT` and my `psql`. Check who else polls before concluding a
+  write was dropped.
+- The `edit_file` tool ran rustfmt on `relay_client.rs` and `contact_requests.rs` and produced large
+  unrelated diffs; a fuzzy match on a repeated `let res = self` also mangled a test file once. Both
+  were reverted from git. Keep edit anchors unique and re-read after touching a repeated pattern.
+
 ## 2026-10-24 — Desktop 1:1 calls (M5, the media half)
 
 ### WebKitGTK on this platform ships without WebRTC, so the desktop WebView can never build an offer [FIXED]
@@ -57,7 +168,7 @@ resolution, and the status.
 - Lesson: the in-process mobile backend must mirror the daemon's unlock bookkeeping, not just its
   request/response shape.
 
-### A second contact request from the same sender is undecryptable [OPEN]
+### A second contact request from the same sender is undecryptable [FIXED]
 
 - Attempted: re-send a contact request after cancelling the first.
 - Symptom: the retry reuses the session the first request opened, so it leaves as a steady-state
@@ -67,6 +178,10 @@ resolution, and the status.
 - Needed: `request_contact` must re-open a prekey session when the peer may not hold the current
   one (or the recipient must keep the session from a request it declines/ignores). Product-level;
   not on the voice critical path but it makes invites flaky.
+- Resolution (2026-10-25): `request_contact` now re-sends on a fresh prekey session whenever its
+  own request is still pending, and the recipient's attribution now includes pending request
+  records. Closed with `a_retry_to_a_pending_peer_re_sends_as_a_fresh_prekey_message`. See the
+  2026-10-25 section for the deeper cause (a stranger's request being mis-attributed to a contact).
 
 ### Running a daemon on a copy of the vault overwrote the account's live prekey record [WORKED AROUND]
 

@@ -50,8 +50,14 @@ rfd = "0.15"
 # The vault itself. The desktop shell never links this crate — it talks to
 # `hush-daemon` over the Unix socket — but Android has no daemon process, so
 # the phone build hosts the account in process (docs/MOBILE_APP_PLAN.md §5.1).
+#
+# `hush-voice` comes along for the same reason: conclave voice's media plane
+# (webrtc-rs + cpal) lives in the daemon on desktop and in this process on the
+# phone. Neither is a dependency of the desktop build.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 hush-core = { path = "../../../crates/hush-core" }
+hush-voice = { path = "../../../crates/hush-voice" }
+uuid = { version = "1", features = ["v4"] }
 
 [lib]
 name = "hush_tauri_lib"
@@ -62,5 +68,7 @@ axum = "0.8"
 # The phone backend is host-testable: these make its vault lifecycle
 # (create/unlock/status/lock) provable without an emulator.
 hush-core = { path = "../../../crates/hush-core" }
+hush-voice = { path = "../../../crates/hush-voice" }
+uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

@@ -543,6 +543,25 @@ const MAX_MAIL_ATTACHMENTS = 8;
 const MAX_MAIL_BYTES = 256 * 1024;
 
 /**
+ * Make sure the phone has granted the microphone.
+ *
+ * The phone's conclave voice runs the native media plane (oboe opens the mic
+ * directly), which needs the Android runtime grant. Only the WebView can raise
+ * that prompt, and on a fresh install nothing else asks for it until a 1:1 call
+ * runs — so ask here, release the stream immediately, and let the plane open its
+ * own. A refusal is not an error here: the plane reports the real failure.
+ */
+async function ensureMicPermission(): Promise<void> {
+  if (!isMobileShell() || !navigator.mediaDevices?.getUserMedia) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+  } catch {
+    // Nothing to do: `voiceOpen`/`voiceJoin` will surface what the OS refused.
+  }
+}
+
+/**
  * Matches `DEFAULT_VAULT_NAME` in `hush-core`: the suffix for a vault that has
  * no name of its own yet (or a contact whose invite predates vault naming).
  */
@@ -9218,10 +9237,20 @@ export class App {
           micBtn.setAttribute("aria-pressed", String(s.inRoom && !s.muted));
           micBtn.replaceChildren(icon(s.muted ? "micOff" : "mic"), micLabel, micLed);
           if (s.action === "open") {
-            toggle.onclick = () =>
-              run(api.voiceOpen(conclaveId), "Voice room opened. The conclave's trustees can join.");
+            toggle.onclick = () => {
+              void ensureMicPermission().then(() =>
+                run(
+                  api.voiceOpen(conclaveId),
+                  "Voice room opened. The conclave's trustees can join.",
+                ),
+              );
+            };
           } else if (s.action === "join") {
-            toggle.onclick = () => run(api.voiceJoin(conclaveId), "You joined the voice room.");
+            toggle.onclick = () => {
+              void ensureMicPermission().then(() =>
+                run(api.voiceJoin(conclaveId), "You joined the voice room."),
+              );
+            };
           } else {
             toggle.onclick = () => run(api.voiceLeave(conclaveId), "You left the voice room.");
             micBtn.onclick = () =>

@@ -1266,6 +1266,12 @@ impl Account {
         if needs_save {
             account.save().await?;
         }
+        // Identity pins are not trust-on-first-use on the next unlock: the store
+        // is rebuilt from `device.enc`, and every contact record already names
+        // the key its invite was signed with.
+        if account.pin_known_identities().await? {
+            account.save().await?;
+        }
         // Fill legacy records before anything can read them: a conclave written
         // before consent and governance has nicknames only and no convener, so it
         // gets trustees and a convener here. Saves the log itself when it changes.
@@ -1281,6 +1287,60 @@ impl Account {
 
     pub fn recovery_acknowledged(&self) -> bool {
         self.state.recovery_acknowledged
+    }
+
+    /// Re-apply the identity keys this vault has already pinned.
+    ///
+    /// `InMemSignalProtocolStore` is trust-on-first-use, and it is rebuilt from
+    /// disk on every unlock. An empty identity store is not harmless: libsignal
+    /// then accepts the first prekey message it is offered for *any* address,
+    /// so a stranger's contact request can be decrypted under the first contact
+    /// tried, refused there as someone else's card, and consumed — the request
+    /// silently disappears. Pinning from the records that already carry the key
+    /// (a contact's `identity_key`, a pending request's verified card) closes
+    /// that window, and enforces the key an invite pinned rather than whatever
+    /// arrives first.
+    ///
+    /// Returns whether anything had to be written, so `open` only pays for a
+    /// save when the vault was behind.
+    async fn pin_known_identities(&mut self) -> Result<bool, Error> {
+        let pins: Vec<(String, Vec<u8>)> = self
+            .state
+            .contacts
+            .iter()
+            .map(|c| (c.account_id.clone(), c.identity_key.clone()))
+            .chain(
+                self.state
+                    .contact_requests
+                    .iter()
+                    .map(|r| (r.account_id.clone(), r.card.identity_key.clone())),
+            )
+            .collect();
+        let mut changed = false;
+        for (name, key) in pins {
+            let Ok(addr) = protocol_address(&name) else {
+                continue;
+            };
+            let Ok(key) = libsignal_protocol::IdentityKey::try_from(key.as_slice()) else {
+                continue;
+            };
+            let known = self
+                .device
+                .store_mut()
+                .get_identity(&addr)
+                .await
+                .map_err(|_| Error::Corrupt)?;
+            if known.as_ref() == Some(&key) {
+                continue;
+            }
+            self.device
+                .store_mut()
+                .save_identity(&addr, &key)
+                .await
+                .map_err(|_| Error::Corrupt)?;
+            changed = true;
+        }
+        Ok(changed)
     }
 
     pub fn take_pending_recovery_code(&mut self) -> Option<String> {
@@ -2102,6 +2162,14 @@ impl Account {
     /// If the relay refuses the put, the exact bytes are kept on the record and
     /// [`Self::retry_contact_requests`] re-puts them; re-encrypting would turn
     /// the retry into a message a stranger cannot attribute.
+    ///
+    /// Asking a peer that already has our request pending *re-sends it*, on a
+    /// fresh prekey session. A pending row proves only that we tried: the put
+    /// may have been lost, or the peer's poll may have thrown the request away
+    /// without record. Refusing the retry left the user stuck on "a request is
+    /// already pending" with nothing to do about it, so the retry is the honest
+    /// answer — and it re-opens the session, because a steady-state message is
+    /// exactly what a peer that never saw the first request cannot attribute.
     pub async fn request_contact(
         &mut self,
         nickname: &str,
@@ -2119,17 +2187,18 @@ impl Account {
         self.validate_contact(nickname, &payload)?;
         let account_id = payload.protocol_name.clone();
 
-        // A request from this account may already be waiting here, or ours may
-        // still be in flight. Either way a second one only crosses the first on
-        // the wire; the honest answer is accept, or wait for the answer.
-        if self
+        // A request from this account may already be waiting here; that is
+        // theirs to answer, not ours to cross. Our own pending row is different:
+        // it may only mean the first attempt was lost, so asking again re-sends.
+        let pending_here = self
             .state
             .contact_requests
             .iter()
-            .any(|r| r.account_id == account_id && r.state == ContactRequestState::Pending)
-        {
+            .find(|r| r.account_id == account_id && r.state == ContactRequestState::Pending);
+        if pending_here.is_some_and(|r| r.direction == ContactRequestDirection::Incoming) {
             return Err(Error::ContactRequestExists);
         }
+        let resend = pending_here.is_some();
         self.state
             .contact_requests
             .retain(|r| r.account_id != account_id);
@@ -2140,7 +2209,11 @@ impl Account {
         // first-message attribution ambiguous; that peer already keeps our
         // account id from the declined record, so a steady-state message is
         // attributable too.
-        if !self.has_session(&account_id).await? {
+        //
+        // A retry to a *pending* peer is the opposite case: nobody knows whether
+        // the first message landed, and only a fresh prekey message can be
+        // attributed by a peer that never saw it.
+        if resend || !self.has_session(&account_id).await? {
             let bundle = payload.to_prekey_bundle()?;
             let local_name = self.state.protocol_name.clone();
             process_contact_bundle(self.device.store_mut(), &local_name, &account_id, &bundle)
@@ -7371,12 +7444,33 @@ impl Account {
             .iter()
             .map(|c| c.account_id.clone())
             .collect();
+        // A peer whose only traffic is a request or an answer to one is not a
+        // contact yet, but the request itself opened a session that must keep
+        // being usable — a re-request or an accept rides it.
+        for record in &self.state.contact_requests {
+            if !candidates.contains(&record.account_id) {
+                candidates.push(record.account_id.clone());
+            }
+        }
         for account_id in extra {
             if !candidates.contains(account_id) {
                 candidates.push(account_id.clone());
             }
         }
+        // A prekey message names its sender in the header. Trying it against a
+        // different address would not just waste a ratchet step: with an empty
+        // identity store libsignal would adopt the stranger's key under that
+        // address, so the message would "belong" to the wrong peer — and a
+        // contact request presented that way is refused as someone else's card
+        // and thrown away. Only the address the header names may open it.
+        let prekey_sender = sender_identity_from_prekey(ct).map(hex::encode);
         for account_id in candidates {
+            if prekey_sender
+                .as_deref()
+                .is_some_and(|sender| sender != account_id)
+            {
+                continue;
+            }
             if let Ok(plain) = self.decrypt_from(&account_id, ct).await {
                 return Ok((plain, account_id));
             }

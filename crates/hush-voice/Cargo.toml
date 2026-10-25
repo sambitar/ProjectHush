@@ -1,0 +1,26 @@
+[package]
+name = "hush-voice"
+version = "0.1.0"
+edition = "2021"
+
+# The live voice media plane: webrtc-rs peer connections, the Opus codec glue
+# (`hush-audio`), and cpal device capture/playout. Extracted from `hush-daemon`
+# so the phone's in-process backend (`mobile.rs`, which has no daemon process)
+# can host the same plane for conclave voice. See docs/tasks/conclave-voice.md
+# and docs/MOBILE_APP_PLAN.md §5.1.
+
+[dependencies]
+webrtc = "0.21.1"
+# The Sample type the plane writes encoded Opus frames with, and the
+# transceiver parameter types the facade leaves in the underlying crate.
+rtc = "0.21.1"
+rtc-media = "0.21.1"
+hush-audio = { path = "../hush-audio" }
+# The TURN config type the plane's constructor takes.
+hush-core = { path = "../hush-core" }
+# Capture and playout. cpal's Android backend is `oboe`; the phone build links
+# it there, the desktop daemon links ALSA.
+cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1.92"

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodingParameters, RTCRtpCodec, RTCRtpEncodingParameters, RtpCodecKind,
+    RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc_media::Sample;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -54,16 +54,15 @@ const SSRC: u32 = 1001;
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
 
 /// The capture/playout cadence: one 20 ms Opus frame.
-const FRAME_TICK: Duration = Duration::from_millis(
-    hush_audio::FRAME_SAMPLES as u64 * 1000 / hush_audio::SAMPLE_RATE as u64,
-);
+const FRAME_TICK: Duration =
+    Duration::from_millis(hush_audio::FRAME_SAMPLES as u64 * 1000 / hush_audio::SAMPLE_RATE as u64);
 
 /// The one runtime handle every peer connection and timer here shares.
 fn runtime() -> Arc<dyn Runtime> {
     static RUNTIME: OnceLock<Arc<dyn Runtime>> = OnceLock::new();
-    Arc::clone(RUNTIME.get_or_init(|| {
-        default_runtime().expect("runtime-tokio is enabled for the daemon")
-    }))
+    Arc::clone(
+        RUNTIME.get_or_init(|| default_runtime().expect("runtime-tokio is enabled for the daemon")),
+    )
 }
 
 /// Where captured audio comes from.
@@ -259,9 +258,8 @@ impl DeviceAudio {
     /// The next 20 ms wire frame from the device, or `None` when not enough
     /// audio has arrived yet (the ticker skips the tick and keeps cadence).
     fn next_frame(&self) -> Option<[i16; hush_audio::FRAME_SAMPLES]> {
-        let raw: Vec<f32> = std::mem::take(
-            &mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()),
-        );
+        let raw: Vec<f32> =
+            std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
         let converted = to_i16(&resample(
             &raw,
             self.in_rate.load(Ordering::SeqCst),
@@ -312,9 +310,9 @@ fn device_thread(inner: Arc<Inner>) {
     // requested against resolved.
     let pick = |want: Option<&str>, output: bool| -> Option<cpal::Device> {
         let by_name = |d: &cpal::Device| {
-            d.name().ok().is_some_and(|n| {
-                want.is_some_and(|w| n.trim().eq_ignore_ascii_case(w.trim()))
-            })
+            d.name()
+                .ok()
+                .is_some_and(|n| want.is_some_and(|w| n.trim().eq_ignore_ascii_case(w.trim())))
         };
         if let Some(want) = want {
             let found = if output {
@@ -322,7 +320,9 @@ fn device_thread(inner: Arc<Inner>) {
                     .ok()
                     .and_then(|mut ds| ds.find(by_name))
             } else {
-                host.input_devices().ok().and_then(|mut ds| ds.find(by_name))
+                host.input_devices()
+                    .ok()
+                    .and_then(|mut ds| ds.find(by_name))
             };
             if found.is_some() {
                 return found;
@@ -370,8 +370,7 @@ fn device_thread(inner: Arc<Inner>) {
         let complained = Arc::clone(&complained);
         let audio = Arc::clone(&audio);
         move |err: cpal::StreamError| {
-            *audio.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(err.to_string());
+            *audio.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
             if !complained.swap(true, Ordering::SeqCst) {
                 eprintln!("hush-daemon: voice: device stream error: {err}");
             }
@@ -413,8 +412,7 @@ fn device_thread(inner: Arc<Inner>) {
                 .build_input_stream(
                     &in_config.clone().into(),
                     move |data: &[i16], _| {
-                        let f32s: Vec<f32> =
-                            data.iter().map(|s| s.to_sample::<f32>()).collect();
+                        let f32s: Vec<f32> = data.iter().map(|s| s.to_sample::<f32>()).collect();
                         queue(&audio, &f32s);
                     },
                     stream_err.clone(),
@@ -479,9 +477,9 @@ fn device_thread(inner: Arc<Inner>) {
     let native_out = output_device
         .as_ref()
         .and_then(|d| d.default_output_config().ok());
-    let at_wire_rate = native_out.as_ref().is_some_and(|c| {
-        c.sample_rate().0 == hush_audio::SAMPLE_RATE
-    });
+    let at_wire_rate = native_out
+        .as_ref()
+        .is_some_and(|c| c.sample_rate().0 == hush_audio::SAMPLE_RATE);
     let out_config = match &native_out {
         Some(config) if at_wire_rate => Some(config.clone()),
         Some(config) => {
@@ -602,8 +600,7 @@ async fn capture_loop(inner: Arc<Inner>) {
             if stats.peers_live > 0 {
                 eprintln!(
                     "hush-daemon: voice stats sent={} decoded={} played={} live={}",
-                    stats.sent_frames, stats.decoded_frames, stats.played_frames,
-                    stats.peers_live
+                    stats.sent_frames, stats.decoded_frames, stats.played_frames, stats.peers_live
                 );
             }
         }
@@ -743,7 +740,9 @@ impl PeerConnectionEventHandler for Handler {
 
 /// Await `future`, giving up after `duration` instead of hanging the caller.
 async fn within<T>(duration: Duration, future: impl Future<Output = T>) -> Option<T> {
-    webrtc::runtime::timeout(&*runtime(), duration, future).await.ok()
+    webrtc::runtime::timeout(&*runtime(), duration, future)
+        .await
+        .ok()
 }
 
 /// A voice session's media plane: one peer connection per joined peer, audio
@@ -875,7 +874,11 @@ impl VoicePlane {
             .device()
             .is_some_and(|d| d.output_live.load(Ordering::SeqCst));
         if audible {
-            *self.inner.test_tone_until.lock().unwrap_or_else(|e| e.into_inner()) =
+            *self
+                .inner
+                .test_tone_until
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
                 Some(Instant::now() + Duration::from_millis(ms));
         }
         audible
@@ -887,7 +890,11 @@ impl VoicePlane {
         let audio = self.inner.device()?;
         // Guards are dropped into locals before the struct is built: a
         // MutexGuard must not outlive its statement.
-        let in_name = audio.in_name.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let in_name = audio
+            .in_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let out_name = audio
             .out_name
             .lock()
@@ -918,7 +925,11 @@ impl VoicePlane {
         if self.inner.mode != MediaMode::Device {
             return;
         }
-        *self.inner.selector.lock().unwrap_or_else(|e| e.into_inner()) = selector;
+        *self
+            .inner
+            .selector
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = selector;
         if let Some(old) = self
             .inner
             .device
@@ -1066,10 +1077,7 @@ impl VoicePlane {
     /// Build one peer connection with the Opus media engine (the spike's
     /// lesson: the answerer needs the registered codecs too, or the answer
     /// comes out unusable) and the receiver its gathering signals arrive on.
-    async fn build(
-        &self,
-        peer: &str,
-    ) -> Result<(Arc<dyn PeerConnection>, Receiver<()>), String> {
+    async fn build(&self, peer: &str) -> Result<(Arc<dyn PeerConnection>, Receiver<()>), String> {
         let (gathered_tx, gathered_rx) = channel::<()>(1);
         let handler = Arc::new(Handler {
             peer: peer.to_string(),
@@ -1201,9 +1209,15 @@ mod tests {
             let b = VoicePlane::new(None, MediaMode::Tone);
 
             let offer = a.offer("b").await.expect("A offers");
-            assert!(offer.contains("m=audio"), "the offer carries an audio m-line");
+            assert!(
+                offer.contains("m=audio"),
+                "the offer carries an audio m-line"
+            );
             let answer = b.answer("a", &offer).await.expect("B answers");
-            assert!(answer.contains("m=audio"), "the answer carries an audio m-line");
+            assert!(
+                answer.contains("m=audio"),
+                "the answer carries an audio m-line"
+            );
             a.accept_answer("b", &answer)
                 .await
                 .expect("A takes the answer");
@@ -1319,11 +1333,7 @@ mod tests {
         // re-request) well past half a second.
         let plane = VoicePlane::new(None, MediaMode::Device);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while plane
-            .device_health()
-            .is_none_or(|h| !h.input_live)
-            && Instant::now() < deadline
-        {
+        while plane.device_health().is_none_or(|h| !h.input_live) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
         let health = plane
@@ -1361,6 +1371,7 @@ mod tests {
         }
         let plane = VoicePlane::with_selector(
             None,
+            None,
             MediaMode::Device,
             DeviceSelector {
                 input: Some("not a real microphone".into()),
@@ -1368,15 +1379,14 @@ mod tests {
             },
         );
         let deadline = Instant::now() + Duration::from_secs(10);
-        while plane
-            .device_health()
-            .is_none_or(|h| !h.input_live)
-            && Instant::now() < deadline
-        {
+        while plane.device_health().is_none_or(|h| !h.input_live) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
         let health = plane.device_health().expect("device queues exist");
-        assert!(health.input_live, "the fallback must still open: {health:?}");
+        assert!(
+            health.input_live,
+            "the fallback must still open: {health:?}"
+        );
         assert_ne!(
             health.input_name.as_deref(),
             Some("not a real microphone"),
@@ -1398,11 +1408,7 @@ mod tests {
         }
         let plane = VoicePlane::new(None, MediaMode::Device);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while plane
-            .device_health()
-            .is_none_or(|h| !h.input_live)
-            && Instant::now() < deadline
-        {
+        while plane.device_health().is_none_or(|h| !h.input_live) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
         let before = plane
@@ -1411,17 +1417,11 @@ mod tests {
             .input_name
             .clone();
         plane.reopen_devices(DeviceSelector {
-            input: Some(
-                before.clone().unwrap_or_else(|| "unused".into()),
-            ),
+            input: Some(before.clone().unwrap_or_else(|| "unused".into())),
             output: None,
         });
         let deadline = Instant::now() + Duration::from_secs(10);
-        while plane
-            .device_health()
-            .is_none_or(|h| !h.input_live)
-            && Instant::now() < deadline
-        {
+        while plane.device_health().is_none_or(|h| !h.input_live) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
         let health = plane.device_health().expect("the reopen must have queues");

@@ -52,6 +52,8 @@ rtc = "0.21.1"
 rtc-media = "0.21.1"
 # Conclave voice's codec/resampler/jitter glue (Task 23 Phase 2).
 hush-audio = { path = "../hush-audio" }
+# The live voice media plane, shared with the phone's in-process backend.
+hush-voice = { path = "../hush-voice" }
 # Capture and playout for the voice plane: ALSA against the host's PipeWire
 # (the spike's probe-proven path; pipewire-rs is the distro-unit follow-up).
 cpal = "0.15"

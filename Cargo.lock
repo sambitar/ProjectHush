@@ -4480,6 +4480,7 @@ dependencies = [
  "hush-audio",
  "hush-core",
  "hush-relay",
+ "hush-voice",
  "hush-wallet",
  "libc",
  "rand 0.9.5",
@@ -4535,6 +4536,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "hush-core",
+ "hush-voice",
  "hyper",
  "hyper-util",
  "libc",
@@ -4551,6 +4553,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4560,6 +4563,21 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hush-voice"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cpal",
+ "hush-audio",
+ "hush-core",
+ "rtc",
+ "rtc-media",
+ "serde",
+ "serde_json",
+ "webrtc",
 ]
 
 [[package]]

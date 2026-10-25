@@ -94,10 +94,7 @@ pub async fn export_store(
 
     let mut pre_keys = Vec::new();
     for id in store.all_pre_key_ids() {
-        let record = store
-            .get_pre_key(*id)
-            .await
-            .map_err(|_| Error::Corrupt)?;
+        let record = store.get_pre_key(*id).await.map_err(|_| Error::Corrupt)?;
         pre_keys.push((
             u32::from(*id),
             record.serialize().map_err(|_| Error::Corrupt)?,
@@ -147,6 +144,25 @@ pub async fn export_store(
         }
     }
 
+    let mut known_identities = Vec::new();
+    for (name, device_id) in session_addresses {
+        let addr = ProtocolAddress::new(
+            name.clone(),
+            DeviceId::try_from(*device_id).map_err(|_| Error::Corrupt)?,
+        );
+        if let Some(key) = store
+            .get_identity(&addr)
+            .await
+            .map_err(|_| Error::Corrupt)?
+        {
+            known_identities.push(IdentityEntry::Named {
+                name: name.clone(),
+                device_id: *device_id,
+                key: key.serialize().to_vec(),
+            });
+        }
+    }
+
     let persisted = PersistedSignal {
         registration_id,
         identity_key_pair,
@@ -154,18 +170,17 @@ pub async fn export_store(
         signed_pre_keys,
         kyber_pre_keys,
         sessions,
-        known_identities: Vec::new(),
+        known_identities,
     };
     serde_json::to_vec(&persisted).map_err(|_| Error::Corrupt)
 }
 
 pub async fn import_store(bytes: &[u8]) -> Result<InMemSignalProtocolStore, Error> {
     let persisted: PersistedSignal = serde_json::from_slice(bytes).map_err(|_| Error::Corrupt)?;
-    let identity_key_pair =
-        IdentityKeyPair::try_from(persisted.identity_key_pair.as_slice()).map_err(|_| Error::Corrupt)?;
-    let mut store =
-        InMemSignalProtocolStore::new(identity_key_pair, persisted.registration_id)
-            .map_err(|_| Error::Corrupt)?;
+    let identity_key_pair = IdentityKeyPair::try_from(persisted.identity_key_pair.as_slice())
+        .map_err(|_| Error::Corrupt)?;
+    let mut store = InMemSignalProtocolStore::new(identity_key_pair, persisted.registration_id)
+        .map_err(|_| Error::Corrupt)?;
 
     for (id, bytes) in persisted.pre_keys {
         let record = PreKeyRecord::deserialize(&bytes).map_err(|_| Error::Corrupt)?;

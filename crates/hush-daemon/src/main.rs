@@ -14,7 +14,6 @@ mod torbox;
 mod torrents;
 mod torrents_store;
 mod ui_prefs;
-mod voice_data;
 mod wallet;
 mod zine_store;
 
@@ -41,6 +40,9 @@ use hush_core::{
     TorrentPolicy, TrusteeReach, VoiceEffect, VoiceManager, VoiceSession,
 };
 use hush_wallet::chain::TransferCheck;
+// The live voice media plane, extracted so the phone's in-process backend can
+// host the same one; the daemon keeps its old module name here.
+use hush_voice as voice_data;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -2567,7 +2569,11 @@ async fn call_media_answer(
             .send_call_answer(&body.to, &body.session_id, &sdp)
             .await,
     )?;
-    eprintln!("hush-daemon: call answer to {} sent ({} bytes)", body.to, sdp.len());
+    eprintln!(
+        "hush-daemon: call answer to {} sent ({} bytes)",
+        body.to,
+        sdp.len()
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2697,12 +2703,8 @@ struct CallDto {
 
 fn call_dto(call: hush_core::ReceivedCall) -> Option<CallDto> {
     let (kind, session_id, sdp, reason) = match call.payload {
-        MessagePayload::CallOffer { session_id, sdp } => {
-            ("offer", session_id, Some(sdp), None)
-        }
-        MessagePayload::CallAnswer { session_id, sdp } => {
-            ("answer", session_id, Some(sdp), None)
-        }
+        MessagePayload::CallOffer { session_id, sdp } => ("offer", session_id, Some(sdp), None),
+        MessagePayload::CallAnswer { session_id, sdp } => ("answer", session_id, Some(sdp), None),
         MessagePayload::CallEnd {
             session_id, reason, ..
         } => ("end", session_id, None, Some(reason)),

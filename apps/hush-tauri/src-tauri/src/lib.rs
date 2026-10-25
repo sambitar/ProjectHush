@@ -7,7 +7,8 @@ mod daemon_supervisor;
 #[cfg(desktop)]
 mod drops;
 // The phone backend compiles on the host under `test` so its vault lifecycle
-// can be exercised without an emulator.
+// can be exercised without an emulator. The desktop binary never links it, so
+// the voice plane the phone hosts stays off the desktop.
 #[cfg(any(target_os = "android", target_os = "ios", test))]
 mod mobile;
 mod sound;
