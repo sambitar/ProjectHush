@@ -158,7 +158,11 @@ export function isDesktopShell(): boolean {
 }
 
 export class AppError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    /** The daemon's HTTP status, when the failure came from a reply. */
+    readonly status?: number,
+  ) {
     super(message);
     this.name = "AppError";
   }
@@ -229,9 +233,9 @@ async function request<T>(
       if (reply.body && reply.body.length < 200) msg = reply.body;
     }
     if (reply.status === 401 && path.includes("unlock")) {
-      throw new AppError("That passphrase didn't work. Try again.");
+      throw new AppError("That passphrase didn't work. Try again.", reply.status);
     }
-    throw new AppError(msg);
+    throw new AppError(msg, reply.status);
   }
   if (reply.status === 204 || !reply.body) return null;
   return JSON.parse(reply.body) as T;

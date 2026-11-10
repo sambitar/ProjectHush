@@ -7,6 +7,77 @@ re-explored and so unverified claims stay visible instead of being quietly dropp
 slice. Newest section first. One entry per problem, with what was attempted, the symptom, the
 resolution, and the status.
 
+## 2026-11-09 — macOS host and iOS target
+
+### nix 0.31.3 does not compile for iOS [FIXED]
+
+- Attempted: `cargo check -p hush-voice --target aarch64-apple-ios-sim` after installing the toolchain.
+- Symptom: `error[E0425]: cannot find value SYSPROTO_CONTROL in crate libc`, and the same for `UTUN_OPT_IFNAME`, from `nix-0.31.3/src/sys/socket/sockopt.rs`. `rtc-shared` (through webrtc) requires nix `^0.31` with the `net` feature. nix gates the utun options on `apple_targets`, which includes iOS, but libc defines those constants only on macOS.
+- Resolution: `[patch.crates-io] nix = { git = ..., rev = "89339c6..." }`, the upstream commit that gates `UtunIfname`, `KextControl` and `GetCString` on `target_os = "macos"`. Upstream main is still version 0.31.3, so the patch satisfies `rtc-shared`'s requirement. Remove it when 0.31.4 ships.
+- Lesson: a one-minute `cargo check` of the leaf crate finds transitive platform bugs that a host-only build never sees. Check upstream main before vendoring a fix.
+
+### Tauri's xcodebuild child loses DEVELOPER_DIR, and xcode-select points at the Command Line Tools [WORKED AROUND]
+
+- Attempted: `npx tauri ios build --debug --target aarch64-sim --no-sign`.
+- Symptom: `xcode-select: error: tool 'xcodebuild' requires Xcode, but active developer directory '/Library/Developer/CommandLineTools' is a command line tools instance`. `xcode-select -p` prints the Xcode path only because the shell exports `DEVELOPER_DIR`; `env -u DEVELOPER_DIR xcode-select -p` shows the CLT. The Tauri CLI does not pass that variable to its xcodebuild child, and `sudo` is not available non-interactively.
+- Workaround: `.tools/bin/xcodebuild` and `.tools/bin/xcrun` wrappers set `DEVELOPER_DIR` and exec Xcode's own binaries; `.tools/` is gitignored and first on PATH for the build.
+- Resolution still needed: `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`. Until that is done the build is not reproducible without the wrappers.
+- Lesson: the environment a tool inherits is not the environment its children inherit; check the child, not the shell.
+
+### Missing llvm-tools left Tauri's Swift symbols internalized [FIXED]
+
+- Attempted: build the iOS app after the Rust static library compiled.
+- Symptom: `Undefined symbols for architecture arm64: _log_stdout, _on_webview_created, _run_plugin_command`, with `cargo:warning=swift-rs: llvm-objcopy not found (run rustup component add llvm-tools); @_cdecl symbols stay internalized on Xcode 27`.
+- Resolution: `rustup component add llvm-tools`, remove `target/.../build/tauri-*` and `swift-rs-*` so the build script reruns, rebuild.
+- Lesson: the build-script warning named the fix; the undefined symbols did not.
+
+### The generated Xcode project did not link CoreAudio [FIXED]
+
+- Attempted: the final link of `Hush.app`.
+- Symptom: undefined `_AudioComponentFindNext`, `_AudioUnitInitialize`, `_AudioSessionGetProperty` and the rest of the CoreAudio API, referenced from cpal and `hush-voice`.
+- Resolution: added `AudioToolbox.framework` and `CoreAudio.framework` to `dependencies` in `gen/apple/project.yml`, then ran `xcodegen generate`. The Rust cdylib link had them through build scripts; the Xcode target did not.
+- Lesson: an Xcode target needs every framework its static library references; the Rust link line is not reused.
+
+### macOS's 104-byte sun_path broke three tests [FIXED]
+
+- Attempted: `cargo test -p hush-tauri` on macOS.
+- Symptom: `Error { kind: InvalidInput, message: "path must be shorter than SUN_LEN" }` in `daemon_client`, and two `daemon_supervisor` tests timed out because the daemon could not bind its socket. The scratch directories came from `std::env::temp_dir()` (`/var/folders/...`).
+- Resolution: the test helpers now create sockets under `/tmp`. The production default (`/tmp/hush-$USER`) was already short enough.
+- Lesson: a `TMPDIR` path is short enough on Linux and not on macOS when a Unix socket is appended to it.
+
+### GNU-only shell commands in the run scripts [FIXED]
+
+- Attempted: port the daily-driver scripts to macOS.
+- Symptom: `realpath --relative-to` (BSD realpath rejects the flag), `wait -n` (bash 4.3+; macOS ships bash 3.2), `sha256sum` (macOS has `shasum`), and `LD_LIBRARY_PATH` (macOS uses `DYLD_LIBRARY_PATH`).
+- Resolution: a prefix strip for the path, wait on the UI PID in `run-one-ui.sh` and poll in `run-two-ui.sh`, a `shasum -a 256` fallback, and a platform-selected loader variable.
+
+### The bundled Tor is a Linux ELF and the scripts selected it on macOS [FIXED]
+
+- Attempted: start the desktop dev stack on macOS.
+- Symptom: `run-one-ui.sh` and `run-two-ui.sh` set `HUSH_TOR_BIN` to the committed `resources/tor/tor`, which is an x86-64 Linux ELF; the kernel refuses it and the Relay panel reports no Tor.
+- Resolution: select the bundled copy only on Linux; use `HUSH_TOR_BIN` or the system `tor` elsewhere. `tauri.macos.conf.json` drops the resources from the macOS bundle, so a packaged Mac no longer carries a Linux ELF.
+
+### The scripts assumed bash 4.4, and macOS ships 3.2 [FIXED]
+
+- Attempted: relaunch `run-one-ui.sh` detached with `/bin/bash`.
+- Symptom: `scripts/lib/hush.sh: line 140: ${url,,}: bad substitution`, then `/bin/bash: a[@]: unbound variable` for an empty array under `set -u`. The earlier foreground run worked only because `/usr/bin/env bash` found Homebrew bash 5.3 first on PATH.
+- Resolution: a version guard at the top of `scripts/lib/hush.sh` prints the `brew install bash` instruction and returns non-zero; README lists bash 4.4+ as a prerequisite.
+- Lesson: `#!/usr/bin/env bash` does not mean the system bash; on macOS it silently depends on PATH order.
+
+### The iOS vault sat inside the automatic iCloud backup [FIXED]
+
+- State: `app_local_data_dir` on iOS is `Library/Application Support/com.hush.capsule`, which iOS backs up by default. Android has a backup rule; iOS had no counterpart.
+- Symptom: none at runtime; the account keys would simply have been uploaded at the next iCloud backup.
+- Resolution: `exclude_vault_from_icloud_backup` sets `NSURLIsExcludedFromBackupKey` on the vault directory at startup, through an iOS-only `objc2-foundation` dependency.
+- Verification: on the simulator, the container's `.../Library/Application Support/com.hush.capsule/vault` reports `com.apple.metadata:com_apple_backup_excludeItem: com.apple.MobileBackup` from `xattr -l`.
+- Lesson: a platform's default backup behaviour is a security decision; check it before shipping.
+
+### The iOS claim stops before a real interaction [OPEN]
+
+- Attempted: verify the iOS target end to end.
+- State: the app builds for the simulator and for the iPhone 13, is signed with a Personal Team, installs, and launches on the device. No vault was created on iOS, no contact or message crossed the relay, no call was placed, and the device screen has not been inspected (the phone is connected over the network, and no screenshot tool could see it).
+- Needed: a vault and contact/chat smoke test on the device, a Tor policy, and call and external-link verification. Backup exclusion and device signing are done.
+
 ## 2026-10-25 — Phone conclave voice
 
 ### The extracted voice crate's tests did not compile [FIXED]

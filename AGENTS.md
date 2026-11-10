@@ -4,7 +4,7 @@ Migrated from Cursor's `.cursor/rules/` on 2026-10-20. Cursor keeps reading its 
 
 ## Implementation problems log
 
-Keep a running log at `/home/sam/ProjectHush/DEEPSEEKPROBLEMS.MD`.
+Keep a running log at `DEEPSEEKPROBLEMS.MD` at the repository root.
 
 ### When to append
 

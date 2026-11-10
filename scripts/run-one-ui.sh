@@ -95,8 +95,13 @@ chmod 700 "$RUN_DIR" 2>/dev/null || true
 TOR_DIR="$ROOT/apps/hush-tauri/src-tauri/resources/tor"
 TOR_BIN=""
 TOR_LIB_DIR=""
-if [[ -x "$TOR_DIR/tor" ]]; then
-  TOR_BIN="${HUSH_TOR_BIN:-$TOR_DIR/tor}"
+# The bundled sidecar is a Linux ELF. A macOS build has none, so use
+# HUSH_TOR_BIN or the system copy there instead of launching a binary the
+# kernel refuses.
+if [[ -n "${HUSH_TOR_BIN:-}" ]]; then
+  TOR_BIN="$HUSH_TOR_BIN"
+elif [[ "$(uname -s)" == "Linux" && -x "$TOR_DIR/tor" ]]; then
+  TOR_BIN="$TOR_DIR/tor"
   TOR_LIB_DIR="$TOR_DIR"
 fi
 
@@ -255,7 +260,13 @@ fi
 UI_ENV=()
 [[ -n "$TOR_BIN" ]] && UI_ENV+=(HUSH_TOR_BIN="$TOR_BIN")
 if [[ -n "$TOR_LIB_DIR" ]]; then
-  UI_ENV+=(LD_LIBRARY_PATH="${TOR_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+  # The bundled Tor resolves libevent through the dynamic loader: LD_LIBRARY_PATH
+  # on Linux, DYLD_LIBRARY_PATH on macOS.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    UI_ENV+=(DYLD_LIBRARY_PATH="${TOR_LIB_DIR}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}")
+  else
+    UI_ENV+=(LD_LIBRARY_PATH="${TOR_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+  fi
 fi
 env HUSH_API_URL="unix://$SOCK" HUSH_WINDOW_TITLE="Hush — one" \
   "${UI_ENV[@]}" "$TAURI_BIN" >"$LOG_DIR/ui.log" 2>&1 &
@@ -275,9 +286,9 @@ echo "The Tor switch (login card or Settings → Relay) is all there is to it: T
 echo "connects on its own and the shield in the top rail shows the connection."
 echo "Logs: $LOG_DIR"
 echo "Stop everything with: kill $UI_PID ${DAEMON_PID:-} ${RELAY_PID:-}"
-# Wait for the first of this run's processes to exit — normally the window
-# closing. What was reused stays up; what was started here stays up too until
-# killed with the line above, so the window can be reopened cheaply.
-wait -n
+# Wait for the window to close. What was reused stays up; what was started here
+# stays up too until killed with the line above, so the window can be reopened
+# cheaply. `wait -n` is bash 4.3+ and macOS ships bash 3.2, so wait on the UI.
+wait "$UI_PID"
 echo "A process exited. The daemon and relay this run started are still up;"
 echo "stop them with: kill ${DAEMON_PID:-} ${RELAY_PID:-} 2>/dev/null"

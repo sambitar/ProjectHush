@@ -2191,6 +2191,16 @@ export class App {
       if (!shellNeeded && this.patchBackground()) return;
       if (!editing) this.scheduleBackgroundRender();
     } catch (e) {
+      // The daemon idle-locks on its own. A 401 here means this window is
+      // still showing a shell for a vault that no longer has keys, so re-read
+      // the status and paint the unlock screen instead of logging every poll
+      // while every action says "locked". `refreshStatus` stops the poll; the
+      // next unlock starts it again.
+      if (e instanceof AppError && e.status === 401) {
+        await this.refreshStatus();
+        this.scheduleRender();
+        return;
+      }
       // A poll that dies must leave a trace: without one, a failed `recv` is
       // indistinguishable from "nothing arrived" and the inbox silently stops
       // draining. The console line is what logcat shows on the phone.
