@@ -29,6 +29,11 @@ Where the two disagree, the addendum wins until the decision is taken.
   501, so "Add a trust" opens the desktop dialog and fails on submit, and the phone cannot yet
   be adopted as a Place. Only Android/x86_64 has run; the arm64 APK builds but has not run on
   hardware.
+- **iOS M1 done (2026-11-09).** `tauri.ios.conf.json` and the generated `gen/apple` project build
+ for `aarch64-apple-ios-sim`; the simulator opens the same phone Welcome screen. The in-process
+ backend and the native voice plane compile and link for iOS. Device signing, Tor, backup
+ exclusion, and calls remain open; see
+ [`plans/2026-11-09-macos-ios-migration.md`](plans/2026-11-09-macos-ios-migration.md).
 
 ## Scope
 

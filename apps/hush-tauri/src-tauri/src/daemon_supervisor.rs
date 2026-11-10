@@ -198,7 +198,10 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
+            // A Unix socket path is capped at `SUN_LEN` (104 bytes on macOS), and
+            // `temp_dir()` there is the long per-user `TMPDIR`. Use the short
+            // system path so the socket this scratch directory holds can bind.
+            let dir = PathBuf::from("/tmp").join(format!(
                 "hush-supervisor-test-{}-{name}",
                 std::process::id()
             ));

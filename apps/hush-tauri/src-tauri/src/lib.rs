@@ -221,6 +221,37 @@ async fn hush_api(
     client.request(&method, &path, body).await
 }
 
+/// Keep the vault out of iCloud backups.
+///
+/// iOS backs up the whole app container by default, including
+/// `Library/Application Support`, so without this the vault — the only copy of
+/// the account keys — would be uploaded to iCloud. The resource key applies to
+/// the directory and everything beneath it.
+#[cfg(target_os = "ios")]
+fn exclude_vault_from_icloud_backup(dir: &std::path::Path) {
+    use objc2_foundation::{NSNumber, NSString, NSURL, NSURLIsExcludedFromBackupKey};
+
+    let Some(path) = dir.to_str() else {
+        eprintln!(
+            "hush: {} is not valid UTF-8; cannot exclude it from iCloud backup",
+            dir.display()
+        );
+        return;
+    };
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+    let value = NSNumber::numberWithBool(true);
+    // SAFETY: `NSURLIsExcludedFromBackupKey` takes an `NSNumber`, which is what
+    // `value` is.
+    match unsafe { url.setResourceValue_forKey_error(Some(&value), NSURLIsExcludedFromBackupKey) }
+    {
+        Ok(()) => {}
+        Err(error) => eprintln!(
+            "hush: could not exclude {} from iCloud backup: {error}",
+            dir.display()
+        ),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let window_title = std::env::var("HUSH_WINDOW_TITLE").unwrap_or_else(|_| "Hush".to_string());
@@ -383,6 +414,8 @@ pub fn run() {
                 if let Err(e) = std::fs::create_dir_all(&dir) {
                     eprintln!("hush: could not create {}: {e}", dir.display());
                 }
+                #[cfg(target_os = "ios")]
+                exclude_vault_from_icloud_backup(&dir);
                 app.manage(mobile::MobileBackend::spawn(dir));
 
                 if let Some(window) = app.get_webview_window("main") {

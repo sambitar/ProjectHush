@@ -94,4 +94,6 @@ fi
 mkdir -p "$(dirname "$DEST")"
 cp "$SRC" "$DEST"
 chmod +x "$DEST" 2>/dev/null || true
-echo "staged $(realpath --relative-to="$ROOT" "$DEST")"
+# `realpath --relative-to` is GNU-only; BSD's realpath rejects it. The prefix
+# strip gives the same path on both hosts.
+echo "staged ${DEST#"$ROOT"/}"

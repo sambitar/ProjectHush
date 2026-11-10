@@ -11,6 +11,9 @@ ciphertext it cannot read, plus a CLI and a Tauri desktop UI.
 | Rust (stable) | every crate in the workspace | https://rustup.rs |
 | Node.js LTS + npm | the UI in `apps/hush-tauri` | https://nodejs.org |
 | `protoc` | libsignal's build script compiles `protos/WhisperTextProtocol.proto`, so nothing depending on `hush-core` builds without it | `sudo apt install protobuf-compiler`, `brew install protobuf`, or see below |
+| bash 4.4+ | the run and smoke scripts (arrays under `set -u`) | `brew install bash` and put `/opt/homebrew/bin` on `PATH` |
+| Xcode + iOS SDK | the iOS target in `apps/hush-tauri` | App Store, or `xcode-select --install` for the desktop shell only |
+| `xcodegen` + CocoaPods | generating and linking the iOS Xcode project | `brew install xcodegen cocoapods` |
 
 On Linux the desktop shell and the voice path also need development packages:
 
@@ -23,6 +26,17 @@ sudo apt-get install -y \
 That is the list the release workflow installs (`.github/workflows/release.yml`)
 plus `libasound2-dev`, which the daemon's audio capture needs and the release
 build does not.
+
+On macOS the desktop shell needs only the Xcode Command Line Tools; the iOS
+target needs full Xcode. For either, after `rustup`:
+
+```
+brew install protobuf
+# iOS only:
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+rustup component add llvm-tools   # swift-rs externalizes Tauri's Swift symbols
+brew install xcodegen cocoapods
+```
 
 `protoc` alternatives, in the order `crates/hush-core/build.rs` looks: an
 explicit `PROTOC=/path/to/protoc`, then a release unzipped into
@@ -57,6 +71,25 @@ desktop entry visible to the shell, KDE Plasma falls back to the window's own ic
 on X11 and still shows the mark, while GNOME Shell has no such fallback and draws a
 placeholder. On Wayland there is no window icon at all, so neither desktop shows it
 until the entry is in place.
+
+## Build for iOS
+
+The phone build is the same Tauri app with the in-process backend the Android
+target uses; there is no daemon child and no Tor sidecar. After
+`npx tauri ios init` has generated `src-tauri/gen/apple`:
+
+```
+cd apps/hush-tauri
+npx tauri ios build --debug --target aarch64-sim --no-sign   # simulator
+npx tauri ios dev                                            # run it
+```
+
+A device or TestFlight build needs an Apple Developer team; see
+`docs/plans/2026-11-09-macos-ios-migration.md` for the signing, Tor, and backup
+decisions that are still open. If `xcode-select -p` prints
+`/Library/Developer/CommandLineTools`, run `sudo xcode-select -s
+/Applications/Xcode.app/Contents/Developer` or point `DEVELOPER_DIR` at Xcode
+for the build.
 
 ## Run it
 
@@ -194,6 +227,11 @@ cargo test --workspace
 `smoke-tor-relay.sh`, `smoke-relay-lab.sh`, `voice-dogfood.sh`, `paper-dogfood.sh`)
 and they assume the same prerequisites as the run scripts.
 
+`cargo check --workspace` also builds `crates/voice-spike`, which needs the
+vendored Opus tree that is deliberately not committed. Fetch it with the snippet
+in `crates/voice-spike/vendor/README.md`; `crates/hush-audio` already carries its
+copy.
+
 ## Layout
 
 ```
@@ -215,3 +253,4 @@ docs/                 protocol, threat model, design, tasks, ops
 - `docs/THREAT_MODEL.md` — what the relay sees, what a compromised host sees
 - `docs/DESIGN.md`, `docs/OPEN_QUESTIONS.md` — design decisions and what is still open
 - `RELEASING.md` — bundles, updater manifest, signing
+- `docs/plans/2026-11-09-macos-ios-migration.md` — what the macOS/iOS move changed and what is open

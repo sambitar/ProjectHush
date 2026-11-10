@@ -28,3 +28,11 @@ debug = 0
 [profile.dev-with-debug]
 inherits = "dev"
 debug = 2
+
+# nix 0.31.3 gates `UtunIfname`/`KextControl` on `apple_targets`, which includes
+# iOS, but `libc` only defines `SYSPROTO_CONTROL`/`UTUN_OPT_IFNAME` on macOS, so
+# `cargo build --target aarch64-apple-ios*` fails inside nix (pulled by
+# rtc-shared through webrtc). Upstream fixed the gates on main; this pins that
+# commit because 0.31.4 is not on crates.io yet. Drop the patch when it is.
+[patch.crates-io]
+nix = { git = "https://github.com/nix-rust/nix", rev = "89339c618783622e3cdd8d7a6b17319a65337e94" }

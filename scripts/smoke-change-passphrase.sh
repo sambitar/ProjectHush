@@ -40,7 +40,13 @@ api() { # api <method> <path> [json] -> body, sets CODE
 }
 
 digest() { # digest <file> -> sha256, or "absent"
-  [[ -e "$1" ]] && sha256sum "$1" | cut -d' ' -f1 || echo "absent"
+  [[ -e "$1" ]] || { echo "absent"; return; }
+  # macOS ships shasum, not sha256sum.
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
 }
 
 HUSH_RUNTIME_DIR="$R" "$CLI" --dir "$T" init --passphrase "first-pass" >/dev/null

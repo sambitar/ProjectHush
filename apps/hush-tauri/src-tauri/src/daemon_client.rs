@@ -209,7 +209,10 @@ mod tests {
     use serde_json::json;
 
     fn temp_socket(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hush-proxy-test-{}", std::process::id()));
+        // A Unix socket path is capped at `SUN_LEN` (104 bytes on macOS). The
+        // per-user `TMPDIR` there is long enough to exceed it once the test
+        // directories are appended, so use the short system path.
+        let dir = PathBuf::from("/tmp").join(format!("hush-proxy-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }

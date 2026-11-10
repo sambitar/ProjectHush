@@ -76,6 +76,9 @@ fn make_record(keys: &IdentityKeyPair, device_id: u32, one_time_count: usize) ->
         kyber_pre_key_public: kyber_public.to_vec(),
         kyber_pre_key_signature: kyber_signature.to_vec(),
         one_time_prekeys,
+        // This build can receive a chunked FileOffer; the flag is a hint and
+        // the relay does not inspect it.
+        supports_file_transfer: true,
     }
 }
 

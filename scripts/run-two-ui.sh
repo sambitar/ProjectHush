@@ -149,8 +149,12 @@ TAURI_BIN="${BIN}/hush-tauri"
 TOR_DIR="${ROOT}/apps/hush-tauri/src-tauri/resources/tor"
 TOR_BIN=""
 TOR_LIB_DIR=""
-if [[ -x "$TOR_DIR/tor" ]]; then
-  TOR_BIN="${HUSH_TOR_BIN:-$TOR_DIR/tor}"
+# See run-one-ui.sh: the bundled sidecar is a Linux ELF, so a macOS run uses
+# HUSH_TOR_BIN or the system copy instead.
+if [[ -n "${HUSH_TOR_BIN:-}" ]]; then
+  TOR_BIN="$HUSH_TOR_BIN"
+elif [[ "$(uname -s)" == "Linux" && -x "$TOR_DIR/tor" ]]; then
+  TOR_BIN="$TOR_DIR/tor"
   TOR_LIB_DIR="$TOR_DIR"
 fi
 
@@ -377,7 +381,12 @@ else
     UI_ENV+=(HUSH_TOR_BIN="$TOR_BIN")
   fi
   if [[ -n "$TOR_LIB_DIR" ]]; then
-    UI_ENV+=(LD_LIBRARY_PATH="${TOR_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+    # The loader variable differs by platform; see run-one-ui.sh.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      UI_ENV+=(DYLD_LIBRARY_PATH="${TOR_LIB_DIR}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}")
+    else
+      UI_ENV+=(LD_LIBRARY_PATH="${TOR_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+    fi
   fi
   if [[ -n "$TOR_BIN" ]]; then
     echo "Tor: the bundled sidecar ($TOR_BIN)"
@@ -422,5 +431,14 @@ if [[ ${#PIDS[@]} -eq 0 ]]; then
   echo "Everything this stack needs was already running; this run started nothing to supervise."
   exit 0
 fi
-wait -n
+# `wait -n` is bash 4.3+; macOS ships bash 3.2. Poll instead, so closing
+# either window still tears the run down.
+while :; do
+  for pid in "${PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break 2
+    fi
+  done
+  sleep 0.2
+done
 echo "A process exited; shutting down…"

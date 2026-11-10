@@ -59,6 +59,11 @@ hush-core = { path = "../../../crates/hush-core" }
 hush-voice = { path = "../../../crates/hush-voice" }
 uuid = { version = "1", features = ["v4"] }
 
+# The iOS build must keep the vault out of iCloud backups, which is an NSURL
+# resource value (`NSURLIsExcludedFromBackupKey`).
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-foundation = { version = "0.3", features = ["NSError", "NSString", "NSURL", "NSValue"] }
+
 [lib]
 name = "hush_tauri_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

@@ -10,6 +10,18 @@
 # Sourced, never executed: nothing here exits on its own. Callers run the checks
 # and let a non-zero return (or their own `set -e`) stop them.
 
+# These scripts expand arrays under `set -u`, which bash before 4.4 treats as
+# unbound when the array is empty. macOS ships 3.2, so a Homebrew bash is
+# required; the scripts' `#!/usr/bin/env bash` shebang finds it when
+# /opt/homebrew/bin is on PATH.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  printf '%s\n' \
+    "These scripts need bash 4.4 or newer; this is bash $BASH_VERSION." \
+    "macOS ships 3.2. Install a newer one with 'brew install bash' and put" \
+    "/opt/homebrew/bin on PATH; the scripts use '#!/usr/bin/env bash'." >&2
+  return 1
+fi
+
 HUSH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # The shared relay, for runs that reach beyond this machine (README: "Test
